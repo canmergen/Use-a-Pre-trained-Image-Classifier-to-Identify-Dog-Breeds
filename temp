@@ -1,63 +1,116 @@
 import cv2
 import numpy as np
 import fitz  # PyMuPDF
-import matplotlib.pyplot as plt
 
 def unsharp_mask(img, blur_kernel=(5, 5), amount=1.5):
     blurred = cv2.GaussianBlur(img, blur_kernel, 0)
     return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
 
-def build_foreground_mask(img_gray, alpha1=6, beta=45, bg_blur_ksize=51, denoise_h=10, min_component_area=120):
+def build_foreground_mask(img_gray,
+                          alpha=1.6, beta=45,  # kontrast ve parlaklık için
+                          denoise_h=10, blur_ksize=3,
+                          min_component_area=120):
+    # 1. Aydınlatma düzeltme
     den = cv2.GaussianBlur(img_gray, (5, 5), 0)
-    bg = cv2.medianBlur(den, bg_blur_ksize)
-    bg = cv2.divide(den, bg, scale=255)
-    norm = cv2.convertScaleAbs(bg, alpha=alpha1, beta=-beta)
-    _, bin_inv = cv2.threshold(norm, 25, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_inv, connectivity=8)
-    for i in range(1, num):
+    bg = cv2.medianBlur(den, 25)
+    den = cv2.divide(den, bg, scale=255)
+
+    # 2. Kontrast arttır
+    norm = cv2.convertScaleAbs(den, alpha=alpha, beta=beta)
+
+    # 3. Eşikleme (invert)
+    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 4. Küçük lekeleri temizle
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    mask = np.zeros_like(binary)
+    for i in range(1, num_labels):
         if stats[i, cv2.CC_STAT_AREA] >= min_component_area:
-            bin_inv[labels == i] = 255
-    mask = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+            mask[labels == i] = 255
+
+    # 5. Alt kenardaki lekeleri doğrudan temizle
+    height = mask.shape[0]
+    bottom_strip = mask[int(height*0.95):, :]
+    if np.sum(bottom_strip) < 5000:
+        mask[int(height*0.95):, :] = 0
+
+    # 6. Morphological Close (bitisikligi toparla)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
     return mask
 
-def crop_to_content(img_gray, mask=None, padding=8):
-    if mask is None:
-        coords = cv2.findNonZero(img_gray)
-    else:
-        coords = cv2.findNonZero(mask)
+def correct_skew_only(img_gray):
+    # Metin veya çizgi tabanlı açı tespiti
+    edges = cv2.Canny(img_gray, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 150)
+
+    angles = []
+    if lines is not None:
+        for rho, theta in lines[:, 0]:
+            angle = (theta * 180 / np.pi) - 90
+            if -45 < angle < 45:  # aşırı açılar filtrelenir
+                angles.append(angle)
+    if len(angles) == 0:
+        return img_gray  # açısızsa, düzeltme gerekmez
+
+    median_angle = np.median(angles)
+    h, w = img_gray.shape
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), median_angle, 1.0)
+    rotated = cv2.warpAffine(img_gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def crop_to_content(img_gray, mask, padding=10):
+    coords = cv2.findNonZero(mask)
     if coords is None:
         return img_gray
     x, y, w, h = cv2.boundingRect(coords)
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    return img_gray[y:y + h + padding, x:x + w + padding]
+    x1 = max(x - padding, 0)
+    y1 = max(y - padding, 0)
+    x2 = min(x + w + padding, img_gray.shape[1])
+    y2 = min(y + h + padding, img_gray.shape[0])
+    return img_gray[y1:y2, x1:x2]
 
-def read_all_pages_as_cv2_images(pdf_path, dpi=400, to_gray=True, apply_sharpen=True,
-                                 sharpening_amount=1.5, display=False, display_page=0):
+def read_all_pages_as_cv2_images(pdf_path,
+                                 dpi=300,
+                                 to_gray=True,
+                                 apply_sharpen=True,
+                                 sharpen_amount=1.5,
+                                 display_page=False):
     doc = fitz.open(pdf_path)
     images = []
     for page_index in range(len(doc)):
-        page = doc[page_index]
-        pix = page.get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR) if pix.n == 4 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        pix = doc[page_index].get_pixmap(dpi=dpi)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
 
         if to_gray:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            mask = build_foreground_mask(img)
-            img = crop_to_content(img, mask, padding=10)
+            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            img_gray = img
 
-        if apply_sharpen and to_gray:
-            img = unsharp_mask(img, amount=sharpening_amount)
+        # Foreground maskeleme
+        mask = build_foreground_mask(img_gray)
 
-        images.append(img)
+        # Skew düzelt (sayfa değil, içerik)
+        skew_corrected = correct_skew_only(img_gray)
 
-        if display and len(images) > display_page:
-            plt.figure(figsize=(10, 10))
-            plt.imshow(images[display_page], cmap='gray' if to_gray else None)
-            plt.title(f"Sayfa {display_page}")
-            plt.axis("off")
-            plt.tight_layout()
+        # Crop
+        cropped = crop_to_content(skew_corrected, mask)
+
+        # Sharpen (isteğe bağlı)
+        if apply_sharpen:
+            final = unsharp_mask(cropped, amount=sharpen_amount)
+        else:
+            final = cropped
+
+        images.append(final)
+
+        if display_page:
+            import matplotlib.pyplot as plt
+            plt.imshow(final, cmap='gray')
+            plt.title(f'Page {page_index}')
+            plt.axis('off')
             plt.show()
 
     return images
