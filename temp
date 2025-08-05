@@ -1,116 +1,115 @@
+
 import cv2
 import numpy as np
-import fitz  # PyMuPDF
+import matplotlib.pyplot as plt
+from PIL import Image
+from io import BytesIO
+import base64
+import requests
 
-def unsharp_mask(img, blur_kernel=(5, 5), amount=1.5):
-    blurred = cv2.GaussianBlur(img, blur_kernel, 0)
-    return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
+def extract_table_region(img, debug=False):
+    inverted = 255 - img.copy()
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    vertical_lines = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+    horizontal_lines = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    table_mask = cv2.add(horizontal_lines, vertical_lines)
+    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-def build_foreground_mask(img_gray,
-                          alpha=1.6, beta=45,  # kontrast ve parlaklık için
-                          denoise_h=10, blur_ksize=3,
-                          min_component_area=120):
-    # 1. Aydınlatma düzeltme
-    den = cv2.GaussianBlur(img_gray, (5, 5), 0)
-    bg = cv2.medianBlur(den, 25)
-    den = cv2.divide(den, bg, scale=255)
+    candidate_boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        aspect_ratio = w / (h + 1e-5)
+        if w * h > 10000 and 3 <= aspect_ratio <= 8 and h > 50:
+            candidate_boxes.append((x, y, w, h))
 
-    # 2. Kontrast arttır
-    norm = cv2.convertScaleAbs(den, alpha=alpha, beta=beta)
+    if not candidate_boxes:
+        print("Uygun tablo kutusu bulunamadı.")
+        return None
 
-    # 3. Eşikleme (invert)
-    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    x, y, w, h = sorted(candidate_boxes, key=lambda b: b[2]*b[3], reverse=True)[0]
+    cropped = img[y:y+h, x:x+w]
 
-    # 4. Küçük lekeleri temizle
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    mask = np.zeros_like(binary)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_component_area:
-            mask[labels == i] = 255
+    if debug:
+        plt.figure(figsize=(12, 6))
+        plt.imshow(cropped, cmap='gray')
+        plt.title("Daha Sağlıklı Kırpılmış Tablo")
+        plt.axis("off")
+        plt.show()
 
-    # 5. Alt kenardaki lekeleri doğrudan temizle
-    height = mask.shape[0]
-    bottom_strip = mask[int(height*0.95):, :]
-    if np.sum(bottom_strip) < 5000:
-        mask[int(height*0.95):, :] = 0
+    return cropped
 
-    # 6. Morphological Close (bitisikligi toparla)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+def extract_cells(table_img, debug=False):
+    gray = cv2.cvtColor(table_img, cv2.COLOR_BGR2GRAY) if len(table_img.shape) == 3 else table_img
+    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-    return mask
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, table_img.shape[0] // 25))
+    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
 
-def correct_skew_only(img_gray):
-    # Metin veya çizgi tabanlı açı tespiti
-    edges = cv2.Canny(img_gray, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, 150)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (table_img.shape[1] // 25, 1))
+    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
 
-    angles = []
-    if lines is not None:
-        for rho, theta in lines[:, 0]:
-            angle = (theta * 180 / np.pi) - 90
-            if -45 < angle < 45:  # aşırı açılar filtrelenir
-                angles.append(angle)
-    if len(angles) == 0:
-        return img_gray  # açısızsa, düzeltme gerekmez
+    table_mask = cv2.add(horizontal_lines, vertical_lines)
+    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    median_angle = np.median(angles)
-    h, w = img_gray.shape
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), median_angle, 1.0)
-    rotated = cv2.warpAffine(img_gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    return rotated
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= 20 and h > 10:
+            boxes.append((x, y, w, h))
 
-def crop_to_content(img_gray, mask, padding=10):
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        return img_gray
-    x, y, w, h = cv2.boundingRect(coords)
-    x1 = max(x - padding, 0)
-    y1 = max(y - padding, 0)
-    x2 = min(x + w + padding, img_gray.shape[1])
-    y2 = min(y + h + padding, img_gray.shape[0])
-    return img_gray[y1:y2, x1:x2]
+    boxes = sorted(boxes, key=lambda b: (b[1] // 10, b[0]))
 
-def read_all_pages_as_cv2_images(pdf_path,
-                                 dpi=300,
-                                 to_gray=True,
-                                 apply_sharpen=True,
-                                 sharpen_amount=1.5,
-                                 display_page=False):
-    doc = fitz.open(pdf_path)
-    images = []
-    for page_index in range(len(doc)):
-        pix = doc[page_index].get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
+    if debug:
+        vis = table_img.copy()
+        for x, y, w, h in boxes:
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 1)
+        plt.figure(figsize=(12, 6))
+        plt.imshow(vis, cmap='gray')
+        plt.title("Tespit Edilen Hücreler")
+        plt.axis("off")
+        plt.show()
 
-        if to_gray:
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            img_gray = img
+    return boxes
 
-        # Foreground maskeleme
-        mask = build_foreground_mask(img_gray)
+def image_to_base64_jpeg(image: Image.Image) -> str:
+    buffer = BytesIO()
+    max_dim = max(image.size)
+    if max_dim > 1000:
+        scale = 1000 / max_dim
+        new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
+        image = image.resize(new_size, Image.LANCZOS)
 
-        # Skew düzelt (sayfa değil, içerik)
-        skew_corrected = correct_skew_only(img_gray)
+    image.save(buffer, format="JPEG", quality=70)
+    image_bytes = buffer.getvalue()
+    return base64.b64encode(image_bytes).decode("utf-8")
 
-        # Crop
-        cropped = crop_to_content(skew_corrected, mask)
+def get_ocr_from_image(roi_image: Image.Image, tesseract_client_url: str, debug: bool = False):
+    try:
+        image_base64 = image_to_base64_jpeg(roi_image)
+        if debug:
+            print(f"[INFO] Görsel çözünürlüğü: {roi_image.size}")
+            print(f"[INFO] Base64 uzunluğu: {len(image_base64)}")
+        response = requests.post(tesseract_client_url, json={"image": image_base64})
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"[OCR ERROR] {e}")
+        return {}
 
-        # Sharpen (isteğe bağlı)
-        if apply_sharpen:
-            final = unsharp_mask(cropped, amount=sharpen_amount)
-        else:
-            final = cropped
-
-        images.append(final)
-
-        if display_page:
-            import matplotlib.pyplot as plt
-            plt.imshow(final, cmap='gray')
-            plt.title(f'Page {page_index}')
-            plt.axis('off')
-            plt.show()
-
-    return images
+def ocr_cells_with_client(image, boxes, tesseract_client, debug=False):
+    results = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        roi_pil = Image.fromarray(image[y:y+h, x:x+w])
+        try:
+            ocr_result = get_ocr_from_image(roi_pil, tesseract_client, debug=debug)
+            if ocr_result and "text" in ocr_result:
+                text = ocr_result["text"].strip()
+            else:
+                print(f"[WARNING] Boş sonuç geldi. index: {i}")
+                text = ""
+        except Exception as e:
+            print(f"[OCR ERROR] Hücre {i} hata verdi: {str(e)}")
+            text = ""
+        results.append(((x, y), text))
+    return results
