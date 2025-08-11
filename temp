@@ -1,86 +1,264 @@
-# Re-importing after code execution state reset
 import cv2
 import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
 import os
-from matplotlib import pyplot as plt
-from typing import List, Tuple
 
-def extract_table_only(
-    image: np.ndarray,
-    debug: bool = False,
-    save_path: str = None,
-    min_table_height_ratio: float = 0.1,
-    max_table_height_ratio: float = 0.8
-) -> np.ndarray:
-    """
-    Extract only the table area from a document image.
-    
-    Args:
-        image (np.ndarray): Input color image.
-        debug (bool): Whether to show intermediate results.
-        save_path (str): If provided, saves the cropped table image.
-        min_table_height_ratio (float): Minimum height ratio relative to image height for table region.
-        max_table_height_ratio (float): Maximum height ratio to filter out signature area.
-    
-    Returns:
-        np.ndarray: Cropped table image.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+def _ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
 
-    # Adaptive thresholding to highlight lines
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10
-    )
+def _binarize(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
-    # Detect horizontal and vertical lines
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+def _merge_lines_1d(positions, eps=6):
+    """Yakın x veya y çizgi konumlarını tek satır/sütun kabul et."""
+    if len(positions) == 0:
+        return positions
+    X = np.array(positions).reshape(-1,1).astype(np.float32)
+    labels = DBSCAN(eps=eps, min_samples=1, metric='euclidean').fit_predict(X)
+    merged = []
+    for k in sorted(set(labels)):
+        merged.append(int(np.median(X[labels==k])))
+    return sorted(merged)
 
-    table_mask = cv2.add(horizontal_lines, vertical_lines)
+def detect_grid_lines(cropped_table,
+                      v_ksize=25, h_ksize=25,
+                      merge_eps=6, debug=False):
+    bin_ = _binarize(cropped_table)
 
-    # Find contours on the table mask
-    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    image_height = image.shape[0]
-    min_height = int(image_height * min_table_height_ratio)
-    max_height = int(image_height * max_table_height_ratio)
-    
-    table_candidates: List[Tuple[int, int, int, int]] = []
+    # Dikey çizgiler
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_ksize))
+    vlines = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, vk, iterations=1)
+    vproj = vlines.sum(axis=0)
+    xs = [int(x) for x in np.where(vproj > 0)[0]]
+    xs = _merge_lines_1d(xs, eps=merge_eps)
 
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        if min_height < h < max_height:
-            table_candidates.append((x, y, w, h))
+    # Yatay çizgiler
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (h_ksize, 1))
+    hlines = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, hk, iterations=1)
+    yproj = hlines.sum(axis=1)
+    ys = [int(y) for y in np.where(yproj > 0)[0]]
+    ys = _merge_lines_1d(ys, eps=merge_eps)
 
-    if not table_candidates:
-        raise ValueError("No valid table region found.")
-
-    # Select the largest table region by area
-    x, y, w, h = max(table_candidates, key=lambda b: b[2] * b[3])
-    table_crop = image[y:y+h, x:x+w]
+    # Kenar emniyeti: sol/üst 0, sağ/alt w/h mutlaka dahil olsun
+    h, w = bin_.shape[:2]
+    xs = sorted(set([0] + xs + [w-1]))
+    ys = sorted(set([0] + ys + [h-1]))
 
     if debug:
-        debug_img = image.copy()
-        for (x_, y_, w_, h_) in table_candidates:
-            cv2.rectangle(debug_img, (x_, y_), (x_ + w_, y_ + h_), (0, 255, 0), 2)
-        plt.figure(figsize=(12, 6))
-        plt.imshow(cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB))
-        plt.title("Detected Table Candidates")
-        plt.axis("off")
-        plt.show()
+        vis = cropped_table.copy()
+        for x in xs: cv2.line(vis, (x,0), (x,h-1), (0,0,255), 1)
+        for y in ys: cv2.line(vis, (0,y), (w-1,y), (255,0,0), 1)
+        # plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)); plt.axis('off'); plt.show()
 
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        cv2.imwrite(save_path, table_crop)
+    return xs, ys
 
-    return table_crop
+def build_cells_from_lines(xs, ys, min_w=8, min_h=8):
+    """Komşu çizgiler arası dikdörtgen hücreler."""
+    cells = []
+    for r in range(len(ys)-1):
+        for c in range(len(xs)-1):
+            x0, x1 = xs[c],   xs[c+1]
+            y0, y1 = ys[r],   ys[r+1]
+            w = x1 - x0; h = y1 - y0
+            if w >= min_w and h >= min_h:
+                cells.append({"row": r, "col": c, "bbox": (x0, y0, w, h)})
+    return cells
 
-# Load the uploaded image for test
-input_path = "/mnt/data/IMG_4A0AB666-33F8-4A35-8F44-E37D4F4A4EF8.jpeg"
-image = cv2.imread(input_path)
+def crop_cell(img, bbox, pad=2):
+    x,y,w,h = bbox
+    h_img, w_img = img.shape[:2]
+    x0 = max(0, x+pad); y0 = max(0, y+pad)
+    x1 = min(w_img, x+w-pad); y1 = min(h_img, y+h-pad)
+    return img[y0:y1, x0:x1]
 
-# Extract only the table part
-table_image = extract_table_only(image, debug=True, save_path="/mnt/data/cropped_table.jpg")
+def guess_signature_col_by_header(img, cells, tc, header_row=0, lang="tur"):
+    # Başlık satırındaki her sütunu OCR’la, 'IMZA' yazanı bul
+    col2text = {}
+    for cell in [c for c in cells if c["row"]==header_row]:
+        roi = crop_cell(img, cell["bbox"])
+        txt = tc.ocr(roi, lang=lang).strip().upper()  # senin arayüzüne uyumla
+        col2text[cell["col"]] = txt
+    for col, txt in col2text.items():
+        if "IMZA" in txt or "İMZA" in txt:
+            return col
+    return None
+
+def is_likely_signature(roi):
+    bin_ = _binarize(roi)
+    ink_ratio = bin_.mean()/255.0  # 1 -> tamamen mürekkep (inverse)
+    return ink_ratio > 0.10  # tabloya göre 0.08–0.15 aralığı iyi çalışır
+
+def table_to_dataframe(cropped_table, tc,
+                       out_dir="cells_out",
+                       lang="tur",
+                       merge_eps=6,
+                       v_ksize=25, h_ksize=25,
+                       debug=False):
+    _ensure_dir(out_dir)
+
+    xs, ys = detect_grid_lines(cropped_table, v_ksize=v_ksize, h_ksize=h_ksize,
+                               merge_eps=merge_eps, debug=debug)
+    cells = build_cells_from_lines(xs, ys)
+
+    # Boyutlar
+    n_rows = max(c["row"] for c in cells) + 1
+    n_cols = max(c["col"] for c in cells) + 1
+
+    # İmza sütununu başlıktan tahmin et
+    sign_col = guess_signature_col_by_header(cropped_table, cells, tc, header_row=0, lang=lang)
+
+    # Boş DataFrame’ler
+    df_text = pd.DataFrame([[""]*n_cols for _ in range(n_rows)])
+    df_meta = pd.DataFrame([[None]*n_cols for _ in range(n_rows)])
+
+    for c in cells:
+        r, col, bbox = c["row"], c["col"], c["bbox"]
+        roi = crop_cell(cropped_table, bbox)
+
+        # OCR
+        text = tc.ocr(roi, lang=lang).strip()  # senin fonksiyonuna göre
+
+        # İmza tespiti
+        is_sig = False
+        if sign_col is not None and col == sign_col:
+            # Başlık imza ise, alt hücreler imza olabilir
+            if r > 0:
+                is_sig = True
+        if not is_sig and text == "":
+            is_sig = is_likely_signature(roi)
+
+        image_path = None
+        if is_sig:
+            fname = os.path.join(out_dir, f"r{r}_c{col}_signature.png")
+            cv2.imwrite(fname, roi)
+            image_path = fname
+            val = "<signature>"
+        else:
+            val = text
+
+        df_text.iat[r, col] = val
+        df_meta.iat[r, col] = {
+            "text": text,
+            "bbox": bbox,
+            "image_path": image_path,
+            "is_signature": bool(is_sig),
+        }
+
+    return df_text, df_meta, {"xs": xs, "ys": ys}
+
+# 1) Önce küçük skew düzeltmesini uygula (safe_deskew)
+img0 = cropped_table  # senin ürettiğin tablo kırpımı
+# img0 = safe_deskew(cropped_table, debug=True)  # istersen
+
+# 2) TesseractClient örneğin
+# tc = tc_new  # senin mevcut client adın neyse
+
+df_text, df_meta, grid = table_to_dataframe(img0, tc, out_dir="cells_out", lang="tur", debug=False)
+
+# df_text: görsel yerleşimle aynı
+# df_meta: her hücre için ayrıntı (bbox, signature image path, vb.)
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+def visualize_cells_overlay(img, xs, ys, font_scale=0.5):
+    vis = img.copy()
+    h, w = vis.shape[:2]
+
+    # Izgara çiz
+    for x in xs: cv2.line(vis, (x,0), (x,h-1), (0,0,255), 1)
+    for y in ys: cv2.line(vis, (0,y), (w-1,y), (255,0,0), 1)
+
+    # Hücre merkezine (r,c) yaz
+    for r in range(len(ys)-1):
+        for c in range(len(xs)-1):
+            x0, x1 = xs[c], xs[c+1]
+            y0, y1 = ys[r], ys[r+1]
+            cx = int((x0 + x1) / 2)
+            cy = int((y0 + y1) / 2)
+            cv2.putText(vis, f"({r},{c})", (cx-15, cy+5),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0,0,0), 2, cv2.LINE_AA)
+            cv2.putText(vis, f"({r},{c})", (cx-15, cy+5),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255,255,255), 1, cv2.LINE_AA)
+
+    plt.figure(figsize=(12,8))
+    plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+    plt.axis('off'); plt.title("Cells overlay (r,c)")
+    plt.show()
+
+xs, ys = grid["xs"], grid["ys"]     # table_to_dataframe dönüşünden
+visualize_cells_overlay(cropped_table, xs, ys, font_scale=0.6)
+
+def show_cells_gallery(img, xs, ys, nrows=5, ncols=6, page=0, pad=2):
+    """
+    nrows*ncols kadar hücreyi tek figürde gösterir. page=0 ilk sayfa.
+    """
+    cells = []
+    for r in range(len(ys)-1):
+        for c in range(len(xs)-1):
+            x0, x1 = xs[c], xs[c+1]
+            y0, y1 = ys[r], ys[r+1]
+            cells.append((r, c, (x0, y0, x1-x0, y1-y0)))
+
+    total = len(cells)
+    per_page = nrows * ncols
+    start = page * per_page
+    end = min(start + per_page, total)
+    if start >= total:
+        print("No cells on this page."); return
+
+    plt.figure(figsize=(ncols*2.2, nrows*2.2))
+    for i, (r, c, bbox) in enumerate(cells[start:end], start=1):
+        x,y,w,h = bbox
+        roi = crop_cell(img, bbox, pad=pad)
+        ax = plt.subplot(nrows, ncols, i)
+        ax.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+        ax.set_title(f"({r},{c})", fontsize=9)
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+# İlk sayfa
+show_cells_gallery(cropped_table, xs, ys, nrows=4, ncols=6, page=0)
+
+# Sonraki sayfa
+show_cells_gallery(cropped_table, xs, ys, nrows=4, ncols=6, page=1)
+
+def show_signature_cells(df_meta, img, highlight_first=True, ncols=4):
+    sig_cells = []
+    for r in range(df_meta.shape[0]):
+        for c in range(df_meta.shape[1]):
+            meta = df_meta.iat[r, c]
+            if isinstance(meta, dict) and meta.get("is_signature"):
+                sig_cells.append((r, c, meta["bbox"]))
+    if not sig_cells:
+        print("Signature cells not found."); return
+
+    nrows = int(np.ceil(len(sig_cells)/ncols))
+    plt.figure(figsize=(ncols*2.5, nrows*2.5))
+    for i, (r,c,bbox) in enumerate(sig_cells, start=1):
+        ax = plt.subplot(nrows, ncols, i)
+        roi = crop_cell(img, bbox, pad=2)
+        ax.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+        ax.set_title(f"({r},{c}) <signature>")
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+show_signature_cells(df_meta, cropped_table, ncols=5)
+
+# 1) Skew düzeltme (gerekirse)
+deskewed = safe_deskew(cropped_table, debug=True)
+
+# 2) Hücre & DF üret
+df_text, df_meta, grid = table_to_dataframe(deskewed, tc_new, out_dir="cells_out", lang="tur", debug=False)
+xs, ys = grid["xs"], grid["ys"]
+
+# 3) Görselleştirme
+visualize_cells_overlay(deskewed, xs, ys, font_scale=0.6)
+show_cells_gallery(deskewed, xs, ys, nrows=4, ncols=6, page=0)  # (r,c) başlıklı galeri
+show_signature_cells(df_meta, deskewed, ncols=5)                # sadece imzalar
