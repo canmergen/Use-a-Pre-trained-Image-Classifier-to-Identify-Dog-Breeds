@@ -1,224 +1,159 @@
 import cv2
 import numpy as np
-from typing import Optional, Tuple
 
-# ----------------------------
+# ----------------------
 # Yardımcılar
-# ----------------------------
-def _binarize(img: np.ndarray, invert: bool = False) -> np.ndarray:
-    """
-    Giriş: BGR/grayscale img
-    Çıkış: 0/255 ikili maske.
-      invert=False  -> yazı/çizgi = 0 (siyah), zemin = 255 (beyaz)
-      invert=True   -> yazı/çizgi = 255 (beyaz), zemin = 0 (siyah)
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    thresh_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
-    bw = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C, thresh_type,
-        15, 10
-    )
-    return bw
-
-def _find_outer_quad(binary_roi: np.ndarray) -> Optional[np.ndarray]:
-    """
-    En büyük dış konturun 4 noktalı yaklaşık dörtgenini döndür (CW sıralı), yoksa None.
-    Beklenen giriş: 0/255 ikili.
-    """
-    cnts = cv2.findContours(binary_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-    if not cnts:
-        return None
-    cnt = max(cnts, key=cv2.contourArea)
-    peri = cv2.arcLength(cnt, True)
-    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-    if len(approx) != 4:
-        return None
-
-    pts = approx.reshape(-1, 2).astype(np.float32)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
+# ----------------------
+def _order_quad(pts: np.ndarray) -> np.ndarray:
+    # 4x2 -> saat yönünde: tl, tr, br, bl
+    pts = pts.astype(np.float32)
+    s = pts.sum(axis=1); d = np.diff(pts, axis=1).ravel()
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
     tr = pts[np.argmin(d)]
     bl = pts[np.argmax(d)]
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
-def _projection_sharpness(img_bw: np.ndarray) -> float:
+def _find_table_quad(binv: np.ndarray) -> tuple:
     """
-    Projeksiyon keskinliği skoru (daha yüksek = daha iyi hizalı).
-    Giriş 0/255 ikili; siyah yazı 0, beyaz zemin 255 ya da tersi olabilir (fark etmez).
+    Çizgi maskesinden en büyük konturu bul, 4'gene yaklaştır.
+    Döndür: (quad[4,2] veya None, bbox_rect)  -> bbox_rect: (x,y,w,h)
     """
-    proj = img_bw.sum(axis=1).astype(np.float32)
-    return float(np.var(proj) + proj.max())
+    cnts = cv2.findContours(binv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    if not cnts:
+        return None, None
+    cnt = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(cnt)
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
+    if len(approx) == 4:
+        quad = _order_quad(approx.reshape(-1,2))
+        return quad, (x,y,w,h)
+    return None, (x,y,w,h)
 
-# ----------------------------
-# Tabloyu tam kutusuyla kırp
-# ----------------------------
-def extract_full_table_region(image: np.ndarray,
-                              pad: int = 5) -> Tuple[np.ndarray, Tuple[int,int,int,int]]:
-    """
-    Satır/sütun çizgilerinin projeksiyonundan tablo bounding box'ını bul ve kırp.
-    Dönüş: (cropped_bgr, (left, top, right, bottom))
-    """
-    # Çizgileri daha iyi görmek için INVerse maske ile çalışmak avantajlıdır.
-    binv = _binarize(image, invert=True)
+def _binarize_inv(img: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    # İnce yazıları korumak için adaptif eşik (INVerse)
+    return cv2.adaptiveThreshold(gray, 255,
+                                 cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+                                 15, 10)
 
-    H, W = binv.shape[:2]
-    kx = max(18, W // 40)
-    ky = max(18, H // 40)
-    horiz_k = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1))
-    vert_k  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky))
-    horiz = cv2.morphologyEx(binv, cv2.MORPH_OPEN, horiz_k, iterations=1)
-    vert  = cv2.morphologyEx(binv, cv2.MORPH_OPEN, vert_k,  iterations=1)
-    lines = cv2.bitwise_or(horiz, vert)
+# ----------------------
+# 1) İlk kaba crop (senin mevcut fonksiyonun)
+# ----------------------
+def extract_full_table_region(image, debug=False, save_path=None):
+    gray  = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 15, 10)
 
-    proj_h = lines.sum(axis=1)
-    proj_v = lines.sum(axis=0)
+    # Yatay ve dikey çizgileri güçlendir
+    H, W = binary.shape[:2]
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, W//40), 1))
+    vertical_kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(40, H//40)))
 
-    if proj_h.max() == 0 or proj_v.max() == 0:
-        # Hiç çizgi yakalanmadıysa tüm görüntüyü döndür.
-        return image.copy(), (0, 0, W-1, H-1)
+    det_horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    det_vertical   = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel,   iterations=1)
+    lines = cv2.bitwise_or(det_horizontal, det_vertical)
 
-    th_h = 0.5 * proj_h.max()
-    th_v = 0.5 * proj_v.max()
-    ys = np.where(proj_h > th_h)[0]
-    xs = np.where(proj_v > th_v)[0]
+    # Projeksiyondan sol-sağ-üst-alt
+    proj_h = lines.sum(axis=1); proj_v = lines.sum(axis=0)
+    th_h = 0.5 * proj_h.max(); th_v = 0.5 * proj_v.max()
+
+    ys = np.where(proj_h > th_h)[0] if proj_h.max() > 0 else np.array([0, H-1])
+    xs = np.where(proj_v > th_v)[0] if proj_v.max() > 0 else np.array([0, W-1])
 
     top, bottom = int(ys[0]), int(ys[-1])
     left, right = int(xs[0]), int(xs[-1])
 
-    top    = max(0, top - pad)
-    bottom = min(H-1, bottom + pad)
-    left   = max(0, left - pad)
-    right  = min(W-1, right + pad)
+    pad = 5
+    top    = max(0, top - pad);    bottom = min(H-1, bottom + pad)
+    left   = max(0, left - pad);   right  = min(W-1, right + pad)
 
     cropped = image[top:bottom+1, left:right+1].copy()
-    return cropped, (left, top, right, bottom)
 
-# ----------------------------
-# Deskew + (opsiyonel) Rectify
-# ----------------------------
-def deskew_and_rectify(binary_roi: np.ndarray,
-                       try_perspective: bool = True,
-                       fine_range: float = 1.0,
-                       fine_step: float = 0.05,
-                       min_hough_len_frac: float = 0.33,
-                       invert: bool = False,
-                       debug: bool = False) -> Tuple[np.ndarray, float]:
+    if debug:
+        print(f"[INFO] Kesilen tablo: x={left}, y={top}, w={right-left}, h={bottom-top}")
+    return cropped
+
+# ----------------------
+# 2) Sıkılaştır + Rectify + (gerekirse) Deskew
+# ----------------------
+def deskew_cropped_table(table_img,
+                         min_thr=0.1, max_thr=10.0,
+                         debug=False):
     """
-    Giriş: 0/255 ikili ROI (invert parametresi yalnızca sınır doldurma için kullanılır).
-    1) Mümkünse dörtgenle perspektif düzelt.
-    2) Hough ile kaba açı + projeksiyon keskinliği ile ince arama.
-    Çıkış: (rectified_binary, best_angle)
+    Girdi: extract_full_table_region'den gelen BGR tablo alanı
+    Çıkış: BGR, sadece tablo (dış yazılar yok), rectify uygulanmış
     """
-    img = binary_roi.copy()
-    H, W = img.shape[:2]
+    # 2.1 Çizgilerden dış kutuyu netleştir – tablo dışındaki yazıları at
+    binv = _binarize_inv(table_img)
 
-    # İnvert'e uygun sınır rengi (beyaz zemin):
-    border_val = 255 if not invert else 0
+    H, W = binv.shape[:2]
+    kx = max(30, W // 25)
+    ky = max(30, H // 25)
+    horiz = cv2.morphologyEx(binv, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (kx,1)), iterations=1)
+    vert  = cv2.morphologyEx(binv, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (1,ky)), iterations=1)
+    line_mask = cv2.bitwise_or(horiz, vert)
 
-    # (1) Perspektif
-    if try_perspective:
-        quad = _find_outer_quad(img)
-        if quad is not None:
-            w = int(max(np.linalg.norm(quad[1]-quad[0]), np.linalg.norm(quad[2]-quad[3])))
-            h = int(max(np.linalg.norm(quad[3]-quad[0]), np.linalg.norm(quad[2]-quad[1])))
-            w = max(w, 1); h = max(h, 1)
-            dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
-            M = cv2.getPerspectiveTransform(quad, dst)
-            img = cv2.warpPerspective(img, M, (w, h),
-                                      flags=cv2.INTER_NEAREST, borderValue=border_val)
-            H, W = img.shape[:2]
-            if debug: print("[rectify] perspective warp applied")
+    quad, bbox = _find_table_quad(line_mask)
+    if bbox is not None:
+        x,y,w,h = bbox
+        # Küçük bir iç pad ile dış yazıları garanti dışına al
+        shrink = max(2, min(w,h)//200)
+        x = max(0, x+shrink); y = max(0, y+shrink)
+        w = max(1, w-2*shrink); h = max(1, h-2*shrink)
+        table_img = table_img[y:y+h, x:x+w].copy()
+        binv      = binv[y:y+h, x:x+w].copy()
+        if debug: print(f"[tight] bbox -> x={x}, y={y}, w={w}, h={h}")
 
-    # (2) Hough ile kaba açı
-    blur = cv2.GaussianBlur(img, (3,3), 0)
-    lines = cv2.HoughLinesP(
-        blur, 1, np.pi/180,
-        threshold=max(80, (H+W)//80),
-        minLineLength=int(max(H, W) * min_hough_len_frac),
-        maxLineGap=10
-    )
+    # 2.2 Perspektif varsa uygula (rectify)
+    if quad is not None:
+        # quad, eski görüntü koordinatlarındaydı; crop sonrası hizala
+        if bbox is not None:
+            x,y,_,_ = bbox
+            quad = quad - np.array([x, y], dtype=np.float32)
 
-    angle0 = 0.0
+        w = int(max(np.linalg.norm(quad[1]-quad[0]), np.linalg.norm(quad[2]-quad[3])))
+        h = int(max(np.linalg.norm(quad[3]-quad[0]), np.linalg.norm(quad[2]-quad[1])))
+        w = max(w, 1); h = max(h, 1)
+        dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+        M = cv2.getPerspectiveTransform(quad, dst)
+        rectified = cv2.warpPerspective(table_img, M, (w, h),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_REPLICATE)
+        if debug: print("[rectify] perspective warp applied")
+        return rectified
+
+    # 2.3 Perspektif bulunamadıysa: hafif açı düzeltme (Hough)
+    gray = cv2.cvtColor(table_img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3,3), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    lines = cv2.HoughLinesP(th, 1, np.pi/180,
+                            threshold=max(80, (H+W)//80),
+                            minLineLength=max(H,W)//3,
+                            maxLineGap=10)
+    angle = None
     if lines is not None:
-        angs, lens = [], []
+        angs = []
         for x1,y1,x2,y2 in lines[:,0]:
             a = np.degrees(np.arctan2(y2-y1, x2-x1))
             a = (a + 180) % 180
             if a > 90: a -= 180
-            if abs(a) <= 45:
-                L = np.hypot(x2-x1, y2-y1)
-                angs.append(a); lens.append(L)
+            if abs(a) <= 45: angs.append(a)
         if angs:
-            angs = np.array(angs); lens = np.array(lens)
-            order = np.argsort(angs)
-            angs = angs[order]; lens = lens[order]
-            cum = np.cumsum(lens) / (lens.sum() + 1e-6)
-            idx = np.searchsorted(cum, 0.5)
-            angle0 = float(angs[max(0, min(idx, len(angs)-1))])
+            angle = float(np.median(angs))
 
-    # İnce arama
-    best_angle, best_score = angle0, -1e9
-    lo, hi = angle0 - fine_range, angle0 + fine_range
-    for a in np.arange(lo, hi + 1e-9, fine_step):
-        M = cv2.getRotationMatrix2D((W/2, H/2), a, 1.0)
-        rot = cv2.warpAffine(img, M, (W, H),
-                             flags=cv2.INTER_NEAREST, borderValue=border_val)
-        score = _projection_sharpness(rot)
-        if score > best_score:
-            best_score, best_angle = score, a
+    if angle is None or abs(angle) < min_thr or abs(angle) > max_thr:
+        if debug: print("[deskew] angle unavailable or out-of-range, skip.")
+        return table_img
 
-    if debug: print(f"[deskew] best_angle={best_angle:.3f}°")
-
-    M = cv2.getRotationMatrix2D((W/2, H/2), best_angle, 1.0)
-    out = cv2.warpAffine(img, M, (W, H),
-                         flags=cv2.INTER_NEAREST, borderValue=border_val)
-    # 0/255'e sabitle
-    out = (out > 0).astype(np.uint8) * 255
-    return out, float(best_angle)
-
-# ----------------------------
-# Tek adım: crop + deskew + rectify
-# ----------------------------
-def crop_and_deskew_rectify_table(image: np.ndarray,
-                                  try_perspective: bool = True,
-                                  fine_range: float = 1.0,
-                                  fine_step: float = 0.05,
-                                  invert: bool = False,
-                                  debug: bool = False) -> np.ndarray:
-    """
-    Giriş: BGR veya gri sayfa görüntüsü.
-    Çıkış: Yalnızca tablo, deskew+rectify uygulanmış, 0/255 ikili.
-      invert=False -> klasik siyah yazı / beyaz zemin
-      invert=True  -> beyaz yazı / siyah zemin
-    """
-    # 1) Tabloyu kırp
-    cropped_bgr, _ = extract_full_table_region(image)
-
-    # 2) İkili maske
-    bw = _binarize(cropped_bgr, invert=invert)
-
-    # 3) Deskew + Rectify
-    rectified, _ = deskew_and_rectify(
-        bw,
-        try_perspective=try_perspective,
-        fine_range=fine_range,
-        fine_step=fine_step,
-        invert=invert,
-        debug=debug
-    )
-    return rectified
-
-# ----------------------------
-# Örnek kullanım
-# ----------------------------
-# page_img = pdf_images[0]  # BGR np.ndarray
-# table_bin = crop_and_deskew_rectify_table(page_img,
-#                                           try_perspective=True,
-#                                           fine_range=1.0,
-#                                           fine_step=0.05,
-#                                           invert=False,   # siyah yazı, beyaz zemin
-#                                           debug=True)
-# cv2.imwrite("table_rectified.png", table_bin)
+    H2, W2 = table_img.shape[:2]
+    M = cv2.getRotationMatrix2D((W2/2, H2/2), angle, 1.0)
+    rotated = cv2.warpAffine(table_img, M, (W2, H2),
+                             flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+    if debug: print(f"[deskew] Rotated by {angle:.2f}°")
+    return rotated
