@@ -1,343 +1,292 @@
-from dataclasses import dataclass
-import numpy as np
+# -*- coding: utf-8 -*-
 import cv2
-import matplotlib.pyplot as plt
+import numpy as np
 
-# ------------------------------
-# Data holders
-# ------------------------------
-@dataclass
-class Cell:
-    r: int; c: int
-    x: int; y: int; w: int; h: int
-    is_signature: bool = False
-    signature_png: bytes | None = None
+# ------------------------------------------------------------
+# 0) (OPSİYONEL) Binaraizasyon yardımcıları
+#    Çıktı: uint8, 0/255; beyaz zemin=255, çizgi/metin=0
+# ------------------------------------------------------------
+def to_binary_white_bg(gray: np.ndarray) -> np.ndarray:
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    # Gamma + hafif kontrast + Otsu -> zemin=255
+    g = np.clip((gray.astype(np.float32) / 255.0) ** (1/1.6) * 255.0, 0, 255).astype(np.uint8)
+    g = cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX)
+    _, binv = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    img_bin = 255 - binv
+    return img_bin
 
-# ------------------------------
-# Helpers: scaling & binarize
-# ------------------------------
-def downscale(img_bgr: np.ndarray, max_w: int = 2000):
-    H, W = img_bgr.shape[:2]
-    if W <= max_w:
-        return img_bgr, 1.0
-    scale = max_w / float(W)
-    small = cv2.resize(img_bgr, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-    return small, scale
+# ------------------------------------------------------------
+# 1) Çok-ölçekli ızgara maskesi (ince/kopuk çizgiler için toleranslı)
+#    Girdi: img_bin (0/255, zemin=255)
+#    Çıktı: grid mask (0/255; çizgiler=255)
+# ------------------------------------------------------------
+def build_grid_mask_multiscale(img_bin: np.ndarray, debug: bool = False) -> np.ndarray:
+    assert img_bin.ndim == 2 and img_bin.dtype == np.uint8
+    H, W = img_bin.shape[:2]
+    inv = (255 - img_bin).astype(np.uint8)     # çizgiler=1
 
-def to_binv(gray_or_bgr: np.ndarray):
-    gray = cv2.cvtColor(gray_or_bgr, cv2.COLOR_BGR2GRAY) if gray_or_bgr.ndim == 3 else gray_or_bgr
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    # Inverted: çizgiler=255 (siyah), zemin=0 (beyaz)
-    _, binv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    return binv
+    # Daha toleranslı (küçük tablo + ince çizgi)
+    kx_list = [max(12, W//90), max(18, W//60), max(18, W//40)]
+    ky_list = [max(12, H//90), max(18, H//60), max(18, H//40)]
 
-# ------------------------------
-# Signature column masking (small scale)
-# ------------------------------
-def mask_signature_column_small(binv_small: np.ndarray, sig_ratio=0.82, debug=False):
-    H, W = binv_small.shape
-    # imza kolonunun geniş bir kısmını maskeler (siyah=0 yapar)
-    sig_w = int(W * (1.0 - sig_ratio))  # en sağ ~%18 imza alanı varsayımı
-    masked = binv_small.copy()
-    if sig_w > 0:
-        x0 = W - sig_w
-        cv2.rectangle(masked, (x0, 0), (W-1, H-1), 0, -1)
+    grid = np.zeros_like(inv)
+    for kx in kx_list:
+        grid = cv2.bitwise_or(grid, cv2.morphologyEx(
+            inv, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), 1
+        ))
+    for ky in ky_list:
+        grid = cv2.bitwise_or(grid, cv2.morphologyEx(
+            inv, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)), 1
+        ))
+
+    # Kopuk hatları onar
+    grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5,5)), 2)
+    grid = cv2.dilate(grid, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)), 1)
+
+    # Ufak parçaları at
+    nlab, labels, stats, _ = cv2.connectedComponentsWithStats((grid>0).astype(np.uint8), 8)
+    keep = np.zeros_like(grid)
+    thr_area = max(200, (H*W)//4000)   # dinamik eşik
+    for i in range(1, nlab):
+        if stats[i, cv2.CC_STAT_AREA] >= thr_area:
+            keep[labels == i] = 255
+    grid = keep
 
     if debug:
-        fig, ax = plt.subplots(1, 1, figsize=(7, 3))
-        ax.imshow(masked, cmap='gray')
-        ax.set_title('Masked for line detection'); ax.axis('off'); plt.show()
+        print(f"[grid-ms] nonzero={np.count_nonzero(grid)}")
+    return grid
 
-    return masked
-
-# ------------------------------
-# Axis-aware line reinforcement
-# ------------------------------
-def reinforce_lines(bin_inv: np.ndarray):
-    """
-    bin_inv: 0=zemin, 255=çizgi-siyah (INVERTED)
-    dönen: v_strong, h_strong, both
-    """
-    H, W = bin_inv.shape
-    kv = max(3, H // 160)  # dikey için kernel yüksekliği
-    kh = max(3, W // 160)  # yatay için kernel genişliği
-
-    # Kopuk ince çizgileri kapat (closing) ve ince tüyleri temizlemek için hafif open
-    vert = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, kv)), iterations=1)
-    horiz = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE,
-                             cv2.getStructuringElement(cv2.MORPH_RECT, (kh, 1)), iterations=1)
-
-    v_strong = cv2.morphologyEx(vert, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)), iterations=1)
-    h_strong = cv2.morphologyEx(horiz, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1)), iterations=1)
-    both = cv2.bitwise_or(v_strong, h_strong)
-    return v_strong, h_strong, both
-
-# ------------------------------
-# Axis candidates via Hough (fallback)
-# ------------------------------
-def hough_axis_candidates(bin_img: np.ndarray, axis: str):
-    H, W = bin_img.shape
-    edges = cv2.Canny(bin_img, 50, 150, apertureSize=3)
-    if axis == 'v':
-        min_len = int(0.75 * H)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
-                                minLineLength=min_len, maxLineGap=max(4, H//180))
-        xs = []
-        if lines is not None:
-            for x1, y1, x2, y2 in lines[:, 0]:
-                if abs(x1 - x2) <= 2:
-                    xs.append(int((x1 + x2) // 2))
-        return xs
-    else:
-        min_len = int(0.75 * W)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
-                                minLineLength=min_len, maxLineGap=max(4, W//180))
-        ys = []
-        if lines is not None:
-            for x1, y1, x2, y2 in lines[:, 0]:
-                if abs(y1 - y2) <= 2:
-                    ys.append(int((y1 + y2) // 2))
-        return ys
-
-def dedup(vals, min_gap):
-    vals = sorted(int(v) for v in vals)
-    out = []
-    for v in vals:
-        if not out or v - out[-1] >= min_gap:
-            out.append(v)
-        else:
-            out[-1] = (out[-1] + v) // 2
-    return out
-
-# ------------------------------
-# Long thin CC picker + merge with Hough/projection
-# ------------------------------
-def pick_long_axes(bin_img: np.ndarray, axis: str, use_mask: np.ndarray | None = None):
-    """
-    axis: 'h' yatay çizgiler (satır sınırları → y-listesi), 'v' dikey çizgiler (sütun sınırları → x-listesi)
-    use_mask: reinforce edilmiş maske
-    """
-    img = use_mask if use_mask is not None else bin_img
-    num, lbl, st, _ = cv2.connectedComponentsWithStats(img, 8)
+# ------------------------------------------------------------
+# 2) Bbox tespiti (multiscale grid -> Hough -> edge-density)
+#    Girdi : img_bin (0/255, zemin=255)
+#    Çıktı : cropped (0/255), (x,y,w,h)
+# ------------------------------------------------------------
+def detect_table_bbox_ultra(img_bin: np.ndarray,
+                            upscale: int = 2,
+                            min_area_ratio: float = 0.015,
+                            debug: bool = False):
+    assert img_bin.ndim == 2 and img_bin.dtype == np.uint8
+    H0, W0 = img_bin.shape
+    img = img_bin
+    scale = 1
+    if upscale > 1:
+        img = cv2.resize(img_bin, (W0*upscale, H0*upscale), interpolation=cv2.INTER_NEAREST)
+        scale = upscale
     H, W = img.shape
 
-    keep = []
-    # (span_frac, max_thickness, min_aspect)
-    stages = [
-        (0.70, max(3, (H if axis == 'h' else W) // 180), 12),
-        (0.60, max(4, (H if axis == 'h' else W) // 160), 10),
-        (0.50, max(5, (H if axis == 'h' else W) // 140),  8),
-    ]
-    for span_frac, thick_max, ar_min in stages:
-        keep.clear()
-        for i in range(1, num):
-            x, y, w, h, area = st[i]
-            if axis == 'h':
-                thickness, span = h, w
-            else:
-                thickness, span = w, h
-            aspect = max(w, h) / max(1, min(w, h))
-            if span >= int(span_frac * (W if axis == 'h' else H)) and thickness <= thick_max and aspect >= ar_min:
-                keep.append((x, y, w, h))
-        if len(keep) >= (2 if axis == 'v' else 1):
-            break
-
-    # CC merkezleri
-    cand = []
-    if axis == 'v':
-        cand += [x + w // 2 for (x, y, w, h) in keep]
-    else:
-        cand += [y + h // 2 for (x, y, w, h) in keep]
-
-    # Hough yedeği
-    cand += hough_axis_candidates(img, 'v' if axis == 'v' else 'h')
-
-    # Projeksiyon desteği
-    if axis == 'v':
-        proj = np.sum(img, axis=0)  # sütun
-        thr = 0.35 * np.max(proj) if np.max(proj) > 0 else 0
-        cand += [i for i, v in enumerate(proj) if v >= thr]
-        pos = dedup(cand, max(8, W // 60))
-    else:
-        proj = np.sum(img, axis=1)  # satır
-        thr = 0.35 * np.max(proj) if np.max(proj) > 0 else 0
-        cand += [i for i, v in enumerate(proj) if v >= thr]
-        pos = dedup(cand, max(8, H // 60))
-
-    return pos
-
-# ------------------------------
-# Grid detection (small scale)
-# ------------------------------
-def detect_grid_small(masked_binv_small: np.ndarray, debug=False):
-    """
-    Girdi: küçük ölçekte, imza sütunu maskelenmiş, binarize (INV) görüntü.
-    Çıkış: rows_y, cols_x (küçük ölçekte sınırlar)
-    """
-    H, W = masked_binv_small.shape
-
-    # 1) çizgileri güçlendir
-    v_strong, h_strong, both = reinforce_lines(masked_binv_small)
-
-    # 2) eksen adayları
-    rows_y = pick_long_axes(h_strong, 'h', use_mask=h_strong)
-    cols_x = pick_long_axes(v_strong, 'v', use_mask=v_strong)
-
-    # 3) Eğer hâlâ zayıfsa projeksiyonla takviye (ikinci tur)
-    if len(rows_y) < 2:
-        py = np.sum(h_strong, axis=1)
-        thr = 0.35 * np.max(py) if np.max(py) > 0 else 0
-        rows_y += [i for i, v in enumerate(py) if v >= thr]
-        rows_y = dedup(rows_y, max(8, H // 60))
-    if len(cols_x) < 3:
-        px = np.sum(v_strong, axis=0)
-        thr = 0.35 * np.max(px) if np.max(px) > 0 else 0
-        cols_x += [i for i, v in enumerate(px) if v >= thr]
-        cols_x = dedup(cols_x, max(8, W // 60))
-
-    if debug:
-        fig, ax = plt.subplots(1, 3, figsize=(14, 5))
-        ax[0].imshow(masked_binv_small, cmap='gray'); ax[0].set_title('Masked small'); ax[0].axis('off')
-        vis = cv2.cvtColor(masked_binv_small, cv2.COLOR_GRAY2BGR)
-        for y in rows_y: cv2.line(vis, (0, y), (W-1, y), (0, 255, 0), 1)
-        for x in cols_x: cv2.line(vis, (x, 0), (x, H-1), (255, 0, 0), 1)
-        ax[1].imshow(vis); ax[1].set_title('Grid small'); ax[1].axis('off')
-        ax[2].plot(np.sum(h_strong, axis=1)); ax[2].set_title('Row projection')
-        plt.show()
-
-    return rows_y, cols_x
-
-# ------------------------------
-# Grid upscale to original
-# ------------------------------
-def upscale_grid(rows_y_small, cols_x_small, scale: float):
-    if scale == 0:
-        return rows_y_small, cols_x_small
-    ry = [int(round(y/scale)) for y in rows_y_small]
-    cx = [int(round(x/scale)) for x in cols_x_small]
-    return ry, cx
-
-# ------------------------------
-# Build cells from grid
-# ------------------------------
-def build_cells(rows_y, cols_x):
-    cells = []
-    for r in range(len(rows_y)-1):
-        y0, y1 = rows_y[r], rows_y[r+1]
-        for c in range(len(cols_x)-1):
-            x0, x1 = cols_x[c], cols_x[c+1]
-            cells.append(Cell(r, c, x0, y0, x1-x0, y1-y0))
-    return cells
-
-# ------------------------------
-# Signature extraction (optional)
-# ------------------------------
-def find_and_extract_signatures(original_bgr, cells, cols_x, sig_col_index=-1, ratio_thr=0.018, debug=False):
-    """
-    sig_col_index: sağdan 1 kolonu hedeflemek için -1 kullanabilirsin.
-    ratio_thr: siyah piksel oranı eşiği (imza var-yok)
-    """
-    H, W = original_bgr.shape[:2]
-    sig_c = (len(cols_x)-2 if sig_col_index == -1 else sig_col_index)
-
-    for cell in cells:
-        if cell.c != sig_c:
+    # -------- 2.1) Multiscale grid
+    grid = build_grid_mask_multiscale(img, debug=debug)
+    cnts, _ = cv2.findContours((grid>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_img = H*W
+    candidate, best = None, -1.0
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if w*h < min_area_ratio*area_img: 
             continue
-        roi = original_bgr[cell.y:cell.y+cell.h, cell.x:cell.x+cell.w]
-        if roi.size == 0:
+        cov = grid[y:y+h, x:x+w].mean()/255.0
+        if cov < 0.35:        # kaplama alt eşiği
             continue
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
-        _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        ratio = binv.sum() / (255.0 * binv.size)
-        ok_box = cv2.boundingRect(cv2.findNonZero(binv)) if np.count_nonzero(binv) else None
-        if ok_box is not None and ratio > ratio_thr:
-            x, y, w, h = ok_box
-            png_roi = cv2.imencode('.png', roi[y:y+h, x:x+w])[1].tobytes()
-            cell.is_signature = True
-            cell.signature_png = png_roi
-            if debug:
-                print(f"sig r{cell.r}c{cell.c} ratio={ratio:.3f}")
-    return cells
+        score = cov           # sade ve etkili
+        if score > best:
+            best = score; candidate = (x,y,w,h)
+    if candidate is not None:
+        x,y,w,h = candidate
+        x//=scale; y//=scale; w//=scale; h//=scale
+        x = max(0, min(x, W0-1)); y = max(0, min(y, H0-1))
+        w = max(1, min(w, W0-x)); h = max(1, min(h, H0-y))
+        return img_bin[y:y+h, x:x+w], (x,y,w,h)
 
-# ------------------------------
-# Debug / visualization
-# ------------------------------
-def plot_cells(img_bgr, cells, title="cells"):
-    fig, ax = plt.subplots(1, 1, figsize=(12, 9))
-    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    for cell in cells:
-        ax.add_patch(plt.Rectangle((cell.x, cell.y), cell.w, cell.h, fill=False, lw=2))
-        ax.text(cell.x+cell.w/2, cell.y+cell.h/2, f"{cell.r}.{cell.c}",
-                ha='center', va='center', fontsize=8, color='yellow')
-    ax.set_title(title); ax.axis('off'); plt.show()
+    # -------- 2.2) Hough fallback
+    inv = (255 - img).astype(np.uint8)
+    blur = cv2.GaussianBlur(inv, (3,3), 0)
+    edges = cv2.Canny(blur, 40, 120, apertureSize=3, L2gradient=True)
+    mY, mX = int(0.03*H), int(0.03*W)   # iç kenar kırpma
+    edges[:mY,:] = 0; edges[-mY:,:] = 0; edges[:,:mX] = 0; edges[:,-mX:] = 0
 
-def roi_rgb(img_bgr, x, y, w, h, max_side=512):
-    rgb = cv2.cvtColor(img_bgr[y:y+h, x:x+w], cv2.COLOR_BGR2RGB)
-    H, W = rgb.shape[:2]
-    s = max(H, W)
-    if s > max_side:
-        scale = max_side / s
-        rgb = cv2.resize(rgb, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-    return rgb
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180,
+                            threshold=max(60,(H+W)//90),
+                            minLineLength=min(W,H)//5, maxLineGap=30)
+    if lines is not None:
+        xs, ys = [], []
+        for x1,y1,x2,y2 in lines[:,0]:
+            ang = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
+            if ang <= 15:   ys += [y1,y2]
+            elif ang >= 75: xs += [x1,x2]
+        if xs and ys:
+            x0, x1 = max(0, min(xs)), min(W-1, max(xs))
+            y0, y1 = max(0, min(ys)), min(H-1, max(ys))
+            if (x1-x0)*(y1-y0) >= 0.02*area_img:
+                x0//=scale; y0//=scale; x1//=scale; y1//=scale
+                x0 = max(0, min(x0, W0-1)); y0 = max(0, min(y0, H0-1))
+                x1 = max(1, min(x1, W0-1)); y1 = max(1, min(y1, H0-1))
+                return img_bin[y0:y1, x0:x1], (x0,y0,x1-x0,y1-y0)
 
-def visualize_cells_by_row(img_bgr, cells, title_prefix="Row"):
-    from collections import defaultdict
-    rows = defaultdict(list)
-    for c in sorted(cells, key=lambda ci: (ci.r, ci.c)):
-        rows[c.r].append(c)
-    for r, row_cells in rows.items():
-        ncols = len(row_cells)
-        fig, axes = plt.subplots(1, ncols, figsize=(2.2*ncols, 2.4), squeeze=False)
-        fig.suptitle(f"{title_prefix} {r} | {ncols} cells", y=1.02, fontsize=10)
-        ax = axes[0]
-        for i, cell in enumerate(row_cells):
-            ax = axes[0, i]
-            rgb = roi_rgb(img_bgr, cell.x, cell.y, cell.w, cell.h)
-            ax.imshow(rgb); ax.set_title(f"{cell.r},{cell.c}", fontsize=8); ax.axis('off')
-            if getattr(cell, "is_signature", False):
-                for spine in ax.spines.values():
-                    spine.set_edgecolor("red"); spine.set_linewidth(2)
-        plt.tight_layout(); plt.show()
+    # -------- 2.3) Edge-density fallback (coarse)
+    S = 32
+    winW, winH = max(200, W0//3), max(120, H0//4)
+    best, best_box = -1.0, (0,0,W0,H0)
+    inv_small = (255 - cv2.resize(img_bin, (W0, H0), interpolation=cv2.INTER_NEAREST))
+    sobx = cv2.Sobel(inv_small, cv2.CV_32F, 1, 0, ksize=3)
+    soby = cv2.Sobel(inv_small, cv2.CV_32F, 0, 1, ksize=3)
+    mag  = cv2.convertScaleAbs(0.5*np.abs(sobx) + 0.5*np.abs(soby))
+    for y in range(0, H0 - winH, S):
+        for x in range(0, W0 - winW, S):
+            roi = mag[y:y+winH, x:x+winW]
+            r   = roi.mean()
+            gx  = cv2.Sobel((255 - img_bin[y:y+winH, x:x+winW]), cv2.CV_32F, 1, 0, ksize=3)
+            gy  = cv2.Sobel((255 - img_bin[y:y+winH, x:x+winW]), cv2.CV_32F, 0, 1, ksize=3)
+            bal = 1.0 - abs(gx.mean() - gy.mean()) / (gx.mean() + gy.mean() + 1e-6)
+            score = r * bal
+            if score > best:
+                best = score; best_box = (x,y,winW,winH)
+    x,y,w,h = best_box
+    return img_bin[y:y+h, x:x+w], best_box
 
-# ------------------------------
-# END-TO-END EXAMPLE (call site)
-# ------------------------------
-def extract_table_cells(deskewed_bgr: np.ndarray,
-                        sig_ratio: float = 0.82,
-                        sig_col_index: int = -1,
-                        debug: bool = True):
-    """
-    Girdi: deskewed tablo görüntüsü (BGR)
-    Çıkış: cells listesi, rows_y, cols_x (orijinal ölçekte)
-    """
-    # 1) küçük ölçekte çalış
-    small, scale = downscale(deskewed_bgr, max_w=5000)
+# ------------------------------------------------------------
+# 3) Dış çerçeveye snap (alt/üst/yan taşmaları kes)
+#    Girdi: img_bin (0/255), bbox
+#    Çıktı: refine edilmiş bbox
+# ------------------------------------------------------------
+def snap_bbox_to_outer_grid(img_bin: np.ndarray, bbox,
+                            min_peak_ratio: float = 0.25,
+                            guard: int = 3,
+                            debug: bool = False):
+    x, y, w, h = bbox
+    H, W = img_bin.shape[:2]
+    roi = (255 - img_bin[y:y+h, x:x+w]).astype(np.uint8)
 
-    # 2) imza sütununu maskele, binarize
-    masked_small = mask_signature_column_small(to_binv(small), sig_ratio=sig_ratio, debug=debug)
+    ky = max(25, h // 40); kx = max(25, w // 40)
+    horiz = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)), 1)
+    vert  = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)), 1)
+    grid  = cv2.bitwise_or(horiz, vert)
 
-    # 3) grid tespiti (küçük ölçekte)
-    rows_y_s, cols_x_s = detect_grid_small(masked_small, debug=debug)
+    row_sum = grid.sum(axis=1) / 255.0
+    col_sum = grid.sum(axis=0) / 255.0
+    r_thr = max(min_peak_ratio * row_sum.max(), 1.0)
+    c_thr = max(min_peak_ratio * col_sum.max(), 1.0)
 
-    # 4) orijinale upscale
-    rows_y, cols_x = upscale_grid(rows_y_s, cols_x_s, scale)
+    rows = np.where(row_sum >= r_thr)[0]
+    cols = np.where(col_sum >= c_thr)[0]
+    if rows.size < 2 or cols.size < 2:
+        if debug: print("[snap] weak projections; keep bbox")
+        return (x, y, w, h)
 
-    # 5) hücreleri üret
-    cells = build_cells(rows_y, cols_x)
+    y0, y1 = rows[0] + guard, rows[-1] - guard
+    x0, x1 = cols[0] + guard, cols[-1] - guard
 
-    # 6) imza hücrelerini işaretle/PNG çıkar
-    cells = find_and_extract_signatures(deskewed_bgr, cells, cols_x,
-                                        sig_col_index=sig_col_index,
-                                        ratio_thr=0.018, debug=debug)
+    X0 = max(0, x + int(x0));  Y0 = max(0, y + int(y0))
+    X1 = min(W, x + int(x1) + 1);  Y1 = min(H, y + int(y1) + 1)
+    if debug: print(f"[snap] -> ({X0},{Y0},{X1-X0},{Y1-Y0})")
+    return (X0, Y0, X1 - X0, Y1 - Y0)
 
-    if debug:
-        plot_cells(deskewed_bgr, cells, title=f"{(len(rows_y)-1)}x{(len(cols_x)-1)} grid")
-        visualize_cells_by_row(deskewed_bgr, cells, title_prefix="Row")
+# ------------------------------------------------------------
+# 4) Perspektif + mikro-deskew (gri üretmeden)
+#    Girdi: binary_roi (0/255)
+#    Çıktı: 0/255 ROI
+# ------------------------------------------------------------
+def _find_outer_quad(binary: np.ndarray):
+    inv = (255 - binary).astype(np.uint8)
+    k = max(3, min(binary.shape[:2]) // 200)
+    inv = cv2.dilate(inv, cv2.getStructuringElement(cv2.MORPH_RECT,(k,k)), 1)
+    cnts, _ = cv2.findContours(inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return None
+    c = max(cnts, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02*peri, True)
+    if len(approx) != 4: return None
+    pts = approx[:,0,:].astype(np.float32)
+    s = pts.sum(axis=1); d = np.diff(pts, axis=1).ravel()
+    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
+    tr = pts[np.argmin(d)]; bl = pts[np.argmax(d)]
+    return np.array([tl,tr,br,bl], dtype=np.float32)
 
-    return cells, rows_y, cols_x
+def _projection_sharpness(img):
+    inv = (255 - img).astype(np.uint8)
+    row = inv.sum(axis=1)
+    dif = np.diff(inv, axis=1) != 0
+    trans = dif.sum(axis=1)
+    return row.var() + 0.5*trans.mean()
 
-# deskewed_bgr: senin mevcut deskew işleminden gelen tablo görüntüsü
-cells, rows_y, cols_x = extract_table_cells(deskewed_bgr, sig_ratio=0.82, sig_col_index=-1, debug=True)
+def deskew_and_rectify_table(binary_roi: np.ndarray,
+                             try_perspective: bool = True,
+                             fine_range: float = 1.0,
+                             fine_step: float = 0.05,
+                             debug: bool = False):
+    assert binary_roi.ndim==2 and binary_roi.dtype==np.uint8
+    img = binary_roi
+
+    # 4.1) Perspektif (varsa)
+    if try_perspective:
+        quad = _find_outer_quad(img)
+        if quad is not None:
+            w1 = np.linalg.norm(quad[1] - quad[0]); w2 = np.linalg.norm(quad[2] - quad[3])
+            h1 = np.linalg.norm(quad[3] - quad[0]); h2 = np.linalg.norm(quad[2] - quad[1])
+            W = int(round(max(w1, w2)));  H = int(round(max(h1, h2)))
+            dst = np.array([[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float32)
+            M  = cv2.getPerspectiveTransform(quad, dst)
+            img = cv2.warpPerspective(img, M, (W,H), flags=cv2.INTER_NEAREST, borderValue=255)
+            if debug: print("[rectify] perspective warp applied")
+
+    H, W = img.shape[:2]
+
+    # 4.2) Kaba açı (Hough)
+    inv = (255 - img).astype(np.uint8)
+    blur = cv2.GaussianBlur(inv, (3,3), 0)
+    lines = cv2.HoughLinesP(blur, 1, np.pi/180,
+                            threshold=max(80,(H+W)//80),
+                            minLineLength=max(W,H)//3, maxLineGap=10)
+
+    angle0 = 0.0
+    if lines is not None:
+        angs, lens = [], []
+        for x1,y1,x2,y2 in lines[:,0]:
+            a = np.degrees(np.arctan2(y2-y1, x2-x1))
+            a = (a + 180) % 180
+            if a > 90: a -= 180
+            if -45 <= a <= 45:
+                L = np.hypot(x2-x1, y2-y1)
+                angs.append(a); lens.append(L)
+        if angs:
+            order = np.argsort(angs)
+            angs = np.array(angs)[order]; lens = np.array(lens)[order]
+            cum = np.cumsum(lens) / (lens.sum()+1e-6)
+            idx = np.searchsorted(cum, 0.5)
+            angle0 = float(angs[max(0, min(idx, len(angs)-1))])
+
+    # 4.3) İnce tarama (projeksiyon keskinliği)
+    lo, hi = angle0 - fine_range, angle0 + fine_range
+    best = (0.0, -1e18)
+    for a in np.arange(lo, hi + 1e-9, fine_step):
+        M = cv2.getRotationMatrix2D((W/2,H/2), a, 1.0)
+        rot = cv2.warpAffine(img, M, (W,H), flags=cv2.INTER_NEAREST, borderValue=255)
+        s = _projection_sharpness(rot)
+        if s > best[1]:
+            best = (a, s)
+    best_angle = best[0]
+
+    if debug: print(f"[deskew] angle={best_angle:.3f}°")
+    if abs(best_angle) < 1e-3:
+        return img
+
+    M = cv2.getRotationMatrix2D((W/2,H/2), best_angle, 1.0)
+    out = cv2.warpAffine(img, M, (W,H), flags=cv2.INTER_NEAREST, borderValue=255)
+    return out
+
+# ------------------------------------------------------------
+# 5) ÖRNEK KULLANIM (senin hücrene karşılık)
+# ------------------------------------------------------------
+# img_input: BGR sayfa görüntün (veya gri). Eğer zaten 0/255 img_bin'in varsa, to_binary_white_bg çağırma.
+# gray_or_bgr = pdf_images[0]
+# img_bin = to_binary_white_bg(gray_or_bgr)
+
+# cropped, bbox = detect_table_bbox_ultra(img_bin, upscale=2, min_area_ratio=0.015, debug=True)
+# bbox = snap_bbox_to_outer_grid(img_bin, bbox, min_peak_ratio=0.28, guard=3, debug=True)
+# x,y,w,h = bbox
+# roi = img_bin[y:y+h, x:x+w]
+# deskewed = deskew_and_rectify_table(roi, try_perspective=True, fine_range=1.0, fine_step=0.05, debug=True)
+# # (Opsiyonel) son bir snap
+# bbox2 = snap_bbox_to_outer_grid(deskewed, (0,0,deskewed.shape[1], deskewed.shape[0]), min_peak_ratio=0.30, guard=2)
+# dy,dx,dw,dh = bbox2
+# deskewed = deskewed[dx:dx+dh, dy:dy+dw]
+# plt.figure(figsize=(22,10)); plt.imshow(deskewed, cmap='gray'); plt.axis('off'); plt.show()
