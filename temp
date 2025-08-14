@@ -1,213 +1,343 @@
-import cv2
+from dataclasses import dataclass
 import numpy as np
-from typing import List
+import cv2
+import matplotlib.pyplot as plt
 
-# ---------- Senin yardımcıların (aynı mantık) ----------
+# ------------------------------
+# Data holders
+# ------------------------------
+@dataclass
+class Cell:
+    r: int; c: int
+    x: int; y: int; w: int; h: int
+    is_signature: bool = False
+    signature_png: bytes | None = None
 
-def normalize_background(
-    img: np.ndarray,
-    gamma: float = 2.7,
-    stretch_contrast: bool = True,
-    apply_clahe: bool = True,
-    clahe_clip_limit: float = 2.0,
-    black_thresh: int = 40,
-    white_thresh: int = 220,
-) -> np.ndarray:
-    """Gri alanları beyazlatır, siyahları korur (senin mantık)."""
-    g = img.astype(np.uint8)
+# ------------------------------
+# Helpers: scaling & binarize
+# ------------------------------
+def downscale(img_bgr: np.ndarray, max_w: int = 2000):
+    H, W = img_bgr.shape[:2]
+    if W <= max_w:
+        return img_bgr, 1.0
+    scale = max_w / float(W)
+    small = cv2.resize(img_bgr, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
+    return small, scale
 
-    # gamma
-    g = np.clip((g / 255.0) ** (1.0 / gamma) * 255.0, 0, 255).astype(np.uint8)
+def to_binv(gray_or_bgr: np.ndarray):
+    gray = cv2.cvtColor(gray_or_bgr, cv2.COLOR_BGR2GRAY) if gray_or_bgr.ndim == 3 else gray_or_bgr
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Inverted: çizgiler=255 (siyah), zemin=0 (beyaz)
+    _, binv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return binv
 
-    if stretch_contrast:
-        p2, p98 = np.percentile(g, (2, 98))
-        if p98 > p2:
-            g = cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX)
-            g = np.clip((g - p2) * 255.0 / (p98 - p2 + 1e-5), 0, 255).astype(np.uint8)
+# ------------------------------
+# Signature column masking (small scale)
+# ------------------------------
+def mask_signature_column_small(binv_small: np.ndarray, sig_ratio=0.82, debug=False):
+    H, W = binv_small.shape
+    # imza kolonunun geniş bir kısmını maskeler (siyah=0 yapar)
+    sig_w = int(W * (1.0 - sig_ratio))  # en sağ ~%18 imza alanı varsayımı
+    masked = binv_small.copy()
+    if sig_w > 0:
+        x0 = W - sig_w
+        cv2.rectangle(masked, (x0, 0), (W-1, H-1), 0, -1)
 
-    if apply_clahe:
-        clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=(8, 8))
-        g = clahe.apply(g)
+    if debug:
+        fig, ax = plt.subplots(1, 1, figsize=(7, 3))
+        ax.imshow(masked, cmap='gray')
+        ax.set_title('Masked for line detection'); ax.axis('off'); plt.show()
 
-    # siyah/beyaz eşikleri
-    res = g.copy()
-    res[g <= black_thresh] = 0
-    res[g >= white_thresh] = 255
-    mid = (g > black_thresh) & (g < white_thresh)
-    pivot = (black_thresh + white_thresh) // 2
-    res[mid] = np.where(g[mid] < pivot, 0, 255).astype(np.uint8)
-    return res
+    return masked
 
-
-def unsharp_mask(image: np.ndarray, sigma: float = 1.0, amount: float = 0.5, threshold: int = 0) -> np.ndarray:
-    """Yumuşak keskinleştirme (senin kullanıma paralel)."""
-    blurred = cv2.GaussianBlur(image, (0, 0), sigma)
-    sharpened = cv2.addWeighted(image, 1.0 + amount, blurred, -amount, 0)
-    if threshold > 0:
-        low = np.abs(image.astype(np.int16) - blurred.astype(np.int16)) < threshold
-        sharpened = np.where(low, image, sharpened).astype(np.uint8)
-    return sharpened
-
-
-def build_foreground_mask(gray_img: np.ndarray, bottom_strip: int = 10) -> np.ndarray:
+# ------------------------------
+# Axis-aware line reinforcement
+# ------------------------------
+def reinforce_lines(bin_inv: np.ndarray):
     """
-    Foreground maskesi (senin fonksiyonla aynı mantık):
-    - Gaussian blur (5,5)
-    - Otsu (THRESH_BINARY + OTSU)
-    - Maskeyi ters çevir (metin/çizgi=255)
-    - Alt 10px şerit varsa bastır
+    bin_inv: 0=zemin, 255=çizgi-siyah (INVERTED)
+    dönen: v_strong, h_strong, both
     """
-    blur = cv2.GaussianBlur(gray_img, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask = 255 - thresh  # metin/çizgi beyaz
+    H, W = bin_inv.shape
+    kv = max(3, H // 160)  # dikey için kernel yüksekliği
+    kh = max(3, W // 160)  # yatay için kernel genişliği
 
-    h = mask.shape[0]
-    strip = mask[h - bottom_strip : h, :]
-    if np.count_nonzero(strip) < 0.05 * strip.size:
-        mask[h - bottom_strip : h, :] = 0
-    return mask
+    # Kopuk ince çizgileri kapat (closing) ve ince tüyleri temizlemek için hafif open
+    vert = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, kv)), iterations=1)
+    horiz = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (kh, 1)), iterations=1)
 
+    v_strong = cv2.morphologyEx(vert, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2)), iterations=1)
+    h_strong = cv2.morphologyEx(horiz, cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1)), iterations=1)
+    both = cv2.bitwise_or(v_strong, h_strong)
+    return v_strong, h_strong, both
 
-def crop_to_content(image: np.ndarray, mask: np.ndarray, margin: int = 10) -> np.ndarray:
-    """Maskeye göre bbox al ve margin ile kırp (senin mantık)."""
-    coords = cv2.findNonZero(mask)
-    if coords is None:
-        return image
-    x, y, w, h = cv2.boundingRect(coords)
-    H, W = image.shape[:2]
-    x0 = max(x - margin, 0); y0 = max(y - margin, 0)
-    x1 = min(x + w + margin, W); y1 = min(y + h + margin, H)
-    return image[y0:y1, x0:x1]
+# ------------------------------
+# Axis candidates via Hough (fallback)
+# ------------------------------
+def hough_axis_candidates(bin_img: np.ndarray, axis: str):
+    H, W = bin_img.shape
+    edges = cv2.Canny(bin_img, 50, 150, apertureSize=3)
+    if axis == 'v':
+        min_len = int(0.75 * H)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                                minLineLength=min_len, maxLineGap=max(4, H//180))
+        xs = []
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                if abs(x1 - x2) <= 2:
+                    xs.append(int((x1 + x2) // 2))
+        return xs
+    else:
+        min_len = int(0.75 * W)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                                minLineLength=min_len, maxLineGap=max(4, W//180))
+        ys = []
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                if abs(y1 - y2) <= 2:
+                    ys.append(int((y1 + y2) // 2))
+        return ys
 
-
-def normalize_black_white_safely(gray_img: np.ndarray, black_thresh: int = 130, white_thresh: int = 220) -> np.ndarray:
-    """
-    Siyaha yakın 0, beyaza yakın 255; arada kalanları yakın olduğu tarafa it.
-    İnce stroke’ları korur. (Önceki diyalogdakiyle aynı)
-    """
-    g = gray_img.astype(np.uint8)
-    res = g.copy()
-    res[g <= black_thresh] = 0
-    res[g >= white_thresh] = 255
-    mid = (g > black_thresh) & (g < white_thresh)
-    pivot = (black_thresh + white_thresh) // 2
-    res[mid] = np.where(g[mid] < pivot, 0, 255).astype(np.uint8)
-    return res
-
-
-# ---------- YENİ: PDF yerine sayfa görüntüsü listesi alan boru hattı ----------
-
-def process_page_images_from_cv2_images(
-    page_images: List[np.ndarray],
-    *,
-    # normalize_background parametreleri:
-    gamma: float = 2.7,
-    stretch_contrast: bool = True,
-    apply_clahe: bool = True,
-    clahe_clip_limit: float = 2.0,
-    black_thresh_norm: int = 40,
-    white_thresh_norm: int = 220,
-    # black/white normalize:
-    bw_black_thresh: int = 130,
-    bw_white_thresh: int = 220,
-    # keskinleştirme:
-    apply_sharpen: bool = True,
-    sharpen_sigma: float = 1.0,
-    sharpen_amount: float = 0.5,
-    sharpen_threshold: int = 0,
-    # crop/mask
-    margin: int = 10,
-    bottom_strip: int = 10,
-    # davranış
-    display_pages: bool = False,
-    debug: bool = False,
-) -> List[np.ndarray]:
-    """
-    Önceden 'read_all_pages_as_cv2_images' + döngüde yaptığın TÜM adımları,
-    artık doğrudan BGR/RGBA/grayscale sayfa görüntü listesi üzerinden uygular.
-    Skew yok. Çıktı: final sayfa görselleri listesi.
-    """
-    outputs: List[np.ndarray] = []
-
-    for page_index, img in enumerate(page_images):
-        # --- 0) Kanal normalizasyonu (BGR/GRAY/RGBA olasılıkları)
-        if img is None or img.size == 0:
-            if debug:
-                print(f"[WARN] Skipped page {page_index}: empty image")
-            continue
-
-        if img.ndim == 3 and img.shape[2] == 4:
-            # RGBA → BGR
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        elif img.ndim == 3 and img.shape[2] == 3:
-            img_bgr = img
+def dedup(vals, min_gap):
+    vals = sorted(int(v) for v in vals)
+    out = []
+    for v in vals:
+        if not out or v - out[-1] >= min_gap:
+            out.append(v)
         else:
-            # Grayscale already
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            out[-1] = (out[-1] + v) // 2
+    return out
 
-        # --- 1) BGR → GRAY + normalize_background (senin fonksiyonun)
-        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        img_gray = normalize_background(
-            img_gray,
-            gamma=gamma,
-            stretch_contrast=stretch_contrast,
-            apply_clahe=apply_clahe,
-            clahe_clip_limit=clahe_clip_limit,
-            black_thresh=black_thresh_norm,
-            white_thresh=white_thresh_norm,
-        )
+# ------------------------------
+# Long thin CC picker + merge with Hough/projection
+# ------------------------------
+def pick_long_axes(bin_img: np.ndarray, axis: str, use_mask: np.ndarray | None = None):
+    """
+    axis: 'h' yatay çizgiler (satır sınırları → y-listesi), 'v' dikey çizgiler (sütun sınırları → x-listesi)
+    use_mask: reinforce edilmiş maske
+    """
+    img = use_mask if use_mask is not None else bin_img
+    num, lbl, st, _ = cv2.connectedComponentsWithStats(img, 8)
+    H, W = img.shape
 
-        if img_gray is None or img_gray.size == 0:
-            if debug:
-                print(f"[WARN] Skipped page {page_index}: invalid gray")
+    keep = []
+    # (span_frac, max_thickness, min_aspect)
+    stages = [
+        (0.70, max(3, (H if axis == 'h' else W) // 180), 12),
+        (0.60, max(4, (H if axis == 'h' else W) // 160), 10),
+        (0.50, max(5, (H if axis == 'h' else W) // 140),  8),
+    ]
+    for span_frac, thick_max, ar_min in stages:
+        keep.clear()
+        for i in range(1, num):
+            x, y, w, h, area = st[i]
+            if axis == 'h':
+                thickness, span = h, w
+            else:
+                thickness, span = w, h
+            aspect = max(w, h) / max(1, min(w, h))
+            if span >= int(span_frac * (W if axis == 'h' else H)) and thickness <= thick_max and aspect >= ar_min:
+                keep.append((x, y, w, h))
+        if len(keep) >= (2 if axis == 'v' else 1):
+            break
+
+    # CC merkezleri
+    cand = []
+    if axis == 'v':
+        cand += [x + w // 2 for (x, y, w, h) in keep]
+    else:
+        cand += [y + h // 2 for (x, y, w, h) in keep]
+
+    # Hough yedeği
+    cand += hough_axis_candidates(img, 'v' if axis == 'v' else 'h')
+
+    # Projeksiyon desteği
+    if axis == 'v':
+        proj = np.sum(img, axis=0)  # sütun
+        thr = 0.35 * np.max(proj) if np.max(proj) > 0 else 0
+        cand += [i for i, v in enumerate(proj) if v >= thr]
+        pos = dedup(cand, max(8, W // 60))
+    else:
+        proj = np.sum(img, axis=1)  # satır
+        thr = 0.35 * np.max(proj) if np.max(proj) > 0 else 0
+        cand += [i for i, v in enumerate(proj) if v >= thr]
+        pos = dedup(cand, max(8, H // 60))
+
+    return pos
+
+# ------------------------------
+# Grid detection (small scale)
+# ------------------------------
+def detect_grid_small(masked_binv_small: np.ndarray, debug=False):
+    """
+    Girdi: küçük ölçekte, imza sütunu maskelenmiş, binarize (INV) görüntü.
+    Çıkış: rows_y, cols_x (küçük ölçekte sınırlar)
+    """
+    H, W = masked_binv_small.shape
+
+    # 1) çizgileri güçlendir
+    v_strong, h_strong, both = reinforce_lines(masked_binv_small)
+
+    # 2) eksen adayları
+    rows_y = pick_long_axes(h_strong, 'h', use_mask=h_strong)
+    cols_x = pick_long_axes(v_strong, 'v', use_mask=v_strong)
+
+    # 3) Eğer hâlâ zayıfsa projeksiyonla takviye (ikinci tur)
+    if len(rows_y) < 2:
+        py = np.sum(h_strong, axis=1)
+        thr = 0.35 * np.max(py) if np.max(py) > 0 else 0
+        rows_y += [i for i, v in enumerate(py) if v >= thr]
+        rows_y = dedup(rows_y, max(8, H // 60))
+    if len(cols_x) < 3:
+        px = np.sum(v_strong, axis=0)
+        thr = 0.35 * np.max(px) if np.max(px) > 0 else 0
+        cols_x += [i for i, v in enumerate(px) if v >= thr]
+        cols_x = dedup(cols_x, max(8, W // 60))
+
+    if debug:
+        fig, ax = plt.subplots(1, 3, figsize=(14, 5))
+        ax[0].imshow(masked_binv_small, cmap='gray'); ax[0].set_title('Masked small'); ax[0].axis('off')
+        vis = cv2.cvtColor(masked_binv_small, cv2.COLOR_GRAY2BGR)
+        for y in rows_y: cv2.line(vis, (0, y), (W-1, y), (0, 255, 0), 1)
+        for x in cols_x: cv2.line(vis, (x, 0), (x, H-1), (255, 0, 0), 1)
+        ax[1].imshow(vis); ax[1].set_title('Grid small'); ax[1].axis('off')
+        ax[2].plot(np.sum(h_strong, axis=1)); ax[2].set_title('Row projection')
+        plt.show()
+
+    return rows_y, cols_x
+
+# ------------------------------
+# Grid upscale to original
+# ------------------------------
+def upscale_grid(rows_y_small, cols_x_small, scale: float):
+    if scale == 0:
+        return rows_y_small, cols_x_small
+    ry = [int(round(y/scale)) for y in rows_y_small]
+    cx = [int(round(x/scale)) for x in cols_x_small]
+    return ry, cx
+
+# ------------------------------
+# Build cells from grid
+# ------------------------------
+def build_cells(rows_y, cols_x):
+    cells = []
+    for r in range(len(rows_y)-1):
+        y0, y1 = rows_y[r], rows_y[r+1]
+        for c in range(len(cols_x)-1):
+            x0, x1 = cols_x[c], cols_x[c+1]
+            cells.append(Cell(r, c, x0, y0, x1-x0, y1-y0))
+    return cells
+
+# ------------------------------
+# Signature extraction (optional)
+# ------------------------------
+def find_and_extract_signatures(original_bgr, cells, cols_x, sig_col_index=-1, ratio_thr=0.018, debug=False):
+    """
+    sig_col_index: sağdan 1 kolonu hedeflemek için -1 kullanabilirsin.
+    ratio_thr: siyah piksel oranı eşiği (imza var-yok)
+    """
+    H, W = original_bgr.shape[:2]
+    sig_c = (len(cols_x)-2 if sig_col_index == -1 else sig_col_index)
+
+    for cell in cells:
+        if cell.c != sig_c:
             continue
+        roi = original_bgr[cell.y:cell.y+cell.h, cell.x:cell.x+cell.w]
+        if roi.size == 0:
+            continue
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+        _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        ratio = binv.sum() / (255.0 * binv.size)
+        ok_box = cv2.boundingRect(cv2.findNonZero(binv)) if np.count_nonzero(binv) else None
+        if ok_box is not None and ratio > ratio_thr:
+            x, y, w, h = ok_box
+            png_roi = cv2.imencode('.png', roi[y:y+h, x:x+w])[1].tobytes()
+            cell.is_signature = True
+            cell.signature_png = png_roi
+            if debug:
+                print(f"sig r{cell.r}c{cell.c} ratio={ratio:.3f}")
+    return cells
 
-        # --- 2) Siyah-beyaz normalize (senin sonraki adımın)
-        img_gray = normalize_black_white_safely(img_gray, black_thresh=bw_black_thresh, white_thresh=bw_white_thresh)
+# ------------------------------
+# Debug / visualization
+# ------------------------------
+def plot_cells(img_bgr, cells, title="cells"):
+    fig, ax = plt.subplots(1, 1, figsize=(12, 9))
+    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    for cell in cells:
+        ax.add_patch(plt.Rectangle((cell.x, cell.y), cell.w, cell.h, fill=False, lw=2))
+        ax.text(cell.x+cell.w/2, cell.y+cell.h/2, f"{cell.r}.{cell.c}",
+                ha='center', va='center', fontsize=8, color='yellow')
+    ax.set_title(title); ax.axis('off'); plt.show()
 
-        if debug:
-            print(f"[DEBUG] p{page_index} shape={img_gray.shape} min={img_gray.min()} max={img_gray.max()}")
+def roi_rgb(img_bgr, x, y, w, h, max_side=512):
+    rgb = cv2.cvtColor(img_bgr[y:y+h, x:x+w], cv2.COLOR_BGR2RGB)
+    H, W = rgb.shape[:2]
+    s = max(H, W)
+    if s > max_side:
+        scale = max_side / s
+        rgb = cv2.resize(rgb, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
+    return rgb
 
-        # --- 3) Foreground mask + crop
-        mask = build_foreground_mask(img_gray, bottom_strip=bottom_strip)
-        cropped = crop_to_content(img_gray, mask, margin=margin)
+def visualize_cells_by_row(img_bgr, cells, title_prefix="Row"):
+    from collections import defaultdict
+    rows = defaultdict(list)
+    for c in sorted(cells, key=lambda ci: (ci.r, ci.c)):
+        rows[c.r].append(c)
+    for r, row_cells in rows.items():
+        ncols = len(row_cells)
+        fig, axes = plt.subplots(1, ncols, figsize=(2.2*ncols, 2.4), squeeze=False)
+        fig.suptitle(f"{title_prefix} {r} | {ncols} cells", y=1.02, fontsize=10)
+        ax = axes[0]
+        for i, cell in enumerate(row_cells):
+            ax = axes[0, i]
+            rgb = roi_rgb(img_bgr, cell.x, cell.y, cell.w, cell.h)
+            ax.imshow(rgb); ax.set_title(f"{cell.r},{cell.c}", fontsize=8); ax.axis('off')
+            if getattr(cell, "is_signature", False):
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("red"); spine.set_linewidth(2)
+        plt.tight_layout(); plt.show()
 
-        # --- 4) Opsiyonel keskinleştirme (unsharp)
-        final = unsharp_mask(cropped, sigma=sharpen_sigma, amount=sharpen_amount, threshold=sharpen_threshold) \
-                if apply_sharpen else cropped
+# ------------------------------
+# END-TO-END EXAMPLE (call site)
+# ------------------------------
+def extract_table_cells(deskewed_bgr: np.ndarray,
+                        sig_ratio: float = 0.82,
+                        sig_col_index: int = -1,
+                        debug: bool = True):
+    """
+    Girdi: deskewed tablo görüntüsü (BGR)
+    Çıkış: cells listesi, rows_y, cols_x (orijinal ölçekte)
+    """
+    # 1) küçük ölçekte çalış
+    small, scale = downscale(deskewed_bgr, max_w=5000)
 
-        if display_pages:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 7))
-            plt.imshow(final, cmap="gray")
-            plt.title(f"Page {page_index}")
-            plt.axis("off")
-            plt.show()
+    # 2) imza sütununu maskele, binarize
+    masked_small = mask_signature_column_small(to_binv(small), sig_ratio=sig_ratio, debug=debug)
 
-        outputs.append(final)
+    # 3) grid tespiti (küçük ölçekte)
+    rows_y_s, cols_x_s = detect_grid_small(masked_small, debug=debug)
 
-    return outputs
+    # 4) orijinale upscale
+    rows_y, cols_x = upscale_grid(rows_y_s, cols_x_s, scale)
 
-# Elinde sayfa görüntüleri listesi var (cv2 BGR / RGBA / GRAY olabilir):
-# page_images = [img1, img2, ...]   # her biri np.ndarray
+    # 5) hücreleri üret
+    cells = build_cells(rows_y, cols_x)
 
-processed_pages = process_page_images_from_cv2_images(
-    page_images,
-    gamma=2.7,
-    stretch_contrast=True,
-    apply_clahe=True,
-    clahe_clip_limit=2.0,
-    black_thresh_norm=40,
-    white_thresh_norm=220,
-    bw_black_thresh=130,
-    bw_white_thresh=220,
-    apply_sharpen=True,
-    sharpen_sigma=1.0,
-    sharpen_amount=0.5,
-    margin=10,
-    bottom_strip=10,
-    display_pages=False,
-    debug=False,
-)
+    # 6) imza hücrelerini işaretle/PNG çıkar
+    cells = find_and_extract_signatures(deskewed_bgr, cells, cols_x,
+                                        sig_col_index=sig_col_index,
+                                        ratio_thr=0.018, debug=debug)
 
-# processed_pages[i] → final gri görüntü (senin boru hattının sonucu)
+    if debug:
+        plot_cells(deskewed_bgr, cells, title=f"{(len(rows_y)-1)}x{(len(cols_x)-1)} grid")
+        visualize_cells_by_row(deskewed_bgr, cells, title_prefix="Row")
+
+    return cells, rows_y, cols_x
+
+# deskewed_bgr: senin mevcut deskew işleminden gelen tablo görüntüsü
+cells, rows_y, cols_x = extract_table_cells(deskewed_bgr, sig_ratio=0.82, sig_col_index=-1, debug=True)
