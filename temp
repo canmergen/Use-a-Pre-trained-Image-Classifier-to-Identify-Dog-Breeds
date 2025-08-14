@@ -1,264 +1,213 @@
 import cv2
 import numpy as np
-import pandas as pd
-from sklearn.cluster import DBSCAN
-import os
+from typing import Tuple, Dict, Any
 
-def _ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
-    return p
+# ---------- Yardımcılar ----------
 
-def _binarize(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
-def _merge_lines_1d(positions, eps=6):
-    """Yakın x veya y çizgi konumlarını tek satır/sütun kabul et."""
-    if len(positions) == 0:
-        return positions
-    X = np.array(positions).reshape(-1,1).astype(np.float32)
-    labels = DBSCAN(eps=eps, min_samples=1, metric='euclidean').fit_predict(X)
-    merged = []
-    for k in sorted(set(labels)):
-        merged.append(int(np.median(X[labels==k])))
-    return sorted(merged)
-
-def detect_grid_lines(cropped_table,
-                      v_ksize=25, h_ksize=25,
-                      merge_eps=6, debug=False):
-    bin_ = _binarize(cropped_table)
-
-    # Dikey çizgiler
-    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_ksize))
-    vlines = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, vk, iterations=1)
-    vproj = vlines.sum(axis=0)
-    xs = [int(x) for x in np.where(vproj > 0)[0]]
-    xs = _merge_lines_1d(xs, eps=merge_eps)
-
-    # Yatay çizgiler
-    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (h_ksize, 1))
-    hlines = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, hk, iterations=1)
-    yproj = hlines.sum(axis=1)
-    ys = [int(y) for y in np.where(yproj > 0)[0]]
-    ys = _merge_lines_1d(ys, eps=merge_eps)
-
-    # Kenar emniyeti: sol/üst 0, sağ/alt w/h mutlaka dahil olsun
-    h, w = bin_.shape[:2]
-    xs = sorted(set([0] + xs + [w-1]))
-    ys = sorted(set([0] + ys + [h-1]))
-
-    if debug:
-        vis = cropped_table.copy()
-        for x in xs: cv2.line(vis, (x,0), (x,h-1), (0,0,255), 1)
-        for y in ys: cv2.line(vis, (0,y), (w-1,y), (255,0,0), 1)
-        # plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)); plt.axis('off'); plt.show()
-
-    return xs, ys
-
-def build_cells_from_lines(xs, ys, min_w=8, min_h=8):
-    """Komşu çizgiler arası dikdörtgen hücreler."""
-    cells = []
-    for r in range(len(ys)-1):
-        for c in range(len(xs)-1):
-            x0, x1 = xs[c],   xs[c+1]
-            y0, y1 = ys[r],   ys[r+1]
-            w = x1 - x0; h = y1 - y0
-            if w >= min_w and h >= min_h:
-                cells.append({"row": r, "col": c, "bbox": (x0, y0, w, h)})
-    return cells
-
-def crop_cell(img, bbox, pad=2):
-    x,y,w,h = bbox
-    h_img, w_img = img.shape[:2]
-    x0 = max(0, x+pad); y0 = max(0, y+pad)
-    x1 = min(w_img, x+w-pad); y1 = min(h_img, y+h-pad)
-    return img[y0:y1, x0:x1]
-
-def guess_signature_col_by_header(img, cells, tc, header_row=0, lang="tur"):
-    # Başlık satırındaki her sütunu OCR’la, 'IMZA' yazanı bul
-    col2text = {}
-    for cell in [c for c in cells if c["row"]==header_row]:
-        roi = crop_cell(img, cell["bbox"])
-        txt = tc.ocr(roi, lang=lang).strip().upper()  # senin arayüzüne uyumla
-        col2text[cell["col"]] = txt
-    for col, txt in col2text.items():
-        if "IMZA" in txt or "İMZA" in txt:
-            return col
-    return None
-
-def is_likely_signature(roi):
-    bin_ = _binarize(roi)
-    ink_ratio = bin_.mean()/255.0  # 1 -> tamamen mürekkep (inverse)
-    return ink_ratio > 0.10  # tabloya göre 0.08–0.15 aralığı iyi çalışır
-
-def table_to_dataframe(cropped_table, tc,
-                       out_dir="cells_out",
-                       lang="tur",
-                       merge_eps=6,
-                       v_ksize=25, h_ksize=25,
-                       debug=False):
-    _ensure_dir(out_dir)
-
-    xs, ys = detect_grid_lines(cropped_table, v_ksize=v_ksize, h_ksize=h_ksize,
-                               merge_eps=merge_eps, debug=debug)
-    cells = build_cells_from_lines(xs, ys)
-
-    # Boyutlar
-    n_rows = max(c["row"] for c in cells) + 1
-    n_cols = max(c["col"] for c in cells) + 1
-
-    # İmza sütununu başlıktan tahmin et
-    sign_col = guess_signature_col_by_header(cropped_table, cells, tc, header_row=0, lang=lang)
-
-    # Boş DataFrame’ler
-    df_text = pd.DataFrame([[""]*n_cols for _ in range(n_rows)])
-    df_meta = pd.DataFrame([[None]*n_cols for _ in range(n_rows)])
-
-    for c in cells:
-        r, col, bbox = c["row"], c["col"], c["bbox"]
-        roi = crop_cell(cropped_table, bbox)
-
-        # OCR
-        text = tc.ocr(roi, lang=lang).strip()  # senin fonksiyonuna göre
-
-        # İmza tespiti
-        is_sig = False
-        if sign_col is not None and col == sign_col:
-            # Başlık imza ise, alt hücreler imza olabilir
-            if r > 0:
-                is_sig = True
-        if not is_sig and text == "":
-            is_sig = is_likely_signature(roi)
-
-        image_path = None
-        if is_sig:
-            fname = os.path.join(out_dir, f"r{r}_c{col}_signature.png")
-            cv2.imwrite(fname, roi)
-            image_path = fname
-            val = "<signature>"
-        else:
-            val = text
-
-        df_text.iat[r, col] = val
-        df_meta.iat[r, col] = {
-            "text": text,
-            "bbox": bbox,
-            "image_path": image_path,
-            "is_signature": bool(is_sig),
-        }
-
-    return df_text, df_meta, {"xs": xs, "ys": ys}
-
-# 1) Önce küçük skew düzeltmesini uygula (safe_deskew)
-img0 = cropped_table  # senin ürettiğin tablo kırpımı
-# img0 = safe_deskew(cropped_table, debug=True)  # istersen
-
-# 2) TesseractClient örneğin
-# tc = tc_new  # senin mevcut client adın neyse
-
-df_text, df_meta, grid = table_to_dataframe(img0, tc, out_dir="cells_out", lang="tur", debug=False)
-
-# df_text: görsel yerleşimle aynı
-# df_meta: her hücre için ayrıntı (bbox, signature image path, vb.)
-
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-
-def visualize_cells_overlay(img, xs, ys, font_scale=0.5):
-    vis = img.copy()
-    h, w = vis.shape[:2]
-
-    # Izgara çiz
-    for x in xs: cv2.line(vis, (x,0), (x,h-1), (0,0,255), 1)
-    for y in ys: cv2.line(vis, (0,y), (w-1,y), (255,0,0), 1)
-
-    # Hücre merkezine (r,c) yaz
-    for r in range(len(ys)-1):
-        for c in range(len(xs)-1):
-            x0, x1 = xs[c], xs[c+1]
-            y0, y1 = ys[r], ys[r+1]
-            cx = int((x0 + x1) / 2)
-            cy = int((y0 + y1) / 2)
-            cv2.putText(vis, f"({r},{c})", (cx-15, cy+5),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(vis, f"({r},{c})", (cx-15, cy+5),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255,255,255), 1, cv2.LINE_AA)
-
-    plt.figure(figsize=(12,8))
-    plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-    plt.axis('off'); plt.title("Cells overlay (r,c)")
-    plt.show()
-
-xs, ys = grid["xs"], grid["ys"]     # table_to_dataframe dönüşünden
-visualize_cells_overlay(cropped_table, xs, ys, font_scale=0.6)
-
-def show_cells_gallery(img, xs, ys, nrows=5, ncols=6, page=0, pad=2):
+def normalize_black_white_safely(gray: np.ndarray,
+                                 black_thresh: int = 130,
+                                 white_thresh: int = 220) -> np.ndarray:
     """
-    nrows*ncols kadar hücreyi tek figürde gösterir. page=0 ilk sayfa.
+    Siyaha yakınları 0, beyaza yakınları 255 yap.
+    Arada kalanları yakın olduğu tarafa doğru iter; siyah strokları korur.
     """
-    cells = []
-    for r in range(len(ys)-1):
-        for c in range(len(xs)-1):
-            x0, x1 = xs[c], xs[c+1]
-            y0, y1 = ys[r], ys[r+1]
-            cells.append((r, c, (x0, y0, x1-x0, y1-y0)))
+    g = gray.astype(np.uint8)
+    res = g.copy()
+    res[g <= black_thresh] = 0
+    res[g >= white_thresh] = 255
+    mid_mask = (g > black_thresh) & (g < white_thresh)
+    # orta griyi yakın olana yönlendir (eşiklerin ortası pivot)
+    pivot = (black_thresh + white_thresh) // 2
+    res[mid_mask] = np.where(g[mid_mask] < pivot, 0, 255).astype(np.uint8)
+    return res
 
-    total = len(cells)
-    per_page = nrows * ncols
-    start = page * per_page
-    end = min(start + per_page, total)
-    if start >= total:
-        print("No cells on this page."); return
+def otsu_with_bias(gray: np.ndarray, bias: int = -10) -> np.ndarray:
+    """
+    Otsu + küçük negatif bias: koyu gri yazıları da al.
+    """
+    thr, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr = np.clip(thr + bias, 0, 255)
+    _, bin_img = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
+    return bin_img
 
-    plt.figure(figsize=(ncols*2.2, nrows*2.2))
-    for i, (r, c, bbox) in enumerate(cells[start:end], start=1):
-        x,y,w,h = bbox
-        roi = crop_cell(img, bbox, pad=pad)
-        ax = plt.subplot(nrows, ncols, i)
-        ax.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-        ax.set_title(f"({r},{c})", fontsize=9)
-        ax.axis('off')
-    plt.tight_layout()
-    plt.show()
+def fast_deskew(binary: np.ndarray, max_dim: int = 3000) -> Tuple[np.ndarray, float]:
+    """
+    Hızlı açı tahmini: downscale ile minAreaRect; orijinale uygula.
+    """
+    if binary.ndim == 3:
+        binary = cv2.cvtColor(binary, cv2.COLOR_BGR2GRAY)
+    b = binary
+    # downscale
+    h, w = b.shape[:2]
+    scale = 1.0
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        b = cv2.resize(b, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    coords = cv2.findNonZero(255 - b)  # siyah (yazı) piksel koordinatları
+    if coords is None:
+        return binary, 0.0
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    # OpenCV minAreaRect açı düzeltmesi
+    if angle < -45:
+        angle = 90 + angle
+    # orijinal boyuta göre açı
+    rot_angle = float(angle)
 
-# İlk sayfa
-show_cells_gallery(cropped_table, xs, ys, nrows=4, ncols=6, page=0)
+    # orijinale uygula
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, rot_angle, 1.0)
+    rotated = cv2.warpAffine(binary, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=255)
+    return rotated, rot_angle
 
-# Sonraki sayfa
-show_cells_gallery(cropped_table, xs, ys, nrows=4, ncols=6, page=1)
+def close_gaps_preserve_strokes(binary: np.ndarray) -> np.ndarray:
+    """
+    İnce yazıları öldürmeden harf içi boşlukları kapat.
+    Küçük yatay + dikey closing ve hafif eğimli line kernel kombinasyonu.
+    """
+    # küçük boşluklar (1-2 px)
+    k1 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k1, iterations=1)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, k2, iterations=1)
 
-def show_signature_cells(df_meta, img, highlight_first=True, ncols=4):
-    sig_cells = []
-    for r in range(df_meta.shape[0]):
-        for c in range(df_meta.shape[1]):
-            meta = df_meta.iat[r, c]
-            if isinstance(meta, dict) and meta.get("is_signature"):
-                sig_cells.append((r, c, meta["bbox"]))
-    if not sig_cells:
-        print("Signature cells not found."); return
+    # 15° civarı eğimli kırık harf boşluklarını toparla (yaklaşık)
+    k_diag = np.array([[0,1,1],
+                       [0,1,1],
+                       [0,0,1]], dtype=np.uint8)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, k_diag, iterations=1)
+    return closed
 
-    nrows = int(np.ceil(len(sig_cells)/ncols))
-    plt.figure(figsize=(ncols*2.5, nrows*2.5))
-    for i, (r,c,bbox) in enumerate(sig_cells, start=1):
-        ax = plt.subplot(nrows, ncols, i)
-        roi = crop_cell(img, bbox, pad=2)
-        ax.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-        ax.set_title(f"({r},{c}) <signature>")
-        ax.axis('off')
-    plt.tight_layout()
-    plt.show()
+def remove_isolated_specks(binary: np.ndarray,
+                           min_area: int = 8,
+                           max_area: int = 3000,
+                           isolation_distance: int = 10,
+                           roundness_max: float = 0.6) -> np.ndarray:
+    """
+    İzole siyah nokta/lekeleri sil (yazıya yakın olanı bırak).
+    roundness_max: 1'e yakınsa dairesel; <0.6 yazıya benzerliği artırır.
+    """
+    inv = 255 - binary
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(inv, connectivity=8)
+    cleaned = inv.copy()
 
-show_signature_cells(df_meta, cropped_table, ncols=5)
+    h, w = inv.shape
+    for i in range(1, num):
+        x, y, bw, bh, area = stats[i]
+        if area < min_area or area > max_area:
+            continue
+        # dairelilik (4πA / P^2)
+        cnt = np.array(np.where(labels == i)).T[:, ::-1]
+        # perimeter yaklaşık: dikdörtgen çevresi yerine kontur daha iyi, ama hızlı olsun:
+        perim = 2 * (bw + bh)
+        if perim == 0:
+            continue
+        roundness = 4 * np.pi * area / (perim * perim)
 
-# 1) Skew düzeltme (gerekirse)
-deskewed = safe_deskew(cropped_table, debug=True)
+        if roundness > roundness_max:
+            # komşulukta başka yazı var mı?
+            x0 = max(x - isolation_distance, 0)
+            y0 = max(y - isolation_distance, 0)
+            x1 = min(x + bw + isolation_distance, w)
+            y1 = min(y + bh + isolation_distance, h)
+            roi = inv[y0:y1, x0:x1]
+            # kendi dışında siyah piksel var mı?
+            own = (labels[y0:y1, x0:x1] == i).sum()
+            total = (roi > 0).sum()
+            if total - own <= 2:  # neredeyse tek başına
+                cleaned[labels == i] = 0  # sil
+    return 255 - cleaned
 
-# 2) Hücre & DF üret
-df_text, df_meta, grid = table_to_dataframe(deskewed, tc_new, out_dir="cells_out", lang="tur", debug=False)
-xs, ys = grid["xs"], grid["ys"]
+def build_foreground_mask(binary: np.ndarray, bottom_strip: int = 10) -> np.ndarray:
+    """
+    Foreground maskesi: yazı=255, arka plan=0. Alt şeritteki küçük siyah lekeyi bastırır.
+    """
+    mask = 255 - binary  # siyah yazı -> 255
+    # alt 10px temizle
+    h, w = mask.shape
+    strip = mask[h-bottom_strip:h, :]
+    if np.count_nonzero(strip) < 0.05 * strip.size:
+        mask[h-bottom_strip:h, :] = 0
+    return mask
 
-# 3) Görselleştirme
-visualize_cells_overlay(deskewed, xs, ys, font_scale=0.6)
-show_cells_gallery(deskewed, xs, ys, nrows=4, ncols=6, page=0)  # (r,c) başlıklı galeri
-show_signature_cells(df_meta, deskewed, ncols=5)                # sadece imzalar
+def crop_to_content(image: np.ndarray, mask: np.ndarray, margin: int = 10) -> np.ndarray:
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        return image
+    x, y, w, h = cv2.boundingRect(coords)
+    h_img, w_img = image.shape[:2]
+    x0 = max(x - margin, 0)
+    y0 = max(y - margin, 0)
+    x1 = min(x + w + margin, w_img)
+    y1 = min(y + h + margin, h_img)
+    return image[y0:y1, x0:x1]
+
+# ---------- Boru hattı ----------
+
+def enhance_document(img_bgr: np.ndarray,
+                     gamma: float = 2.7,
+                     black_thresh: int = 130,
+                     white_thresh: int = 220,
+                     otsu_bias: int = -10,
+                     do_sharpen: bool = True,
+                     debug: bool = False) -> Dict[str, Any]:
+    """
+    Verilen görüntüyü OCR için düzeltir: normalize → binarize → deskew → gap close →
+    speck removal → crop. Ara çıktıları isterse döndürür.
+    Returns dict: {"final", "gray", "normalized", "binary", "deskewed", "closed", "cleaned", "cropped"}
+    """
+    out: Dict[str, Any] = {}
+
+    # 1) Grayscale + siyahı koruyan normalize
+    if img_bgr.ndim == 3:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_bgr.copy()
+    # hafif gamma, siyaha ağırlık
+    gray_f = np.clip((gray / 255.0) ** (1.0 / gamma) * 255.0, 0, 255).astype(np.uint8)
+    normalized = normalize_black_white_safely(gray_f, black_thresh, white_thresh)
+
+    # 2) Binarize (Otsu + bias)
+    binary0 = otsu_with_bias(normalized, bias=otsu_bias)
+
+    # 3) Deskew (binariden)
+    deskewed, angle = fast_deskew(binary0)
+
+    # 4) Harf içi boşlukları doldur (ince strokları koruyarak)
+    closed = close_gaps_preserve_strokes(deskewed)
+
+    # 5) İzole leke temizliği
+    cleaned = remove_isolated_specks(closed,
+                                     min_area=8,
+                                     max_area=3000,
+                                     isolation_distance=12,
+                                     roundness_max=0.7)
+
+    # 6) Foreground maskesi ve crop
+    mask = build_foreground_mask(cleaned, bottom_strip=10)
+    cropped_bin = crop_to_content(cleaned, mask, margin=10)
+
+    # 7) Opsiyonel hafif keskinleştirme (yalnızca binari değil, gri üzerinde)
+    if do_sharpen:
+        # Unsharp mask: gaussian + fark
+        g = cv2.GaussianBlur(cropped_bin, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(cropped_bin, 1.5, g, -0.5, 0)
+    else:
+        sharpened = cropped_bin
+
+    out["gray"] = gray
+    out["normalized"] = normalized
+    out["binary"] = binary0
+    out["deskewed"] = deskewed
+    out["closed"] = closed
+    out["cleaned"] = cleaned
+    out["cropped"] = cropped_bin
+    out["final"] = sharpened
+    out["deskew_angle_deg"] = angle
+    return out
+
+# img_bgr = cv2.imread("input.jpg")
+result = enhance_document(img_bgr, debug=False)
+final = result["final"]
+# Kaydet:
+# cv2.imwrite("enhanced.png", final)
