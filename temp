@@ -1,123 +1,321 @@
-import cv2, numpy as np
-from typing import Dict, Any
+# -*- coding: utf-8 -*-
+"""
+PDF auto-orient (RAM'de): OSD kararı image üzerinde, uygulama PDF'te /Rotate.
+Gerekenler: PyMuPDF, PyPDF2, opencv-python, pillow, matplotlib
+"""
 
-# ---------- helpers ----------
-def _to_gray(img): 
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+from io import BytesIO
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import cv2
+import fitz  # PyMuPDF
+from PyPDF2 import PdfReader, PdfWriter
 
-def _order_quad(pts: np.ndarray) -> np.ndarray:
-    s = pts.sum(1); d = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]; bl = pts[np.argmax(d)]
-    return np.array([tl,tr,br,bl], np.float32)
+# =========================================================
+# ----------------- Yardımcı: render / preview ------------
+# =========================================================
+def _render_page_bgr(pdf_bytes: bytes, page_idx: int, dpi: int = 300, as_gray: bool = False) -> np.ndarray:
+    """
+    Sayfayı RAM'de rasterize et. Çıkış: cv2 BGR (ya da GRAY).
+    Sadece karar/önizleme için; nihai PDF rasterize edilmez.
+    """
+    zoom = dpi / 72.0
+    with fitz.open("pdf", pdf_bytes) as doc:
+        p = doc.load_page(page_idx)
+        if as_gray:
+            pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csGRAY)
+            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)  # RGB
+            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-def _grid_mask(gray: np.ndarray) -> np.ndarray:
-    H, W = gray.shape
-    # Yazıyı bastırıp çizgileri öne çıkar
-    bin_ = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_MEAN_C,
-                                 cv2.THRESH_BINARY_INV, 31, 10)
-    kx = max(15, W//60); ky = max(15, H//60)
-    hor = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)), 1)
-    ver = cv2.morphologyEx(bin_, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)), 1)
-    grid = cv2.bitwise_or(hor, ver)
-    # dış çerçeveyi sürekli hale getir
-    grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_RECT,(max(3,W//400),max(3,H//400))), 2)
-    # metin köprülerini zayıflat
-    grid = cv2.erode(grid, cv2.getStructuringElement(cv2.MORPH_RECT,(2,2)), 1)
-    return grid
+# =========================================================
+# -------------------- OSD normalize ----------------------
+# =========================================================
+def _unwrap_osd(raw: dict) -> dict:
+    # Bazı server'lar {'dict': {...}} döndürür
+    return raw.get("dict", raw) if isinstance(raw.get("dict", None), dict) else raw
 
-def _largest_rect_like(mask: np.ndarray) -> np.ndarray:
-    # En büyük bileşen -> hull -> approx 4 nokta; olmazsa minAreaRect
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        raise RuntimeError("Tablo çizgileri bulunamadı.")
-    # dikdörtgen benzerliğine göre skorlama
-    def score(c):
-        area = cv2.contourArea(c)
-        if area <= 0: return 0
-        x,y,w,h = cv2.boundingRect(c)
-        fill = area / (w*h + 1e-6)
-        return fill * np.sqrt(area)
-    cmax = max(cnts, key=score)
+def _pick(d: dict, keys, default=None):
+    for k in keys:
+        if k in d and d[k] not in (None, "", "None"):
+            return d[k]
+    return default
 
-    hull = cv2.convexHull(cmax)
-    peri = cv2.arcLength(hull, True)
-    approx = cv2.approxPolyDP(hull, 0.02*peri, True)
+def _parse_angle(val) -> Optional[int]:
+    try:
+        return int(round(float(str(val).strip()))) % 360
+    except Exception:
+        return None
 
-    if len(approx) == 4:
-        quad = approx.reshape(-1,2).astype(np.float32)
+def _parse_float(val) -> Optional[float]:
+    try:
+        return float(str(val).strip())
+    except Exception:
+        return None
+
+def _normalize_osd_dict(raw: dict) -> Tuple[Optional[int], Optional[float]]:
+    """
+    OSD sözlüğünden (rotate, confidence) çıkarır.
+    rotate yoksa orientation'dan türetir: rotate = (360 - orientation) % 360
+    Sonucu 0/90/180/270'a yaklaştırır (snap).
+    """
+    ang = _parse_angle(_pick(raw, ["rotate", "rotation", "rot", "orientation", "orientation_angle", "osd_rotate"]))
+    conf = _parse_float(_pick(raw, ["orientation_confidence", "orientation_conf", "confidence", "conf", "osd_conf"]))
+
+    if ang is not None and ang not in (0, 90, 180, 270):
+        ang = min((0, 90, 180, 270), key=lambda a: abs(a - ang))
+
+    if ang in (None, 0):
+        ori = _parse_angle(_pick(raw, ["orientation", "orientation_angle"]))
+        if ori in (90, 180, 270):
+            ang = (-ori) % 360  # 90→270 (CW), 270→90 (CW)
+
+    return ang, conf
+
+# =========================================================
+# --------------- OSD: image bazlı rotate -----------------
+# =========================================================
+def rotate_img_using_osd(
+    img_bgr: np.ndarray,
+    osd_tc=None,               # Remote tesseract client (önerilen). Eğer None ise döndürmeden geri verir.
+    osd_conf: float = 0.0      # osd_conf==0 davranışı için eşik
+) -> Tuple[np.ndarray, int, float]:
+    """
+    OSD çıktısına göre görüntüyü döndürür (90/180/270), aksi halde olduğu gibi bırakır.
+    Dönen: (rotated_bgr, used_deg, used_conf)
+    """
+    if osd_tc is None:
+        return img_bgr, 0, 0.0
+
+    # ---- OSD çağır ----
+    from PIL import Image
+    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    try:
+        raw = osd_tc.get_osd_ocr(pil, config="", model="best", output_type="dict")
+    except Exception:
+        return img_bgr, 0, 0.0
+
+    if not isinstance(raw, dict) or "error" in raw:
+        return img_bgr, 0, 0.0
+
+    inner = _unwrap_osd(raw)
+    deg, conf = _normalize_osd_dict(inner)
+
+    if conf is None:
+        conf = 0.0
+    if deg is None:
+        deg = 0
+
+    # ---- Kararı uygula ----
+    if conf < osd_conf or deg == 0:
+        return img_bgr, 0, conf
+
+    if   deg == 90:  rot = cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    elif deg == 180: rot = cv2.rotate(img_bgr, cv2.ROTATE_180)
+    elif deg == 270: rot = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
     else:
-        rect = cv2.minAreaRect(hull)
-        quad = cv2.boxPoints(rect).astype(np.float32)
+        # nadiren 0/90/180/270 dışı gelirse (teoride olmayacak)
+        h, w = img_bgr.shape[:2]
+        M = cv2.getRotationMatrix2D((w/2, h/2), -float(deg), 1.0)  # CW pozitif
+        rot = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR)
 
-    return _order_quad(quad)
+    return rot, int(deg), float(conf)
 
-def _warp_with_landscape(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    # hedef boyut: kenarların uzunlukları (ölçek korunur)
-    tl,tr,br,bl = quad
-    wA = np.linalg.norm(br - bl); wB = np.linalg.norm(tr - tl)
-    hA = np.linalg.norm(tr - br); hB = np.linalg.norm(tl - bl)
-    Wt = int(round(max(wA, wB))); Ht = int(round(max(hA, hB)))
+# =========================================================
+# -------------- /Rotate uygulaması (PDF) -----------------
+# =========================================================
+def _get_existing_rotation(page) -> int:
+    try:
+        rot = int(getattr(page, "rotation", 0) or 0)
+    except Exception:
+        rot = 0
+    if rot % 90 != 0:
+        try:
+            rot = int(page.get("/Rotate", 0) or 0)
+        except Exception:
+            rot = 0
+    return rot % 360
 
-    # Peyzaj zorlaması: gerektiğinde hedefi çevir
-    landscape = Wt >= Ht
-    if not landscape:
-        Wt, Ht = Ht, Wt  # hedef yönü değişir
+def _apply_cw(page, angle_cw: int):
+    """
+    Açıyı **her zaman saat yönünde** uygula (90/180/270). PyPDF2 sürüm farkına dayanıklı.
+    """
+    angle_cw = int(angle_cw) % 360
+    if angle_cw == 0:
+        return
+    if hasattr(page, "rotate_clockwise"):
+        page.rotate_clockwise(angle_cw); return
+    if hasattr(page, "rotateClockwise"):
+        page.rotateClockwise(angle_cw); return
+    before = _get_existing_rotation(page)
+    if hasattr(page, "rotate"):
+        try:
+            page.rotate(-angle_cw)  # rotate() CCW ise -angle -> CW etkisi
+        except Exception:
+            pass
+        after = _get_existing_rotation(page)
+        if after == (before + angle_cw) % 360:
+            return
+    page["/Rotate"] = (before + angle_cw) % 360
 
-    dst = np.array([[0,0],[Wt-1,0],[Wt-1,Ht-1],[0,Ht-1]], np.float32)
-    M = cv2.getPerspectiveTransform(quad, dst)
-    warped = cv2.warpPerspective(image, M, (Wt, Ht),
-                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+def apply_rotations_in_memory(pdf_bytes: bytes, decisions: List[Dict]) -> bytes:
+    """
+    decisions listesine göre PDF'i RAM'de döndür ve yeni PDF bytes döndür.
+    PDF içerik rasterize edilmez; yalnızca /Rotate güncellenir.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    by_idx = {d["page_index"]: d for d in decisions}
 
-    # Küçük artık eğimi (0.2°–10°) düzelt
-    g = _to_gray(warped)
-    _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    ys,xs = np.where(bw==0)
-    if len(xs) > 20:
-        rect = cv2.minAreaRect(np.column_stack([xs,ys]).astype(np.float32))
-        raw = rect[-1]; ang = raw if raw < 45 else raw - 90
-        if 0.2 < abs(ang) < 10:
-            h,w = g.shape
-            R = cv2.getRotationMatrix2D((w/2,h/2), ang, 1.0)
-            interp = cv2.INTER_NEAREST if warped.ndim==2 else cv2.INTER_LINEAR
-            warped = cv2.warpAffine(warped, R, (w,h), flags=interp, borderMode=cv2.BORDER_REPLICATE)
+    for i, page in enumerate(reader.pages):
+        d = by_idx.get(i)
+        if d and d.get("decision") == "rotate":
+            _apply_cw(page, int(d.get("needed_rotation", 0)) % 360)
+        writer.add_page(page)
 
-    return warped
+    out = BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.read()
 
-# ---------- main ----------
-def extract_and_rectify_table_v3(image: np.ndarray, debug: bool=False) -> Dict[str, Any]:
-    gray = _to_gray(image)
-    H,W = gray.shape
+# =========================================================
+# --------- Karar: image üstünde, uygulama: PDF ----------
+# =========================================================
+def decide_rotations_from_pdf_osd_tc(
+    pdf_bytes: bytes,
+    osd_tc,
+    dpi: int = 300,
+    min_confidence: float = 0.0,   # osd_conf==0 karşılığı
+    pages: Optional[List[int]] = None,
+    gray_for_speed: bool = False   # OSD için RGB önerilir; hız için True yapılabilir.
+) -> List[Dict]:
+    """
+    Her sayfayı (karar için) rasterize eder, OSD ile image'ı döndürür,
+    çıkan açıya göre PDF'e uygulanacak /Rotate kararını üretir.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    idxs = pages if pages is not None else list(range(len(reader.pages)))
+    out: List[Dict] = []
 
-    grid = _grid_mask(gray)
+    for i in idxs:
+        existing = _get_existing_rotation(reader.pages[i])
+        img_bgr = _render_page_bgr(pdf_bytes, i, dpi=dpi, as_gray=gray_for_speed)
 
-    # En büyük dikdörtgen benzeri bölge -> köşeler
-    quad = _largest_rect_like(grid)
+        # IMAGE bazında OSD rotasyonu uygula (önizleme için)
+        after_bgr, deg, conf = rotate_img_using_osd(img_bgr, osd_tc=osd_tc, osd_conf=min_confidence)
+        needed = (deg - existing) % 360
 
-    # Güvenlik: sınır içine kırp
-    quad[:,0] = np.clip(quad[:,0], 0, W-1)
-    quad[:,1] = np.clip(quad[:,1], 0, H-1)
+        if conf is None or conf < min_confidence:
+            needed, decision = 0, "skip"
+        else:
+            decision = "skip" if needed == 0 else "rotate"
 
-    # Bbox ile tabloyu kaba cropla (yan yazıları at)
-    x0,y0 = np.floor(quad.min(0)).astype(int)
-    x1,y1 = np.ceil(quad.max(0)).astype(int)
-    pad = max(4, int(0.01*max(W,H)))
-    x0,y0 = max(0, x0-pad), max(0, y0-pad)
-    x1,y1 = min(W, x1+pad), min(H, y1+pad)
-    crop = image[y0:y1, x0:x1].copy()
+        out.append({
+            "page_index": i,
+            "existing_rotate": existing,
+            "suggested_angle": deg,
+            "confidence": conf,
+            "needed_rotation": needed,
+            "decision": decision,
+            # debug için istersen ön/son shape bilgisi
+            "shape_before": tuple(int(x) for x in img_bgr.shape[:2]),
+            "shape_after":  tuple(int(x) for x in after_bgr.shape[:2]),
+            "dpi": dpi
+        })
 
-    # Crop koordinatlarına göre yerel quad
-    quad_local = quad - np.array([x0, y0], np.float32)
-
-    rectified = _warp_with_landscape(crop, quad_local)
-
-    out = {"rectified": rectified, "quad_page": quad, "crop": crop, "quad_local": quad_local}
-    if debug:
-        dbg = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        for i in range(4):
-            p1 = tuple(quad[i].astype(int)); p2 = tuple(quad[(i+1)%4].astype(int))
-            cv2.line(dbg, p1, p2, (0,255,0), 3)
-        out["debug_grid"] = grid
-        out["debug_overlay"] = dbg
     return out
+
+def auto_orient_pdf_bytes_osd_tc(
+    pdf_bytes: bytes,
+    osd_tc,
+    dpi: int = 300,
+    min_confidence: float = 0.0,
+    pages: Optional[List[int]] = None,
+    gray_for_speed: bool = False
+) -> Tuple[bytes, List[Dict]]:
+    """
+    Tek çağrıda karar + uygulama. Çıkış: (rotated_pdf_bytes, decisions)
+    """
+    decisions = decide_rotations_from_pdf_osd_tc(
+        pdf_bytes=pdf_bytes,
+        osd_tc=osd_tc,
+        dpi=dpi,
+        min_confidence=min_confidence,
+        pages=pages,
+        gray_for_speed=gray_for_speed,
+    )
+    rotated = apply_rotations_in_memory(pdf_bytes, decisions)
+    return rotated, decisions
+
+# =========================================================
+# ---------------- Debug / doğrulama araçları -------------
+# =========================================================
+def rotations_list(pdf_bytes: bytes):
+    r = PdfReader(BytesIO(pdf_bytes))
+    return [(i, int(getattr(p, "rotation", 0) or p.get("/Rotate", 0) or 0) % 360) for i, p in enumerate(r.pages)]
+
+def _render_page_rgb_for_display(pdf_bytes: bytes, page_index: int, dpi: int = 200) -> np.ndarray:
+    zoom = dpi / 72.0
+    with fitz.open("pdf", pdf_bytes) as doc:
+        p = doc.load_page(page_index)
+        pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)  # RGB
+        return img
+
+def show_before_after(pdf_bytes_before: bytes, pdf_bytes_after: bytes,
+                      page_index: int = 0, dpi: int = 300,
+                      title_before: str = "Before", title_after: str = "After"):
+    import matplotlib.pyplot as plt
+    img_b = _render_page_rgb_for_display(pdf_bytes_before, page_index, dpi=dpi)
+    img_a = _render_page_rgb_for_display(pdf_bytes_after,  page_index, dpi=dpi)
+    fig = plt.figure(figsize=(16, 7))
+    ax1 = fig.add_subplot(1, 2, 1); ax2 = fig.add_subplot(1, 2, 2)
+    ax1.imshow(img_b); ax1.set_title(f"{title_before} (p{page_index}, {dpi} DPI)"); ax1.axis("off")
+    ax2.imshow(img_a); ax2.set_title(f"{title_after} (p{page_index}, {dpi} DPI)");  ax2.axis("off")
+    plt.tight_layout(); plt.show()
+
+# =========================================================
+# -------- Tablo preprocess (0/255 biten binary) ----------
+# =========================================================
+def preprocess_table_img(table_bgr: np.ndarray) -> np.ndarray:
+    """
+    Tablo görüntüsünü OCR için hazırlar. Çıktı: tek kanal ve sadece 0/255.
+    """
+    gray = cv2.cvtColor(table_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    blurred = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    sharp = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+    _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+
+# 1) PDF'i RAM'e al
+with open(selected_pdf, "rb") as f:
+    pdf_bytes = f.read()
+
+# 2) Kararı image bazında ver, PDF'e /Rotate uygula
+rotated_bytes, decisions = auto_orient_pdf_bytes_osd_tc(
+    pdf_bytes,
+    osd_tc=osd_tc,        # senin TesseractClient
+    dpi=300,
+    min_confidence=0.0,   # osd_conf==0 karşılığı
+    gray_for_speed=False
+)
+
+# 3) Doğrulama
+print("BEFORE:", rotations_list(pdf_bytes)[:10])
+print("AFTER :", rotations_list(rotated_bytes)[:10])
+for d in decisions:
+    print({k: d[k] for k in ("page_index","existing_rotate","suggested_angle","confidence","needed_rotation","decision")})
+
+# 4) Önizleme
+show_before_after(pdf_bytes, rotated_bytes, page_index=0, dpi=300,
+                  title_before="Before (p0)", title_after=f"After rot={decisions[0]['suggested_angle']} conf={decisions[0]['confidence']:.2f}")
+
+# 5) Tablo preprocess (0/255)
+# table_bgr = ... (kendi crop kodundan)
+# table_bin = preprocess_table_img(table_bgr)
