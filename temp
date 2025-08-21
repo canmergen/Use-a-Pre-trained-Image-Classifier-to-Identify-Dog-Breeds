@@ -1,189 +1,53 @@
 # -*- coding: utf-8 -*-
-import cv2, base64, json, re, numpy as np, requests, pandas as pd, matplotlib.pyplot as plt
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
-from difflib import SequenceMatcher
-import textwrap
+import cv2, json, base64, requests, re, numpy as np, pandas as pd
+from typing import Any, List, Tuple
 
+# =========================================================
+# 0) BOX NORMALİZASYONU  (TextBox / tuple / dict hepsi destekli)
+# =========================================================
+def _to_xywh(b: Any) -> Tuple[int,int,int,int] | None:
+    """Her tür kutuyu (x,y,w,h)'ye çevirir."""
+    # tuple/list/np.array
+    if isinstance(b, (tuple, list, np.ndarray)) and len(b) == 4:
+        x,y,w,h = [int(round(float(v))) for v in b]
+        return (x,y,w,h)
+    # obj: x,y,w,h
+    for attrs in [("x","y","w","h"), ("left","top","width","height")]:
+        if all(hasattr(b, a) for a in attrs):
+            x,y,w,h = [int(round(float(getattr(b,a)))) for a in attrs]
+            return (x,y,w,h)
+    # obj: x0,y0,x1,y1
+    for attrs in [("x0","y0","x1","y1"), ("left","top","right","bottom")]:
+        if all(hasattr(b, a) for a in attrs):
+            x0,y0,x1,y1 = [float(getattr(b,a)) for a in attrs]
+            return (int(round(x0)), int(round(y0)), int(round(x1-x0)), int(round(y1-y0)))
+    # dict
+    if isinstance(b, dict):
+        if all(k in b for k in ("x","y","w","h")):
+            return (int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"]))
+        if all(k in b for k in ("x0","y0","x1","y1")):
+            return (int(b["x0"]), int(b["y0"]),
+                    int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"]))
+    return None
 
-# =========================
-# 0) Yardımcı tip
-# =========================
-@dataclass
-class TextBox:
-    x: int
-    y: int
-    w: int
-    h: int
-    signature: bool = False  # görsel analizle imza var/yok
-
-
-# =========================
-# 1) Görüntü işleme yardımcıları
-# =========================
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
-
-def _binarize_strong(gray: np.ndarray) -> np.ndarray:
-    """
-    Siyah yazı, beyaz zemin üret. (ink=255, bg=0)
-    """
-    g = cv2.GaussianBlur(gray, (3, 3), 0)
-    thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    # yazı siyah (255) olsun
-    if thr.mean() > 127:
-        thr = 255 - thr
-    return thr
-
-def _find_word_contours(img_bin: np.ndarray, W: int, H: int) -> Tuple[List[Tuple[int,int,int,int]], np.ndarray]:
-    """
-    Karakterleri birleştirip kelime/satır kutuları üret.
-    img_bin: siyah=255, beyaz=0
-    """
-    kx = max(15, W // 80)
-    ky = max(3,  H // 200)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
-    merged = cv2.morphologyEx(img_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def _normalize_boxes(boxes: List[Any]) -> List[Tuple[int,int,int,int]]:
     out = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if w*h < 150 or h < 8:
+    for i,b in enumerate(boxes):
+        nb = _to_xywh(b)
+        if nb is None:  # dönüştürülemeyenleri atla
+            print(f"[WARN] Box #{i} dönüştürülemedi: {type(b)}")
             continue
-        out.append((x, y, w, h))
-    return out, merged
-
-def _merge_nearby_boxes(boxes: List[Tuple[int,int,int,int]]) -> List[Tuple[int,int,int,int]]:
-    """
-    Yakın/örtüşen kutuları blok düzeyinde birleştir.
-    """
-    if not boxes: 
-        return []
-    rects = np.array(boxes, dtype=np.int32)
-    med_h = float(np.median(rects[:,3]))
-    taken = [False]*len(rects)
-    clusters = []
-    for i in range(len(rects)):
-        if taken[i]: 
-            continue
-        xi, yi, wi, hi = rects[i]
-        x1, y1, x2, y2 = xi, yi, xi+wi, yi+hi
-        for j in range(i+1, len(rects)):
-            if taken[j]: 
-                continue
-            xj, yj, wj, hj = rects[j]
-            u1, v1, u2, v2 = xj, yj, xj+wj, yj+hj
-            # merkez mesafesi veya overlap
-            cx_i, cy_i = xi+wi/2, yi+hi/2
-            cx_j, cy_j = xj+wj/2, yj+hj/2
-            dist = np.hypot(cx_i-cx_j, cy_i-cy_j)
-            overlap = not (x2 < u1 or u2 < x1 or y2 < v1 or v2 < y1)
-            if dist < 1.6*med_h or overlap:
-                x1, y1 = min(x1, u1), min(y1, v1)
-                x2, y2 = max(x2, u2), max(y2, v2)
-                taken[j] = True
-        taken[i] = True
-        clusters.append((int(x1), int(y1), int(x2-x1), int(y2-y1)))
-    clusters = [(x,y,w,h) for (x,y,w,h) in clusters if w*h >= 250]
-    clusters.sort(key=lambda r: (r[1]//12, r[0]))  # yukarı->aşağı, sol->sağ
-    return clusters
-
-def _reject_stamp_like(c) -> bool:
-    """
-    Mühür/damga benzeri (yuvarlak/dolu) büyük blobları ayıkla.
-    """
-    A = cv2.contourArea(c)
-    P = cv2.arcLength(c, True)
-    if P == 0: 
-        return False
-    circ = 4.0*np.pi*A/(P*P)  # 0..1 (1 daire)
-    return (circ > 0.55) and (A > 3000)
-
-def _signature_heuristic(sub_bin: np.ndarray) -> bool:
-    """
-    İmza var/yok kestirimi (ink=255, bg=0).
-    """
-    h, w = sub_bin.shape[:2]
-    area = h*w
-    if area < 600: 
-        return False
-
-    ink_ratio = float(np.count_nonzero(sub_bin))/area
-    if ink_ratio < 0.02:
-        return False
-
-    cnts, _ = cv2.findContours(sub_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts: 
-        return False
-    cnts = [c for c in cnts if not _reject_stamp_like(c)]
-    if not cnts:
-        return False
-
-    c = max(cnts, key=cv2.contourArea)
-    A = cv2.contourArea(c)
-    P = cv2.arcLength(c, True)
-    if P == 0: 
-        return False
-    thinness = 4.0*np.pi*A/(P*P)      # 0..1
-    approx = cv2.approxPolyDP(c, 0.01*P, True)
-    complexity = len(approx)
-
-    cond_area = (A/area) > 0.02       # kutunun %2'sinden büyük
-    cond_thin = 0.08 < thinness < 0.45
-    cond_cmpx = complexity > 12
-    return bool(cond_area and cond_thin and cond_cmpx)
-
-def segment_lower_area_into_boxes(lower_img: np.ndarray,
-                                  expand_px: int = 6,
-                                  debug: bool = False) -> Tuple[List[TextBox], Dict[str, Any]]:
-    """
-    Tablo altı ROI -> blok kutular + imza label.
-    debug=True ise ara görselleri döndürür.
-    """
-    dbg: Dict[str, Any] = {}
-    gray = _to_gray(lower_img)
-    bin_inv = _binarize_strong(gray)          # ink=255
-    H, W = bin_inv.shape[:2]
-    word_boxes, merged = _find_word_contours(bin_inv, W, H)
-    block_boxes = _merge_nearby_boxes(word_boxes)
-
-    out = []
-    for (x,y,w,h) in block_boxes:
-        xa, ya = max(0, x-expand_px), max(0, y-expand_px)
-        xb, yb = min(W, x+w+expand_px), min(H, y+h+expand_px)
-        sub = bin_inv[ya:yb, xa:xb]
-        sig = _signature_heuristic(sub)
-        out.append(TextBox(x=x, y=y, w=w, h=h, signature=sig))
-
-    if debug:
-        # ara overlay'ler
-        dbg["gray"] = gray
-        dbg["bin_inv"] = bin_inv
-        dbg["merged"] = merged
-
-        # word box görseli
-        vis_word = cv2.cvtColor(bin_inv, cv2.COLOR_GRAY2BGR)
-        for (x,y,w,h) in word_boxes:
-            cv2.rectangle(vis_word, (x,y), (x+w,y+h), (0,160,255), 1)
-        dbg["vis_word_boxes"] = vis_word
-
-        # block box görseli
-        vis_block = lower_img.copy() if lower_img.ndim==3 else cv2.cvtColor(lower_img, cv2.COLOR_GRAY2BGR)
-        for (x,y,w,h) in block_boxes:
-            cv2.rectangle(vis_block, (x,y), (x+w,y+h), (0,255,0), 2)
-        dbg["vis_block_boxes"] = vis_block
-
-    return out, dbg
+        x,y,w,h = nb
+        if w>0 and h>0:
+            out.append((x,y,w,h))
+    return out
 
 
-# =========================
-# 2) OCR Wrapper (uzak Tesseract)
-# =========================
-def ocr_box_via_remote_tesseract(img_bgr: np.ndarray,
-                                 url: str,
-                                 lang: str = "tur",
-                                 config: str = "--psm 6 --oem 1") -> str:
+# =========================================================
+# 1) UZAK OCR (NEW_URL)
+# =========================================================
+def _ocr_remote_png(img_bgr: np.ndarray, url: str,
+                    lang: str="tur", config: str="--psm 6 --oem 1") -> str:
     ok, buf = cv2.imencode(".png", img_bgr)
     if not ok:
         return ""
@@ -198,172 +62,134 @@ def ocr_box_via_remote_tesseract(img_bgr: np.ndarray,
     except Exception:
         return ""
 
-
-# =========================
-# 3) Debug görselleştirme (etiketli kutular)
-# =========================
-def visualize_lower_boxes(lower_img: np.ndarray,
-                          boxes: List[TextBox],
-                          ocr_texts: List[str] | None = None,
-                          max_chars_per_line: int = 28,
-                          max_lines: int = 2) -> np.ndarray:
-    vis = lower_img.copy() if lower_img.ndim==3 else cv2.cvtColor(lower_img, cv2.COLOR_GRAY2BGR)
-    for i, tb in enumerate(boxes):
-        x, y, w, h = tb.x, tb.y, tb.w, tb.h
-        color = (0, 200, 0) if tb.signature else (0, 120, 255)  # imza varsa yeşil
-        cv2.rectangle(vis, (x, y), (x+w, y+h), color, 2)
-        label = f"#{i} | sig={'1' if tb.signature else '0'}"
-        cv2.putText(vis, label, (x, max(0, y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-
-        if ocr_texts is not None and i < len(ocr_texts):
-            txt = (ocr_texts[i] or "").strip().replace("\n", " ")
-            if txt:
-                lines = textwrap.wrap(txt, max_chars_per_line)[:max_lines]
-                for k, line in enumerate(lines):
-                    yy = y + 14 + k*14
-                    cv2.putText(vis, line, (x, min(y+h-4, yy)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (30,30,30), 2, cv2.LINE_AA)
-                    cv2.putText(vis, line, (x, min(y+h-4, yy)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245,245,245), 1, cv2.LINE_AA)
-    return vis
+def _ocr_text_from_box_remote(img: np.ndarray, box_xywh: Tuple[int,int,int,int], url: str) -> str:
+    x,y,w,h = box_xywh
+    roi = img[y:y+h, x:x+w]
+    if roi.ndim == 2:
+        roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+    return _ocr_remote_png(roi, url=url, lang="tur", config="--psm 6 --oem 1")
 
 
-# =========================
-# 4) Alan çıkarımı (regex + fuzzy + layout)
-# =========================
+# =========================================================
+# 2) İMZA HEURİSTİĞİ (hızlı ve pratik)
+# =========================================================
+def _has_signature(img: np.ndarray, box_xywh: Tuple[int,int,int,int],
+                   ink_ratio_thr: float=0.012, thinness_max: float=0.45) -> bool:
+    """
+    - ink_ratio_thr: mürekkep yoğunluğu eşiği (0.008–0.02 aralığında ayarlanır)
+    - thinness_max: dairesel mühürleri elemek için daire benzerliği üst sınırı
+    """
+    x,y,w,h = box_xywh
+    roi = img[y:y+h, x:x+w]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim==3 else roi.copy()
+    thr = cv2.threshold(cv2.GaussianBlur(gray,(3,3),0), 0, 255,
+                        cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+    ink_ratio = cv2.countNonZero(thr) / max(1, w*h)
+    if ink_ratio < ink_ratio_thr:
+        return False
+    cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False
+    c = max(cnts, key=cv2.contourArea)
+    A = cv2.contourArea(c); P = max(1.0, cv2.arcLength(c, True))
+    thinness = 4*np.pi*A/(P*P)  # 1'e yakın daire; imza için daha düşük
+    return thinness < thinness_max
+
+
+# =========================================================
+# 3) METİN ARAÇLARI
+# =========================================================
+TL_NUM = re.compile(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+)\s*(TL|₺)?", re.IGNORECASE)
+
 ROLE_ALIASES = {
-    "toplanti_baskani":    ["toplantı başkanı", "divan başkanı", "divan bşk"],
-    "tutanak_yazmani":     ["tutanak yazmanı", "yazman"],
-    "bakanlik_temsilcisi": ["bakanlık temsilcisi", "ticaret bakanlığı temsilcisi", "temsilcisi"],
-    "yk_uyesi":            ["yönetim kurulu üyesi", "yk üyesi"],
-    "yk_baskani":          ["yönetim kurulu başkanı", "yk başkanı"],
-    "katip":               ["katip", "kâtip", "oy toplama memuru", "oy toplayıcı"],
-    "divan_baskani":       ["divan başkanı"],
+    "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","DİVAN BAŞKANI","DIVAN BASKANI"],
+    "tutanak_yazmani":     ["TUTANAK YAZMANI","YAZMAN"],
+    "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
+    "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI"],
+    "yk_baskani":          ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
+    "katip":               ["KÂTİP","KATİP","OY TOPLAYICI","OY TOPLAMA MEMURU","OY TOPLAYAN"],
+    "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
 }
+DROP_WORDS = ["TOPLANTI","BAŞKANI","BASKANI","YÖNETİM","KURULU","ÜYESİ","UYESI","YK",
+              "BAKANLIK","TEMSİLCİSİ","TEMSILCISI","KATİP","KÂTİP","YAZMANI","DİVAN","DIVAN",
+              "İMZA","IMZA","KAŞE","MÜHÜR","STAMP","ASALATEN","VEKALETEN","HAZIRUN","HAZİRUN"]
 
-CAPITAL_KEYS = [
-    "şirketin sermayesi ve payların toplam itibari değeri",
-    "şirketin sermayesi",
-    "sermayesi ve payların toplam itibari değeri",
-    "sermaye miktarı"
-]
+def _contains_any(text_u: str, alias_list: List[str]) -> bool:
+    t = text_u.upper()
+    return any(a in t for a in alias_list)
 
-NUM_WITH_TL = re.compile(
-    r"(?<!\d)(\d{1,3}(\.\d{3})*(,\d{2})?|\d+)\s*(TL|₺)?",
-    flags=re.IGNORECASE
-)
-
-def _fuzzy(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-def _normalize_name(text: str) -> str:
-    s = re.sub(r"[^A-ZÇĞİÖŞÜa-zçğıöşü\s\.\-']", " ", text)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-def _extract_name(text: str) -> str|None:
-    if not text:
-        return None
-    t = text
-    drop = [
-        "t.c.", "tc", "kimlik", "no", "temsilcisi", "temsilci",
-        "başkanı", "baskani", "divan", "yönetim", "kurulu", "üyesi", "uyesi",
-        "katip", "kâtip", "oy", "toplama", "memuru", "yazmanı", "yazmani",
-        "imza", "kaşe", "mühür", "stamp", "asaleten", "vekaleten"
-    ]
-    for w in drop:
+def _extract_name(text_u: str) -> str | None:
+    t = text_u
+    for w in DROP_WORDS:
         t = re.sub(rf"\b{w}\b", " ", t, flags=re.IGNORECASE)
-    t = _normalize_name(t)
+    t = re.sub(r"[^A-ZÇĞİÖŞÜa-zçğıöşü\.\-\'\s]", " ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
     parts = [p for p in t.split() if len(p) >= 2]
-    if len(parts) >= 2:
-        return " ".join(parts[-3:])  # çoğu durumda sondaki 2-3 parça
-    return None
+    return " ".join(parts[-3:]) if len(parts) >= 2 else None
 
-def _zone_bonus(idx: int, boxes: List[TextBox]) -> Dict[str, float]:
-    xs = [b.x for b in boxes]
-    ws = [b.w for b in boxes]
-    if not xs:
-        return {"left": 0, "mid": 0, "right": 0}
-    x_min, x_max = min(xs), max(x+w for x,w in zip(xs,ws))
-    width = max(1, x_max - x_min)
-
-    b = boxes[idx]
-    cx = b.x + b.w/2
-    rel = (cx - x_min) / width  # 0..1
-
-    zone = "mid"
-    if rel < 0.33: zone = "left"
-    elif rel > 0.66: zone = "right"
-
-    return {"left": 1.0 if zone=="left" else 0.0,
-            "mid":  1.0 if zone=="mid"  else 0.0,
-            "right":1.0 if zone=="right"else 0.0}
-
-def _find_anchor_for_role(ocr_texts: List[str], aliases: list[str]) -> List[Tuple[int,float]]:
-    scored = []
-    for i, t in enumerate(ocr_texts):
-        sc = max(SequenceMatcher(None, t.lower(), al.lower()).ratio() for al in aliases)
-        scored.append((i, sc))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored
-
-def _nearest_name_to_anchor(anchor_idx: int, ocr_texts: List[str], boxes: List[TextBox]) -> Tuple[str|None, int|None]:
-    ax, ay, aw, ah = boxes[anchor_idx].x, boxes[anchor_idx].y, boxes[anchor_idx].w, boxes[anchor_idx].h
-    acx, acy = ax + aw/2, ay + ah/2
-    best = (None, None, 1e9)  # (name, idx, dist)
-    for j, b in enumerate(boxes):
-        if j == anchor_idx: 
-            continue
-        cx, cy = b.x + b.w/2, b.y + b.h/2
-        # sağ/alt komşu öncelik
-        if (cx >= acx - 5) and (cy >= ay - ah) and (abs(cy - acy) < 3*ah):
-            name = _extract_name(ocr_texts[j])
-            if not name:
-                continue
-            d = np.hypot(cx - acx, cy - acy)
-            if d < best[2]:
-                best = (name, j, d)
-    return best[0], best[1]
-
-def _pick_capital_value(texts: List[str]) -> Tuple[str|None, float|None]:
-    # 1) anahtar geçen kutulara öncelik ver
-    scored = []
-    for i, t in enumerate(texts):
-        t_low = t.lower()
-        score = max((_fuzzy(t_low, key) for key in CAPITAL_KEYS), default=0.0)
-        scored.append((score, i, t))
-    scored.sort(reverse=True)
-    for score, i, t in scored[:4]:
-        if score < 0.55:
-            continue
-        neigh = [i]
-        if i+1 < len(texts): neigh.append(i+1)
-        if i-1 >= 0:         neigh.append(i-1)
-        for j in neigh:
-            for m in NUM_WITH_TL.finditer(texts[j]):
-                raw = m.group(1)
-                v = raw.replace(".", "").replace(" ", "").replace(",", ".")
-                try:
-                    return raw, float(v)
-                except Exception:
-                    pass
-    # fallback: tüm metinlerdeki en uzun sayı
+def _parse_tl(text: str) -> float | None:
     best = None
-    for i, t in enumerate(texts):
-        for m in NUM_WITH_TL.finditer(t):
-            raw = m.group(1)
-            if (best is None) or (len(raw) > len(best)):
-                best = raw
-    if best:
-        v = best.replace(".", "").replace(" ", "").replace(",", ".")
+    for m in TL_NUM.finditer(text):
+        raw = m.group(1)
+        v = raw.replace(".", "").replace(" ", "").replace(",", ".")
         try:
-            return best, float(v)
-        except Exception:
-            return best, None
-    return None, None
+            val = float(v)
+            best = val if (best is None or val > best) else best
+        except:
+            pass
+    return best
 
-def map_to_fields_v2(ocr_texts: List[str], boxes: List[TextBox], debug: bool=False) -> Dict[str, Any]:
+
+# =========================================================
+# 4) ALAN ÇIKARIMI ve DF OLUŞTURMA
+# =========================================================
+def build_bottom_df_remote(lower_img,
+                           boxes: List[Any],
+                           NEW_URL: str,
+                           debug: bool=False) -> pd.DataFrame:
+    """
+    Girdi:
+      - lower_img: tablo alt görseli (BGR veya GRAY)
+      - boxes: TextBox veya (x,y,w,h) listesi
+      - NEW_URL: uzak OCR endpoint
+    Çıktı:
+      - bottom_df: tek satırlık DataFrame (istenen alanlar)
+    """
+    # 1) normalize
+    norm_boxes = _normalize_boxes(boxes)
+    if debug:
+        print(f"[INFO] {len(boxes)} → {len(norm_boxes)} box")
+        for i,b in enumerate(norm_boxes): print(i, b)
+
+    # 2) OCR + imza
+    texts_u, sigs = [], []
+    for i, b in enumerate(norm_boxes):
+        txt = _ocr_text_from_box_remote(lower_img, b, NEW_URL).strip()
+        tU  = txt.upper()
+        sig = _has_signature(lower_img, b)
+        if debug:
+            print(f"[BOX {i}] sig={int(sig)} | {tU[:160]}")
+        texts_u.append(tU); sigs.append(bool(sig))
+
+    # 3) Sermaye
+    cap_keys = ["ŞİRKETİN SERMAYESİ","SERMAYESİ VE PAYLARIN TOPLAMI","SERMAYE","TOPLAM İTİBARİ DEĞERİ"]
+    idxs = sorted([(sum(k in t for k in cap_keys), i) for i,t in enumerate(texts_u)], reverse=True)
+    sermaye = None
+    for score,i in idxs[:3]:
+        if score == 0: break
+        for j in [i-1,i,i+1]:
+            if 0 <= j < len(texts_u):
+                v = _parse_tl(texts_u[j])
+                if v is not None:
+                    sermaye = v; break
+        if sermaye is not None: break
+    if sermaye is None:
+        vals = [ _parse_tl(t) for t in texts_u ]
+        sermaye = max([v for v in vals if v is not None], default=None)
+
+    # 4) Roller
     out = {
-        "sermaye_toplam_tl": None,
-        "sermaye_raw": None,
+        "sermaye_toplam_tl": sermaye,
         "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
         "tutanak_yazmani_ad_soyad": None,  "tutanak_yazmani_imza_var_mi": None,
         "bakanlik_temsilcisi_ad_soyad": None, "bakanlik_temsilcisi_imza_var_mi": None,
@@ -371,146 +197,45 @@ def map_to_fields_v2(ocr_texts: List[str], boxes: List[TextBox], debug: bool=Fal
         "yk_baskani_ad_soyad": None, "yk_baskani_imza_var_mi": None,
         "katip_ad_soyad": None, "katip_imza_var_mi": None,
         "divan_baskani_ad_soyad": None, "divan_baskani_imza_var_mi": None,
-        "_role_debug": {}
     }
 
-    # 1) sermaye
-    raw, val = _pick_capital_value(ocr_texts)
-    out["sermaye_raw"] = raw
-    out["sermaye_toplam_tl"] = val
+    def _set_role(role_key: str, raw_text: str, has_sig: bool):
+        name = _extract_name(raw_text) or raw_text
+        if role_key == "toplanti_baskani":
+            out["toplanti_baskani_ad_soyad"] = name; out["toplanti_baskani_imza_var_mi"] = has_sig
+        elif role_key == "tutanak_yazmani":
+            out["tutanak_yazmani_ad_soyad"] = name; out["tutanak_yazmani_imza_var_mi"] = has_sig
+        elif role_key == "bakanlik_temsilcisi":
+            out["bakanlik_temsilcisi_ad_soyad"] = name; out["bakanlik_temsilcisi_imza_var_mi"] = has_sig
+        elif role_key == "yk_uyesi":
+            out["yk_uyesi_ad_soyad"] = name; out["yk_uyesi_imza_var_mi"] = has_sig
+        elif role_key == "yk_baskani":
+            out["yk_baskani_ad_soyad"] = name; out["yk_baskani_imza_var_mi"] = has_sig
+        elif role_key == "katip":
+            out["katip_ad_soyad"] = name; out["katip_imza_var_mi"] = has_sig
+        elif role_key == "divan_baskani":
+            out["divan_baskani_ad_soyad"] = name; out["divan_baskani_imza_var_mi"] = has_sig
 
-    # 2) roller
-    role_zone_bonus = {
-        "toplanti_baskani": {"left":10, "mid":8, "right":0},
-        "bakanlik_temsilcisi": {"left":3, "mid":10, "right":3},
-        "yk_baskani": {"left":0, "mid":5, "right":10},
-        "yk_uyesi": {"left":0, "mid":5, "right":8},
-        "tutanak_yazmani": {"left":7, "mid":6, "right":0},
-        "katip": {"left":7, "mid":6, "right":0},
-        "divan_baskani": {"left":6, "mid":7, "right":3},
-    }
+    for i, t in enumerate(texts_u):
+        for rk, aliases in ROLE_ALIASES.items():
+            if _contains_any(t, aliases):
+                _set_role(rk, t, sigs[i])
 
-    for role_key, aliases in ROLE_ALIASES.items():
-        scored = _find_anchor_for_role(ocr_texts, aliases)[:5]
-        best_score, best_idx, best_name = -1e9, None, None
-        candidates_dbg = []
-
-        for idx, fuzzy_sc in scored:
-            zone = _zone_bonus(idx, boxes)
-            bonus = (zone["left"]  * role_zone_bonus[role_key]["left"] +
-                     zone["mid"]   * role_zone_bonus[role_key]["mid"] +
-                     zone["right"] * role_zone_bonus[role_key]["right"])
-
-            name_self = _extract_name(ocr_texts[idx])
-            name_near, near_idx = _nearest_name_to_anchor(idx, ocr_texts, boxes)
-            use_name, name_from_idx = (name_self or name_near), (idx if name_self else near_idx)
-
-            total = 100*fuzzy_sc + bonus  # fuzzy baskın, bonus ince ayar
-            candidates_dbg.append({"idx": idx, "fuzzy": round(fuzzy_sc,3), "bonus": bonus, "total": round(total,2),
-                                   "name": use_name})
-
-            if use_name and total > best_score:
-                best_score, best_idx, best_name = total, name_from_idx, use_name
-
-        out["_role_debug"][role_key] = candidates_dbg
-
-        if best_idx is not None:
-            sign = boxes[best_idx].signature
-            if role_key == "toplanti_baskani":
-                out["toplanti_baskani_ad_soyad"] = best_name
-                out["toplanti_baskani_imza_var_mi"] = bool(sign)
-            elif role_key == "tutanak_yazmani":
-                out["tutanak_yazmani_ad_soyad"] = best_name
-                out["tutanak_yazmani_imza_var_mi"] = bool(sign)
-            elif role_key == "bakanlik_temsilcisi":
-                out["bakanlik_temsilcisi_ad_soyad"] = best_name
-                out["bakanlik_temsilcisi_imza_var_mi"] = bool(sign)
-            elif role_key == "yk_uyesi":
-                out["yk_uyesi_ad_soyad"] = best_name
-                out["yk_uyesi_imza_var_mi"] = bool(sign)
-            elif role_key == "yk_baskani":
-                out["yk_baskani_ad_soyad"] = best_name
-                out["yk_baskani_imza_var_mi"] = bool(sign)
-            elif role_key == "katip":
-                out["katip_ad_soyad"] = best_name
-                out["katip_imza_var_mi"] = bool(sign)
-            elif role_key == "divan_baskani":
-                out["divan_baskani_ad_soyad"] = best_name
-                out["divan_baskani_imza_var_mi"] = bool(sign)
-
-    if debug:
-        # rol skorlari konsola dökülsün
-        import pprint; print("\n[ROLE DEBUG]"); pprint.pprint(out["_role_debug"])
-    return out
-
-
-# =========================
-# 5) Uçtan uca çalıştırıcı
-# =========================
-def run_bottom_extraction(lower_img: np.ndarray, NEW_URL: str,
-                          lang: str = "tur",
-                          config: str = "--psm 6 --oem 1",
-                          debug: bool = False) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Girdi: lower_img (ROI), NEW_URL
-    Çıktı: bottom_df (tek satır), debug_artifacts
-    """
-    # 1) kutular
-    boxes, seg_dbg = segment_lower_area_into_boxes(lower_img, debug=debug)
-
-    # 2) OCR
-    ocr_texts = []
-    for tb in boxes:
-        x, y, w, h = tb.x, tb.y, tb.w, tb.h
-        roi = lower_img[y:y+h, x:x+w]
-        if roi.ndim == 2: roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
-        txt = ocr_box_via_remote_tesseract(roi, url=NEW_URL, lang=lang, config=config)
-        ocr_texts.append(txt)
-
-    # 3) görselleştirme (debug)
-    viz = visualize_lower_boxes(lower_img, boxes, ocr_texts) if debug else None
-
-    # 4) alanlar
-    fields = map_to_fields_v2(ocr_texts, boxes, debug=debug)
-
-    # 5) dataframe (istenen kolonlar)
-    bottom_df = pd.DataFrame([{
-        "sermaye_toplam_tl":                fields["sermaye_toplam_tl"],
-        "toplanti_baskani_ad_soyad":        fields["toplanti_baskani_ad_soyad"],
-        "toplanti_baskani_imza_var_mi":     fields["toplanti_baskani_imza_var_mi"],
-        "tutanak_yazmani_ad_soyad":         fields["tutanak_yazmani_ad_soyad"],
-        "tutanak_yazmani_imza_var_mi":      fields["tutanak_yazmani_imza_var_mi"],
-        "bakanlik_temsilcisi_ad_soyad":     fields["bakanlik_temsilcisi_ad_soyad"],
-        "bakanlik_temsilcisi_imza_var_mi":  fields["bakanlik_temsilcisi_imza_var_mi"],
-        "yk_uyesi_ad_soyad":                fields["yk_uyesi_ad_soyad"],
-        "yk_uyesi_imza_var_mi":             fields["yk_uyesi_imza_var_mi"],
-        "yk_baskani_ad_soyad":              fields["yk_baskani_ad_soyad"],
-        "yk_baskani_imza_var_mi":           fields["yk_baskani_imza_var_mi"],
-        "katip_ad_soyad":                   fields["katip_ad_soyad"],
-        "katip_imza_var_mi":                fields["katip_imza_var_mi"],
-        "divan_baskani_ad_soyad":           fields["divan_baskani_ad_soyad"],
-        "divan_baskani_imza_var_mi":        fields["divan_baskani_imza_var_mi"],
+    # 5) DF
+    return pd.DataFrame([{
+        "sermaye_toplam_tl":               out["sermaye_toplam_tl"],
+        "toplanti_baskani_ad_soyad":       out["toplanti_baskani_ad_soyad"],
+        "toplanti_baskani_imza_var_mi":    out["toplanti_baskani_imza_var_mi"],
+        "tutanak_yazmani_ad_soyad":        out["tutanak_yazmani_ad_soyad"],
+        "tutanak_yazmani_imza_var_mi":     out["tutanak_yazmani_imza_var_mi"],
+        "bakanlik_temsilcisi_ad_soyad":    out["bakanlik_temsilcisi_ad_soyad"],
+        "bakanlik_temsilcisi_imza_var_mi": out["bakanlik_temsilcisi_imza_var_mi"],
+        "yk_uyesi_ad_soyad":               out["yk_uyesi_ad_soyad"],
+        "yk_uyesi_imza_var_mi":            out["yk_uyesi_imza_var_mi"],
+        "yk_baskani_ad_soyad":             out["yk_baskani_ad_soyad"],
+        "yk_baskani_imza_var_mi":          out["yk_baskani_imza_var_mi"],
+        "katip_ad_soyad":                  out["katip_ad_soyad"],
+        "katip_imza_var_mi":               out["katip_imza_var_mi"],
+        "divan_baskani_ad_soyad":          out["divan_baskani_ad_soyad"],
+        "divan_baskani_imza_var_mi":       out["divan_baskani_imza_var_mi"],
     }])
-
-    # 6) debug görselleri göster
-    dbg_art = {"segmentation": seg_dbg, "viz": viz, "boxes": boxes, "ocr_texts": ocr_texts, "fields": fields}
-    if debug:
-        # ara görseller
-        plt.figure(figsize=(12,3)); plt.title("gray"); plt.imshow(seg_dbg["gray"], cmap="gray"); plt.axis("off")
-        plt.figure(figsize=(12,3)); plt.title("bin_inv (ink=255)"); plt.imshow(seg_dbg["bin_inv"], cmap="gray"); plt.axis("off")
-        plt.figure(figsize=(12,3)); plt.title("morph-merged"); plt.imshow(seg_dbg["merged"], cmap="gray"); plt.axis("off")
-        plt.figure(figsize=(12,5)); plt.title("word boxes"); plt.imshow(cv2.cvtColor(seg_dbg["vis_word_boxes"], cv2.COLOR_BGR2RGB)); plt.axis("off")
-        plt.figure(figsize=(12,5)); plt.title("block boxes"); plt.imshow(cv2.cvtColor(seg_dbg["vis_block_boxes"], cv2.COLOR_BGR2RGB)); plt.axis("off")
-        plt.figure(figsize=(12,6)); plt.title("labeled boxes + OCR snippets"); plt.imshow(cv2.cvtColor(viz, cv2.COLOR_BGR2RGB)); plt.axis("off")
-        plt.show()
-
-    return bottom_df, dbg_art
-
-
-# =========================
-# 6) Örnek çağrı (senin ortamında)
-# =========================
-# lower_img -> senin extract_lower_text_area_from_table_v4(...) çıktın
-# NEW_URL    -> senin uzak Tesseract endpoint'in
-# bottom_df, debug_pack = run_bottom_extraction(lower_img, NEW_URL=NEW_URL, debug=True)
-# display(bottom_df)
