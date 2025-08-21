@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-import cv2, json, base64, requests, re, numpy as np, pandas as pd
-import unicodedata
+import cv2, json, base64, requests, re, numpy as np, pandas as pd, unicodedata
 from typing import Any, List, Tuple, Dict, Optional
 
 # =========================
-# 0) Sabitler / Yardımcılar
+# 0) Yardımcılar (metin)
 # =========================
 def _strip_diacritics(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+    return ''.join(c for c in unicodedata.normalize('NFKD', s or "") if not unicodedata.combining(c))
 
 def _norm_text(s: str) -> str:
     s = (s or "").upper()
@@ -15,16 +14,38 @@ def _norm_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _tokens(s: str) -> List[str]:
+    return re.findall(r"[A-ZÇĞİÖŞÜ]+", _norm_text(s))
+
+def _lev(a: str, b: str) -> int:
+    # küçük ve hızlı Levenshtein
+    a, b = _norm_text(a), _norm_text(b)
+    if a == b: return 0
+    if not a:  return len(b)
+    if not b:  return len(a)
+    prev = list(range(len(b)+1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            ins = curr[-1] + 1
+            dele = prev[j] + 1
+            sub = prev[j-1] + (ca != cb)
+            curr.append(min(ins, dele, sub))
+        prev = curr
+    return prev[-1]
+
+# OCR karelerinden kişi adını bulmak için:
 NAME_TOKEN = re.compile(r"[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,})+")
+
 DROP_WORDS = [
-    "TOPLANTI","TOPLANII","BAŞKANI","BASKANI","YÖNETİM","KURULU","ÜYESİ","UYESI","YK",
+    "TOPLANTI","BAŞKANI","BASKANI","YÖNETİM","KURULU","ÜYESİ","UYESI","YK",
     "BAKANLIK","TEMSİLCİSİ","TEMSILCISI","KATİP","KÂTİP","YAZMANI",
     "DİVAN","DIVAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP",
-    "ASALATEN","VEKALETEN","HAZIRUN","HAZİRUN","HAZIRIN"
+    "ASALATEN","VEKALETEN","HAZIRUN","HAZİRUN"
 ]
 
 ROLE_ALIASES: Dict[str, List[str]] = {
-    "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANII BAŞKANI","DİVAN BAŞKANI","DIVAN BASKANI"],
+    "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","DİVAN BAŞKANI","DIVAN BASKANI"],
     "tutanak_yazmani":     ["TUTANAK YAZMANI","YAZMAN"],
     "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
     "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI"],
@@ -33,71 +54,16 @@ ROLE_ALIASES: Dict[str, List[str]] = {
     "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
 }
 
-# ------------- fuzzy eşleştirme -------------
-def _lev(a: str, b: str) -> int:
-    la, lb = len(a), len(b)
-    if la == 0: return lb
-    if lb == 0: return la
-    dp = list(range(lb+1))
-    for i, ca in enumerate(a, 1):
-        prev = dp[0]
-        dp[0] = i
-        for j, cb in enumerate(b, 1):
-            ins = dp[j-1] + 1
-            dele = dp[j] + 1
-            sub = prev + (ca != cb)
-            prev = dp[j]
-            dp[j] = min(ins, dele, sub)
-    return dp[lb]
-
-def _tokens(s: str) -> List[str]:
-    t = _norm_text(s)
-    return [tok for tok in re.split(r"[^A-ZÇĞİÖŞÜ]+", t) if tok]
-
-def _alias_hits_fuzzy(text_u: str, alias: str,
-                      per_token_max_dist: int = 2,
-                      require_ratio: float = 0.8) -> bool:
-    tt = _tokens(text_u)
-    aa = _tokens(alias)
-    if not tt or not aa:
-        return False
-    ok = 0
-    for a in aa:
-        if len(a) <= 3:
-            if a in tt: ok += 1
-            continue
-        best = min((_lev(a, t) for t in tt), default=99)
-        if best <= per_token_max_dist:
-            ok += 1
-    return ok >= max(1, int(round(len(aa) * require_ratio)))
-
-def match_roles_fuzzy(text_u: str, ROLE_ALIASES: dict,
-                      per_token_max_dist: int = 2,
-                      require_ratio: float = 0.8) -> List[str]:
-    hits = []
-    for role_key, aliases in ROLE_ALIASES.items():
-        if any(_alias_hits_fuzzy(text_u, al, per_token_max_dist, require_ratio) for al in aliases):
-            hits.append(role_key)
-    return hits
-
-# ------------- isim temizleyici -------------
+# İsim temizleme: başta/ortada kalan rol kelimelerini at, çoklu boşlukları düzelt
 def cleanup_name(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
+    if not name: return None
     t = _norm_text(name)
-    drop = set(_norm_text(w) for w in DROP_WORDS)
-    toks = [tok for tok in re.split(r"\s+", t) if tok and tok not in drop and not tok.isdigit()]
-    if not toks:
-        return None
-    # sondaki 2-3 token genel olarak isim-soyisim
-    tail = toks[-3:]
-    tail = [re.sub(r"[^A-ZÇĞİÖŞÜ\-']", "", x) for x in tail]
-    tail = [x for x in tail if len(x) >= 2]
-    if not tail:
-        return None
-    return " ".join(w.capitalize() for w in tail)
+    for w in DROP_WORDS:
+        t = re.sub(rf"\b{_norm_text(w)}\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    # Title-case ama Türkçe büyük harfleri koru
+    return " ".join(p.capitalize() for p in t.split()) if t else None
 
-# ------------- isim çıkarıcılar -------------
 def _extract_name_general(text_u: str) -> Optional[str]:
     t = text_u
     for w in DROP_WORDS:
@@ -110,45 +76,27 @@ def _extract_name_general(text_u: str) -> Optional[str]:
     parts = [p for p in t.split() if len(p) >= 2]
     return cleanup_name(" ".join(parts[-3:])) if len(parts) >= 2 else None
 
-def _extract_name_after_label(text: str, label_aliases: List[str]) -> Optional[str]:
-    raw = text or ""
+def _extract_name_after_label(raw_text: str, label_aliases: List[str]) -> Optional[str]:
+    raw = raw_text or ""
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    if not lines:
-        return None
-
+    if not lines: return None
     norm_lines = [_norm_text(ln) for ln in lines]
     norm_aliases = [_norm_text(a) for a in label_aliases]
-
     label_idx = None
     for i, nl in enumerate(norm_lines):
         if any(na in nl for na in norm_aliases):
             label_idx = i; break
-    if label_idx is None:
-        return None
-
-    cand_lines = lines[label_idx: min(label_idx + 4, len(lines))]
-
-    for cand in cand_lines:
-        tmp = _norm_text(cand)
-        # etiket/düşürülecek kelimeleri temizle
-        for w in set(norm_aliases) | set(_norm_text(w) for w in DROP_WORDS):
-            tmp = re.sub(rf"\b{re.escape(w)}\b", " ", tmp)
-        tmp = re.sub(r"\s+", " ", tmp).strip()
-
-        if sum(ch.isdigit() for ch in tmp) > 3:
+    if label_idx is None: return None
+    for j in range(label_idx + 1, min(label_idx + 4, len(lines))):
+        cand = lines[j]
+        if sum(ch.isdigit() for ch in cand) > 3:  # TCKN satırını at
             continue
-
-        m = NAME_TOKEN.search(tmp)
-        if m:
-            return cleanup_name(m.group(0))
-
-        nm = cleanup_name(tmp)
-        if nm:
-            return nm
+        if NAME_TOKEN.search(_norm_text(cand)):
+            return cleanup_name(cand)
     return None
 
 # =========================
-# 1) Kutu normalizasyonu
+# 1) Kutu normalize/çizim
 # =========================
 def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
     if isinstance(b, (tuple, list, np.ndarray)) and len(b) == 4:
@@ -188,7 +136,7 @@ def draw_boxes_with_ids(img_bgr: np.ndarray,
     return vis
 
 # =========================
-# 2) OCR (remote) & imza
+# 2) OCR (remote) & İmza
 # =========================
 def _ocr_remote_png(img_bgr: np.ndarray, url: str,
                     lang: str="tur", config: str="--psm 6 --oem 1") -> str:
@@ -213,24 +161,66 @@ def ocr_text_from_box_remote(img: np.ndarray, box_xywh: Tuple[int,int,int,int], 
     return _ocr_remote_png(roi, url=url, lang="tur", config="--psm 6 --oem 1")
 
 def has_signature(img: np.ndarray, box_xywh: Tuple[int,int,int,int],
-                  ink_ratio_thr: float=0.012, thinness_max: float=0.45) -> bool:
+                  ink_ratio_thr: float=0.02,
+                  thinness_max: float=0.40,
+                  min_blob_area_ratio: float=0.003,
+                  max_blob_area_ratio: float=0.25) -> bool:
     x,y,w,h = box_xywh
     roi = img[y:y+h, x:x+w]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim==3 else roi
     thr = cv2.threshold(cv2.GaussianBlur(gray,(3,3),0), 0, 255,
                         cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+
     ink_ratio = cv2.countNonZero(thr) / max(1, w*h)
     if ink_ratio < ink_ratio_thr:
         return False
+
     cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts: return False
-    c = max(cnts, key=cv2.contourArea)
-    A = cv2.contourArea(c); P = max(1.0, cv2.arcLength(c, True))
-    thinness = 4*np.pi*A/(P*P)
-    return thinness < thinness_max
+
+    H, W = h, w
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:3]
+    for c in cnts:
+        A = cv2.contourArea(c)
+        P = max(1.0, cv2.arcLength(c, True))
+        thinness = 4*np.pi*A/(P*P)
+        area_ratio = A / float(W*H)
+        if area_ratio < min_blob_area_ratio or area_ratio > max_blob_area_ratio:
+            continue
+        if thinness < thinness_max:
+            x0,y0,w0,h0 = cv2.boundingRect(c)
+            if h0 / float(H) >= 0.25:
+                return True
+    return False
 
 # =========================
-# 3) Komşudan isim
+# 3) Rol skorlama (tek rol)
+# =========================
+def _alias_score(text_u: str, alias: str) -> float:
+    tt = _tokens(text_u)
+    aa = _tokens(alias)
+    if not tt or not aa:
+        return 0.0
+    hit = 0
+    for a in aa:
+        if len(a) <= 3:
+            if a in tt: hit += 1
+            continue
+        dist = min((_lev(a, t) for t in tt), default=99)
+        if dist <= 2: hit += 1
+    return hit / max(1, len(aa))
+
+def best_role_for_text(text_u: str) -> Tuple[Optional[str], float]:
+    priority = ["yk_baskani","toplanti_baskani","bakanlik_temsilcisi","yk_uyesi","katip","tutanak_yazmani","divan_baskani"]
+    best = (None, 0.0)
+    for rk, aliases in ROLE_ALIASES.items():
+        s = max((_alias_score(text_u, a) for a in aliases), default=0.0)
+        if s > best[1] or (abs(s - best[1]) < 1e-6 and rk in priority and (best[0] is None or priority.index(rk) < priority.index(best[0]))):
+            best = (rk, s)
+    return best if best[1] >= 0.5 else (None, 0.0)
+
+# =========================
+# 4) Komşudan ad alma
 # =========================
 def nearest_name_from_neighbors(i: int,
                                 boxes_xywh: List[Tuple[int,int,int,int]],
@@ -267,14 +257,19 @@ def nearest_name_from_neighbors(i: int,
     return None, None
 
 # =========================
-# 4) Kutuları incele (debug)
+# 5) DEBUG: kutu inceleme
 # =========================
 def inspect_boxes(lower_img: np.ndarray,
                   boxes: List[Any],
                   NEW_URL: str,
-                  ink_ratio_thr: float=0.012,
-                  thinness_max: float=0.45,
+                  ink_ratio_thr: float=0.02,
+                  thinness_max: float=0.40,
                   debug: bool=True) -> Tuple[np.ndarray, pd.DataFrame]:
+    """
+    Dönüş:
+      vis_img : kutular + indexlerin çizildiği BGR görsel
+      per_box_df: i, bbox, tek_rol, skor, isim, imza, text önizleme
+    """
     boxes_xywh = normalize_boxes(boxes)
     vis_img = draw_boxes_with_ids(lower_img, boxes_xywh)
 
@@ -282,30 +277,26 @@ def inspect_boxes(lower_img: np.ndarray,
     for i,b in enumerate(boxes_xywh):
         text = ocr_text_from_box_remote(lower_img, b, NEW_URL).strip()
         text_u = text.upper()
+        role_best, role_score = best_role_for_text(text_u)
         sig  = has_signature(lower_img, b, ink_ratio_thr=ink_ratio_thr, thinness_max=thinness_max)
 
-        # FUZZY rol tespiti
-        role_hits = match_roles_fuzzy(text_u, ROLE_ALIASES, per_token_max_dist=2, require_ratio=0.8)
-
-        # Etiket satırından sonra isim ya da genel isim
         name_here = None
-        for rk in role_hits:
-            name_here = _extract_name_after_label(text, ROLE_ALIASES[rk]) or _extract_name_general(text_u)
+        if role_best:
+            name_here = _extract_name_after_label(text, ROLE_ALIASES[role_best]) or _extract_name_general(text_u)
             if name_here:
-                break
-        if name_here:
-            name_here = cleanup_name(name_here)
+                name_here = cleanup_name(name_here)
 
         rows.append({
             "i": i,
             "bbox": b,
             "sig": bool(sig),
-            "role_hits": ",".join(role_hits) if role_hits else "",
+            "role_best": role_best or "",
+            "role_score": float(role_score),
             "name_in_box": name_here,
             "text_preview": re.sub(r"\s+", " ", text_u)[:160]
         })
 
-    per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_hits","name_in_box","text_preview"])
+    per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_best","role_score","name_in_box","text_preview"])
     if debug:
         print(f"[INFO] {len(boxes_xywh)} box")
         display(per_box_df)
@@ -313,17 +304,26 @@ def inspect_boxes(lower_img: np.ndarray,
     return vis_img, per_box_df
 
 # =========================
-# 5) Nihai tablo
+# 6) bottom_df üretimi
 # =========================
 def build_bottom_df_from_report(lower_img: np.ndarray,
                                 boxes: List[Any],
                                 per_box_df: pd.DataFrame) -> pd.DataFrame:
     boxes_xywh = normalize_boxes(boxes)
-    texts_u = [None]*len(boxes_xywh)
-    sigs    = [False]*len(boxes_xywh)
-    for _,r in per_box_df.iterrows():
-        i = int(r["i"]); texts_u[i] = str(r["text_preview"]); sigs[i] = bool(r["sig"])
 
+    texts_u = [""]*len(boxes_xywh)
+    sigs    = [False]*len(boxes_xywh)
+    roles   = [""  ]*len(boxes_xywh)
+    names   = [None]*len(boxes_xywh)
+
+    for _,r in per_box_df.iterrows():
+        i = int(r["i"])
+        texts_u[i] = str(r["text_preview"] or "")
+        sigs[i]    = bool(r["sig"])
+        roles[i]   = str(r["role_best"] or "")
+        names[i]   = r["name_in_box"] if r["name_in_box"] else None
+
+    # ---- Sermaye ----
     def _parse_tl(text: str) -> Optional[float]:
         TL_NUM = re.compile(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+)\s*(TL|₺)?", re.IGNORECASE)
         best=None
@@ -361,53 +361,42 @@ def build_bottom_df_from_report(lower_img: np.ndarray,
         "divan_baskani_ad_soyad": None, "divan_baskani_imza_var_mi": None,
     }
 
-    def _maybe_set(k_name, k_sig, val, sig):
-        if out[k_name] is None and val: out[k_name] = val
-        if out[k_sig]  is None and sig is not None: out[k_sig]  = bool(sig)
+    def _set(role_key: str, name: Optional[str], sig_flag: Optional[bool]):
+        if not role_key:
+            return
+        if name:
+            name = cleanup_name(name)
+        if role_key == "toplanti_baskani":
+            if out["toplanti_baskani_ad_soyad"] is None: out["toplanti_baskani_ad_soyad"] = name
+            if out["toplanti_baskani_imza_var_mi"] is None: out["toplanti_baskani_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "tutanak_yazmani":
+            if out["tutanak_yazmani_ad_soyad"] is None: out["tutanak_yazmani_ad_soyad"] = name
+            if out["tutanak_yazmani_imza_var_mi"] is None: out["tutanak_yazmani_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "bakanlik_temsilcisi":
+            if out["bakanlik_temsilcisi_ad_soyad"] is None: out["bakanlik_temsilcisi_ad_soyad"] = name
+            if out["bakanlik_temsilcisi_imza_var_mi"] is None: out["bakanlik_temsilcisi_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "yk_uyesi":
+            if out["yk_uyesi_ad_soyad"] is None: out["yk_uyesi_ad_soyad"] = name
+            if out["yk_uyesi_imza_var_mi"] is None: out["yk_uyesi_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "yk_baskani":
+            if out["yk_baskani_ad_soyad"] is None: out["yk_baskani_ad_soyad"] = name
+            if out["yk_baskani_imza_var_mi"] is None: out["yk_baskani_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "katip":
+            if out["katip_ad_soyad"] is None: out["katip_ad_soyad"] = name
+            if out["katip_imza_var_mi"] is None: out["katip_imza_var_mi"] = bool(sig_flag)
+        elif role_key == "divan_baskani":
+            if out["divan_baskani_ad_soyad"] is None: out["divan_baskani_ad_soyad"] = name
+            if out["divan_baskani_imza_var_mi"] is None: out["divan_baskani_imza_var_mi"] = bool(sig_flag)
 
-    for _,r in per_box_df.iterrows():
-        i = int(r["i"]); t = r["text_preview"]; sig_here = bool(r["sig"])
-        role_hits = (r["role_hits"] or "").split(",") if r["role_hits"] else []
-
-        # fallback: raporda rol yoksa fuzzy dene
-        if not role_hits:
-            role_hits = match_roles_fuzzy(t, ROLE_ALIASES)
-
-        if not role_hits:
+    # 1) Önce kutu içi isim varsa kullan; yoksa komşudan SADECE isim al (imzayı taşımadan).
+    for i, rk in enumerate(roles):
+        if not rk: 
             continue
-
-        name_here = r.get("name_in_box") or None
-        if not name_here:
-            # kutudan türet
-            for rk in role_hits:
-                name_here = _extract_name_after_label(t, ROLE_ALIASES.get(rk, [])) or _extract_name_general(t)
-                if name_here: break
-
-        if not name_here:
-            # komşudan tamamla
-            nn, jn = nearest_name_from_neighbors(i, boxes_xywh, [str(x or "") for x in texts_u])
-            if nn:
-                name_here = nn
-                if jn is not None:
-                    sig_here = sigs[jn]
-
-        if name_here:
-            name_here = cleanup_name(name_here)
-
-        role = role_hits[0]
-        if role == "toplanti_baskani":
-            _maybe_set("toplanti_baskani_ad_soyad","toplanti_baskani_imza_var_mi", name_here, sig_here)
-        elif role == "tutanak_yazmani":
-            _maybe_set("tutanak_yazmani_ad_soyad","tutanak_yazmani_imza_var_mi", name_here, sig_here)
-        elif role == "bakanlik_temsilcisi":
-            _maybe_set("bakanlik_temsilcisi_ad_soyad","bakanlik_temsilcisi_imza_var_mi", name_here, sig_here)
-        elif role == "yk_uyesi":
-            _maybe_set("yk_uyesi_ad_soyad","yk_uyesi_imza_var_mi", name_here, sig_here)
-        elif role == "yk_baskani":
-            _maybe_set("yk_baskani_ad_soyad","yk_baskani_imza_var_mi", name_here, sig_here)
-        elif role == "katip":
-            _maybe_set("katip_ad_soyad","katip_imza_var_mi", name_here, sig_here)
-        elif role == "divan_baskani":
-            _maybe_set("divan_baskani_ad_soyad","divan_baskani_imza_var_mi", name_here, sig_here)
+        nm = names[i]
+        sg = sigs[i]                     # imza sadece kendi kutusundan
+        if not nm:
+            nn, _ = nearest_name_from_neighbors(i, boxes_xywh, texts_u)
+            nm = nn
+        _set(rk, nm, sg)
 
     return pd.DataFrame([out])
