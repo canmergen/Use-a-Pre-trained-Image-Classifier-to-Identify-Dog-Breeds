@@ -1,321 +1,369 @@
 # -*- coding: utf-8 -*-
-"""
-PDF auto-orient (RAM'de): OSD kararı image üzerinde, uygulama PDF'te /Rotate.
-Gerekenler: PyMuPDF, PyPDF2, opencv-python, pillow, matplotlib
-"""
+import cv2, base64, json, re, numpy as np, requests
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+from difflib import SequenceMatcher
 
-from io import BytesIO
-from typing import List, Dict, Optional, Tuple
-import numpy as np
-import cv2
-import fitz  # PyMuPDF
-from PyPDF2 import PdfReader, PdfWriter
+# =========================
+# 1) Yardımcılar
+# =========================
 
-# =========================================================
-# ----------------- Yardımcı: render / preview ------------
-# =========================================================
-def _render_page_bgr(pdf_bytes: bytes, page_idx: int, dpi: int = 300, as_gray: bool = False) -> np.ndarray:
-    """
-    Sayfayı RAM'de rasterize et. Çıkış: cv2 BGR (ya da GRAY).
-    Sadece karar/önizleme için; nihai PDF rasterize edilmez.
-    """
-    zoom = dpi / 72.0
-    with fitz.open("pdf", pdf_bytes) as doc:
-        p = doc.load_page(page_idx)
-        if as_gray:
-            pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csGRAY)
-            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        else:
-            pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)  # RGB
-            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+@dataclass
+class TextBox:
+    x: int
+    y: int
+    w: int
+    h: int
+    signature: bool = False  # görsel analizle imza var/yok
 
-# =========================================================
-# -------------------- OSD normalize ----------------------
-# =========================================================
-def _unwrap_osd(raw: dict) -> dict:
-    # Bazı server'lar {'dict': {...}} döndürür
-    return raw.get("dict", raw) if isinstance(raw.get("dict", None), dict) else raw
+def _to_gray(img: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
 
-def _pick(d: dict, keys, default=None):
-    for k in keys:
-        if k in d and d[k] not in (None, "", "None"):
-            return d[k]
-    return default
+def _binarize_strong(gray: np.ndarray) -> np.ndarray:
+    """Siyah yazı, beyaz zemin üret. (ink=255, bg=0)"""
+    g = cv2.GaussianBlur(gray, (3, 3), 0)
+    thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    if thr.mean() > 127:
+        thr = 255 - thr
+    return thr
 
-def _parse_angle(val) -> Optional[int]:
+def _find_word_contours(img_bin: np.ndarray) -> List[Tuple[int,int,int,int]]:
+    """Karakterleri birleştirip kelime/satır kutuları üret."""
+    H, W = img_bin.shape[:2]
+    kx = max(15, W // 80)
+    ky = max(3,  H // 200)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+    merged = cv2.morphologyEx(img_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w*h < 150 or h < 8:
+            continue
+        out.append((x, y, w, h))
+    return out
+
+def _merge_nearby_boxes(boxes: List[Tuple[int,int,int,int]]) -> List[Tuple[int,int,int,int]]:
+    """Yakın/örtüşen kutuları blok düzeyinde birleştir."""
+    if not boxes: 
+        return []
+    rects = np.array(boxes, dtype=np.int32)
+    med_h = float(np.median(rects[:,3]))
+    taken = [False]*len(rects)
+    clusters = []
+    for i in range(len(rects)):
+        if taken[i]: 
+            continue
+        xi, yi, wi, hi = rects[i]
+        x1, y1, x2, y2 = xi, yi, xi+wi, yi+hi
+        for j in range(i+1, len(rects)):
+            if taken[j]: 
+                continue
+            xj, yj, wj, hj = rects[j]
+            u1, v1, u2, v2 = xj, yj, xj+wj, yj+hj
+            # merkez mesafesi veya overlap
+            cx_i, cy_i = xi+wi/2, yi+hi/2
+            cx_j, cy_j = xj+wj/2, yj+hj/2
+            dist = np.hypot(cx_i-cx_j, cy_i-cy_j)
+            overlap = not (x2 < u1 or u2 < x1 or y2 < v1 or v2 < y1)
+            if dist < 1.6*med_h or overlap:
+                x1, y1 = min(x1, u1), min(y1, v1)
+                x2, y2 = max(x2, u2), max(y2, v2)
+                taken[j] = True
+        taken[i] = True
+        clusters.append((int(x1), int(y1), int(x2-x1), int(y2-y1)))
+    clusters = [(x,y,w,h) for (x,y,w,h) in clusters if w*h >= 250]
+    clusters.sort(key=lambda r: (r[1]//12, r[0]))  # yukarı->aşağı, sol->sağ
+    return clusters
+
+def _reject_stamp_like(c) -> bool:
+    """Mühür/damga benzeri (yuvarlak/dolu) büyük blobları ayıkla."""
+    A = cv2.contourArea(c)
+    P = cv2.arcLength(c, True)
+    if P == 0: 
+        return False
+    circ = 4.0*np.pi*A/(P*P)  # 0..1 (1 daire)
+    # geniş alan ve yüksek circularity -> damga olma ihtimali
+    return (circ > 0.55) and (A > 3000)
+
+def _signature_heuristic(sub_bin: np.ndarray) -> bool:
+    """İmza var/yok kestirimi (ink=255, bg=0)."""
+    h, w = sub_bin.shape[:2]
+    area = h*w
+    if area < 600: 
+        return False
+
+    ink_ratio = float(np.count_nonzero(sub_bin))/area
+    if ink_ratio < 0.02:
+        return False
+
+    cnts, _ = cv2.findContours(sub_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts: 
+        return False
+    cnts = [c for c in cnts if not _reject_stamp_like(c)]
+    if not cnts:
+        return False
+
+    c = max(cnts, key=cv2.contourArea)
+    A = cv2.contourArea(c)
+    P = cv2.arcLength(c, True)
+    if P == 0: 
+        return False
+    thinness = 4.0*np.pi*A/(P*P)      # 0..1
+    approx = cv2.approxPolyDP(c, 0.01*P, True)
+    complexity = len(approx)
+
+    cond_area = (A/area) > 0.02       # kutunun %2'sinden büyük
+    cond_thin = 0.08 < thinness < 0.45
+    cond_cmpx = complexity > 12
+    return bool(cond_area and cond_thin and cond_cmpx)
+
+def segment_lower_area_into_boxes(lower_img: np.ndarray,
+                                  expand_px: int = 6) -> List[TextBox]:
+    """Tablo altı ROI -> blok kutular + imza label."""
+    gray = _to_gray(lower_img)
+    bin_inv = _binarize_strong(gray)          # ink=255
+    H, W = bin_inv.shape[:2]
+    word_boxes = _find_word_contours(bin_inv)
+    blocks = _merge_nearby_boxes(word_boxes)
+
+    out = []
+    for (x,y,w,h) in blocks:
+        xa, ya = max(0, x-expand_px), max(0, y-expand_px)
+        xb, yb = min(W, x+w+expand_px), min(H, y+h+expand_px)
+        sub = bin_inv[ya:yb, xa:xb]
+        sig = _signature_heuristic(sub)
+        out.append(TextBox(x=x, y=y, w=w, h=h, signature=sig))
+    return out
+
+# =========================
+# 2) OCR Wrapper (uzak Tesseract)
+# =========================
+
+def ocr_box_via_remote_tesseract(img_bgr: np.ndarray,
+                                 url: str,
+                                 lang: str = "tur",
+                                 config: str = "--psm 6 --oem 1") -> str:
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        return ""
+    img_b64 = base64.b64encode(buf).decode()
+    payload = {"image": img_b64, "lang": lang, "config": config}
     try:
-        return int(round(float(str(val).strip()))) % 360
+        r = requests.post(url, json=payload, timeout=30)
+        if r.ok:
+            j = json.loads(r.text)
+            return (j.get("text") or "").strip()
+        return ""
     except Exception:
+        return ""
+
+# =========================
+# 3) Alan çıkarımı (regex + fuzzy)
+# =========================
+
+ROLE_ALIASES = {
+    "toplanti_baskani":    ["toplantı başkanı", "divan başkanı", "divan bşk"],
+    "tutanak_yazmani":     ["tutanak yazmanı", "yazman"],
+    "bakanlik_temsilcisi": ["bakanlık temsilcisi", "ticaret bakanlığı temsilcisi", "temsilcisi"],
+    "yk_uyesi":            ["yönetim kurulu üyesi", "yk üyesi"],
+    "yk_baskani":          ["yönetim kurulu başkanı", "yk başkanı"],
+    "katip":               ["katip", "kâtip", "oy toplama memuru", "oy toplayıcı"],
+    "divan_baskani":       ["divan başkanı"],
+}
+
+CAPITAL_KEYS = [
+    "şirketin sermayesi ve payların toplam itibari değeri",
+    "şirketin sermayesi",
+    "sermayesi ve payların toplam itibari değeri",
+    "sermaye miktarı"
+]
+
+NUM_WITH_TL = re.compile(
+    r"(?<!\d)(\d{1,3}(\.\d{3})*(,\d{2})?|\d+)\s*(TL|₺)?",
+    flags=re.IGNORECASE
+)
+
+def _fuzzy(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def _normalize_name(text: str) -> str:
+    s = re.sub(r"[^A-ZÇĞİÖŞÜa-zçğıöşü\s\.\-']", " ", text)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+def _extract_name(text: str) -> str|None:
+    if not text:
         return None
+    t = text
+    drop = [
+        "t.c.", "tc", "kimlik", "no", "temsilcisi", "temsilci",
+        "başkanı", "baskani", "divan", "yönetim", "kurulu", "üyesi", "uyesi",
+        "katip", "kâtip", "oy", "toplama", "memuru", "yazmanı", "yazmani",
+        "imza", "kaşe", "mühür", "stamp", "asaleten", "vekaleten"
+    ]
+    for w in drop:
+        t = re.sub(rf"\b{w}\b", " ", t, flags=re.IGNORECASE)
+    t = _normalize_name(t)
+    parts = [p for p in t.split() if len(p) >= 2]
+    if len(parts) >= 2:
+        return " ".join(parts[-3:])  # çoğu durumda sondaki 2-3 parça
+    return None
 
-def _parse_float(val) -> Optional[float]:
-    try:
-        return float(str(val).strip())
-    except Exception:
+def _nearby_name_box(idx: int,
+                     texts: List[str],
+                     boxes: List[TextBox]) -> str|None:
+    """Role kutusunun hemen sağ/alt komşusundan isim dene."""
+    if not (0 <= idx < len(boxes)):
         return None
+    x,y,w,h = boxes[idx].x, boxes[idx].y, boxes[idx].w, boxes[idx].h
+    cx, cy = x + w/2, y + h/2
+    best_j, best_d = None, 10**9
+    for j, tb in enumerate(boxes):
+        if j == idx: 
+            continue
+        cx2, cy2 = tb.x + tb.w/2, tb.y + tb.h/2
+        # role kutusunun sağında veya hemen altında ve çok uzak değil
+        if (cx2 >= cx - 5) and (cy2 >= y - h) and (abs(cy2 - cy) < 3*h):
+            d = np.hypot(cx2 - cx, cy2 - cy)
+            if d < best_d:
+                best_d, best_j = d, j
+    if best_j is not None:
+        cand = _extract_name(texts[best_j])
+        return cand
+    return None
 
-def _normalize_osd_dict(raw: dict) -> Tuple[Optional[int], Optional[float]]:
-    """
-    OSD sözlüğünden (rotate, confidence) çıkarır.
-    rotate yoksa orientation'dan türetir: rotate = (360 - orientation) % 360
-    Sonucu 0/90/180/270'a yaklaştırır (snap).
-    """
-    ang = _parse_angle(_pick(raw, ["rotate", "rotation", "rot", "orientation", "orientation_angle", "osd_rotate"]))
-    conf = _parse_float(_pick(raw, ["orientation_confidence", "orientation_conf", "confidence", "conf", "osd_conf"]))
-
-    if ang is not None and ang not in (0, 90, 180, 270):
-        ang = min((0, 90, 180, 270), key=lambda a: abs(a - ang))
-
-    if ang in (None, 0):
-        ori = _parse_angle(_pick(raw, ["orientation", "orientation_angle"]))
-        if ori in (90, 180, 270):
-            ang = (-ori) % 360  # 90→270 (CW), 270→90 (CW)
-
-    return ang, conf
-
-# =========================================================
-# --------------- OSD: image bazlı rotate -----------------
-# =========================================================
-def rotate_img_using_osd(
-    img_bgr: np.ndarray,
-    osd_tc=None,               # Remote tesseract client (önerilen). Eğer None ise döndürmeden geri verir.
-    osd_conf: float = 0.0      # osd_conf==0 davranışı için eşik
-) -> Tuple[np.ndarray, int, float]:
-    """
-    OSD çıktısına göre görüntüyü döndürür (90/180/270), aksi halde olduğu gibi bırakır.
-    Dönen: (rotated_bgr, used_deg, used_conf)
-    """
-    if osd_tc is None:
-        return img_bgr, 0, 0.0
-
-    # ---- OSD çağır ----
-    from PIL import Image
-    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    try:
-        raw = osd_tc.get_osd_ocr(pil, config="", model="best", output_type="dict")
-    except Exception:
-        return img_bgr, 0, 0.0
-
-    if not isinstance(raw, dict) or "error" in raw:
-        return img_bgr, 0, 0.0
-
-    inner = _unwrap_osd(raw)
-    deg, conf = _normalize_osd_dict(inner)
-
-    if conf is None:
-        conf = 0.0
-    if deg is None:
-        deg = 0
-
-    # ---- Kararı uygula ----
-    if conf < osd_conf or deg == 0:
-        return img_bgr, 0, conf
-
-    if   deg == 90:  rot = cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
-    elif deg == 180: rot = cv2.rotate(img_bgr, cv2.ROTATE_180)
-    elif deg == 270: rot = cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    else:
-        # nadiren 0/90/180/270 dışı gelirse (teoride olmayacak)
-        h, w = img_bgr.shape[:2]
-        M = cv2.getRotationMatrix2D((w/2, h/2), -float(deg), 1.0)  # CW pozitif
-        rot = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR)
-
-    return rot, int(deg), float(conf)
-
-# =========================================================
-# -------------- /Rotate uygulaması (PDF) -----------------
-# =========================================================
-def _get_existing_rotation(page) -> int:
-    try:
-        rot = int(getattr(page, "rotation", 0) or 0)
-    except Exception:
-        rot = 0
-    if rot % 90 != 0:
+def _pick_capital_value(texts: List[str]) -> Tuple[str|None, float|None]:
+    """Sermaye satırına yakın en büyük sayı."""
+    # 1) anahtar geçen kutulara öncelik ver
+    scored = []
+    for i, t in enumerate(texts):
+        t_low = t.lower()
+        score = max((_fuzzy(t_low, key) for key in CAPITAL_KEYS), default=0.0)
+        scored.append((score, i, t))
+    scored.sort(reverse=True)
+    for score, i, t in scored[:4]:  # en iyi 4 kutuya bak
+        if score < 0.55:
+            continue
+        # bu kutuda veya yakın komşusunda sayı ara
+        neigh = [i]
+        if i+1 < len(texts): neigh.append(i+1)
+        if i-1 >= 0:         neigh.append(i-1)
+        for j in neigh:
+            for m in NUM_WITH_TL.finditer(texts[j]):
+                raw = m.group(1)
+                v = raw.replace(".", "").replace(" ", "")
+                v = v.replace(",", ".")
+                try:
+                    return raw, float(v)
+                except Exception:
+                    pass
+    # fallback: tüm metinlerdeki en uzun sayı
+    best = None
+    for i, t in enumerate(texts):
+        for m in NUM_WITH_TL.finditer(t):
+            raw = m.group(1)
+            if (best is None) or (len(raw) > len(best)):
+                best = raw
+    if best:
+        v = best.replace(".", "").replace(" ", "")
+        v = v.replace(",", ".")
         try:
-            rot = int(page.get("/Rotate", 0) or 0)
+            return best, float(v)
         except Exception:
-            rot = 0
-    return rot % 360
+            return best, None
+    return None, None
 
-def _apply_cw(page, angle_cw: int):
-    """
-    Açıyı **her zaman saat yönünde** uygula (90/180/270). PyPDF2 sürüm farkına dayanıklı.
-    """
-    angle_cw = int(angle_cw) % 360
-    if angle_cw == 0:
-        return
-    if hasattr(page, "rotate_clockwise"):
-        page.rotate_clockwise(angle_cw); return
-    if hasattr(page, "rotateClockwise"):
-        page.rotateClockwise(angle_cw); return
-    before = _get_existing_rotation(page)
-    if hasattr(page, "rotate"):
-        try:
-            page.rotate(-angle_cw)  # rotate() CCW ise -angle -> CW etkisi
-        except Exception:
-            pass
-        after = _get_existing_rotation(page)
-        if after == (before + angle_cw) % 360:
-            return
-    page["/Rotate"] = (before + angle_cw) % 360
+def map_to_fields(ocr_texts: List[str],
+                  boxes: List[TextBox],
+                  min_role_ratio: float = 0.72) -> Dict[str, Any]:
+    """OCR metinlerini role-isim-imza ve sermaye alanlarına dönüştür."""
+    out = {
+        "sermaye_toplam_tl": None,
+        "sermaye_raw": None,
+        "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
+        "tutanak_yazmani_ad_soyad": None,  "tutanak_yazmani_imza_var_mi": None,
+        "bakanlik_temsilcisi_ad_soyad": None, "bakanlik_temsilcisi_imza_var_mi": None,
+        "yk_uyesi_ad_soyad": None, "yk_uyesi_imza_var_mi": None,
+        "yk_baskani_ad_soyad": None, "yk_baskani_imza_var_mi": None,
+        "katip_ad_soyad": None, "katip_imza_var_mi": None,
+        "divan_baskani_ad_soyad": None, "divan_baskani_imza_var_mi": None,
+    }
 
-def apply_rotations_in_memory(pdf_bytes: bytes, decisions: List[Dict]) -> bytes:
-    """
-    decisions listesine göre PDF'i RAM'de döndür ve yeni PDF bytes döndür.
-    PDF içerik rasterize edilmez; yalnızca /Rotate güncellenir.
-    """
-    reader = PdfReader(BytesIO(pdf_bytes))
-    writer = PdfWriter()
-    by_idx = {d["page_index"]: d for d in decisions}
+    # 1) Sermaye
+    raw, val = _pick_capital_value(ocr_texts)
+    out["sermaye_raw"] = raw
+    out["sermaye_toplam_tl"] = val
 
-    for i, page in enumerate(reader.pages):
-        d = by_idx.get(i)
-        if d and d.get("decision") == "rotate":
-            _apply_cw(page, int(d.get("needed_rotation", 0)) % 360)
-        writer.add_page(page)
+    # 2) Roller
+    for role_key, aliases in ROLE_ALIASES.items():
+        # en iyi eşleşen kutuyu bul
+        best = (-1.0, None)  # (score, idx)
+        for idx, t in enumerate(ocr_texts):
+            sc = max(_fuzzy(t, al) for al in aliases)
+            if sc > best[0]:
+                best = (sc, idx)
+        if best[0] >= min_role_ratio and best[1] is not None:
+            idx = best[1]
+            # aynı kutudan isim çıkarmayı dene, yoksa yakın kutuya bak
+            name = _extract_name(ocr_texts[idx]) or _nearby_name_box(idx, ocr_texts, boxes)
+            sign = boxes[idx].signature if (0 <= idx < len(boxes)) else None
 
-    out = BytesIO()
-    writer.write(out)
-    out.seek(0)
-    return out.read()
-
-# =========================================================
-# --------- Karar: image üstünde, uygulama: PDF ----------
-# =========================================================
-def decide_rotations_from_pdf_osd_tc(
-    pdf_bytes: bytes,
-    osd_tc,
-    dpi: int = 300,
-    min_confidence: float = 0.0,   # osd_conf==0 karşılığı
-    pages: Optional[List[int]] = None,
-    gray_for_speed: bool = False   # OSD için RGB önerilir; hız için True yapılabilir.
-) -> List[Dict]:
-    """
-    Her sayfayı (karar için) rasterize eder, OSD ile image'ı döndürür,
-    çıkan açıya göre PDF'e uygulanacak /Rotate kararını üretir.
-    """
-    reader = PdfReader(BytesIO(pdf_bytes))
-    idxs = pages if pages is not None else list(range(len(reader.pages)))
-    out: List[Dict] = []
-
-    for i in idxs:
-        existing = _get_existing_rotation(reader.pages[i])
-        img_bgr = _render_page_bgr(pdf_bytes, i, dpi=dpi, as_gray=gray_for_speed)
-
-        # IMAGE bazında OSD rotasyonu uygula (önizleme için)
-        after_bgr, deg, conf = rotate_img_using_osd(img_bgr, osd_tc=osd_tc, osd_conf=min_confidence)
-        needed = (deg - existing) % 360
-
-        if conf is None or conf < min_confidence:
-            needed, decision = 0, "skip"
-        else:
-            decision = "skip" if needed == 0 else "rotate"
-
-        out.append({
-            "page_index": i,
-            "existing_rotate": existing,
-            "suggested_angle": deg,
-            "confidence": conf,
-            "needed_rotation": needed,
-            "decision": decision,
-            # debug için istersen ön/son shape bilgisi
-            "shape_before": tuple(int(x) for x in img_bgr.shape[:2]),
-            "shape_after":  tuple(int(x) for x in after_bgr.shape[:2]),
-            "dpi": dpi
-        })
+            if role_key == "toplanti_baskani":
+                out["toplanti_baskani_ad_soyad"] = name
+                out["toplanti_baskani_imza_var_mi"] = bool(sign)
+            elif role_key == "tutanak_yazmani":
+                out["tutanak_yazmani_ad_soyad"] = name
+                out["tutanak_yazmani_imza_var_mi"] = bool(sign)
+            elif role_key == "bakanlik_temsilcisi":
+                out["bakanlik_temsilcisi_ad_soyad"] = name
+                out["bakanlik_temsilcisi_imza_var_mi"] = bool(sign)
+            elif role_key == "yk_uyesi":
+                out["yk_uyesi_ad_soyad"] = name
+                out["yk_uyesi_imza_var_mi"] = bool(sign)
+            elif role_key == "yk_baskani":
+                out["yk_baskani_ad_soyad"] = name
+                out["yk_baskani_imza_var_mi"] = bool(sign)
+            elif role_key == "katip":
+                out["katip_ad_soyad"] = name
+                out["katip_imza_var_mi"] = bool(sign)
+            elif role_key == "divan_baskani":
+                out["divan_baskani_ad_soyad"] = name
+                out["divan_baskani_imza_var_mi"] = bool(sign)
 
     return out
 
-def auto_orient_pdf_bytes_osd_tc(
-    pdf_bytes: bytes,
-    osd_tc,
-    dpi: int = 300,
-    min_confidence: float = 0.0,
-    pages: Optional[List[int]] = None,
-    gray_for_speed: bool = False
-) -> Tuple[bytes, List[Dict]]:
+# =========================
+# 4) Uçtan uca çalıştırıcı
+# =========================
+
+def extract_bottom_fields(lower_img: np.ndarray, NEW_URL: str,
+                          lang: str = "tur",
+                          config: str = "--psm 6 --oem 1") -> Dict[str, Any]:
     """
-    Tek çağrıda karar + uygulama. Çıkış: (rotated_pdf_bytes, decisions)
+    lower_img: extract_lower_text_area_from_table_v4(...) çıktısı (BGR/GRAY)
+    NEW_URL:  uzak Tesseract endpoint'in
     """
-    decisions = decide_rotations_from_pdf_osd_tc(
-        pdf_bytes=pdf_bytes,
-        osd_tc=osd_tc,
-        dpi=dpi,
-        min_confidence=min_confidence,
-        pages=pages,
-        gray_for_speed=gray_for_speed,
-    )
-    rotated = apply_rotations_in_memory(pdf_bytes, decisions)
-    return rotated, decisions
+    if lower_img.ndim == 2:
+        lower_img_bgr = cv2.cvtColor(lower_img, cv2.COLOR_GRAY2BGR)
+    else:
+        lower_img_bgr = lower_img
 
-# =========================================================
-# ---------------- Debug / doğrulama araçları -------------
-# =========================================================
-def rotations_list(pdf_bytes: bytes):
-    r = PdfReader(BytesIO(pdf_bytes))
-    return [(i, int(getattr(p, "rotation", 0) or p.get("/Rotate", 0) or 0) % 360) for i, p in enumerate(r.pages)]
+    boxes = segment_lower_area_into_boxes(lower_img_bgr)
 
-def _render_page_rgb_for_display(pdf_bytes: bytes, page_index: int, dpi: int = 200) -> np.ndarray:
-    zoom = dpi / 72.0
-    with fitz.open("pdf", pdf_bytes) as doc:
-        p = doc.load_page(page_index)
-        pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)  # RGB
-        return img
+    ocr_texts = []
+    for tb in boxes:
+        x, y, w, h = tb.x, tb.y, tb.w, tb.h
+        roi = lower_img_bgr[y:y+h, x:x+w]
+        txt = ocr_box_via_remote_tesseract(roi, url=NEW_URL, lang=lang, config=config)
+        ocr_texts.append(txt)
 
-def show_before_after(pdf_bytes_before: bytes, pdf_bytes_after: bytes,
-                      page_index: int = 0, dpi: int = 300,
-                      title_before: str = "Before", title_after: str = "After"):
-    import matplotlib.pyplot as plt
-    img_b = _render_page_rgb_for_display(pdf_bytes_before, page_index, dpi=dpi)
-    img_a = _render_page_rgb_for_display(pdf_bytes_after,  page_index, dpi=dpi)
-    fig = plt.figure(figsize=(16, 7))
-    ax1 = fig.add_subplot(1, 2, 1); ax2 = fig.add_subplot(1, 2, 2)
-    ax1.imshow(img_b); ax1.set_title(f"{title_before} (p{page_index}, {dpi} DPI)"); ax1.axis("off")
-    ax2.imshow(img_a); ax2.set_title(f"{title_after} (p{page_index}, {dpi} DPI)");  ax2.axis("off")
-    plt.tight_layout(); plt.show()
-
-# =========================================================
-# -------- Tablo preprocess (0/255 biten binary) ----------
-# =========================================================
-def preprocess_table_img(table_bgr: np.ndarray) -> np.ndarray:
-    """
-    Tablo görüntüsünü OCR için hazırlar. Çıktı: tek kanal ve sadece 0/255.
-    """
-    gray = cv2.cvtColor(table_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    blurred = cv2.GaussianBlur(gray, (0, 0), 1.0)
-    sharp = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-    _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
-
-
-
-# 1) PDF'i RAM'e al
-with open(selected_pdf, "rb") as f:
-    pdf_bytes = f.read()
-
-# 2) Kararı image bazında ver, PDF'e /Rotate uygula
-rotated_bytes, decisions = auto_orient_pdf_bytes_osd_tc(
-    pdf_bytes,
-    osd_tc=osd_tc,        # senin TesseractClient
-    dpi=300,
-    min_confidence=0.0,   # osd_conf==0 karşılığı
-    gray_for_speed=False
-)
-
-# 3) Doğrulama
-print("BEFORE:", rotations_list(pdf_bytes)[:10])
-print("AFTER :", rotations_list(rotated_bytes)[:10])
-for d in decisions:
-    print({k: d[k] for k in ("page_index","existing_rotate","suggested_angle","confidence","needed_rotation","decision")})
-
-# 4) Önizleme
-show_before_after(pdf_bytes, rotated_bytes, page_index=0, dpi=300,
-                  title_before="Before (p0)", title_after=f"After rot={decisions[0]['suggested_angle']} conf={decisions[0]['confidence']:.2f}")
-
-# 5) Tablo preprocess (0/255)
-# table_bgr = ... (kendi crop kodundan)
-# table_bin = preprocess_table_img(table_bgr)
+    fields = map_to_fields(ocr_texts, boxes)
+    # debug amaçlı eklemek istersen:
+    fields["_debug"] = {
+        "n_boxes": len(boxes),
+        "boxes": [(tb.x, tb.y, tb.w, tb.h, tb.signature) for tb in boxes],
+        "ocr_texts": ocr_texts
+    }
+    return fields
