@@ -1,269 +1,128 @@
 # -*- coding: utf-8 -*-
-import re, cv2, json, base64, requests, numpy as np, pandas as pd
+import re, json, base64, requests, numpy as np, pandas as pd
 import unicodedata
-from typing import Any, List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional
 
-# ============ 1) METİN NORMALİZASYON & LEVENSHTEIN ============
+# ============ Metin normalizasyonu & benzerlik ============
+
 def _strip_diacritics(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if not unicodedata.combining(c))
+    return ''.join(c for c in unicodedata.normalize('NFKD', s or "") if not unicodedata.combining(c))
 
 def _norm_text(s: str) -> str:
-    s = (s or "").upper()
-    s = _strip_diacritics(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    s = _strip_diacritics((s or "").upper())
+    s = re.sub(r"[^A-Z0-9ÇĞİÖŞÜ\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-def _lev(a: str, b: str) -> int:
-    a = a or ""; b = b or ""
+def _bigrams(s: str) -> set:
+    s = _norm_text(s).replace(" ", "")
+    return {s[i:i+2] for i in range(max(0, len(s)-1))} if s else set()
+
+def _levenshtein(a: str, b: str) -> int:
+    a, b = _norm_text(a), _norm_text(b)
     if not a: return len(b)
     if not b: return len(a)
-    da = [[0]*(len(b)+1) for _ in range(len(a)+1)]
-    for i in range(len(a)+1): da[i][0] = i
-    for j in range(len(b)+1): da[0][j] = j
-    for i,ch_a in enumerate(a,1):
-        for j,ch_b in enumerate(b,1):
-            cost = 0 if ch_a==ch_b else 1
-            da[i][j] = min(da[i-1][j]+1, da[i][j-1]+1, da[i-1][j-1]+cost)
-    return da[-1][-1]
+    dp = list(range(len(b)+1))
+    for i, ca in enumerate(a, 1):
+        prev, dp[0] = dp[0], i
+        for j, cb in enumerate(b, 1):
+            ins = dp[j-1] + 1
+            dele = dp[j] + 1
+            sub = prev + (ca != cb)
+            prev, dp[j] = dp[j], min(ins, dele, sub)
+    return dp[-1]
 
 def _sim(a: str, b: str) -> float:
-    a=_norm_text(a); b=_norm_text(b)
-    if not a and not b: return 1.0
-    if not a or not b: return 0.0
-    m = max(len(a), len(b))
-    return 1.0 - (_lev(a,b)/m)
+    """Jaccard(bigram) ile Levenshtein oranını harmanlar."""
+    A, B = _bigrams(a), _bigrams(b)
+    j = (len(A & B) / len(A | B)) if (A or B) else 0.0
+    lev = 1.0 - (_levenshtein(a, b) / max(1, len(_norm_text(a)), len(_norm_text(b))))
+    return 0.6*j + 0.4*lev
 
-# ============ 2) ROL ALIASES & ROL SKORU ============
-ROLE_ALIASES: Dict[str, List[str]] = {
-    "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI", "DİVAN BAŞKANI", "DIVAN BASKANI"],
-    "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
-    "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
-    "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETIM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
-    "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI", "YÖNETİM KURULU ÜYELERİ"],
-    "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
-    "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
-}
+def match_known_names_in_text(text: str, known_names: List[str], threshold: float=0.75) -> List[str]:
+    """
+    OCR metni içinde, verilen known_names listesine fuzzy bakar.
+    Eşik üzerindeki tüm kanonik isimleri (listede yazdığı gibi) döner.
+    Birden fazla isim bulunabilir; tekrarı kaldırır, orijinal sıra korunur.
+    """
+    t = _norm_text(text)
+    hits = []
+    seen = set()
+    for name in known_names:
+        if not name: 
+            continue
+        score = _sim(t, name)
+        # çok uzun listelerde hız için kısa bir hızlı yol: ad soyadın her iki parçası da metinde kısmen geçiyorsa puanı artırır
+        parts = [p for p in _norm_text(name).split() if p]
+        if len(parts) >= 2 and all(p[:3] in t for p in parts):  # üç harflik tohumlar
+            score = max(score, 0.85)
+        if score >= threshold and name not in seen:
+            hits.append(name)
+            seen.add(name)
+    return hits
 
-# rol önceliği (eşit skorda bu sıra kullanılır)
-ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
+# ============ TL sayısı yakalama ============
 
-def _alias_score(text_u: str, alias: str) -> float:
-    # basit fuzzy: token tabanlı ortalama benzerlik
-    t = _norm_text(text_u)
-    a = _norm_text(alias)
-    toks_t = t.split()
-    toks_a = a.split()
-    if not toks_t or not toks_a: 
-        return _sim(t, a)
-    bests = []
-    for ta in toks_a:
-        bests.append(max(_sim(ta,tb) for tb in toks_t))
-    return float(np.mean(bests))
+_TL_NUM = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?\s*(?:TL|₺)?", re.IGNORECASE)
 
-def best_role_for_text(text_u: str) -> Tuple[Optional[str], float]:
-    best_role, best_score = None, 0.0
-    for rk, aliases in ROLE_ALIASES.items():
-        score = max(_alias_score(text_u, a) for a in aliases)
-        if (score > best_score) or (abs(score-best_score)<1e-6 and ROLE_PRIORITY.index(rk) < ROLE_PRIORITY.index(best_role) if best_role else True):
-            best_role, best_score = rk, score
-    return best_role, best_score
+def _parse_tl_int(text: str) -> Optional[int]:
+    """
+    Metinden TL sayısı yakalar: 1.000.000,00 -> 1000000 (int)
+    Birden fazla varsa en büyüğünü döner.
+    """
+    best = None
+    for m in _TL_NUM.finditer(text or ""):
+        raw = m.group(1)
+        v = raw.replace(".", "").replace(" ", "")
+        try:
+            val = int(v)
+            best = val if (best is None or val > best) else best
+        except:
+            pass
+    return best
 
-# ============ 3) İSİM ÇIKARMA ============
-NAME_TOKEN = re.compile(r"[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,})+")
+# ============ Rapor: sadece kutu içi imza, isimler fuzzy-known, sermaye komşuya bakabilir ============
 
-DROP_WORDS = [
-    "TOPLANTI","TOPLANII","BAŞKANI","BASKANI","YÖNETİM","KURULU","ÜYESİ","UYESI","ÜYELERİ","UYE",
-    "BAKANLIK","TEMSİLCİSİ","TEMSILCISI","KATİP","KÂTİP","YAZMANI","OY","TOPLAMA","MEMURU",
-    "DİVAN","DIVAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP","HAZİRUN","HAZIRUN","T.C","TC"
-]
+ROLE_KEYS = ["toplanti_baskani", "tutanak_yazmani", "bakanlik_temsilcisi",
+             "yk_uyesi", "yk_baskani", "katip", "divan_baskani"]
 
-def extract_all_names(raw: str) -> List[str]:
-    # rolleri/etiketleri temizle
-    t = _norm_text(raw)
-    for w in DROP_WORDS:
-        t = re.sub(rf"\b{w}\b", " ", t)
-    t = re.sub(r"[^A-ZÇĞİÖŞÜ\s\.\-']", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    # isim bloklarını yakala
-    names = []
-    for m in NAME_TOKEN.finditer(t):
-        cand = m.group(0).title()
-        if cand and cand not in names:
-            names.append(cand)
-    return names
+CAP_HINTS = ["ŞİRKETİN SERMAYESİ", "SERMAYESİ VE PAYLARIN",
+             "TOPLAMI İTİBARİ DEĞERİ", "SERMAYE"]
 
-def fuzzy_map_to_known(cands: List[str], known_pool: List[str], threshold: float=0.8, allow_multiple=True) -> List[str]:
-    if not cands or not known_pool: 
-        return []
-    out=[]
-    for c in cands:
-        best=None; best_s=0.0
-        for k in known_pool:
-            s=_sim(c,k)
-            if s>best_s: best_s, best = s, k
-        if best and best_s>=threshold and best not in out:
-            out.append(best)
-            if not allow_multiple: break
-    return out
-
-def cleanup_names_to_known(text_u: str, known_pool: List[str], threshold: float=0.8, allow_multiple=True) -> List[str]:
-    raw_names = extract_all_names(text_u)
-    return fuzzy_map_to_known(raw_names, known_pool, threshold, allow_multiple)
-
-# ============ 4) KUTU DÖNÜŞÜM & ÇİZİM ============
-def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
-    if isinstance(b, (tuple,list,np.ndarray)) and len(b)==4:
-        x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
-    for attrs in [("x","y","w","h"),("left","top","width","height")]:
-        if all(hasattr(b,a) for a in attrs):
-            x,y,w,h = [int(round(float(getattr(b,a)))) for a in attrs]; return (x,y,w,h)
-    for attrs in [("x0","y0","x1","y1"),("left","top","right","bottom")]:
-        if all(hasattr(b,a) for a in attrs):
-            x0,y0,x1,y1 = [float(getattr(b,a)) for a in attrs]
-            return (int(round(x0)),int(round(y0)),int(round(x1-x0)),int(round(y1-y0)))
-    if isinstance(b, dict):
-        if all(k in b for k in ("x","y","w","h")):
-            return (int(b["x"]),int(b["y"]),int(b["w"]),int(b["h"]))
-        if all(k in b for k in ("x0","y0","x1","y1")):
-            return (int(b["x0"]),int(b["y0"]),int(b["x1"]-b["x0"]),int(b["y1"]-b["y0"]))
-    return None
-
-def normalize_boxes(boxes: List[Any]) -> List[Tuple[int,int,int,int]]:
-    out=[]
-    for b in boxes:
-        nb=_to_xywh(b)
-        if nb is None: continue
-        x,y,w,h = nb
-        if w>0 and h>0: out.append((x,y,w,h))
-    return out
-
-def draw_boxes_with_ids(img_bgr: np.ndarray, boxes_xywh: List[Tuple[int,int,int,int]]) -> np.ndarray:
-    vis = img_bgr.copy()
-    if vis.ndim==2: vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-    for i,(x,y,w,h) in enumerate(boxes_xywh):
-        cv2.rectangle(vis,(x,y),(x+w,y+h),(0,200,0),2)
-        cv2.putText(vis,str(i),(x+4,y+18),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,120,0),2,cv2.LINE_AA)
-    return vis
-
-# ============ 5) OCR (NEW_URL) & İMZA (yalnız KENDİ kutusu) ============
-def _ocr_remote_png(img_bgr: np.ndarray, url: str, lang="tur", config="--psm 6 --oem 1") -> str:
-    ok,buf=cv2.imencode(".png",img_bgr); 
-    if not ok: return ""
-    payload={"image": base64.b64encode(buf).decode(), "lang": lang, "config": config}
-    try:
-        r=requests.post(url, json=payload, timeout=30)
-        if r.ok:
-            j=json.loads(r.text)
-            return (j.get("text") or "").strip()
-    except Exception:
-        pass
-    return ""
-
-def ocr_text_from_box_remote(img: np.ndarray, box_xywh: Tuple[int,int,int,int], url: str) -> str:
-    x,y,w,h = box_xywh
-    roi = img[y:y+h, x:x+w]
-    if roi.ndim==2: roi=cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
-    return _ocr_remote_png(roi, url)
-
-def has_signature_strict(img: np.ndarray, box_xywh: Tuple[int,int,int,int],
-                         ink_ratio_min: float=0.006,
-                         thinness_max: float=0.50) -> bool:
-    """Sadece kutu içi: mürekkep oranı + kontur inceliği + çizgisel yapı."""
-    x,y,w,h = box_xywh
-    roi = img[y:y+h, x:x+w]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim==3 else roi
-
-    g = cv2.GaussianBlur(gray,(3,3),0)
-    thr = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
-
-    ink_ratio = cv2.countNonZero(thr)/max(1,w*h)
-    if ink_ratio < ink_ratio_min: 
-        return False
-
-    cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: return False
-    c = max(cnts, key=cv2.contourArea)
-    A = cv2.contourArea(c); P = max(1.0, cv2.arcLength(c, True))
-    thinness = 4*np.pi*A/(P*P)  # küçükse daha çizgisel
-    return thinness < thinness_max
-
-# ============ 6) OCR RAPORU (kutular) ============
-def inspect_boxes(lower_img: np.ndarray,
-                  boxes: List[Any],
-                  NEW_URL: str,
-                  role_threshold: float=0.80,
-                  known_names: Optional[List[str]] = None,
-                  name_sim_threshold: float=0.80,
-                  debug: bool=True) -> Tuple[np.ndarray, pd.DataFrame]:
-    boxes_xywh = normalize_boxes(boxes)
-    vis = draw_boxes_with_ids(lower_img, boxes_xywh)
-
-    rows=[]
-    for i,b in enumerate(boxes_xywh):
-        txt  = ocr_text_from_box_remote(lower_img, b, NEW_URL)
-        txtu = _norm_text(txt)
-        sig  = has_signature_strict(lower_img, b)
-
-        role, rscore = best_role_for_text(txtu)
-
-        # kutu içindeki isim(ler) → bilinen isim havuzuna fuzzy map
-        mapped_names = cleanup_names_to_known(txt, known_names or [], threshold=name_sim_threshold, allow_multiple=True)
-        name_in_box = "; ".join(mapped_names) if mapped_names else None
-
-        rows.append({
-            "i": i,
-            "bbox": b,
-            "sig": bool(sig),              # *** sadece KENDİ kutusundan ***
-            "role_best": role if rscore>=role_threshold else None,
-            "role_score": float(rscore),
-            "name_in_box": name_in_box,
-            "text_preview": re.sub(r"\s+"," ",txt)[:200]
-        })
-
-    per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_best","role_score","name_in_box","text_preview"])
-    if debug:
-        print(f"[INFO] {len(boxes_xywh)} box")
-        display(per_box_df)
-    return vis, per_box_df
-
-# ============ 7) RAPORDAN ÖZET TABLO ============
 def build_bottom_df_from_report(lower_img: np.ndarray,
-                                boxes: List[Any],
+                                boxes: List[Tuple[int,int,int,int]],
                                 per_box_df: pd.DataFrame,
-                                known_names: Optional[Dict[str, List[str]]] = None,
-                                name_sim_threshold: float=0.80) -> pd.DataFrame:
-    """Sadece eşleşen rol kutularından doldurur; imza YALNIZ kendi kutusundan alınır."""
-    boxes_xywh = normalize_boxes(boxes)
+                                known_names: List[str],
+                                name_sim_threshold: float = 0.75) -> pd.DataFrame:
+    """
+    - İsim: sadece o kutunun OCR metninden, fuzzy known_names ile
+    - İmza: sadece o kutunun 'sig' değeri
+    - Sermaye: başlık kutusu ve komşuları (i-1, i, i+1) içinden en büyük sayı
+    """
+    n = len(per_box_df)
+    texts = [str(per_box_df.loc[i, "text_preview"] or "") for i in range(n)]
+    roles  = [per_box_df.loc[i, "role_best"] if "role_best" in per_box_df.columns else None for i in range(n)]
+    sigs   = [bool(per_box_df.loc[i, "sig"]) for i in range(n)]
 
-    # --- Sermaye: yakınındaki “SERMAYE/DEĞERİ/İTİBARİ” kelimelerine göre kutu +-1 alanında sayı ara
-    texts_u = [str(r.get("text_preview") or "") for _,r in per_box_df.iterrows()]
-    def _parse_tl_int(s: str) -> Optional[int]:
-        # 1.000.000 € / 1.000.000 TL / 1000000 benzeri
-        s = s.replace("€"," ").replace("₺"," ").replace("TL"," ")
-        nums = re.findall(r"\d{1,3}(?:\.\d{3})+|\d+", s)
-        best=None
-        for raw in nums:
-            try:
-                v = int(raw.replace(".",""))
-                best = v if (best is None or v>best) else best
-            except: pass
-        return best
-
-    cap_keys = ["SERMAYES", "TOPLAM", "DEĞER", "ITIBARI", "İTİBARİ"]  # geniş eşleşme
+    # --- Sermaye ---
     sermaye = None
-    for i,t in enumerate(texts_u):
-        tu=_norm_text(t)
-        if any(k in tu for k in cap_keys):
-            for j in [i-1,i,i+1]:
-                if 0<=j<len(texts_u):
-                    v=_parse_tl_int(texts_u[j])
-                    if v is not None:
-                        sermaye=v; break
-        if sermaye is not None: break
+    # önce başlık ipuçlarını içeren kutulara yakın bak
+    scored = []
+    for i, t in enumerate(texts):
+        score = sum(hint in _norm_text(t) for hint in CAP_HINTS)
+        if score:
+            scored.append((score, i))
+    for _, i in sorted(scored, reverse=True):
+        for j in [i-1, i, i+1]:
+            if 0 <= j < n:
+                val = _parse_tl_int(texts[j])
+                if val is not None:
+                    sermaye = val if sermaye is None else max(sermaye, val)
+        if sermaye is not None:
+            break
+    # hala yoksa: tüm kutuların en büyüğü
     if sermaye is None:
-        # fallback: tüm kutulardaki en büyük TL sayısı
-        vals=[_parse_tl_int(t) for t in texts_u]
-        sermaye=max([v for v in vals if v is not None], default=None)
+        vals = [_parse_tl_int(t) for t in texts]
+        sermaye = max([v for v in vals if v is not None], default=None)
 
     out = {
         "sermaye_toplam_tl": sermaye,
@@ -277,40 +136,35 @@ def build_bottom_df_from_report(lower_img: np.ndarray,
     }
 
     key_map = {
-        "toplanti_baskani": ("toplanti_baskani_ad_soyad","toplanti_baskani_imza_var_mi"),
-        "tutanak_yazmani":  ("tutanak_yazmani_ad_soyad","tutanak_yazmani_imza_var_mi"),
-        "bakanlik_temsilcisi":("bakanlik_temsilcisi_ad_soyad","bakanlik_temsilcisi_imza_var_mi"),
-        "yk_uyesi":         ("yk_uyesi_ad_soyad","yk_uyesi_imza_var_mi"),
-        "yk_baskani":       ("yk_baskani_ad_soyad","yk_baskani_imza_var_mi"),
-        "katip":            ("katip_ad_soyad","katip_imza_var_mi"),
-        "divan_baskani":    ("divan_baskani_ad_soyad","divan_baskani_imza_var_mi"),
+        "toplanti_baskani": ("toplanti_baskani_ad_soyad", "toplanti_baskani_imza_var_mi"),
+        "tutanak_yazmani":  ("tutanak_yazmani_ad_soyad",  "tutanak_yazmani_imza_var_mi"),
+        "bakanlik_temsilcisi": ("bakanlik_temsilcisi_ad_soyad","bakanlik_temsilcisi_imza_var_mi"),
+        "yk_uyesi": ("yk_uyesi_ad_soyad", "yk_uyesi_imza_var_mi"),
+        "yk_baskani": ("yk_baskani_ad_soyad", "yk_baskani_imza_var_mi"),
+        "katip": ("katip_ad_soyad", "katip_imza_var_mi"),
+        "divan_baskani": ("divan_baskani_ad_soyad", "divan_baskani_imza_var_mi"),
     }
 
-    def _set(role_key: str, names_val: Optional[str], sig_val: Optional[bool]):
+    def _set(role_key: str, i: int):
+        """Sadece kendi kutusunun isim/imza bilgisi."""
+        if role_key not in key_map: 
+            return
         k_name, k_sig = key_map[role_key]
-        if names_val and out[k_name] is None:
-            out[k_name] = names_val
-        if sig_val is not None and out[k_sig] is None:
-            out[k_sig] = bool(sig_val)
+        text_here = texts[i]
+        sig_here  = sigs[i]
 
-    # sadece EŞİK ÜSTÜ role sahip kutular (yan komşudan imza YOK)
-    for _,r in per_box_df.iterrows():
-        role = r.get("role_best")
-        if not role or role not in key_map: 
-            continue
+        # isimler: fuzzy-known (çoklu olabilir)
+        names = match_known_names_in_text(text_here, known_names, threshold=name_sim_threshold)
+        name_val = "; ".join(names) if names else None
 
-        # isim: önce per_box içindeki isim(ler); yoksa OCR'dan yakala + known havuzuna map
-        name_in = str(r.get("name_in_box") or "").strip()
-        if not name_in:
-            # OCR ham metinden çıkarıp known’a map
-            text_here = str(r.get("text_preview") or "")
-            known_pool = (known_names or {}).get(role, [])
-            mapped = cleanup_names_to_known(text_here, known_pool, threshold=name_sim_threshold, allow_multiple=(role=="yk_uyesi"))
-            name_in = "; ".join(mapped) if mapped else None
+        if name_val is not None:
+            out[k_name] = name_val
+        if sig_here is not None:
+            out[k_sig] = bool(sig_here)
 
-        # imza: sadece bu kutunun kendisi
-        sig_here = bool(r.get("sig", False))
-
-        _set(role, name_in, sig_here)
+    # kutu bazında rolleri işle
+    for i, rk in enumerate(roles):
+        if rk in ROLE_KEYS:
+            _set(rk, i)
 
     return pd.DataFrame([out])
