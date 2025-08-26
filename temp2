@@ -1,0 +1,216 @@
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+import unicodedata, re
+from difflib import SequenceMatcher
+import numpy as np
+
+# ==== veri tipiniz ====
+@dataclass(frozen=True)
+class TextBox:
+    x:int; y:int; w:int; h:int
+
+# ==== yardımcılar ====
+_TR_TABLE = str.maketrans({
+    "İ":"I","I":"I","ı":"i","Ğ":"G","ğ":"g","Ü":"U","ü":"u",
+    "Ş":"S","ş":"s","Ö":"O","ö":"o","Ç":"C","ç":"c"
+})
+def _strip_diacritics(s:str)->str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+def norm_text(s:str)->str:
+    s = _strip_diacritics(s or "").translate(_TR_TABLE)
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s:/.-]", " ", s)
+    s = re.sub(r"\s+"," ", s).strip()
+    return s
+def fuzzy(a:str,b:str)->float:
+    return 100.0*SequenceMatcher(None,a,b).ratio()
+
+def hchar(boxes:List[TextBox])->float:
+    hs=[b.h for b in boxes if b.h>0]
+    return float(np.clip(np.median(hs), 10, 80)) if hs else 20.0
+
+def x_overlap_ratio(a:TextBox,b:TextBox)->float:
+    ax1,ax2=a.x,a.x+a.w; bx1,bx2=b.x,b.x+b.w
+    inter=max(0, min(ax2,bx2)-max(ax1,bx1))
+    denom=max(1, min(a.w,b.w))
+    return inter/denom
+
+def v_gap(a:TextBox,b:TextBox)->int:
+    return max(0, b.y-(a.y+a.h))
+
+def union(a:TextBox,b:TextBox)->TextBox:
+    x1=min(a.x,b.x); y1=min(a.y,b.y)
+    x2=max(a.x+a.w,b.x+b.w); y2=max(a.y+a.h,b.y+b.h)
+    return TextBox(x1,y1,x2-x1,y2-y1)
+
+# ==== heuristikler ====
+ROLE_LEXICON: Dict[str,List[str]] = {
+    "toplanti_baskani": [
+        "toplanti baskani","divan baskani","toplanti bsk","toplanti bşk"
+    ],
+    "yonetim_kurulu_baskani": [
+        "yonetim kurulu baskani","yk baskani","yk bsk","yon kur bsk"
+    ],
+    "yonetim_kurulu_uyeleri": [
+        "yonetim kurulu uyeleri","yk uyeleri","yk uyesi"
+    ],
+    "oy_toplama_memuru": [
+        "oy toplama memuru","oy toplama mem."
+    ],
+    "katip_uyesi": [
+        "katip uyesi","katip"
+    ],
+}
+CAP_KEYS = [
+    "sirketin sermayesi","sermayesi","paylarin toplam itibari degeri",
+    "toplam hisse adedi","sermaye yapisi"
+]
+
+def looks_like_signature(b:TextBox, text:str, H:float)->bool:
+    t = norm_text(text)
+    letters_digits = re.sub(r"[^a-z0-9]","",t)
+    aspect = b.w / max(1,b.h)
+    return (aspect>=1.2) and (1.0*H <= b.h <= 7.0*H) and (len(letters_digits)<=8)
+
+def looks_like_capital(text:str)->bool:
+    t=norm_text(text)
+    return any(k in t for k in CAP_KEYS)
+
+def best_role(text:str, thr:float=72.0)->Tuple[Optional[str],float]:
+    t=norm_text(text); best=None; best_sc=0.0
+    for role,vars in ROLE_LEXICON.items():
+        for v in vars:
+            sc=fuzzy(t,v)
+            if sc>best_sc:
+                best_sc=sc; best=role
+    return (best if best_sc>=thr else None), best_sc
+
+# ==== kolonlara böl ====
+def split_into_columns(boxes:List[TextBox], min_x_overlap_ratio:float=0.45)->List[List[int]]:
+    order = sorted(range(len(boxes)), key=lambda i:(boxes[i].x+boxes[i].w//2, boxes[i].y))
+    cols:List[List[int]]=[]
+    for i in order:
+        b=boxes[i]; placed=False
+        for col in cols:
+            if x_overlap_ratio(boxes[col[-1]], b) >= min_x_overlap_ratio:
+                col.append(i); placed=True; break
+        if not placed:
+            cols.append([i])
+    return cols
+
+# ==== asıl fonksiyon ====
+@dataclass
+class LabeledGroup:
+    role: Optional[str]
+    score: float
+    member_ids: List[int]
+    merged: TextBox
+
+def group_by_labels_fuzzy(
+    boxes: List[TextBox],
+    texts: List[str],
+    *,
+    role_thr: float = 72.0,
+    min_x_overlap_ratio: float = 0.45,
+    max_vertical_gap_scale: float = 0.9,
+    x_band_pad_scale: float = 0.55,
+    max_width_expand: float = 1.35,
+) -> List[LabeledGroup]:
+    """
+    - Label’ı fuzzy ile yakalar -> grup başlangıcı
+    - Aşağı iner; imza görünce bitirir (imza dahil)
+    - İkinci label görünürse bitirir (blokta tek label)
+    - Kolon bandı ile yatay taşmayı engeller; gerekirse bandı daraltır
+    """
+    assert len(boxes)==len(texts)
+    if not boxes: return []
+
+    H = hchar(boxes)
+    max_gap = int(round(max_vertical_gap_scale*H))
+
+    # adaptif band: label metni kısaysa band daha dar
+    def band_pad_for(text:str)->int:
+        L = max(1, len(norm_text(text)))
+        scale = 0.35 if L<=10 else (0.55 if L<=25 else 0.7)
+        return int(round(max(8, scale*H)))
+
+    used=[False]*len(boxes)
+    groups:List[LabeledGroup]=[]
+
+    # 0) sermaye bloklarını ayır
+    for i,(b,t) in enumerate(zip(boxes,texts)):
+        if looks_like_capital(t):
+            groups.append(LabeledGroup(role=None, score=0.0, member_ids=[i], merged=b))
+            used[i]=True
+
+    # 1) kolonlara böl, her kolonu yukarıdan aşağı tara
+    cols = split_into_columns(boxes, min_x_overlap_ratio=min_x_overlap_ratio)
+    for col in cols:
+        col = sorted(col, key=lambda i: boxes[i].y)
+        k=0
+        while k < len(col):
+            i = col[k]
+            if used[i]: 
+                k+=1; continue
+
+            b, t = boxes[i], texts[i]
+            role, r_sc = best_role(t, thr=role_thr)
+
+            # label değilse: bağımsız (rolsüz) küçük blok – bu aşamada dokunma
+            if role is None:
+                k+=1
+                continue
+
+            # label bulundu -> grup başlat
+            pad = band_pad_for(t)             # adaptif
+            band_left  = b.x - pad
+            band_right = b.x + b.w + pad
+
+            merged = b
+            members=[i]; used[i]=True
+
+            # aşağı tarama
+            j = k+1
+            while j < len(col):
+                jj = col[j]
+                if used[jj]:
+                    j+=1; continue
+                nb, nt = boxes[jj], texts[jj]
+
+                # kolon bandı dışında -> grupla ilgisiz; kır
+                if (nb.x + nb.w) < band_left or nb.x > band_right:
+                    break
+
+                # ikinci bir label görünürse -> blok başına tek label: burada bitir
+                r2,_ = best_role(nt, thr=role_thr)
+                if r2 is not None:
+                    break
+
+                # imza ise ekle ve bitir
+                if looks_like_signature(nb, nt, H):
+                    merged = union(merged, nb); members.append(jj); used[jj]=True
+                    j+=1
+                    break
+
+                # dikey yakınlık + az da olsa x-örtüşme
+                if v_gap(merged, nb) <= max_gap and x_overlap_ratio(merged, nb) >= min_x_overlap_ratio:
+                    cand = union(merged, nb)
+                    # yatay aşırı genişlemeyi frenle
+                    if cand.w <= max_width_expand * max(merged.w, nb.w):
+                        merged = cand; members.append(jj); used[jj]=True; j+=1
+                    else:
+                        break
+                else:
+                    break
+
+            groups.append(LabeledGroup(role=role, score=r_sc, member_ids=members, merged=merged))
+            k = j
+
+    # 2) Henüz kullanılmamışlar kaldıysa olduğu gibi ekle
+    for i in range(len(boxes)):
+        if not used[i]:
+            groups.append(LabeledGroup(role=None, score=0.0, member_ids=[i], merged=boxes[i]))
+
+    # 3) çıktı: sayfa sırası
+    groups.sort(key=lambda g:(g.merged.y, g.merged.x))
+    return groups
