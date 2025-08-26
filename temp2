@@ -1,132 +1,140 @@
-# ==== 1) İmza sezgisi: daha toleranslı ====
+# ============================================================
+#  Hazirun Cetveli — Box Sonlandırma (rol + imza kuralları)
+#  (tek dosya/fonksiyon bloğu, senin akışına hazır)
+# ============================================================
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+import numpy as np
+from difflib import SequenceMatcher
+
+# ---- Temel kutu yapısı ----
+@dataclass(frozen=True)
+class TextBox:
+    x:int; y:int; w:int; h:int
+
+def union(a: TextBox, b: TextBox) -> TextBox:
+    x1 = min(a.x, b.x); y1 = min(a.y, b.y)
+    x2 = max(a.x+a.w, b.x+b.w); y2 = max(a.y+a.h, b.y+b.h)
+    return TextBox(x1, y1, x2-x1, y2-y1)
+
+def union_many(boxes: List[TextBox]) -> TextBox:
+    out = boxes[0]
+    for b in boxes[1:]:
+        out = union(out, b)
+    return out
+
+# ---- Metin normalize / fuzzy ----
+_TR = str.maketrans("çğıöşüÇĞİÖŞÜÂÎÊÔÛâîêôû", "cgiosuCGIOSU AIEOUa ieou")
+def _norm_text(s: str) -> str:
+    s = (s or "").upper().translate(_TR)
+    s = s.replace("\n", " ")
+    return " ".join(s.split())
+
+def _fuzzy(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm_text(a), _norm_text(b)).ratio()
+
+# ---- Karakter yüksekliğini metin-kutularından kestir ----
+def _alnum_count(s: str) -> int: return sum(ch.isalnum() for ch in (s or ""))
+
+def estimate_h_char_text(boxes: List[TextBox], texts: List[str], default: float=20.0) -> float:
+    cands = []
+    for b,t in zip(boxes, texts):
+        if _alnum_count(t) < 8:           # metin fakir/gürültülü olanı alma
+            continue
+        asp = b.w/max(1.0,b.h)            # çok yatay/ince olmasın
+        if asp < 0.6 or asp > 6.0: 
+            continue
+        if b.h < 8 or b.h > 200: 
+            continue
+        cands.append(b.h)
+    return float(np.median(cands)) if cands else default
+
+# ---- İmza sezgisi (geometri + düşük metin) ----
 def is_signature_box(box: TextBox, text: str, h_char_txt: float) -> bool:
-    # metin az olmalı (OCR hataları vs. için toleranslı)
-    letters_digits = sum(c.isalnum() for c in (text or ""))
-    low_text = letters_digits <= 20
+    a = _alnum_count(text)
+    asp = box.w/max(1.0, box.h)        # imzalar genelde yatay
+    ok_rel_h = (0.6*h_char_txt <= box.h <= 8.0*h_char_txt)
+    ok_abs_h = (12 <= box.h <= 220)    # 600/300 DPI güvenli aralık
+    ok_asp   = (asp >= 1.8 and asp <= 18.0)
+    low_text = (a <= 8)
+    # metin yoksa geometri güçlü; metin varsa bile geometri uygunsa kabul
+    return (low_text and (ok_rel_h or ok_abs_h)) or (ok_asp and ok_abs_h and a <= 20)
 
-    # imzalar genelde yatay-uzun
-    asp = box.w / max(1.0, box.h)            # en-boy oranı
-    ok_asp = 1.3 <= asp <= 10.0
-
-    # karakter yüksekliğine göre göreli yükseklik + mutlak güvenli aralık
-    ok_rel_h = (0.5*h_char_txt <= box.h <= 10.0*h_char_txt)
-    ok_abs_h = (10 <= box.h <= 260)
-
-    # çok yüksek en-boy + çok az metin + makul yükseklik -> imza
-    return (low_text and (ok_rel_h or ok_abs_h) and ok_asp)
-
-
-# ==== 2) Sadece imzayı bir üst kutuya bağla (zincirleme yok) + detaylı DEBUG ====
-def attach_signatures_upward_once(
+# ------------------------------------------------------------
+# 1) İmza kutusunu en yakın ÜSTTEKİ metne ekle (öncelik x-örtüşme)
+#    x-örtüşme yoksa: dar x-band + merkez yakınlığı -> en küçük dikey boşluk
+#    Bir imza yalnız bir kez bağlanır; zaten metin kutusunun içinde ise atlanır.
+# ------------------------------------------------------------
+def attach_signatures_vertical_first(
     boxes: List[TextBox],
     texts: List[str],
-    dbg: bool = False,
-    x_ov_thr: float = 0.30,          # normal bağlama için x-örtüşme eşiği
-    band_pad_frac: float = 0.40,     # fallback x-band yarı genişliği = frac * imza.w
-    max_center_frac: float = 0.60,   # fallback merkez farkı toleransı = frac * imza.w
-    contain_thr: float = 0.85        # imza zaten bir kutunun %85+ içinde ise dokunma
-) -> List[TextBox]:
-
-    if not boxes:
-        return boxes
-
-    # karakter yüksekliği tahmini (sadece metin-benzeri kutulardan)
-    def estimate_h_char_text(boxes, texts, default=20.0):
-        cands=[]
-        for b,t in zip(boxes,texts):
-            a=sum(c.isalnum() for c in (t or ""))
-            if a<8: continue
-            asp=b.w/max(1.0,b.h)
-            if asp<0.6 or asp>6.0: continue
-            if not (8<=b.h<=220): continue
-            cands.append(b.h)
-        import numpy as np
-        return float(np.median(cands)) if cands else default
-
-    def x_overlap_ratio(a: TextBox, b: TextBox) -> float:
-        ax1,ax2=a.x,a.x+a.w; bx1,bx2=b.x,b.x+b.w
-        inter_w=max(0, min(ax2,bx2)-max(ax1,bx1))
-        return 0.0 if min(a.w,b.w)<=0 else inter_w/float(min(a.w,b.w))
-
-    def contains_ratio(outer: TextBox, inner: TextBox) -> float:
-        x1=max(outer.x, inner.x); y1=max(outer.y, inner.y)
-        x2=min(outer.x+outer.w, inner.x+inner.w)
-        y2=min(outer.y+outer.h, inner.y+inner.h)
-        inside=max(0, x2-x1)*max(0, y2-y1)
-        a=max(0, inner.w)*max(0, inner.h)
-        return 0.0 if a==0 else inside/float(a)
-
-    def union(a: TextBox, b: TextBox) -> TextBox:
-        x1=min(a.x,b.x); y1=min(a.y,b.y)
-        x2=max(a.x+a.w, b.x+b.w); y2=max(a.y+a.h, b.y+b.h)
-        return TextBox(x1,y1,x2-x1,y2-y1)
+    detect_fn = is_signature_box,
+    band_pad_frac: float = 0.35,     # imza genişliğine göre band
+    max_center_frac: float = 0.75,   # merkeze uzaklığa tolerans
+    dbg: bool = False
+) -> Tuple[List[TextBox], List[str]]:
+    if not boxes: return boxes, texts
+    n = len(boxes)
+    order = list(range(n))
+    order.sort(key=lambda i: boxes[i].y)  # yukarıdan aşağı
+    used  = [False]*n
+    out_boxes: List[TextBox] = []
+    out_texts: List[str]     = []
 
     h_char_txt = estimate_h_char_text(boxes, texts, default=20.0)
 
-    order = list(range(len(boxes)))
-    order.sort(key=lambda i: boxes[i].y)     # yukarıdan aşağı
+    def _x_overlap_ratio(a: TextBox, b: TextBox) -> float:
+        ax1, ax2 = a.x, a.x+a.w
+        bx1, bx2 = b.x, b.x+b.w
+        inter = max(0, min(ax2, bx2) - max(ax1, bx1))
+        return inter / max(1, min(a.w, b.w))
 
-    used = [False]*len(boxes)
-    out: List[TextBox] = []
-
-    # debug başlık
-    if dbg:
-        print(f"[DBG] h_char_txt ~= {h_char_txt:.1f}px")
-
-    # imza kutusu zaten başka bir kutunun içinde mi?
-    def is_inside_any(i_sig: int) -> bool:
-        b = boxes[i_sig]
-        for j in range(len(boxes)):
-            if j==i_sig: continue
-            if contains_ratio(boxes[j], b) >= contain_thr:
-                return True
-        return False
+    # nearest-above: indekse en yakın üst
+    def _nearest_above_idx(i: int) -> Optional[int]:
+        bi = boxes[i]
+        candidates = []
+        for j in range(n):
+            if j == i or used[j]: continue
+            bj = boxes[j]
+            if bj.y + bj.h <= bi.y:  # üstte olanlar
+                candidates.append((bi.y - (bj.y + bj.h), j))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
     for i in order:
-        if used[i]: 
+        if used[i]:
+            continue
+        b, t = boxes[i], texts[i] if i < len(texts) else ""
+
+        # eğer bu zaten METIN kutusuysa bırak; imza gibi değilse dokunma
+        if not detect_fn(b, t, h_char_txt):
+            out_boxes.append(b); out_texts.append(t); used[i] = True
             continue
 
-        b = boxes[i]
-        t = texts[i] if i < len(texts) else ""
-
-        # her kutu için decision log yaz
-        if dbg:
-            alnum = sum(c.isalnum() for c in (t or ""))
-            asp = b.w/max(1.0,b.h)
-            ok_rel = (0.5*h_char_txt <= b.h <= 10.0*h_char_txt)
-            ok_abs = (10 <= b.h <= 260)
-            ok_asp = (1.3 <= asp <= 10.0)
-            is_sig = is_signature_box(b, t, h_char_txt)
-            print(f"[DBG] i={i} box=({b.x},{b.y},{b.w},{b.h}) "
-                  f"alnum={alnum} h_char={h_char_txt:.1f} ok_rel={ok_rel} "
-                  f"ok_abs={ok_abs} asp={asp:.2f} ok_asp={ok_asp} -> is_sig={is_sig}")
-
-        # imza değilse aynen ekle
-        if not is_signature_box(b, t, h_char_txt):
-            out.append(b); used[i]=True
-            continue
-
-        # imza zaten bir kutunun içinde -> dokunma
-        if is_inside_any(i):
-            if dbg: print(f"[SIG] inside-skip: i={i}")
-            out.append(b); used[i]=True
-            continue
-
-        # 1) normal bağlama: x-örtüşmeli en iyi üst kutu
-        best_j=None; best_ov=0.0
-        for j in range(len(boxes)):
+        # İmza -> önce x-örtüşmeli en iyi üst metin
+        best_j = None; best_xov = 0.0
+        for j in range(n):
             if j==i or used[j]: continue
-            top=boxes[j]
-            if top.y+top.h > b.y:   # sadece üsttekiler
+            top = boxes[j]
+            if top.y + top.h > b.y:   # üstte olmalı
                 continue
-            ov = x_overlap_ratio(top, b)
-            if ov >= x_ov_thr and ov > best_ov:
-                best_ov=ov; best_j=j
+            # eğer imza zaten top'un içinde büyük oranda ise, bağlama gereksiz
+            if (b.x   >= top.x and b.x+b.w <= top.x+top.w and
+                b.y   >= top.y and b.y+b.h <= top.y+top.h):
+                best_j = j; best_xov = 1.0; break
 
-        if best_j is not None:
-            out.append( union(boxes[best_j], b) )
-            used[i]=True; used[best_j]=True
-            if dbg: print(f"[DBG] normal bağlandı: i={i} -> j={best_j}, x-ovl={best_ov:.2f}")
+            xov = _x_overlap_ratio(top, b)
+            if xov > best_xov:
+                best_xov = xov; best_j = j
+
+        if best_j is not None and best_xov > 0.0:
+            # normal x-örtüşmeli bağlama
+            merged = union(boxes[best_j], b)
+            out_boxes.append(merged); out_texts.append(texts[best_j])
+            used[i] = True; used[best_j] = True
+            if dbg: print(f"[SIG] normal bağlandı: i={i} -> j={best_j}, x-ovr={best_xov:.2f}")
             continue
 
         # 2) fallback: dar x-band + merkez yakınlığı ile en yakın üst kutu
@@ -137,33 +145,189 @@ def attach_signatures_upward_once(
         max_dx = max_center_frac * b.w
 
         candidates=[]
-        for j in range(len(boxes)):
+        for j in range(n):
             if j==i or used[j]: continue
             top=boxes[j]
-            if top.y+top.h > b.y: continue
+            if top.y+top.h > b.y: 
+                continue  # üstte olmalı
             in_band = not (top.x + top.w < left or top.x > right)
-            if not in_band: continue
-            cxt = top.x + top.w//2
-            if abs(cxt - cx) > max_dx: continue
-            candidates.append( (b.y - (top.y+top.h), j) )  # dikey mesafe
+            cx_diff = abs((top.x + top.w//2) - cx)
+            if not in_band and cx_diff > max_dx:
+                continue
+            dy = b.y - (top.y+top.h)
+            candidates.append((dy, j))
 
         if candidates:
             candidates.sort()
             j = candidates[0][1]
-            out.append( union(boxes[j], b) )
+            merged = union(boxes[j], b)
+            out_boxes.append(merged); out_texts.append(texts[j])
             used[i]=True; used[j]=True
             if dbg: 
-                print(f"[DBG] FALLBACK bağlandı: i={i} -> j={j} "
-                      f"(band=({left},{right}), |cxΔ|<={max_dx:.1f})")
+                print(f"[SIG] FALLBACK bağlandı: i={i} -> j={j} "
+                      f"(dy={candidates[0][0]}, band_pad={band_pad}, max_dx={max_dx:.1f})")
         else:
-            # üstte hiç kutu yoksa tek bırak
-            if dbg: print(f"[DBG] üstte kutu yok, imza tek bırakıldı: i={i}")
-            out.append(b); used[i]=True
+            # üstte hiç metin yok: imzayı tek bırak
+            out_boxes.append(b); out_texts.append(t)
+            used[i] = True
+            if dbg: print(f"[SIG] üstte aday yok; imza tek bırakıldı: i={i}")
 
-    # kalanları ekle
-    for i in range(len(boxes)):
+    # henüz kullanılmamış kutu kaldıysa ekle (çok nadir)
+    for i in range(n):
         if not used[i]:
-            out.append(boxes[i])
+            out_boxes.append(boxes[i]); out_texts.append(texts[i] if i < len(texts) else "")
 
-    out.sort(key=lambda b: (b.y, b.x))
-    return out
+    return out_boxes, out_texts
+
+# ------------------------------------------------------------
+# 2) Rol bazlı grupla ve final kutuları üret
+#    - Sermaye başlığı ayrı
+#    - Diğer roller: label'dan başlayıp İMZAYA KADAR aşağı in (mesafe önemsiz)
+# ------------------------------------------------------------
+def build_final_boxes(
+    merged_boxes: List[TextBox],
+    ocr_texts: List[str],
+    role_aliases: Dict[str, List[str]],
+    role_priority: List[str],
+    thr: float = 0.72,
+    include_sermaye: bool = True,
+    sermaye_key: str = "sermaye",
+    dbg: bool = False,
+) -> List[TextBox]:
+    assert len(merged_boxes) == len(ocr_texts)
+    if not merged_boxes:
+        return []
+
+    def _best_role(text: str) -> Optional[Tuple[str, float]]:
+        best = None; best_sc = -1.0
+        for role, syns in role_aliases.items():
+            sc = max((_fuzzy(text, s) for s in syns), default=0.0)
+            if sc > best_sc:
+                best_sc = sc; best = role
+        return (best, best_sc) if best_sc >= thr else None
+
+    # rol önceliği aynı satırda çakışmalar için
+    def _role_rank(r: Optional[str]) -> int:
+        if r is None: return 10**6
+        try: return role_priority.index(r)
+        except ValueError: return 10**6 - 1
+
+    # sıralama: y, ardından rol önceliği
+    order = list(range(len(merged_boxes)))
+    order.sort(key=lambda i: (merged_boxes[i].y, _role_rank(_best_role(ocr_texts[i] or "")[0] 
+                                                            if _best_role(ocr_texts[i] or "") else None)))
+
+    # rol etiketleri
+    roles: List[Optional[str]] = [None]*len(merged_boxes)
+    role_scores = [0.0]*len(merged_boxes)
+    for i in range(len(merged_boxes)):
+        br = _best_role(ocr_texts[i] or "")
+        if br:
+            roles[i], role_scores[i] = br
+
+    # final gruplar
+    used = [False]*len(merged_boxes)
+    groups: List[List[int]] = []
+
+    # 2.1 Sermaye özel kuralı (isteğe bağlı)
+    if include_sermaye:
+        for i in order:
+            if used[i]: continue
+            if roles[i] != sermaye_key: continue
+            members = [i]; used[i] = True
+            # rakam içeren satırları 1-2 satır ekle (üstteki kurallarında böyle konuşmuştuk)
+            k = order.index(i) + 1
+            while k < len(order):
+                j = order[k]
+                if used[j]: k += 1; continue
+                if roles[j] is not None and roles[j] != sermaye_key:
+                    break
+                if any(ch.isdigit() for ch in (ocr_texts[j] or "")):
+                    members.append(j); used[j] = True
+                else:
+                    break
+                k += 1
+            groups.append(members)
+            if dbg: print(f"[DBG] sermaye grubu: {members}")
+
+    # 2.2 Diğer roller: label'dan başla, imzaya kadar aşağı in
+    # imza, attach_signatures_vertical_first sonunda metinle birleşmiş olmalı
+    for i in order:
+        if used[i]: continue
+        r = roles[i]
+        if r is None: 
+            continue
+        members = [i]; used[i] = True
+        # Aşağı doğru ilerle (aynı role gelene kadar)
+        k = order.index(i) + 1
+        while k < len(order):
+            j = order[k]
+            if used[j]: k += 1; continue
+            # farklı bir role rastlayınca dur
+            if roles[j] is not None and roles[j] != r:
+                break
+            members.append(j); used[j] = True
+            k += 1
+        groups.append(members)
+
+    # 2.3 Rolü olmayan kalan tekil kutuları tek başına ekle
+    for i in order:
+        if not used[i]:
+            groups.append([i]); used[i] = True
+
+    # 2.4 Grupları kutuya çevir
+    final_boxes: List[TextBox] = []
+    for g in groups:
+        g_boxes = [merged_boxes[idx] for idx in sorted(set(g))]
+        final_boxes.append(union_many(g_boxes))
+
+    # soldan-sağa, yukarıdan-aşağı sırala
+    final_boxes.sort(key=lambda b: (b.y, b.x))
+    return final_boxes
+
+# ============================================================
+#  Kullanım (SENİN akışında tam buradan çağır)
+#  - detected_boxes: modelinden/algoritmandan gelen ilk kutular
+#  - ocr_text_from_box_remote: zaten sende var
+#  - merge_vertical_textboxes: senin “sadece metin bloklarını birleştir” adımı
+# ============================================================
+
+# 1) OCR (sende mevcut fonksiyonla)
+# ocr_texts = [ocr_text_from_box_remote(lower_img, (b.x,b.y,b.w,b.h), NEW_URL) for b in detected_boxes]
+
+# 2) Metin kutularını birleştir (senin fonksiyonun)
+# merged_boxes = merge_vertical_textboxes(detected_boxes)
+
+# 3) (opsiyonel) metinleri, IoU ile birleştirilmiş kutular üzerinden topla
+# merged_texts  = texts_for_merged(merged_boxes, detected_boxes, ocr_texts, iou_thr=0.10)
+
+# 4) İmzaları ÖNCE yukarı bağla (bir imza = bir metin; x-örtüşme yoksa fallback)
+# merged_boxes2, merged_texts2 = attach_signatures_vertical_first(
+#     merged_boxes, merged_texts, detect_fn=is_signature_box, dbg=True
+# )
+
+# 5) Rol sözlüğün (sende var)
+# ROLE_ALIASES = {
+#   "toplanti_baskani": ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
+#   "yk_baskani":       ["YÖNETİM KURULU BAŞKANI", "YK BAŞKANI", "YK BASKANI"],
+#   "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ", "YK ÜYESİ"],
+#   "katip":            ["KATİP", "KATIP"],
+#   "divan_baskani":    ["DİVAN BAŞKANI", "DIVAN BASKANI"],
+#   "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ"],
+#   "sermaye":          ["ŞİRKETİN SERMAYESİ", "SERMAYESI"]
+# }
+# ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
+
+# 6) Final kutuları oluştur
+# final_boxes = build_final_boxes(
+#     merged_boxes2, merged_texts2,
+#     role_aliases=ROLE_ALIASES,
+#     role_priority=ROLE_PRIORITY,
+#     thr=0.72,
+#     include_sermaye=True,   # sermaye bölümü ayrı grupta kalsın
+#     sermaye_key="sermaye",
+#     dbg=True
+# )
+
+# 7) Görselle (sende zaten var)
+# plot_boxes(lower_img, final_boxes, color="r", title="Final Boxes (Grouped + Signature rules)")
