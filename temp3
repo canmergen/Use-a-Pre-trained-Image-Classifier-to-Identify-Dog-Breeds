@@ -1,0 +1,246 @@
+# boxes_from_lower_img.py
+# Gereksinimler: opencv-python (cv2), numpy
+from __future__ import annotations
+import cv2, numpy as np
+from typing import List, Tuple, Dict, Optional
+
+BBox = Tuple[int, int, int, int]  # (x, y, w, h)
+
+# =========================================================
+# 0) Yardımcılar
+# =========================================================
+def _iou(a: BBox, b: BBox) -> float:
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    xi1, yi1 = max(ax, bx), max(ay, by)
+    xi2, yi2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    if inter <= 0: return 0.0
+    return inter / (aw * ah + bw * bh - inter)
+
+def _skeletonize(bin_img: np.ndarray) -> np.ndarray:
+    img = bin_img.copy()
+    skel = np.zeros_like(img)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    while cv2.countNonZero(img) > 0:
+        eroded = cv2.erode(img, element)
+        temp = cv2.dilate(eroded, element)
+        temp = cv2.subtract(img, temp)
+        skel = cv2.bitwise_or(skel, temp)
+        img = eroded
+    return skel
+
+# =========================================================
+# 1) Ön-işleme (deskew + “siyah metin / beyaz zemin” mantığı)
+# =========================================================
+def _deskew_by_lines(gray: np.ndarray, max_angle: float = 8.0) -> np.ndarray:
+    inv = cv2.bitwise_not(gray)
+    edges = cv2.Canny(inv, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 150)
+    angle = 0.0
+    if lines is not None:
+        vals = []
+        for rho, theta in lines[:, 0]:
+            deg = theta * 180 / np.pi - 90
+            if -max_angle <= deg <= max_angle:
+                vals.append(deg)
+        if vals:
+            angle = float(np.median(vals))
+    if abs(angle) < 0.2:
+        return gray
+    h, w = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def _normalize_black_white(gray: np.ndarray) -> np.ndarray:
+    # Amaç: metin/ink = 255 (beyaz), arka plan = 0 (siyah) olacak şekilde invert binary
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    norm = cv2.normalize(blur, None, 0, 255, cv2.NORM_MINMAX)
+    bin_inv = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    return bin_inv  # yazılar/ink = 255
+
+# =========================================================
+# 2) Metin kutuları (Detected → Merged)
+# =========================================================
+def detect_text_boxes(bin_inv: np.ndarray,
+                      min_area: int = 250,
+                      max_area: int = 2_000_000,
+                      kx: int = 25, ky: int = 3) -> List[BBox]:
+    # Morfolojik kapama ile satır/paragraf benzeri bloklar
+    ker = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+    closed = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE, ker, iterations=1)
+    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    H, W = bin_inv.shape[:2]
+    out: List[BBox] = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area, aspect = w * h, w / max(h, 1)
+        if not (min_area <= area <= max_area): continue
+        if h < 10 or w < 15: continue                       # çok ince kırpıntı
+        if aspect > 50 and h < 25: continue                 # yatay çizgi (tablo kenarı) ele
+        out.append((x, y, w, h))
+    return out
+
+def merge_aligned(boxes: List[BBox],
+                  iou_thr: float = 0.05, x_gap: int = 25, y_align: int = 18) -> List[BBox]:
+    # Aynı satırda ve yakın kutuları birleştir.
+    if not boxes: return []
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged: List[List[int]] = [list(boxes[0])]
+    for (bx, by, bw, bh) in boxes[1:]:
+        mx, my, mw, mh = merged[-1]
+        same_row = abs((my + mh // 2) - (by + bh // 2)) <= y_align
+        touching = (bx - (mx + mw)) <= x_gap and (by < my + mh) and ((by + bh) > my)
+        if (same_row and touching) or _iou((mx, my, mw, mh), (bx, by, bw, bh)) > iou_thr:
+            nx = min(mx, bx); ny = min(my, by)
+            nw = max(mx + mw, bx + bw) - nx
+            nh = max(my + mh, by + bh) - ny
+            merged[-1] = [nx, ny, nw, nh]
+        else:
+            merged.append([bx, by, bw, bh])
+    return [tuple(b) for b in merged]  # type: ignore[return-value]
+
+# =========================================================
+# 3) İmza ve damga adayları (lokal, OCR’sız)
+# =========================================================
+def _ink_ratio(patch_inv: np.ndarray) -> float:
+    return float(np.count_nonzero(patch_inv == 255)) / patch_inv.size
+
+def _curviness_score(patch_inv: np.ndarray) -> float:
+    skel = _skeletonize(patch_inv)
+    length = np.count_nonzero(skel == 255)
+    area = np.count_nonzero(patch_inv == 255)
+    return 0.0 if area == 0 else length / area
+
+def detect_signature_and_stamp(bin_inv: np.ndarray,
+                               min_area: int = 1500,
+                               ink_thr: float = 0.02,
+                               curvy_thr: float = 0.12,
+                               circ_thr: float = 0.55) -> Tuple[List[BBox], List[BBox]]:
+    blobs = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)), iterations=1)
+    cnts, _ = cv2.findContours(blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = bin_inv.shape[:2]
+    sigs: List[BBox] = []; stamps: List[BBox] = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if w * h < min_area: continue
+        patch = bin_inv[y:y + h, x:x + w]
+        ink = _ink_ratio(patch)
+        if ink < ink_thr: continue
+
+        (cx, cy), r = cv2.minEnclosingCircle(c)
+        circ_ratio = (np.pi * r * r) / (w * h + 1e-6)
+        curvy = _curviness_score(patch)
+
+        if circ_ratio > circ_thr and curvy < (curvy_thr * 0.8) and 0.3 < (w / max(h,1)) < 3.5:
+            stamps.append((x, y, w, h))
+        elif curvy >= curvy_thr and h < int(0.35 * H):
+            sigs.append((x, y, w, h))
+    return sigs, stamps
+
+# =========================================================
+# 4) Final kural katmanı (yakınlık/hizalama ile grupla)
+# =========================================================
+def group_final(text_merged: List[BBox],
+                signatures: List[BBox],
+                stamps: List[BBox],
+                pair_dx: int = 120, pair_dy: int = 80) -> Dict[str, List[Dict]]:
+    """
+    Amaç: metin bloklarını kendi içlerinde düzenli listelemek ve
+    imza/damgayı en yakın metin bloğuna (aynı sütun/benzer y bandı) iliştirmek.
+    OCR gerektirmez; geometri tabanlı gruplama yapar.
+    """
+    def _center(b: BBox) -> Tuple[int, int]:
+        x, y, w, h = b; return x + w // 2, y + h // 2
+
+    final_groups: List[Dict] = [{'text_box': b, 'sign_box': None, 'stamp_box': None} for b in text_merged]
+
+    # imzayı en yakın text box'a ata (aynı sütun yakını + sınırlı dy)
+    for sig in signatures:
+        sx, sy = _center(sig)
+        best_i, best_d = -1, 1e9
+        for i, g in enumerate(final_groups):
+            x, y, w, h = g['text_box']
+            cx, cy = x + w // 2, y + h // 2
+            if abs(sy - cy) <= pair_dy and abs(sx - cx) <= pair_dx:
+                d = abs(sx - cx) + abs(sy - cy)
+                if d < best_d:
+                    best_d, best_i = d, i
+        if best_i >= 0 and final_groups[best_i]['sign_box'] is None:
+            final_groups[best_i]['sign_box'] = sig
+
+    # damgayı da benzer şekilde ata
+    for st in stamps:
+        sx, sy = _center(st)
+        best_i, best_d = -1, 1e9
+        for i, g in enumerate(final_groups):
+            x, y, w, h = g['text_box']
+            cx, cy = x + w // 2, y + h // 2
+            if abs(sy - cy) <= (pair_dy * 1.2) and abs(sx - cx) <= (pair_dx * 1.2):
+                d = abs(sx - cx) + abs(sy - cy)
+                if d < best_d:
+                    best_d, best_i = d, i
+        if best_i >= 0 and final_groups[best_i]['stamp_box'] is None:
+            final_groups[best_i]['stamp_box'] = st
+
+    return {
+        'text_boxes': text_merged,
+        'signature_boxes': signatures,
+        'stamp_boxes': stamps,
+        'groups': final_groups
+    }
+
+# =========================================================
+# 5) Ana API: lower_img -> Detected/Merged/Final
+# =========================================================
+def build_boxes_from_lower_img(lower_img: np.ndarray,
+                               text_kx: int = 25, text_ky: int = 3,
+                               merge_iou: float = 0.05, merge_x_gap: int = 25, merge_y_align: int = 18,
+                               sig_curvy_thr: float = 0.12, stamp_circ_thr: float = 0.55
+                               ) -> Dict[str, object]:
+    """
+    Girdi: lower_img (BGR veya GRAY). Çıktı: dict
+      - detected_text_boxes: List[BBox]
+      - merged_text_boxes:   List[BBox]
+      - signature_boxes:     List[BBox]
+      - stamp_boxes:         List[BBox]
+      - final:               Dict (gruplar)
+      - bin_inv:             Önişleme sonrası ikili görüntü (debug için)
+    """
+    gray = lower_img if len(lower_img.shape) == 2 else cv2.cvtColor(lower_img, cv2.COLOR_BGR2GRAY)
+    gray = _deskew_by_lines(gray)
+    bin_inv = _normalize_black_white(gray)
+
+    detected = detect_text_boxes(bin_inv, kx=text_kx, ky=text_ky)
+    merged = merge_aligned(detected, iou_thr=merge_iou, x_gap=merge_x_gap, y_align=merge_y_align)
+
+    sigs, stamps = detect_signature_and_stamp(bin_inv, curvy_thr=sig_curvy_thr, circ_thr=stamp_circ_thr)
+    final = group_final(merged, sigs, stamps)
+
+    return {
+        'detected_text_boxes': detected,
+        'merged_text_boxes': merged,
+        'signature_boxes': sigs,
+        'stamp_boxes': stamps,
+        'final': final,
+        'bin_inv': bin_inv
+    }
+
+# =========================================================
+# (Opsiyonel) Görselleştirme
+# =========================================================
+def draw_boxes(img: np.ndarray, boxes: List[BBox], color=(0,255,0), thickness: int=2) -> np.ndarray:
+    out = img.copy()
+    for (x,y,w,h) in boxes:
+        cv2.rectangle(out, (x,y), (x+w, y+h), color, thickness)
+    return out
+
+def draw_final(img: np.ndarray, result: Dict[str, object]) -> np.ndarray:
+    out = img.copy()
+    out = draw_boxes(out, result['merged_text_boxes'], (0, 0, 255), 2)      # kırmızı: text merged
+    out = draw_boxes(out, result['signature_boxes'], (255, 0, 0), 2)        # mavi: imza
+    out = draw_boxes(out, result['stamp_boxes'], (0, 255, 255), 2)          # sarı: damga
+    return out
