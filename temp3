@@ -1,22 +1,15 @@
-# --- Robust signature detection from numpy array (2-pass) ---
+# -*- coding: utf-8 -*-
+# Tek hücre: İmza tespiti (numpy array -> textbox'lar)
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
-import cv2, numpy as np
+from typing import List, Tuple
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
-BBox = Tuple[int,int,int,int]  # (x,y,w,h)
+BBox = Tuple[int, int, int, int]  # (x, y, w, h)
 
-@dataclass
-class _Params:
-    target_height: int = 1600
-    include_stamps: bool = True
-    nms_iou: float = 0.25
-    min_aspect: float = 1.05
-    max_aspect: float = 20.0
-    min_ink_ratio: float = 0.02
-    max_solid: float = 0.975
-    max_circularity_for_signature: float = 0.90
-
+# ---------- Yardımcılar ----------
 def _to_gray_any(img: np.ndarray) -> np.ndarray:
     if img is None:
         raise ValueError("img is None")
@@ -32,7 +25,7 @@ def _to_gray_any(img: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if img.ndim == 3 and img.shape[2] == 4:
         return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported image shape {img.shape}")
+    raise ValueError(f"Unsupported image shape: {img.shape}")
 
 def _resize_keep_aspect(img: np.ndarray, target_h: int):
     h, w = img.shape[:2]
@@ -43,8 +36,12 @@ def _resize_keep_aspect(img: np.ndarray, target_h: int):
     new_h = max(1, int(round(h * scale)))
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR), scale
 
-def _binarize(gray: np.ndarray) -> np.ndarray:
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+def _binarize_clahe(gray: np.ndarray) -> np.ndarray:
+    # Kontrastı yükselt + Otsu
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g2 = clahe.apply(gray)
+    g2 = cv2.GaussianBlur(g2, (3,3), 0)
+    _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return 255 - bw  # ink=255
 
 def _remove_lines(ink: np.ndarray) -> np.ndarray:
@@ -56,27 +53,30 @@ def _remove_lines(ink: np.ndarray) -> np.ndarray:
             cv2.line(work, (x1,y1), (x2,y2), 0, 5)
     return work
 
-def _morph_refine(ink: np.ndarray) -> np.ndarray:
+def _morph_refine(ink: np.ndarray, dilate_iter: int = 0) -> np.ndarray:
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
     k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    closed  = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k_close, 1)
-    opened  = cv2.morphologyEx(closed, cv2.MORPH_OPEN,  k_open,  1)
-    return opened
+    m = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k_close, 1)
+    m = cv2.morphologyEx(m,   cv2.MORPH_OPEN,  k_open,  1)
+    if dilate_iter > 0:
+        k_d = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        m = cv2.dilate(m, k_d, iterations=dilate_iter)
+    return m
 
 def _estimate_min_area(mask: np.ndarray) -> int:
     bin_ = (mask > 0).astype(np.uint8)
     num, _, stats, _ = cv2.connectedComponentsWithStats(bin_, connectivity=8)
     areas, dims = [], []
     for i in range(1, num):
-        x, y, w, h, a = stats[i]
+        x,y,w,h,a = stats[i]
         if w > 1 and h > 1:
-            areas.append(int(a)); dims.append((w, h))
+            areas.append(int(a)); dims.append((w,h))
     if not areas:
         return 96
     areas = np.array(areas, np.float32)
     loga = np.log(areas + 1.0).astype(np.float32)
     loga_norm = cv2.normalize(loga, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    otsu, _ = cv2.threshold(loga_norm, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    otsu,_ = cv2.threshold(loga_norm, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
     alpha = float(otsu) / 255.0
     log_thr = float(loga.min()) + (float(loga.max()) - float(loga.min())) * alpha
     area_otsu = max(1.0, float(np.exp(log_thr) - 1.0))
@@ -89,25 +89,25 @@ def _component_features(mask: np.ndarray, x: int, y: int, w: int, h: int):
     roi = mask[y:y+h, x:x+w]
     area = int(np.count_nonzero(roi))
     ink_ratio = area / float(max(1, w*h))
-    cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts,_ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return area, ink_ratio, 1.0, 1.0
-    cnt = max(cnts, key=cv2.contourArea)
+    cnt  = max(cnts, key=cv2.contourArea)
     hull = cv2.convexHull(cnt)
-    ca = cv2.contourArea(cnt); ha = max(1.0, cv2.contourArea(hull))
+    ca   = cv2.contourArea(cnt); ha = max(1.0, cv2.contourArea(hull))
     solidity = ca / ha
     per = cv2.arcLength(cnt, True)
     circularity = (4.0*np.pi*ca) / (per*per + 1e-6)
     return area, ink_ratio, solidity, circularity
 
-def _nms(boxes: List[Tuple[int,int,int,int]], scores: np.ndarray, iou_thr: float):
+def _nms(boxes, scores, iou_thr: float):
     if not boxes: return []
     b = np.array(boxes, np.float32)
     x1,y1,x2,y2 = b[:,0],b[:,1],b[:,2],b[:,3]
     areas = (x2-x1+1)*(y2-y1+1)
-    order = scores.argsort()[::-1]
+    order = np.argsort(scores)[::-1]
     keep = []
-    while order.size>0:
+    while order.size > 0:
         i = order[0]
         keep.append(i)
         xx1 = np.maximum(x1[i], x1[order[1:]])
@@ -121,56 +121,110 @@ def _nms(boxes: List[Tuple[int,int,int,int]], scores: np.ndarray, iou_thr: float
         order = order[inds + 1]
     return [boxes[i] for i in keep]
 
-def _detect_once(img: np.ndarray, p: _Params) -> List[BBox]:
-    # ölçek + binarizasyon
-    work, _ = _resize_keep_aspect(img, p.target_height)
+def _merge_adjacent_horizontals(boxes: List[Tuple[int,int,int,int]], max_gap: int = 16):
+    if not boxes: return boxes
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged = []
+    cur = list(boxes[0])
+    for b in boxes[1:]:
+        same_row = abs(b[1]-cur[1]) < max(b[3]-b[1], cur[3]-cur[1]) * 0.5
+        touching = b[0] - cur[2] <= max_gap
+        if same_row and touching:
+            cur[2] = max(cur[2], b[2]); cur[3] = max(cur[3], b[3])
+        else:
+            merged.append(tuple(cur)); cur = list(b)
+    merged.append(tuple(cur))
+    return merged
+
+@dataclass
+class _Params:
+    target_height: int = 1600
+    include_stamps: bool = True
+    nms_iou: float = 0.25
+    min_aspect: float = 1.00       # gevşettim
+    max_aspect: float = 22.0
+    min_ink_ratio: float = 0.015   # gevşettim
+    max_solid: float = 0.975
+    max_circularity_for_signature: float = 0.92
+
+def _detect_once(img: np.ndarray, p: _Params, dilate_iter: int = 0) -> List[BBox]:
+    # Ölçekle ve ikili maske oluştur
+    work, scale = _resize_keep_aspect(img, p.target_height)
     gray = _to_gray_any(work)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
-    ink  = _binarize(gray)
+    ink  = _binarize_clahe(gray)
     ink  = _remove_lines(ink)
-    ink  = _morph_refine(ink)
+    ink  = _morph_refine(ink, dilate_iter=dilate_iter)
 
     min_area = _estimate_min_area(ink)
     num, _, stats, _ = cv2.connectedComponentsWithStats((ink>0).astype(np.uint8), connectivity=8)
 
     H, W = ink.shape[:2]; page_area = H*W
-    cands, scores = [], []
+    boxes_rsz, scores = [], []
+
     for i in range(1, num):
         x,y,w,h,_ = stats[i]
-        if w <= 2 or h <= 2: continue
+        if w <= 2 or h <= 2: 
+            continue
         A = w*h
-        if A < min_area or A > 0.35*page_area: continue
+        if A < min_area or A > 0.35*page_area:
+            continue
         aspect = w/float(h)
-        if not (p.min_aspect <= aspect <= p.max_aspect): continue
+        if not (p.min_aspect <= aspect <= p.max_aspect):
+            continue
         _, ink_ratio, solidity, circ = _component_features(ink, x, y, w, h)
-        if ink_ratio < p.min_ink_ratio: continue
+        if ink_ratio < p.min_ink_ratio:
+            continue
         if not p.include_stamps:
-            if solidity > p.max_solid or circ > p.max_circularity_for_signature: 
+            if solidity > p.max_solid or circ > p.max_circularity_for_signature:
                 continue
-        cands.append((int(x),int(y),int(x+w),int(y+h)))
+        boxes_rsz.append((int(x), int(y), int(x+w), int(y+h)))
         scores.append(float(ink_ratio))
 
-    if not cands:
+    if not boxes_rsz:
         return []
-    boxes = _nms(cands, np.array(scores, np.float32), p.nms_iou)
-    # kesin Python tuple/int döndür
-    return [(int(x1), int(y1), int(x2-x1), int(y2-y1)) for (x1,y1,x2,y2) in boxes]
 
-def robust_detect_signatures_from_array(img: np.ndarray,
-                                        include_stamps: bool = True) -> List[BBox]:
+    # NMS + yatay birleştirme (resized uzayında)
+    keep = _nms(boxes_rsz, np.array(scores, np.float32), p.nms_iou)
+    keep = _merge_adjacent_horizontals(keep, max_gap=18)
+
+    # Orijinal ölçeğe geri dön
+    inv = 1.0 / float(scale)
+    boxes_org = []
+    for (x1,y1,x2,y2) in keep:
+        X1 = int(round(x1 * inv)); Y1 = int(round(y1 * inv))
+        X2 = int(round(x2 * inv)); Y2 = int(round(y2 * inv))
+        boxes_org.append((X1, Y1, X2 - X1, Y2 - Y1))
+    return boxes_org
+
+# ---------- KAMU API (tek çağrı) ----------
+def detect_signatures(img: np.ndarray, include_stamps: bool = True) -> List[BBox]:
     """
-    2 geçişli sağlam tespit:
-      1) Normal eşikler
-      2) Sonuç yoksa eşikleri gevşet (küçük paraf/soluk imza için)
+    Numpy array üzerinden imza/damga textbox'ları.
+    2-geçişli: normal -> sonuç yoksa agresif.
     """
-    # Pass-1
-    p1 = _Params(include_stamps=include_stamps,
-                 target_height=1600, min_aspect=1.05, min_ink_ratio=0.02)
-    boxes = _detect_once(img, p1)
+    # Pass-1 (normal)
+    p1 = _Params(include_stamps=include_stamps, target_height=1600,
+                 min_aspect=1.0, min_ink_ratio=0.015)
+    boxes = _detect_once(img, p1, dilate_iter=0)
     if boxes:
-        return boxes
+        return [(int(x), int(y), int(w), int(h)) for (x,y,w,h) in boxes]
 
-    # Pass-2 (aggressive)
-    p2 = _Params(include_stamps=include_stamps,
-                 target_height=2000, min_aspect=0.60, min_ink_ratio=0.010)
-    return _detect_once(img, p2)
+    # Pass-2 (agresif: daha yüksek çözünürlük ve dilate)
+    p2 = _Params(include_stamps=include_stamps, target_height=2100,
+                 min_aspect=0.6, min_ink_ratio=0.008)
+    boxes = _detect_once(img, p2, dilate_iter=1)
+    return [(int(x), int(y), int(w), int(h)) for (x,y,w,h) in boxes]
+
+# ---------- Görselleştirme (isteğe bağlı) ----------
+def visualize_boxes(img: np.ndarray, boxes: List[BBox]) -> None:
+    vis = img.copy()
+    for (x,y,w,h) in boxes:
+        cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
+    plt.figure(figsize=(10,6))
+    if vis.ndim == 3:
+        plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+    else:
+        plt.imshow(vis, cmap='gray')
+    plt.axis("off")
+    plt.title("Detected signatures")
+    plt.show()
