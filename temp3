@@ -1,226 +1,402 @@
-# -*- coding: utf-8 -*-
-# Dinamik, çok-ölçekli, çok-eşikli imza/paraf/damga tespiti (yalnızca OpenCV+NumPy)
-
-from typing import List, Tuple
-from dataclasses import dataclass
+from typing import Any, List, Tuple, Dict, Optional
+import re, unicodedata
 import numpy as np
-import cv2
-import matplotlib.pyplot as plt
+import pandas as pd
+from rapidfuzz import fuzz, process
 
-BBox = Tuple[int,int,int,int]  # (x,y,w,h)
+# ---- TEK GİRİŞ NOKTASI ------------------------------------------------------
+def run_perbox_pipeline(
+    lower_img: np.ndarray,
+    result: Dict[str, Any],
+    table_df_final: pd.DataFrame,
+    NEW_URL: str,
+    known_names: Optional[List[str]] = None,
+    role_threshold: float = 0.80,
+    name_sim_threshold: float = 0.80,
+    psm_list: Tuple[int,...] = (11, 6, 7),
+    oem_list: Tuple[int,...] = (1, 3),
+    lang: str = "tur+eng",
+    debug: bool = True,
+) -> Tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
+    """
+    - Kutu OCR -> role + name çıkarımı (çoklu PSM/OEM, en iyi okuma seçimi)
+    - name_in_box: bilinen isimlere map + aksan geri kazanımı + çoklu isim desteği
+    - per_box_df: role_best bazında yakın mükerrer isimleri eler (ilkini bırakır)
+    - bottom_df: rol kolonlarını doldurur, sermaye_toplam_tl çıkarır, yedekle doldurur
+    Döndürür: (vis, per_box_df, bottom_df)
+    """
 
-# ---------- Yardımcılar ----------
-def _to_gray_any(img: np.ndarray) -> np.ndarray:
-    if img is None: raise ValueError("img is None")
-    if img.dtype != np.uint8:
-        img = (np.clip(img,0,1)*255).astype(np.uint8) if img.dtype in (np.float32,np.float64) else img.astype(np.uint8)
-    if img.ndim == 2: return img
-    if img.ndim == 3 and img.shape[2] == 3: return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if img.ndim == 3 and img.shape[2] == 4: return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported shape: {img.shape}")
+    # ---------------------------- Yardımcılar (lokal) -------------------------
+    def _strip_diacritics(s: str) -> str:
+        return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
-def _resize_keep_aspect(img: np.ndarray, target_h: int):
-    h, w = img.shape[:2]
-    s = target_h / float(h)
-    if abs(s-1.0) < 1e-3: return img.copy(), 1.0
-    return cv2.resize(img, (max(1,int(round(w*s))), max(1,int(round(h*s)))), cv2.INTER_LINEAR), s
+    def _NORM(s: str) -> str:
+        s = (s or "").upper().strip()
+        s = _strip_diacritics(s)
+        return re.sub(r"\s+", " ", s)
 
-def _binarize_union(gray: np.ndarray) -> np.ndarray:
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8,8))
-    g = clahe.apply(gray)
-    g = cv2.GaussianBlur(g, (3,3), 0)
-    _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU); otsu = 255 - otsu
-    adp = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7)
-    kbh = cv2.getStructuringElement(cv2.MORPH_RECT, (25,25))
-    bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, kbh); _, bh = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    return np.maximum(np.maximum(otsu, adp), bh)  # ink=255
+    def _TOKS(s: str) -> List[str]:
+        return [t for t in _NORM(s).split() if t]
 
-def _remove_lines(ink: np.ndarray) -> np.ndarray:
-    e = cv2.Canny(ink, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(e, 1, np.pi/180, threshold=140, minLineLength=120, maxLineGap=6)
-    out = ink.copy()
-    if lines is not None:
-        for x1,y1,x2,y2 in lines[:,0]:
-            cv2.line(out, (x1,y1), (x2,y2), 0, 5)
-    return out
+    def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
+        if isinstance(b, (tuple, list, np.ndarray)) and len(b) == 4:
+            x,y,w,h = [int(round(float(v))) for v in b]
+            return (x,y,w,h)
+        if isinstance(b, dict) and all(k in b for k in ("x","y","w","h")):
+            return (int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"]))
+        if isinstance(b, dict) and all(k in b for k in ("x0","y0","x1","y1")):
+            return (int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"]))
+        return None
 
-def _morph(ink: np.ndarray, close=5, open_=3, dilate_iter=0) -> np.ndarray:
-    k1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close,close))
-    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_,open_))
-    m  = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k1, 1)
-    m  = cv2.morphologyEx(m,   cv2.MORPH_OPEN,  k2, 1)
-    if dilate_iter>0:
-        kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-        m = cv2.dilate(m, kd, iterations=dilate_iter)
-    return m
+    def _to_xyxy(b: Any) -> Tuple[int,int,int,int]:
+        x,y,w,h = _to_xywh(b)
+        return (x, y, x+w, y+h)
 
-def _estimate_min_area(mask: np.ndarray) -> int:
-    bin_ = (mask>0).astype(np.uint8)
-    num, _, stats, _ = cv2.connectedComponentsWithStats(bin_, 8)
-    areas, dims = [], []
-    for i in range(1,num):
-        x,y,w,h,a = stats[i]
-        if w>1 and h>1: areas.append(int(a)); dims.append((w,h))
-    if not areas: return 96
-    areas = np.array(areas, np.float32)
-    loga  = np.log(areas+1.0).astype(np.float32)
-    logn  = cv2.normalize(loga, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    otsu,_= cv2.threshold(logn, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    alpha = float(otsu)/255.0
-    thr   = float(loga.min()) + (float(loga.max())-float(loga.min()))*alpha
-    a_otsu= max(1.0, float(np.exp(thr)-1.0))
-    dims  = np.array(dims, np.float32)
-    sw    = float(np.median(dims.min(1)))
-    a_floor = (max(1.0, sw)*6.0)**2
-    return int(max(a_otsu*1.3, a_floor, 96.0))
+    def _expand_xyxy(b: Tuple[int,int,int,int], px: int = 3) -> Tuple[int,int,int,int]:
+        x1,y1,x2,y2 = b
+        return (x1-px, y1-px, x2+px, y2+px)
 
-def _features(mask: np.ndarray, x:int,y:int,w:int,h:int):
-    roi = mask[y:y+h, x:x+w]
-    area = int(np.count_nonzero(roi))
-    ink_ratio = area / float(max(1,w*h))
-    cnts,_ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts: return area, ink_ratio, 1.0, 1.0, 0.0
-    cnt  = max(cnts, key=cv2.contourArea)
-    hull = cv2.convexHull(cnt)
-    ca   = cv2.contourArea(cnt); ha = max(1.0, cv2.contourArea(hull))
-    solidity = ca/ha
-    per  = cv2.arcLength(cnt, True)
-    circ = (4.0*np.pi*ca)/(per*per + 1e-6)
-    dt   = cv2.distanceTransform((roi>0).astype(np.uint8), cv2.DIST_L2, 3)
-    stroke = float(dt[dt>0].mean()*2.0) if np.any(dt>0) else 0.0
-    return area, ink_ratio, solidity, circ, stroke
+    def _contains(outer, inner, pad=2) -> bool:
+        ox1,oy1,ox2,oy2 = _expand_xyxy(outer, pad)
+        ix1,iy1,ix2,iy2 = inner
+        return (ix1 >= ox1) and (iy1 >= oy1) and (ix2 <= ox2) and (iy2 <= oy2)
 
-def _nms(boxes: List[Tuple[int,int,int,int]], scores: np.ndarray, iou_thr: float):
-    if not boxes: return []
-    b = np.array(boxes, np.float32)
-    x1,y1,x2,y2 = b[:,0],b[:,1],b[:,2],b[:,3]
-    areas = (x2-x1+1)*(y2-y1+1)
-    order = scores.argsort()[::-1]
-    keep=[]
-    while order.size>0:
-        i=order[0]; keep.append(i)
-        xx1 = np.maximum(x1[i], x1[order[1:]]); yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]]); yy2 = np.minimum(y2[i], y2[order[1:]])
-        w = np.maximum(0.0, xx2-xx1+1); h = np.maximum(0.0, yy2-yy1+1)
-        inter = w*h
-        iou = inter/(areas[i]+areas[order[1:]]-inter+1e-6)
-        inds = np.where(iou<=iou_thr)[0]
-        order = order[inds+1]
-    return [boxes[i] for i in keep]
+    def _iou(a, b) -> float:
+        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
+        ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+        ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+        iw,ih = max(0, ix2-ix1), max(0, iy2-iy1)
+        inter = iw*ih
+        if inter == 0: return 0.0
+        aarea = (ax2-ax1)*(ay2-ay1); barea = (bx2-bx1)*(by2-by1)
+        return inter / float(aarea + barea - inter + 1e-9)
 
-def _merge_horizontals(boxes: List[Tuple[int,int,int,int]], max_gap:int=18):
-    if not boxes: return boxes
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    out=[]; cur=list(boxes[0])
-    for b in boxes[1:]:
-        same_row = abs(b[1]-cur[1]) < max(b[3]-b[1], cur[3]-cur[1]) * 0.6
-        touching = b[0] - cur[2] <= max_gap
-        if same_row and touching:
-            cur[2]=max(cur[2],b[2]); cur[3]=max(cur[3],b[3])
+    # Rol alias seti
+    ROLE_ALIASES: Dict[str, List[str]] = {
+        "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
+        "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
+        "katip":               ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
+        "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
+    }
+    ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
+
+    def _alias_score(text_u: str, alias: str) -> float:
+        t = _NORM(text_u); a = _NORM(alias)
+        toks_t, toks_a = t.split(), a.split()
+        if not toks_t or not toks_a:
+            return fuzz.token_sort_ratio(t, a)/100.0
+        return float(np.mean([max(fuzz.token_sort_ratio(ta,tb)/100.0 for tb in toks_t) for ta in toks_a]))
+
+    def best_role_for_text(text_u: str) -> Tuple[Optional[str], float]:
+        best_role, best_score = None, 0.0
+        for rk, aliases in ROLE_ALIASES.items():
+            score = max(_alias_score(text_u, a) for a in aliases)
+            if (score > best_score) or (abs(score - best_score) < 1e-6 and (best_role is None or ROLE_PRIORITY.index(rk) < ROLE_PRIORITY.index(best_role))):
+                best_role, best_score = rk, score
+        return best_role, float(best_score)
+
+    # Çoklu PSM/OEM ile en iyi OCR
+    def _score_text(s: str, known_names_u: List[str]) -> float:
+        if not s: return -1e9
+        t = s.strip()
+        # harf sayısı, çöp karakter cezası, bilinen token eşleşmesi
+        letters = len(re.findall(r"[A-Za-zÇĞİÖŞÜçğışöü]", t))
+        bads    = len(re.findall(r"[^A-Za-zÇĞİÖŞÜçğışöü0-9\s,.;:/\-()]", t))
+        capsSeq = len(re.findall(r"\b[A-ZÇĞİÖŞÜ][a-zçğıöşü']+\b", t))
+        # bilinen isim/alias ile benzerlik sinyali
+        pools = known_names_u[:]
+        for al in sum(ROLE_ALIASES.values(), []): pools.append(al)
+        simsig = 0.0
+        if pools:
+            best = process.extractOne(t, pools, scorer=fuzz.token_set_ratio)
+            simsig = (best[1]/100.0) if best else 0.0
+        return 1.0*letters - 2.0*bads + 0.2*capsSeq + 2.0*simsig
+
+    def ocr_multi_read(img: np.ndarray, box_xywh: Tuple[int,int,int,int]) -> str:
+        # Hafif pad: Tesseract'ın keskin sınırdan etkilenmesini önler
+        x,y,w,h = box_xywh
+        pad = max(2, int(0.02*max(w,h)))
+        x1, y1 = max(0, x-pad), max(0, y-pad)
+        x2, y2 = min(img.shape[1], x+w+pad), min(img.shape[0], y+h+pad)
+        b2 = (x1, y1, x2-x1, y2-y1)
+
+        candidates = []
+        known_u = [ _NORM(k) for k in (known_names or []) ]
+        for psm in psm_list:
+            for oem in oem_list:
+                try:
+                    txt = ocr_text_from_box_remote(img, b2, lang=lang, psm=psm, oem=oem, url=NEW_URL)
+                except Exception:
+                    txt = ""
+                candidates.append((txt, psm, oem, _score_text(txt, known_u)))
+        # En iyi skorlu metni seç
+        candidates.sort(key=lambda t: t[3], reverse=True)
+        return candidates[0][0] if candidates else ""
+
+    # İsim çıkarımı ve bilinene yükseltme
+    DROP_ROLE_WORDS = {"TOPLANTI","BAŞKANI","BAŞKAN","YÖNETİM","KURULU","ÜYESİ","ÜYE","YAZMAN","YAZMANI","KATİP","KÂTİP","TEMSİLCİSİ","BAKANLIK","DİVAN","DIVAN","OY","TOPLAMA","MEMURU"}
+
+    def extract_person_names(text: str) -> List[str]:
+        # Title-case yakalama (en güvenilir)
+        t = text.replace("\n", " ")
+        tmp = []
+        for m in re.finditer(r"\b([A-ZÇĞİÖŞÜ][a-zçğıöşü’']+(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü’']+){1,3})\b", t):
+            cand = m.group(1).strip()
+            toks = cand.split()
+            if len(toks) >= 2 and not any(tok.upper() in DROP_ROLE_WORDS for tok in toks):
+                tmp.append(cand)
+        # ALL-CAPS fallback
+        if not tmp:
+            u = _NORM(text)
+            for m in re.finditer(r"[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,})+", u):
+                tmp.append(m.group(0).title())
+        # sırayı koruyarak tekilleştir
+        out, seen = [], set()
+        for x in tmp:
+            if x not in seen: seen.add(x); out.append(x)
+        return out
+
+    def promote_to_known_fullname(name_in: Optional[str], ctx: Optional[str]) -> Optional[str]:
+        if not name_in: return None
+        if known_names:
+            # bağlam-odaklı fuzzy (token_set + partial)
+            best, best_s = None, 0.0
+            for kn in known_names:
+                s1 = fuzz.token_set_ratio(name_in, kn)/100.0
+                s2 = fuzz.partial_ratio(name_in, kn)/100.0
+                s  = max(s1, s2)
+                # soyad harfi/soyad bağlam ipucu
+                if ctx:
+                    kt = _TOKS(kn)
+                    last = kt[-1] if kt else ""
+                    if last and (_NORM(last) in _NORM(ctx) or (len(last) > 0 and f"{last[0]}." in _NORM(ctx))):
+                        s += 0.15
+                if s > best_s: best_s, best = s, kn
+            if best and best_s >= name_sim_threshold:
+                return best  # aksan korunur
+        # bilinmeyense normalize etmeden sadeleştir
+        return " ".join(p.strip() for p in str(name_in).split())
+
+    def extract_name_after_role(text: str, role_key: Optional[str]) -> Optional[str]:
+        if not role_key: return None
+        NAME_RE = r"([A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+(?:\s+[A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+){1,3})"
+        for ali in ROLE_ALIASES.get(role_key, []):
+            m = re.search(rf"{re.escape(ali)}\s*[:-–—]?\s*{NAME_RE}", text, flags=re.IGNORECASE)
+            if m:
+                cand = m.group(1).strip()
+                toks = cand.split()
+                if len(toks) >= 2 and not any(tok.upper() in DROP_ROLE_WORDS for tok in toks):
+                    return cand
+        return None
+
+    def dedupe_names_within_role(per_box_df: pd.DataFrame) -> pd.DataFrame:
+        """role_best bazında 'yakın aynı' isimlerin tekrarını temizle (ilkini bırak)."""
+        def canon(s: str) -> str:
+            return re.sub(r"[^A-ZÇĞİÖŞÜ0-9]", "", _NORM(s))
+        keep = []
+        seen_by_role: Dict[str, List[str]] = {}
+        for _, r in per_box_df.iterrows():
+            role = r.get("role_best")
+            name = r.get("name_in_box")
+            if not role or not isinstance(name, str) or not name.strip():
+                keep.append(name); continue
+            parts = [p.strip() for p in name.split(";")]
+            accepted = []
+            for p in parts:
+                c = canon(p)
+                if not c: continue
+                prev = seen_by_role.setdefault(role, [])
+                # yakınlık eşiği: 90
+                is_dup = any(fuzz.ratio(c, q) >= 90 for q in prev)
+                if not is_dup:
+                    accepted.append(p)
+                    prev.append(c)
+            keep.append("; ".join(accepted) if accepted else None)
+        per_box_df = per_box_df.copy()
+        per_box_df["name_in_box"] = keep
+        return per_box_df
+
+    def normalize_boxes(boxes: List[Any]) -> List[Tuple[int,int,int,int]]:
+        out=[]
+        for b in boxes:
+            xywh = _to_xywh(b)
+            if xywh is None: continue
+            x,y,w,h = xywh
+            if w>0 and h>0: out.append((x,y,w,h))
+        return out
+
+    # Metinden TL değeri seçimi (başlık yakınlığı + ipucu)
+    TL_HINTS = ("TL","₺","LIRA","LİRA","TURK LIRASI","TÜRK LİRASI","TRY","DEĞER","DEGER","İTİBARİ","ITIBARI","TOPLAMI")
+    def _is_plain_11_digit(s: str) -> bool:
+        return bool(re.fullmatch(r"\d{11}", s))
+
+    def _amount_candidates_with_scores(text: str):
+        cands=[]
+        # 1) binlik ayraçlı
+        for m in re.finditer(r"\b(\d{1,3}(?:\.\d{3})+)(?:[,.]\d{2})?\b", text):
+            raw = m.group(1); val = int(raw.replace(".",""))
+            win = text[max(0, m.start()-12): m.end()+12].upper()
+            sc = 1.0 + (0.5 if any(h in win for h in TL_HINTS) else 0.0)
+            cands.append((val, sc))
+        # 2) düz sayılar (TCKN 11 hane hariç)
+        for m in re.finditer(r"\b(\d{6,12})\b", text):
+            raw = m.group(1)
+            if _is_plain_11_digit(raw): continue
+            val = int(raw)
+            win = text[max(0, m.start()-8): m.end()+8].upper()
+            sc = 0.4 + (0.4 if any(h in win for h in TL_HINTS) else 0.0)
+            cands.append((val, sc))
+        return cands
+
+    def _extract_sermaye(texts: List[str]) -> Optional[int]:
+        # etiket skoru
+        cap_keys = ["SERMAYE","SERMAYESI","SERMAYESİ","TOPLAM","TOPLAMI","TOPLAM ITIBARI DEGER","TOPLAM İTİBARİ DEĞER","PAYLARIN TOPLAMI","DEGERI","DEĞERİ","DEGER","DEĞER"]
+        scored = [(sum(1 for k in cap_keys if k in _NORM(t)), i) for i,t in enumerate(texts)]
+        label_idxs = [i for sc,i in sorted(scored, reverse=True) if sc>0][:3]
+        best_v, best_s = None, -1.0
+        for idx in label_idxs:
+            for j in (idx-1, idx, idx+1):
+                if 0 <= j < len(texts):
+                    for v, s in _amount_candidates_with_scores(texts[j]):
+                        if s>best_s or (s==best_s and (best_v is None or v>best_v)):
+                            best_v, best_s = v, s
+        if best_v is not None: return best_v
+        # global fallback
+        for t in texts:
+            for v, s in _amount_candidates_with_scores(t):
+                if s>best_s or (s==best_s and (best_v is None or v>best_v)):
+                    best_v, best_s = v, s
+        return best_v
+
+    # ---------------------------- Hazırlık ------------------------------------
+    if known_names is None:
+        if "pay_sahibinin_ad_soyadi_unvani" in table_df_final.columns:
+            known_names = list(table_df_final["pay_sahibinin_ad_soyadi_unvani"].dropna().astype(str).values)
         else:
-            out.append(tuple(cur)); cur=list(b)
-    out.append(tuple(cur)); return out
+            known_names = []
 
-# ---------- Dinamik dedektör ----------
-@dataclass
-class _P:
-    target_height:int
-    min_aspect:float
-    min_ink_ratio:float
-    min_stroke:float
-    include_stamps:bool=True
+    boxes_xywh = normalize_boxes(result.get("final", []))
+    boxes_xyxy = [_to_xyxy(b) for b in boxes_xywh]
+    sig_xyxy = []
+    for sb in result.get("sigs", []):
+        try: sig_xyxy.append(_to_xyxy(sb))
+        except: pass
 
-def _detect_once(img: np.ndarray, p:_P, dilate_iter:int, min_area_scale:float, nms_iou:float=0.25):
-    work, s = _resize_keep_aspect(img, p.target_height)
-    gray   = _to_gray_any(work)
-    ink    = _binarize_union(gray)
-    ink    = _remove_lines(ink)
-    ink    = _morph(ink, close=5, open_=3, dilate_iter=dilate_iter)
-    min_area = max(32, int(_estimate_min_area(ink)*float(min_area_scale)))
+    # Görselleştirme
+    vis = lower_img.copy()
+    if vis.ndim == 2:
+        import cv2
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    import cv2
+    for i,(x,y,w,h) in enumerate(boxes_xywh):
+        cv2.rectangle(vis,(x,y),(x+w,y+h),(0,200,0),2)
+        cv2.putText(vis,str(i),(x+4,y+18),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,120,0),2,cv2.LINE_AA)
 
-    num, _, stats, _ = cv2.connectedComponentsWithStats((ink>0).astype(np.uint8), 8)
-    H,W = ink.shape[:2]; page_area = H*W
+    # ---------------------------- OCR & çıkarım -------------------------------
+    rows = []
+    for i, (b_xywh, b_xyxy) in enumerate(zip(boxes_xywh, boxes_xyxy)):
+        txt = ocr_multi_read(lower_img, b_xywh)               # <— çoklu deneme
+        role, rscore = best_role_for_text(txt)
+        # imza temas
+        sig_hit = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.03 for s in sig_xyxy)
 
-    cand, scores = [], []
-    for i in range(1,num):
-        x,y,w,h,a = stats[i]
-        if w<=2 or h<=2: continue
-        A = w*h
-        if A < min_area or A > 0.40*page_area: continue
-        aspect = w/float(h)
-        if aspect < p.min_aspect or aspect > 22.0: continue
+        # isim adayları
+        primary_names = extract_person_names(txt)              # birden fazla olabilir
+        names_promoted = [promote_to_known_fullname(n, txt) for n in primary_names]
+        names_promoted = [n for n in names_promoted if n]
 
-        _, ink_ratio, solidity, circ, stroke = _features(ink, x,y,w,h)
-        if ink_ratio < p.min_ink_ratio: continue
-        if stroke < p.min_stroke: continue
-        if not p.include_stamps:
-            if solidity > 0.975 or circ > 0.92:   # damga/kaşe ele
-                continue
+        # rol-sonrası kalıp: "ROL: Ad Soyad"
+        if not names_promoted:
+            after = extract_name_after_role(txt, role)
+            if after:
+                p = promote_to_known_fullname(after, txt)
+                if p: names_promoted = [p]
 
-        cand.append((int(x),int(y),int(x+w),int(y+h)))
-        score = float(ink_ratio * (1.2 - min(1.0,solidity)) * (1.05 - min(1.0,circ)) * (0.5 + min(stroke,3.0)/3.0))
-        scores.append(score)
+        name_in_box = "; ".join(dict.fromkeys(names_promoted)) if names_promoted else None
+        rows.append({
+            "i": i,
+            "bbox": b_xywh,
+            "sig": bool(sig_hit),
+            "role_best": role if rscore >= role_threshold else None,
+            "role_score": float(rscore),
+            "name_in_box": name_in_box,
+            "text_preview": re.sub(r"\s+"," ", txt)[:200]
+        })
 
-    if not cand: return []
+    per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_best","role_score","name_in_box","text_preview"])
 
-    keep = _nms(cand, np.array(scores,np.float32), nms_iou)
-    keep = _merge_horizontals(keep, max_gap=18)
+    # role_best bazında mükerrer veya çok yakın isimleri temizle
+    per_box_df = dedupe_names_within_role(per_box_df)
 
-    inv = 1.0/s
-    return [(int(round(x1*inv)),int(round(y1*inv)),int(round((x2-x1)*inv)),int(round((y2-y1)*inv))) for (x1,y1,x2,y2) in keep]
+    if debug:
+        print(f"[INFO] {len(per_box_df)} box")
+        try:
+            from IPython.display import display
+            display(per_box_df)
+        except Exception:
+            pass
 
-def detect_signatures_dynamic(img: np.ndarray, include_stamps: bool=True) -> List[BBox]:
-    """
-    Tam dinamik tespit: görüntüden istatistik çıkar, çok-ölçek + çok-eşik gridini otomatik kur,
-    sonuçları birleştir (NMS) ve (x,y,w,h) döndür.
-    """
-    H, W = img.shape[:2]
+    # ---------------------------- bottom_df -----------------------------------
+    texts = [str(r.get("text_preview") or "") for _, r in per_box_df.iterrows()]
+    sermaye = _extract_sermaye(texts)
 
-    # Görüntü tabanlı otomatik grid:
-    # sayfa yüksekliği küçükse ölçek listesi daraltılır
-    base_scales = [1400, 1700, 2000, 2300] if H < 2200 else [1600, 2000, 2400, 2800]
-    # tahmini gürültü/doluluk → daha boş sayfada daha gevşek eşikler
-    gray = _to_gray_any(img); ink0 = _binarize_union(gray)
-    ink_density = float(np.count_nonzero(ink0))/float(H*W + 1e-6)
+    out = {
+        "sermaye_toplam_tl": sermaye,
+        "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
+        "tutanak_yazmani_ad_soyad":  None, "tutanak_yazmani_imza_var_mi":  None,
+        "bakanlik_temsilcisi_ad_soyad": None, "bakanlik_temsilcisi_imza_var_mi": None,
+        "yk_uyesi_ad_soyad": None, "yk_uyesi_imza_var_mi": None,
+        "yk_baskani_ad_soyad": None, "yk_baskani_imza_var_mi": None,
+        "katip_ad_soyad": None, "katip_imza_var_mi": None,
+        "divan_baskani_ad_soyad": None, "divan_baskani_imza_var_mi": None,
+    }
+    name_cols = {
+        "toplanti_baskani":"toplanti_baskani_ad_soyad",
+        "tutanak_yazmani":"tutanak_yazmani_ad_soyad",
+        "bakanlik_temsilcisi":"bakanlik_temsilcisi_ad_soyad",
+        "yk_uyesi":"yk_uyesi_ad_soyad",
+        "yk_baskani":"yk_baskani_ad_soyad",
+        "katip":"katip_ad_soyad",
+        "divan_baskani":"divan_baskani_ad_soyad",
+    }
+    sig_cols = {k: v.replace("_ad_soyad","_imza_var_mi") for k,v in name_cols.items()}
 
-    if ink_density < 0.08:
-        min_ink_list = [0.010, 0.006, 0.003]   # çok boş: paraflar zayıf olabilir
-        stroke_list  = [0.7, 0.6, 0.5]
-        min_area_scales = [1.0, 0.7, 0.45]
-        dilates = [0,1,2]
-    else:
-        min_ink_list = [0.014, 0.010, 0.006]
-        stroke_list  = [0.8, 0.7, 0.6]
-        min_area_scales = [1.0, 0.8, 0.6]
-        dilates = [0,1,2]
+    for idx, r in per_box_df.iterrows():
+        role = r.get("role_best")
+        if not role: continue
+        ncol = name_cols.get(role); scol = sig_cols.get(role)
+        if ncol:
+            raw = r.get("name_in_box")
+            parts = [p.strip() for p in raw.split(";")] if isinstance(raw,str) and ";" in raw else ([raw.strip()] if isinstance(raw,str) and raw.strip() else [])
+            # her parça için son kez bilinene yükselt (aksan doğrulama)
+            promoted = [promote_to_known_fullname(p, r.get("text_preview","")) for p in parts if p]
+            promoted = [p for p in promoted if p]
+            if role == "yk_uyesi":
+                if promoted:
+                    out[ncol] = (out[ncol] + "; " + "; ".join(promoted)) if out[ncol] else "; ".join(promoted)
+            else:
+                if out[ncol] is None and promoted:
+                    out[ncol] = "; ".join(promoted)
+            if scol and out[scol] is None:
+                out[scol] = bool(r.get("sig"))
 
-    # grid denemesi
-    all_boxes: List[BBox] = []
-    tried = 0
-    for th in base_scales:
-        for mi, st, mas, d in zip(min_ink_list, stroke_list, min_area_scales, dilates):
-            p = _P(target_height=th, min_aspect=0.5, min_ink_ratio=mi, min_stroke=st, include_stamps=include_stamps)
-            boxes = _detect_once(img, p, dilate_iter=d, min_area_scale=mas, nms_iou=0.25)
-            all_boxes.extend(boxes)
-            tried += 1
-        # erken durdurma: bu ölçekte yeterince kutu bulunduysa diğer ölçeklere geçme
-        if len(all_boxes) >= 3:  # istersen artır/azalt
-            pass  # yorum satırı bırakıyorum; çok çeşit doküman varsa erken durdurmayı istemeyebilirsin
+    bottom_df = pd.DataFrame([out])
 
-    if not all_boxes: return []
+    # sermaye fallback: tablo toplamı
+    if bottom_df.at[0, "sermaye_toplam_tl"] is None and "paylarin_toplam_itibari_degeri(tl)" in table_df_final.columns:
+        try:
+            bottom_df.at[0, "sermaye_toplam_tl"] = int(pd.to_numeric(table_df_final["paylarin_toplam_itibari_degeri(tl)"], errors="coerce").fillna(0).sum())
+        except Exception:
+            pass
 
-    xyxy = [(x,y,x+w,y+h) for (x,y,w,h) in all_boxes]
-    scores = np.ones(len(xyxy), np.float32)
-    keep = _nms(xyxy, scores, 0.25)
-    merged = _merge_horizontals(keep, max_gap=18)
-    return [(int(x1),int(y1),int(x2-x1),int(y2-y1)) for (x1,y1,x2,y2) in merged]
+    if debug:
+        try:
+            from IPython.display import display
+            display(bottom_df)
+        except Exception:
+            pass
 
-# ---- Opsiyonel görselleştirme
-def visualize_boxes(img: np.ndarray, boxes: List[BBox]) -> None:
-    vis = img.copy()
-    for (x,y,w,h) in boxes:
-        cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
-    plt.figure(figsize=(10,6))
-    if vis.ndim==3: plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-    else:           plt.imshow(vis, cmap='gray')
-    plt.axis("off"); plt.title("Detected signatures (dynamic)"); plt.show()
+    return vis, per_box_df, bottom_df
