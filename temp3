@@ -11,22 +11,13 @@ def run_perbox_pipeline(
     NEW_URL: str,
     known_names: Optional[List[str]] = None,
     role_threshold: float = 0.80,
-    name_sim_threshold: float = 0.80,
+    name_sim_threshold: float = 0.88,
     psm_list: Tuple[int,...] = (11, 6, 7, 4),
     oem_list: Tuple[int,...] = (1, 3),
     lang: str = "tur+eng",
     debug: bool = False,
 ):
-    """
-    Kutu OCR -> rol + isim çıkarımı (çoklu PSM/OEM, en iyi okuma),
-    isimleri bilinen havuza fuzzy-map ederek aksanı geri kazandırır,
-    role_best içinde mükerrer isimleri eler, bottom_df’yi oluşturur.
-
-    DÖNER: (vis_img, per_box_df, bottom_df)
-    Kolonlar (per_box_df): i, bbox(x,y,w,h), sig(bool), role_best, role_score, name_in_box, text_preview
-    """
-
-    # ---------- küçük yardımcılar (lokal) ----------
+    # ------------------- helpers -------------------
     def _strip_diacritics(s: str) -> str:
         return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
@@ -42,14 +33,12 @@ def run_perbox_pipeline(
         # dict{'bbox': ...}
         if isinstance(obj, dict) and "bbox" in obj:
             obj = obj["bbox"]
-
         # tuple/list: (x,y,w,h) veya (x1,y1,x2,y2)
         if isinstance(obj, (tuple, list, np.ndarray)) and len(obj) == 4:
             x1,y1,a,b = [int(round(float(v))) for v in obj]
-            if a > x1 and b > y1:  # xyxy
+            if a > x1 and b > y1:   # xyxy
                 return (x1, y1, max(0, a-x1), max(0, b-y1))
             return (x1, y1, max(0, a), max(0, b))
-
         # dict varyantları
         if isinstance(obj, dict):
             if all(k in obj for k in ("x","y","w","h")):
@@ -57,19 +46,15 @@ def run_perbox_pipeline(
             if all(k in obj for k in ("x0","y0","x1","y1")):
                 x0,y0,x1,y1 = int(obj["x0"]), int(obj["y0"]), int(obj["x1"]), int(obj["y1"])
                 return (x0, y0, max(0, x1-x0), max(0, y1-y0))
-
         # attribute-based custom Box
         if hasattr(obj, "__dict__"):
             def get(o,*names):
                 for n in names:
                     if hasattr(o,n): return getattr(o,n)
                 return None
-            x  = get(obj,"x","x0","left")
-            y  = get(obj,"y","y0","top")
-            w  = get(obj,"w","width")
-            h  = get(obj,"h","height")
-            x1 = get(obj,"x1","right")
-            y1 = get(obj,"y1","bottom")
+            x  = get(obj,"x","x0","left");  y  = get(obj,"y","y0","top")
+            w  = get(obj,"w","width");      h  = get(obj,"h","height")
+            x1 = get(obj,"x1","right");     y1 = get(obj,"y1","bottom")
             if x is not None and y is not None and w is not None and h is not None:
                 return (int(x), int(y), int(w), int(h))
             if x is not None and y is not None and x1 is not None and y1 is not None:
@@ -80,8 +65,7 @@ def run_perbox_pipeline(
         x,y,w,h = xywh; return (x, y, x+w, y+h)
 
     def _expand(b, px=2):
-        x1,y1,x2,y2 = b
-        return (x1-px, y1-px, x2+px, y2+px)
+        x1,y1,x2,y2 = b; return (x1-px, y1-px, x2+px, y2+px)
 
     def _contains(outer, inner, pad=2) -> bool:
         ox1,oy1,ox2,oy2 = _expand(outer, pad); ix1,iy1,ix2,iy2 = inner
@@ -90,8 +74,7 @@ def run_perbox_pipeline(
     def _iou(a,b):
         ax1,ay1,ax2,ay2=a; bx1,by1,bx2,by2=b
         ix1,iy1=max(ax1,bx1),max(ay1,by1); ix2,iy2=min(ax2,bx2),min(ay2,by2)
-        iw,ih=max(0,ix2-ix1),max(0,iy2-iy1)
-        inter=iw*ih
+        iw,ih=max(0,ix2-ix1),max(0,iy2-iy1); inter=iw*ih
         if inter==0: return 0.0
         return inter/float((ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter+1e-9)
 
@@ -105,6 +88,11 @@ def run_perbox_pipeline(
         "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
     }
     ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
+
+    ROLE_WORDS = {
+        "TOPLANTI","BAŞKANI","BAŞKAN","YÖNETİM","KURULU","ÜYESİ","ÜYE","YAZMAN","YAZMANI",
+        "KATİP","KÂTİP","TEMSİLCİSİ","BAKANLIK","DİVAN","DIVAN","OY","TOPLAMA","MEMURU","BŞK","YK"
+    }
 
     def _alias_score(text_u: str, alias: str) -> float:
         t=_NORM(text_u); a=_NORM(alias)
@@ -121,17 +109,15 @@ def run_perbox_pipeline(
                 best_role,best_score=rk,s
         return best_role,float(best_score)
 
-    # en iyi OCR seçimi için kaba kalite skoru
-    def _score_text(s: str, known_names_u: List[str]) -> float:
+    def _score_text(s: str, pools_u: List[str]) -> float:
         if not s: return -1e9
         t=s.strip()
         letters=len(re.findall(r"[A-Za-zÇĞİÖŞÜçğışöü]", t))
         bads=len(re.findall(r"[^A-Za-zÇĞİÖŞÜçğışöü0-9\s,.;:/\-()]", t))
         caps=len(re.findall(r"\b[A-ZÇĞİÖŞÜ][a-zçğıöşü']+\b", t))
-        pools=known_names_u[:]+[a for v in ROLE_ALIASES.values() for a in v]
         sim=0.0
-        if pools:
-            m=process.extractOne(t,pools,scorer=fuzz.token_set_ratio)
+        if pools_u:
+            m=process.extractOne(t,pools_u,scorer=fuzz.token_set_ratio)
             sim=(m[1]/100.0) if m else 0.0
         return 1.0*letters - 2.0*bads + 0.2*caps + 2.0*sim
 
@@ -141,59 +127,69 @@ def run_perbox_pipeline(
         x1=max(0,x-pad); y1=max(0,y-pad); x2=min(img.shape[1],x+w+pad); y2=min(img.shape[0],y+h+pad)
         crop=(x1,y1,x2-x1,y2-y1)
         cands=[]
-        known_u=[_NORM(k) for k in (known_names or [])]
+        pools_u=[_NORM(k) for k in (known_names or [])]+[a for v in ROLE_ALIASES.values() for a in v]
         for psm in psm_list:
             for oem in oem_list:
                 try:
                     txt=ocr_text_from_box_remote(img,crop,lang=lang,psm=psm,oem=oem,url=NEW_URL)
                 except Exception:
                     txt=""
-                cands.append((txt, _score_text(txt,known_u)))
+                cands.append((txt,_score_text(txt,pools_u)))
         cands.sort(key=lambda t:t[1], reverse=True)
         return cands[0][0] if cands else ""
 
-    DROP_ROLE_WORDS={"TOPLANTI","BAŞKANI","BAŞKAN","YÖNETİM","KURULU","ÜYESİ","ÜYE","YAZMAN","YAZMANI","KATİP","KÂTİP","TEMSİLCİSİ","BAKANLIK","DİVAN","DIVAN","OY","TOPLAMA","MEMURU"}
+    def _is_name_like_tokens(tokens: List[str]) -> bool:
+        if not (2 <= len(tokens) <= 3): 
+            return False
+        for t in tokens:
+            u = re.sub(r"[^A-Za-zÇĞİÖŞÜçğışöü]", "", t)
+            if not u or u.upper() in ROLE_WORDS:
+                return False
+        return True
 
-    def extract_person_names(text: str) -> List[str]:
-        t=text.replace("\n"," ")
-        tmp=[]
-        for m in re.finditer(r"\b([A-ZÇĞİÖŞÜ][a-zçğıöşü’']+(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü’']+){1,3})\b", t):
-            cand=m.group(1).strip(); toks=cand.split()
-            if len(toks)>=2 and not any(tok.upper() in DROP_ROLE_WORDS for tok in toks):
-                tmp.append(cand)
-        if not tmp:
-            u=_NORM(text)
-            for m in re.finditer(r"[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,})+", u):
-                tmp.append(m.group(0).title())
-        out,seen=[],set()
-        for x in tmp:
-            if x not in seen: seen.add(x); out.append(x)
+    def extract_person_names_strict(text: str) -> List[str]:
+        t=(text or "").replace("\n"," ")
+        out, seen = [], set()
+        # ALL-CAPS (öncelikli)
+        for m in re.finditer(r"\b([A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,}){1,2})\b", _NORM(t)):
+            toks = m.group(1).split()
+            if _is_name_like_tokens(toks):
+                cand = " ".join(w.title() for w in toks)
+                k = _NORM(cand)
+                if k not in seen: seen.add(k); out.append(cand)
+        # Title-Case (ikincil)
+        for m in re.finditer(r"\b([A-ZÇĞİÖŞÜ][a-zçğıöşü’']+(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü’']+){1,2})\b", t):
+            toks = m.group(1).split()
+            if _is_name_like_tokens(toks):
+                cand = " ".join(toks)
+                k = _NORM(cand)
+                if k not in seen: seen.add(k); out.append(cand)
         return out
 
-    def promote_to_known_fullname(name_in: Optional[str], ctx: Optional[str]) -> Optional[str]:
+    def extract_name_after_role(text: str, role_key: Optional[str]) -> Optional[str]:
+        if not role_key: return None
+        NAME_RE=r"([A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+(?:\s+[A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+){1,2})"
+        for ali in ROLE_ALIASES.get(role_key, []):
+            m=re.search(rf"{re.escape(ali)}\s*[:-–—]?\s*{NAME_RE}", text, flags=re.IGNORECASE)
+            if m:
+                toks=m.group(1).split()
+                if _is_name_like_tokens(toks):
+                    return " ".join(toks)
+        return None
+
+    def promote_to_known_fullname(name_in: Optional[str], ctx: str, role_key: Optional[str]) -> Optional[str]:
         if not name_in: return None
         if known_names:
             best,best_s=None,0.0
             for kn in known_names:
                 s=max(fuzz.token_set_ratio(name_in,kn), fuzz.partial_ratio(name_in,kn))/100.0
-                if ctx:
-                    last=_TOKS(kn)[-1] if _TOKS(kn) else ""
-                    if last and (_NORM(last) in _NORM(ctx) or f"{last[:1]}." in _NORM(ctx)):
-                        s+=0.15
+                if role_key and role_key in _NORM(ctx):
+                    s+=0.02
                 if s>best_s: best_s,best=s,kn
-            if best and best_s>=name_sim_threshold: return best
-        return " ".join(str(name_in).split())
-
-    def extract_name_after_role(text: str, role_key: Optional[str]) -> Optional[str]:
-        if not role_key: return None
-        NAME_RE=r"([A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+(?:\s+[A-ZÇĞİÖŞÜ][A-Za-zÇĞİÖŞÜçğışöü’']+){1,3})"
-        for ali in ROLE_ALIASES.get(role_key, []):
-            m=re.search(rf"{re.escape(ali)}\s*[:-–—]?\s*{NAME_RE}", text, flags=re.IGNORECASE)
-            if m:
-                cand=m.group(1).strip(); toks=cand.split()
-                if len(toks)>=2 and not any(tok.upper() in DROP_ROLE_WORDS for tok in toks):
-                    return cand
-        return None
+            if best and best_s>=name_sim_threshold:
+                return best
+        toks = name_in.split()
+        return name_in if _is_name_like_tokens(toks) else None
 
     def dedupe_names_within_role(df: pd.DataFrame) -> pd.DataFrame:
         def canon(s: str) -> str:
@@ -207,7 +203,7 @@ def run_perbox_pipeline(
             acc=[]; prev=seen.setdefault(role,[])
             for p in parts:
                 c=canon(p)
-                if c and not any(fuzz.ratio(c,q)>=90 for q in prev):
+                if c and not any(fuzz.ratio(c,q)>=94 for q in prev):
                     acc.append(p); prev.append(c)
             keep.append("; ".join(acc) if acc else None)
         df=df.copy(); df["name_in_box"]=keep; return df
@@ -224,14 +220,15 @@ def run_perbox_pipeline(
             if w>0 and h>0: out.append((xywh,item))
         return out
 
-    # ---------- known_names hazırlığı ----------
+    # ------------------- known names -------------------
     if known_names is None:
-        if "pay_sahibinin_ad_soyadi_unvani" in table_df_final.columns:
-            known_names=list(table_df_final["pay_sahibinin_ad_soyadi_unvani"].dropna().astype(str).values)
-        else:
-            known_names=[]
+        cols=[]
+        for c in ["pay_sahibinin_ad_soyadi_unvani","temsilci_adi_soyadi_unvani"]:
+            if c in table_df_final.columns:
+                cols.append(table_df_final[c].dropna().astype(str))
+        known_names = pd.concat(cols).dropna().astype(str).unique().tolist() if cols else []
 
-    # ---------- kutular & imzalar ----------
+    # ------------------- boxes & signatures -------------------
     pairs = normalize_boxes_with_refs(result.get("final", []))
     boxes_xywh = [p[0] for p in pairs]
     orig_items  = [p[1] for p in pairs]
@@ -240,10 +237,9 @@ def run_perbox_pipeline(
     sigs=[]
     for sb in result.get("sigs", []):
         xywh=_to_xywh(sb if not (isinstance(sb,dict) and "bbox" in sb) else sb["bbox"])
-        if xywh:
-            sigs.append(_to_xyxy(xywh))
+        if xywh: sigs.append(_to_xyxy(xywh))
 
-    # ---------- görselleştirme katmanı ----------
+    # ------------------- visualization -------------------
     vis = lower_img.copy()
     try:
         import cv2
@@ -254,32 +250,32 @@ def run_perbox_pipeline(
     except Exception:
         pass
 
-    # ---------- OCR + çıkarım ----------
+    # ------------------- OCR + extraction -------------------
     rows=[]
     for i,(b_xywh,b_xyxy,obj) in enumerate(zip(boxes_xywh, boxes_xyxy, orig_items)):
         # obj.txt bağlamı
-        try:
-            obj_txt = getattr(obj,"txt", None)
-        except Exception:
-            obj_txt = None
+        try:    obj_txt = getattr(obj,"txt", None)
+        except: obj_txt = None
         if obj_txt is None and isinstance(obj, dict):
             obj_txt = obj.get("txt")
 
         ocr_txt = ocr_multi_read(lower_img, b_xywh)
-        base_txt = obj_txt or ocr_txt or ""
+        base_txt = (obj_txt or "") or ocr_txt
 
         role, rscore = best_role_for_text(base_txt)
 
-        cand = extract_person_names(ocr_txt) + (extract_person_names(obj_txt) if obj_txt else [])
-        cand = [promote_to_known_fullname(n, base_txt) for n in cand]
-        cand = [n for n in cand if n]
-        if not cand:
-            after = extract_name_after_role(base_txt, role)
-            if after:
-                p = promote_to_known_fullname(after, base_txt)
-                if p: cand=[p]
-        name_in_box = "; ".join(dict.fromkeys(cand)) if cand else None
+        cands = extract_person_names_strict(ocr_txt) + extract_person_names_strict(obj_txt or "")
+        after = extract_name_after_role(base_txt, role)
+        if after: cands.append(after)
 
+        final_names=[]
+        for c in cands:
+            p = promote_to_known_fullname(c, base_txt, role)
+            if p and all(w.upper() not in ROLE_WORDS for w in p.split()):
+                final_names.append(p)
+        final_names = list(dict.fromkeys(final_names))  # sırayı koruyarak uniq
+
+        name_in_box = "; ".join(final_names) if final_names else None
         sig_hit = any(_contains(b_xyxy,s,2) or _iou(b_xyxy,s)>=0.03 for s in sigs)
 
         rows.append({
@@ -302,7 +298,7 @@ def run_perbox_pipeline(
         except Exception:
             pass
 
-    # ---------- bottom_df ----------
+    # ------------------- bottom_df -------------------
     def _amount_candidates_with_scores(text: str):
         TL_HINTS=("TL","₺","LIRA","LİRA","TRY","TÜRK","TURK","İTİBARİ","ITIBARI","TOPLAMI","DEĞER","DEGER")
         c=[]
@@ -313,7 +309,7 @@ def run_perbox_pipeline(
             c.append((val,sc))
         for m in re.finditer(r"\b(\d{6,12})\b", text):
             raw=m.group(1)
-            if re.fullmatch(r"\d{11}", raw): continue  # TCKN değil
+            if re.fullmatch(r"\d{11}", raw): continue
             val=int(raw); win=text[max(0,m.start()-8):m.end()+8].upper()
             sc=0.4+(0.4 if any(h in win for h in TL_HINTS) else 0.0)
             c.append((val,sc))
@@ -367,7 +363,8 @@ def run_perbox_pipeline(
         ncol=name_cols.get(role); scol=sig_cols.get(role)
         raw=r.get("name_in_box")
         parts=[p.strip() for p in raw.split(";")] if isinstance(raw,str) and ";" in raw else ([raw.strip()] if isinstance(raw,str) and raw.strip() else [])
-        promoted=[promote_to_known_fullname(p, r.get("text_preview","")) for p in parts if p]
+        # son kez known'a terfi
+        promoted=[promote_to_known_fullname(p, r.get("text_preview",""), role) for p in parts if p]
         promoted=[p for p in promoted if p]
         if ncol:
             if role=="yk_uyesi":
