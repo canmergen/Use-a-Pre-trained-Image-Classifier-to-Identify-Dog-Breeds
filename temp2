@@ -1,52 +1,38 @@
-# Gereksinim: rapidfuzz
 # pip install rapidfuzz
 import copy, unicodedata, re
 from typing import Any, List, Tuple, Dict, Optional
 from rapidfuzz import fuzz
 
-def split_equal_when_multi_role_fuzzy(
+def split_equal_when_multi_role_fuzzy_strict(
     role_blocks: List[Any],
     *,
     ROLE_ALIASES: Optional[Dict[str, List[str]]] = None,
     gap_px: int = 6,
     min_piece_w: int = 12,
     fuzzy_enable: bool = True,
-    fuzzy_score_thr: int = 85,   # 0-100; 85 iyi bir başlangıç
+    fuzzy_score_thr: int = 85,
     debug: bool = False
 ) -> List[Any]:
     """
-    Çoklu rol içeren kutuları N eşit parçaya böler; tek rol içerenleri bölmez.
-    Rol tespiti:
-      1) Kanonikleştirilmiş metinde exact substring (deterministik)
-      2) Bulunamazsa fuzzy (partial_ratio / token_set_ratio) yedek eşleşme
-
-    Girdi/çıktı: role_blocks (dict/obj; x,y,w,h,txt[,role]).
+    Aynı kutuda 2+ rol varsa kutuyu N eşit parçaya böler (parçalar arasında garanti gap).
+    Tek rol varsa bölmez.
+    Çakışan alias'larda en uzun eşleşmeyi seçer (non-overlap, longest-match-first).
     """
 
-    # -------- dict/obj yardımcıları --------
-    def getf(b, k, default=None):
-        if isinstance(b, dict): return b.get(k, default)
-        return getattr(b, k, default)
-    def setf(b, k, v):
-        if isinstance(b, dict): b[k] = v
-        else: setattr(b, k, v)
-    def new_like(b):
-        return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
-    def xyxy(b) -> Tuple[int,int,int,int]:
+    # ---- dict/obj yardımcıları ----
+    def getf(b, k, d=None): return b.get(k, d) if isinstance(b, dict) else getattr(b, k, d)
+    def setf(b, k, v): b.__setitem__(k, v) if isinstance(b, dict) else setattr(b, k, v)
+    def new_like(b): return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
+    def xyxy(b):
         x,y,w,h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
         return x, y, x+w, y+h
 
-    # -------- kanonikleştirme (TR güvenli) --------
-    def tr_upper(s: str) -> str:
-        return (s or "").replace("i","İ").replace("ı","I").upper()
-    def strip_diac(s: str) -> str:
-        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def canon(s: str) -> str:
-        s = tr_upper(strip_diac(s))
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    # ---- kanonikleştirme ----
+    def tr_upper(s:str)->str: return (s or "").replace("i","İ").replace("ı","I").upper()
+    def strip_diac(s:str)->str: return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    def canon(s:str)->str: return re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
 
-    # -------- rol sözlüğü (alias) --------
+    # ---- alias sözlüğü ----
     if ROLE_ALIASES is None:
         ROLE_ALIASES = {
             "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
@@ -56,94 +42,130 @@ def split_equal_when_multi_role_fuzzy(
             "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
             "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
             "mudur":            ["MÜDÜR","MUDUR","GENEL MÜDÜR","GENEL MUDUR"],
-            "baskan":           ["BAŞKAN","BASKAN"],
+            "baskan":           ["BAŞKAN","BASKAN"],  # kısa alias — çatışma durumunda elenir
         }
 
-    # (family, canon_alias) listesi
-    CANON_ALIASES: List[Tuple[str,str]] = []
+    # (family, alias, canon_alias, length)
+    ALIASES: List[Tuple[str,str,str,int]] = []
     for fam, vals in ROLE_ALIASES.items():
         for v in vals:
-            CANON_ALIASES.append((fam, canon(v)))
+            cv = canon(v)
+            ALIASES.append((fam, v, cv, len(cv)))
+    # En uzun alias'ları önce deneyeceğiz
+    ALIASES.sort(key=lambda t: t[3], reverse=True)
 
-    # -------- rol tespiti: deterministik + fuzzy --------
-    def detect_roles_ordered(text: str) -> List[Tuple[str,int,int]]:
-        """
-        Dönüş: [(family, start_index, confidence)], start_index küçük olan önce.
-        confidence: 100 (exact) veya fuzzy skor (0..100).
-        """
+    def _exact_hits(c_text: str) -> List[Tuple[str,int,int]]:
+        """Canon metinde exact eşleşmeleri (family, start, end) döndürür (non-overlap, longest-first)."""
+        taken = [False]*len(c_text)
+        hits: List[Tuple[str,int,int]] = []
+        for fam, _, cv, _ in ALIASES:
+            if not cv: continue
+            start = 0
+            while True:
+                idx = c_text.find(cv, start)
+                if idx == -1: break
+                rng = range(idx, idx+len(cv))
+                # overlap engelle
+                if any(taken[i] for i in rng):
+                    start = idx + 1
+                    continue
+                for i in rng: taken[i] = True
+                hits.append((fam, idx, idx+len(cv)))
+                start = idx + len(cv)
+        hits.sort(key=lambda x: x[1])  # soldan sağa
+        return hits
+
+    def _fuzzy_candidates(c_text: str) -> List[Tuple[str,int,int,int]]:
+        """Fuzzy adaylar: (family, approx_pos, approx_end, score) — overlap filtreleyeceğiz."""
+        if not fuzzy_enable:
+            return []
+        cands: List[Tuple[str,int,int,int]] = []
+        for fam, _, cv, _ in ALIASES:
+            # kaba skor
+            s1 = fuzz.partial_ratio(c_text, cv)
+            s2 = fuzz.token_set_ratio(c_text, cv)
+            sc = max(s1, s2)
+            if sc >= fuzzy_score_thr:
+                key = cv.split()[0]
+                pos = c_text.find(key)
+                if pos == -1: pos = len(c_text) + 10
+                cands.append((fam, pos, pos+len(cv), sc))
+        # en iyi skor -> soldan sağa
+        cands.sort(key=lambda x: (-x[3], x[1]))
+        # non-overlap seçim
+        taken = [False]*len(c_text)
+        out: List[Tuple[str,int,int,int]] = []
+        for fam, a, b, sc in cands:
+            rng = range(max(0,a), min(len(c_text), b))
+            if any(taken[i] for i in rng): 
+                continue
+            for i in rng: taken[i] = True
+            out.append((fam, a, b, sc))
+        out.sort(key=lambda x: x[1])
+        return out
+
+    def detect_roles_ordered(text: str) -> List[str]:
+        """Önce exact non-overlap, sonra fuzzy non-overlap; family isimlerini sırayla döndür."""
         t = canon(text)
-        hits: Dict[str, Tuple[int,int]] = {}  # fam -> (start, score)
+        exact = _exact_hits(t)
+        fams = [fam for fam,_,_ in exact]
 
-        # 1) Exact substring
-        for fam, phrase in CANON_ALIASES:
-            idx = t.find(phrase)
-            if idx != -1:
-                if fam not in hits or idx < hits[fam][0]:
-                    hits[fam] = (idx, 100)
+        if debug:
+            print("[exact_hits]", exact, "| text:", t)
 
-        # 2) Fuzzy fallback
-        if fuzzy_enable:
-            for fam, phrase in CANON_ALIASES:
-                if fam in hits: 
-                    continue  # exact bulundu
-                # iki farklı ölçüyü birleştirelim (daha sağlam)
-                s1 = fuzz.partial_ratio(t, phrase)
-                s2 = fuzz.token_set_ratio(t, phrase)
-                sc = max(s1, s2)
-                if sc >= fuzzy_score_thr:
-                    # pozisyonu yaklaşıkla: alias’ın ilk kelimesini ara
-                    key = phrase.split()[0]
-                    idx = t.find(key)
-                    if idx == -1:
-                        idx = len(t) + 10  # en sona at
-                    # varsa daha iyi skor/erken index ile güncelle
-                    if fam not in hits or (sc > hits[fam][1]) or (sc == hits[fam][1] and idx < hits[fam][0]):
-                        hits[fam] = (idx, sc)
+        # exact hiç yoksa ya da 1 ise ve metin içinde başka rol de olmalı diyorsak fuzzy ekle
+        if len(fams) <= 1:
+            fuzzy = _fuzzy_candidates(t)
+            for fam, _, _, _ in fuzzy:
+                if fam not in fams:
+                    fams.append(fam)
 
-        ordered = [(fam, pos, sc) for fam,(pos,sc) in hits.items()]
-        ordered.sort(key=lambda x: x[1])
-        return ordered
+        # kısa alias kaynaklı “baskan” gibi genel aileler, daha spesifik aileyle çakışıyorsa at
+        SPECIFIC_FIRST = {"divan_baskani", "toplanti_baskani", "yk_baskani"}
+        if any(f in fams for f in SPECIFIC_FIRST):
+            fams = [f for f in fams if f not in {"baskan"}]
 
-    # -------- ana akış --------
+        return fams
+
+    # ---- ana akış ----
     out: List[Any] = []
     for b in role_blocks:
         txt = getf(b, "txt") or ""
-        role_hits = detect_roles_ordered(txt)
+        fams = detect_roles_ordered(txt)
 
         if debug:
-            print(f"[split_fuzzy] roles={role_hits}  txt[:80]={str(txt)[:80]!r}")
+            print(f"[roles_detected] {fams} | txt[:80]={str(txt)[:80]!r}")
 
-        if len(role_hits) <= 1:
+        if len(fams) <= 1:
             nb = new_like(b)
-            if role_hits:
-                setf(nb, "role", role_hits[0][0])  # family adı
+            if fams: setf(nb, "role", fams[0])
             out.append(nb)
             continue
 
-        # N rol → eşit N parçaya böl (ortası boş için gap uygula)
-        N = len(role_hits)
-        x, y, x2, y2 = xyxy(b)
+        # N parçaya eşit böl + garanti gap (mümkünse en az 1 px)
+        N = len(fams)
+        x,y,x2,y2 = xyxy(b)
         W = x2 - x
 
-        total_gap = gap_px * (N - 1)
-        usable_w = max(0, W - total_gap)
-        if usable_w // N < min_piece_w:
-            total_gap = 0
-            usable_w = W
+        desired_gap = max(1, int(gap_px))
+        max_gap = max(0, (W - N*min_piece_w)) // max(1, (N-1))
+        actual_gap = min(desired_gap, max_gap) if N>1 else 0
+        if actual_gap == 0 and N>1 and (W - N*min_piece_w) >= (N-1):
+            actual_gap = 1  # son çare
 
+        usable_w = max(0, W - actual_gap*(N-1))
         base = usable_w // N
         rem  = usable_w % N
 
         cur_x = x
         for i in range(N):
-            w_piece = base + (1 if i < rem else 0)
+            w_piece = max(min_piece_w, base + (1 if i < rem else 0))
             nb = new_like(b)
-            setf(nb, "x", cur_x)
-            setf(nb, "y", y)
-            setf(nb, "w", max(1, w_piece))
-            setf(nb, "h", y2 - y)
-            setf(nb, "role", role_hits[i][0])   # i’nci rol family
+            setf(nb, "x", cur_x); setf(nb, "y", y)
+            setf(nb, "w", w_piece); setf(nb, "h", y2 - y)
+            setf(nb, "role", fams[i])
             out.append(nb)
-            cur_x += w_piece + (gap_px if total_gap else 0)
+            if i < N-1:
+                cur_x += w_piece + actual_gap
 
     return out
