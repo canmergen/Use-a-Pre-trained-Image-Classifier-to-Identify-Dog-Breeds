@@ -135,7 +135,6 @@ def extract_roles_and_bottom(
         "UYESI","YAZMAN","KATIP","DIVAN","SERMAYESI","NISABI","PAY","TOPLAMI"
     }
 
-    # strong regexes (after normalize_hard)
     YKBASKANI_RE   = re.compile(r"\b(?:YK|YONETIM\s+KURULU)\s*BASKANI\b")
     YKUYESI_RE     = re.compile(r"\b(?:YK|YONETIM\s+KURULU)\s*UYESI\b")
     TOPBASKANI_RE  = re.compile(r"\bTOPLANTI\s*BASKANI\b")
@@ -261,7 +260,7 @@ def extract_roles_and_bottom(
     for row in rows:
         if len(row["items"]) < 2:
             continue
-        # sağ uç çoğunlukla YK Başkani: sinyal varsa zorla
+        # sağ uç sıklıkla YK Başkanı: sinyal varsa zorla
         _, rb_right = row["items"][-1]
         t_right = normalize_hard(rb_right.get("txt",""))
         if YKBASKANI_RE.search(t_right) or ("YK" in t_right and "BASKANI" in t_right):
@@ -273,7 +272,7 @@ def extract_roles_and_bottom(
             if ("BAKANLIK" in t_mid or "TICARET" in t_mid) and "TEMSILCISI" in t_mid:
                 rb_mid["role"] = "bakanlik_temsilcisi"; rb_mid["why"] = "layout(center)"
 
-    # ---------- final boxes ----------
+    # ---------- final boxes normalize ----------
     def normalize_with_ref(seq):
         out=[]
         if seq is None: return out
@@ -296,41 +295,81 @@ def extract_roles_and_bottom(
 
     H,W = lower_img.shape[:2]
 
-    # ---------- per box ----------
+    # ---------- per box (ROL SEÇİMİ GÜNCEL) ----------
+    ROLE_PRIORITY_ORDER = {
+        "yk_baskani": 5,
+        "bakanlik_temsilcisi": 4,
+        "toplanti_baskani": 3,
+        "yk_uyesi": 2,
+        "tutanak_yazmani": 1,
+        "katip": 1,
+        "divan_baskani": 1,
+        "sermaye": 0,
+        None: -1,
+    }
+
     rows_out=[]
     for i,(xywh,xyxy,obj) in enumerate(zip(boxes_xywh, boxes_xyxy, objs)):
-        # metin
+        # 1) metin
         obj_txt=None
         if isinstance(obj, dict): obj_txt=obj.get("txt")
         if (obj_txt is None) and hasattr(obj,"txt"): obj_txt=getattr(obj,"txt")
         text = obj_txt if (obj_txt and obj_txt.strip()) else ocr_text(lower_img, xywh, lang, psm_list, oem_list, new_url)
         text = norm_space(text)
 
-        # roleblock overlap → force
-        forced=None; reasons=[]
+        # 2) kutu için regex (KUVVETLİ SİNYAL)
+        r_rgx, sc_rgx, why_rgx = regex_role(text)
+
+        # 3) roleblock adaylarını topla
         box_exp_xyxy = expand_xyxy(xyxy, force_margin_px)
-        candidates=[]
+        cands=[]
         for rb in role_blocks:
             rb_xyxy = xywh_to_xyxy(rb["bbox"])
-            if contains_xyxy(rb_xyxy, box_exp_xyxy, tol=0) or iou_xyxy(rb_xyxy, box_exp_xyxy) >= iou_thresh:
+            iou = iou_xyxy(rb_xyxy, box_exp_xyxy)
+            if contains_xyxy(rb_xyxy, box_exp_xyxy, tol=0) or iou >= iou_thresh:
                 bx=(xyxy[0]+xyxy[2])/2.0; by=(xyxy[1]+xyxy[3])/2.0
                 rx=(rb_xyxy[0]+rb_xyxy[2])/2.0; ry=(rb_xyxy[1]+rb_xyxy[3])/2.0
                 dist = (bx-rx)**2 + (by-ry)**2
-                candidates.append({"rb": rb, "dist": dist})
-        if candidates:
-            chosen = min(candidates, key=lambda c: (c["dist"], -c["rb"].get("score", 0.0)))
-            forced = chosen["rb"]["role"]
-            reasons.append("roleblock:"+chosen["rb"].get("why",""))
+                cand = {
+                    "rb": rb,
+                    "iou": iou,
+                    "dist": dist,
+                    "score": rb.get("score", 0.0),
+                    "role": rb.get("role"),
+                    "prio": ROLE_PRIORITY_ORDER.get(rb.get("role"), -1),
+                    "why": rb.get("why","")
+                }
+                # regex varsa roleblock ile hizalanma puanı
+                cand["regex_bonus"] = 1.0 if (r_rgx and rb.get("role")==r_rgx) else 0.0
+                cands.append(cand)
 
-        # fallback fuzzy
-        if forced:
-            role_best, role_score = forced, 1.0
+        # 4) aday seçimi: IoU > regex_bonus > rol önceliği > skor > (küçük) mesafe
+        forced = None; reasons=[]
+        if cands:
+            cands.sort(key=lambda c: (-c["iou"], -c["regex_bonus"], -c["prio"], -c["score"], c["dist"]))
+            chosen = cands[0]
+            forced = chosen["role"]
+            reasons.append(f"roleblock:{chosen['why'] or ''} iou={chosen['iou']:.2f}")
+
+        # 5) text tabanlı yedek
+        if forced is None:
+            # önce regex; yoksa fuzzy
+            if r_rgx:
+                role_best, role_score = r_rgx, max(sc_rgx, 0.95)
+                reasons.append("regex-text")
+            else:
+                r_fz, sc_fz, why_fz = fuzzy_best_role(text)
+                role_best, role_score = r_fz, sc_fz
+                reasons.append(why_fz)
         else:
-            r, sc, why = fuzzy_best_role(text)
-            role_best, role_score = r, sc
-            reasons.append(why)
+            # roleblock'a rağmen regex 'kritik roller'de override eder
+            if r_rgx in {"yk_baskani","toplanti_baskani","yk_uyesi","bakanlik_temsilcisi","sermaye"} and r_rgx != forced:
+                role_best, role_score = r_rgx, max(sc_rgx, 0.98)
+                reasons.append(f"regex-override({forced}->{r_rgx})")
+            else:
+                role_best, role_score = forced, 1.0
 
-        # isim çıkarımı
+        # 6) isim çıkarımı
         def scrub_roles_for_name(t: str) -> str:
             t = normalize_hard(t)
             t = re.sub(r"\b(TOPLANTI|BASKANI|YK|YONETIM|KURULU|UYESI|BAKANLIK|TEMSILCISI|KATIP|YAZMANI|DIVAN|SERMAYESI|NISABI|PAY|TOPLAMI)\b"," ", t)
@@ -384,7 +423,7 @@ def extract_roles_and_bottom(
 
     per_box_df = pd.DataFrame(rows_out, columns=["i","bbox","sig","role_best","role_score","role_reasons","name_in_box","text_preview"])
 
-    # rol bazında isim de-dup
+    # ---------- per-role name de-dup ----------
     def _lastname(s: str) -> str:
         toks = canon_key(s).split()
         return toks[-1] if toks else ""
