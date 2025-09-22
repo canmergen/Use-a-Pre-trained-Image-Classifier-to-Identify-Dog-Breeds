@@ -11,53 +11,45 @@ def extract_roles_and_bottom(
     known_names=None,
     role_threshold=0.60,
     name_sim_threshold=0.88,
+    force_margin_px=10,            # role_area çevresine esneklik
     debug=False,
 ):
-    """Tek çağrıda: per_box_df ve bottom_df üretir. OCR için ocr_fn ver.
-
+    """
+    Role-block (result['roles']) alanları kullanarak kutuları 8 role zorla eşler.
     Dönüş: (per_box_df, bottom_df)
     """
-
-    # ===== imports (içeride) =====
-    import re, math, unicodedata
+    # ===== içe importlar
+    import re, unicodedata
     from dataclasses import dataclass
     from typing import Any, Dict, List, Optional, Tuple
     import numpy as np
     import pandas as pd
     from rapidfuzz import fuzz
 
-    # ========= Utilities =========
+    # ========= yardımcılar
     def tr_upper(s: str) -> str:
         return (s or "").replace("i","İ").replace("ı","I").upper()
-
     def tr_lower(s: str) -> str:
         return (s or "").replace("I","ı").replace("İ","i").lower()
-
     def tr_title(s: str) -> str:
-        words = re.split(r"(\s+)", s or "")
-        out=[]
+        words = re.split(r"(\s+)", s or ""); out=[]
         for w in words:
             if not w or w.isspace(): out.append(w); continue
             out.append(tr_upper(w[:1]) + tr_lower(w[1:]))
         return "".join(out)
-
     def strip_diac(s: str) -> str:
         return "".join(c for c in unicodedata.normalize("NFD", s) if not unicodedata.combining(c))
-
     def canon_key(name: str) -> str:
         k = re.sub(r"[^A-ZÇĞIİÖŞÜ ]", " ", tr_upper(strip_diac(name or "")))
         toks = [t for t in k.split() if len(t) >= 2]
         return " ".join(toks)
-
     def norm_space(s: str) -> str:
         return re.sub(r"\s+", " ", (s or "").strip())
-
     def is_all_caps_ctx(s: str) -> bool:
         letters = re.findall(r"[A-ZÇĞIİÖŞÜ]", tr_upper(s or ""))
         total   = len(re.findall(r"[A-Za-zÇĞIİÖŞÜçğıişöü]", s or ""))
         return len(letters) >= max(1, int(0.8*total))
 
-    # ========= Geometry =========
     def to_xywh(obj: Any) -> Optional[Tuple[int,int,int,int]]:
         if isinstance(obj, dict) and "bbox" in obj: obj = obj["bbox"]
         if isinstance(obj, (tuple, list, np.ndarray)) and len(obj)==4:
@@ -82,122 +74,97 @@ def extract_roles_and_bottom(
             if None not in (x,y,w,h):   return (int(x),int(y),int(w),int(h))
             if None not in (x,y,x1,y1): return (int(x),int(y),int(x1)-int(x),int(y1)-int(y))
         return None
+    def to_xyxy(b): x,y,w,h=b; return (x,y,x+w,y+h)
+    def expand(b, m): x,y,w,h=b; return (x-m, y-m, w+2*m, h+2*m)
+    def iou(a_xyxy, b_xyxy):
+        ax0,ay0,ax1,ay1=a_xyxy; bx0,by0,bx1,by1=b_xyxy
+        ix=max(0, min(ax1,bx1)-max(ax0,bx0)); iy=max(0, min(ay1,by1)-max(ay0,by0))
+        inter=ix*iy
+        if inter<=0: return 0.0
+        a=(ax1-ax0)*(ay1-ay0); b=(bx1-bx0)*(by1-by0)
+        return inter/max(1,a+b-inter)
+    def contains(a_xyxy, b_xyxy, tol=0):  # b, a içinde mi?
+        ax0,ay0,ax1,ay1=a_xyxy; bx0,by0,bx1,by1=b_xyxy
+        return (bx0>=ax0-tol and by0>=ay0-tol and bx1<=ax1+tol and by1<=ay1+tol)
 
-    def to_xyxy(xywh): x,y,w,h = xywh; return (x,y,x+w,y+h)
-
-    # ========= OCR helpers =========
+    # ========= OCR normalize
     def normalize_text(t: str) -> str:
         x = tr_upper(t or "")
         fixes = [
+            (r"\bTOF\s*LAN[I1]\b","TOPLANTI"),
             (r"\bTOFLAN[I1]\b","TOPLANTI"),
-            (r"\bBA[ŞS]\s*I\b","BAŞKANI"),  # "BAŞ I" → "BAŞKANI"
+            (r"\bBA[ŞS]\s*I\b","BAŞKANI"),
             (r"\bUYES[I1]\b","ÜYESİ"),
             (r"\bTEMS[Iİ]LC[İI]S[İI]\b","TEMSİLCİSİ"),
             (r"\bY\s*K\b","YK"),
         ]
-        for pat,rep in fixes:
-            x = re.sub(pat, rep, x)
+        for pat,rep in fixes: x = re.sub(pat, rep, x)
         return norm_space(x)
 
     def ocr_text(img, xywh, lang, psm_list, oem_list, url):
         x,y,w,h = xywh
         pad = max(3, int(0.04*max(w,h)))
-        x1=max(0,x-pad); y1=max(0,y-pad); x2=min(img.shape[1],x+w+pad); y2=min(img.shape[0],y+h+pad)
-        crop=(x1,y1,x2-x1,y2-y1)
+        crop=(max(0,x-pad), max(0,y-pad),
+              min(img.shape[1],x+w+pad)-max(0,x-pad),
+              min(img.shape[0],y+h+pad)-max(0,y-pad))
         best=""; bestq=-1e9
         for psm in psm_list:
             for oem in oem_list:
-                try:
-                    txt=ocr_fn(img, crop, lang=lang, psm=psm, oem=oem, url=url)
-                except Exception:
-                    txt=""
+                try: txt=ocr_fn(img, crop, lang=lang, psm=psm, oem=oem, url=url)
+                except Exception: txt=""
                 q = len(re.findall(r"[A-Za-zÇĞIİÖŞÜçğışöü]", txt)) - 2*len(re.findall(r"[^\w\s]", txt))
                 if q>bestq: bestq, best = q, txt
         return best
 
-    # ========= Role configuration (8 role) =========
-    ROLE_PRIORITY = [
-        "sermaye",
-        "toplanti_baskani",
-        "bakanlik_temsilcisi",
-        "yk_baskani",
-        "yk_uyesi",
-        "tutanak_yazmani",
-        "katip",
-        "divan_baskani",
-    ]
+    # ========= 8 rol konfig
+    ROLE_PRIORITY = ["sermaye","toplanti_baskani","bakanlik_temsilcisi","yk_baskani","yk_uyesi","tutanak_yazmani","katip","divan_baskani"]
     ROLE_CFG: Dict[str, Dict] = {
         "sermaye": {
-            "regex": [
-                r"\bS[İI]RKET[İI]N\s+SERMAYES[İI]\b",
-                r"\bSERMAYES[İI]\s+VE\s+PAYLAR[İI]N\s+TOPLAMI\s+[İI]T[İI]BAR[İI]\s+DE[ĞG]ER[İI]\b",
-                r"\bASGAR[İI]\s+TOPLANTI\s+N[İI]SABI\b",
-                r"\bMEVCUT\s+TOPLANTI\s+N[İI]SABI\b",
-            ],
-            "aliases": ["SERMAYE","SERMAYE VE PAYLARIN TOPLAMI","ASGARİ TOPLANTI NİSABI","MEVCUT TOPLANTI NİSABI"],
-            "keywords_pos": {"SERMAYE","PAY","TOPLAMI","NİSABI"},
-            "keywords_neg": {"BAŞKAN","ÜYESİ","TEMSİLCİSİ"},
-            "spatial_prior": {"y_frac_max": 0.50},
+            "regex":[r"\bS[İI]RKET[İI]N\s+SERMAYES[İI]\b", r"\bSERMAYES[İI]\s+VE\s+PAYLAR[İI]N\s+TOPLAMI\s+[İI]T[İI]BAR[İI]\s+DE[ĞG]ER[İI]\b", r"\bASGAR[İI]\s+TOPLANTI\s+N[İI]SABI\b", r"\bMEVCUT\s+TOPLANTI\s+N[İI]SABI\b"],
+            "aliases":["SERMAYE","SERMAYE VE PAYLARIN TOPLAMI","ASGARİ TOPLANTI NİSABI","MEVCUT TOPLANTI NİSABI"],
+            "keywords_pos":{"SERMAYE","PAY","TOPLAMI","NİSABI"},
+            "keywords_neg":{"BAŞKAN","ÜYESİ","TEMSİLCİSİ"},
+            "spatial_prior":{"y_frac_max":0.50},
         },
         "toplanti_baskani": {
-            "regex": [r"\bTOPLANTI\s+BA[ŞS]KANI\b"],
-            "aliases": ["TOPLANTI BAŞKANI","TOPLANTI BŞK"],
-            "keywords_pos": {"TOPLANTI","BAŞKAN","BAŞKANI"},
-            "keywords_neg": {"ÜYE","ÜYESİ"},
+            "regex":[r"\bTOPLANTI\s+BA[ŞS]KANI\b"],
+            "aliases":["TOPLANTI BAŞKANI","TOPLANTI BŞK"],
+            "keywords_pos":{"TOPLANTI","BAŞKAN","BAŞKANI"},
+            "keywords_neg":{"ÜYE","ÜYESİ"},
         },
         "bakanlik_temsilcisi": {
-            "regex": [r"\b(T[İI]CARET\s+BAKANLI[ĞG][Iİ]|BAKANLIK)\s+TEMS[İI]LC[İI]S[İI]\b"],
-            "aliases": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ"],
-            "keywords_pos": {"BAKANLIK","TİCARET","TEMSİLCİSİ"},
+            "regex":[r"\b(T[İI]CARET\s+BAKANLI[ĞG][Iİ]|BAKANLIK)\s+TEMS[İI]LC[İI]S[İI]\b"],
+            "aliases":["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ"],
+            "keywords_pos":{"BAKANLIK","TİCARET","TEMSİLCİSİ"},
         },
         "yk_baskani": {
-            "regex": [r"\b(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+BA[ŞS]KANI\b"],
-            "aliases": ["YK BAŞKANI","YÖNETİM KURULU BAŞKANI","YK BŞK","YONETIM KURULU BASKANI"],
-            "keywords_pos": {"YK","YÖNETİM","KURULU","BAŞKAN","BAŞKANI"},
-            "keywords_neg": {"ÜYE","ÜYESİ"},
+            "regex":[r"\b(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+BA[ŞS]KANI\b"],
+            "aliases":["YK BAŞKANI","YÖNETİM KURULU BAŞKANI","YK BŞK","YONETIM KURULU BASKANI"],
+            "keywords_pos":{"YK","YÖNETİM","KURULU","BAŞKAN","BAŞKANI"},
+            "keywords_neg":{"ÜYE","ÜYESİ"},
         },
         "yk_uyesi": {
-            "regex": [r"\b(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+ÜYES[İI]\b"],
-            "aliases": ["YK ÜYESİ","YÖNETİM KURULU ÜYESİ","YK UYESI"],
-            "keywords_pos": {"YK","YÖNETİM","KURULU","ÜYE","ÜYESİ"},
-            "keywords_neg": {"BAŞKAN","BAŞKANI"},
+            "regex":[r"\b(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+ÜYES[İI]\b"],
+            "aliases":["YK ÜYESİ","YÖNETİM KURULU ÜYESİ","YK UYESI"],
+            "keywords_pos":{"YK","YÖNETİM","KURULU","ÜYE","ÜYESİ"},
+            "keywords_neg":{"BAŞKAN","BAŞKANI"},
         },
-        "tutanak_yazmani": {
-            "regex": [r"\bTUTANAK\s+YAZMAN[Iİ]\b"],
-            "aliases": ["TUTANAK YAZMANI","YAZMAN"],
-            "keywords_pos": {"TUTANAK","YAZMAN"},
-        },
-        "katip": {
-            "regex": [r"\bK[ÂA]T[İI]P\b"],
-            "aliases": ["KÂTİP","KATİP","KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-            "keywords_pos": {"KÂTİP","KATİP","KATIP","OY","TOPLAMA","MEMURU"},
-        },
-        "divan_baskani": {
-            "regex": [r"\bD[İI]VAN\s+BA[ŞS]KANI\b"],
-            "aliases": ["DİVAN BAŞKANI","DIVAN BASKANI","DİVAN BŞK"],
-            "keywords_pos": {"DİVAN","BAŞKAN","BAŞKANI"},
-        },
+        "tutanak_yazmani": {"regex":[r"\bTUTANAK\s+YAZMAN[Iİ]\b"],"aliases":["TUTANAK YAZMANI","YAZMAN"],"keywords_pos":{"TUTANAK","YAZMAN"}},
+        "katip": {"regex":[r"\bK[ÂA]T[İI]P\b"],"aliases":["KÂTİP","KATİP","KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],"keywords_pos":{"KÂTİP","KATİP","KATIP","OY","TOPLAMA","MEMURU"}},
+        "divan_baskani": {"regex":[r"\bD[İI]VAN\s+BA[ŞS]KANI\b"],"aliases":["DİVAN BAŞKANI","DIVAN BASKANI","DİVAN BŞK"],"keywords_pos":{"DİVAN","BAŞKAN","BAŞKANI"}},
     }
-    ROLE_WORD_SET = set().union(*[set(v.get("keywords_pos",[])) for v in ROLE_CFG.values()]) \
-                      .union({"YK","BŞK","BASKANI","BAŞI","BAŞKANI","ÜYESİ","ÜYE","TEMSİLCİSİ"})
+    ROLE_WORD_SET = set().union(*[set(v.get("keywords_pos",[])) for v in ROLE_CFG.values()]).union({"YK","BŞK","BASKANI","BAŞI","BAŞKANI","ÜYESİ","ÜYE","TEMSİLCİSİ"})
 
-    # ========= Role scoring =========
+    # ========= rol skorlama (metinle)
     @dataclass
-    class RoleScore:
-        role: Optional[str]
-        score: float
-        reasons: List[str]
+    class RoleScore: role: Optional[str]; score: float; reasons: List[str]
 
     def keyword_score(toks: set, pos: set, neg: set):
-        sc = 0.0; rs=[]
-        hits = toks & pos
-        if hits:
-            sc += 0.15 * len(hits)
-            rs.append(f"+kw:{','.join(sorted(hits))}")
-        nhits = toks & neg if neg else set()
-        if nhits:
-            sc -= 0.20 * len(nhits)
-            rs.append(f"-kw:{','.join(sorted(nhits))}")
+        sc=0.0; rs=[]
+        hits=toks & pos
+        if hits: sc+=0.15*len(hits); rs.append(f"+kw:{','.join(sorted(hits))}")
+        nhits=toks & neg if neg else set()
+        if nhits: sc-=0.20*len(nhits); rs.append(f"-kw:{','.join(sorted(nhits))}")
         return sc, rs
 
     def fuzzy_alias_score(txt: str, aliases: List[str]):
@@ -207,17 +174,9 @@ def extract_roles_and_bottom(
 
     def spatial_score(xywh, page_shape, prior):
         if not prior: return 0.0,""
-        H, W = page_shape
-        x,y,w,h = xywh
-        cx,cy = x+w/2.0, y+h/2.0
-        s=0.0; why=[]
-        if "y_frac_max" in prior and (cy/H) <= prior["y_frac_max"]:
-            s += 0.15; why.append("sp:top")
-        if "x_band" in prior:
-            frac = cx/W; band = prior["x_band"]
-            if band=="left" and frac<0.33: s+=0.10; why.append("sp:left")
-            if band=="center" and 0.33<=frac<=0.66: s+=0.10; why.append("sp:center")
-            if band=="right" and frac>0.66: s+=0.10; why.append("sp:right")
+        H,W = page_shape; x,y,w,h = xywh
+        cx,cy = x+w/2.0, y+h/2.0; s=0.0; why=[]
+        if "y_frac_max" in prior and (cy/H) <= prior["y_frac_max"]: s+=0.15; why.append("sp:top")
         return s, "+".join(why)
 
     def regex_hit(txt: str, patterns: List[str]):
@@ -225,59 +184,48 @@ def extract_roles_and_bottom(
             if re.search(p, txt): return p
         return None
 
-    def classify_box(txt_raw, xywh, page_shape, fuzzy_floor=0.60):
-        t = normalize_text(txt_raw)
-        toks = set(t.split())
-        best = RoleScore(role=None, score=-1.0, reasons=[])
+    def classify_text_role(txt_raw, xywh, page_shape, fuzzy_floor=0.60):
+        t = normalize_text(txt_raw); toks=set(t.split())
+        best = RoleScore(None, -1.0, [])
         for role in ROLE_PRIORITY:
-            rc = ROLE_CFG[role]
-            reasons=[]; score=0.0
-            if regex_hit(t, rc.get("regex", [])):
-                return RoleScore(role=role, score=1.0, reasons=["regex"])
+            rc = ROLE_CFG[role]; reasons=[]; score=0.0
+            if regex_hit(t, rc.get("regex", [])): return RoleScore(role, 1.0, ["regex"])
             ks, rs = keyword_score(toks, set(rc.get("keywords_pos",[])), set(rc.get("keywords_neg",[])))
-            score += ks; reasons += rs
-            fs, fr = fuzzy_alias_score(t, rc.get("aliases",[]))
-            score += fs; reasons.append(fr)
-            ss, sr = spatial_score(xywh, page_shape, rc.get("spatial_prior"))
-            score += ss; 
+            score+=ks; reasons+=rs
+            fs, fr = fuzzy_alias_score(t, rc.get("aliases",[])); score+=fs; reasons.append(fr)
+            ss, sr = spatial_score(xywh, page_shape, rc.get("spatial_prior")); score+=ss; 
             if sr: reasons.append(sr)
+            # "TOPLANTI + İSİM" heuristiği
+            if role=="toplanti_baskani" and ("TOPLANTI" in toks) and ("BAŞKAN" not in toks and "BAŞKANI" not in toks):
+                if re.search(r"\bTOPLANT[İI]\s+[A-ZÇĞİÖŞÜ]{2,}\s+[A-ZÇĞİÖŞÜ]{2,}\b", t):
+                    score=max(score, 0.88); reasons.append("heur:toplanti+name")
             if role=="sermaye":
-                digits = sum(ch.isdigit() for ch in t)
-                ratio  = digits/max(1,len(t))
-                if ratio>=0.15: score += 0.10; reasons.append(f"num:{ratio:.2f}")
-            if score>best.score: best = RoleScore(role, score, reasons)
+                digits=sum(ch.isdigit() for ch in t); ratio=digits/max(1,len(t))
+                if ratio>=0.15: score+=0.10; reasons.append(f"num:{ratio:.2f}")
+            if score>best.score: best=RoleScore(role, score, reasons)
         if (best.score < fuzzy_floor) and ("regex" not in best.reasons):
             return RoleScore(None, best.score, best.reasons)
         return best
 
-    # ========= Role scrub (name extraction) =========
-    def build_role_patterns() -> List[re.Pattern]:
-        pats=[]
-        cores = [
-            r"TOPLANTI\s+BA[ŞS]KANI",
-            r"(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+BA[ŞS]KANI",
-            r"(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+ÜYES[İI]",
-            r"(?:T[İI]CARET\s+BAKANLI[ĞG][Iİ]|BAKANLIK)\s+TEMS[İI]LC[İI]S[İI]",
-            r"S[İI]RKET[İI]N\s+SERMAYES[İI]",
-            r"SERMAYES[İI]\s+VE\s+PAYLAR[İI]N\s+TOPLAMI\s+[İI]T[İI]BAR[İI]\s+DE[ĞG]ER[İI]",
-            r"ASGAR[İI]\s+TOPLANTI\s+N[İI]SABI",
-            r"MEVCUT\s+TOPLANTI\s+N[İI]SABI",
-            r"K[ÂA]T[İI]P",
-            r"TUTANAK\s+YAZMAN[Iİ]",
-            r"D[İI]VAN\s+BA[ŞS]KANI",
+    # ========= isim çıkarımı
+    def build_role_patterns():
+        pats=[]; cores=[
+            r"TOPLANTI\s+BA[ŞS]KANI", r"(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+BA[ŞS]KANI",
+            r"(?:YK|Y[ÖO]NET[İI]M\s+KURULU)\s+ÜYES[İI]", r"(?:T[İI]CARET\s+BAKANLI[ĞG][Iİ]|BAKANLIK)\s+TEMS[İI]LC[İI]S[İI]",
+            r"S[İI]RKET[İI]N\s+SERMAYES[İI]", r"SERMAYES[İI]\s+VE\s+PAYLAR[İI]N\s+TOPLAMI\s+[İI]T[İI]BAR[İI]\s+DE[ĞG]ER[İI]",
+            r"ASGAR[İI]\s+TOPLANTI\s+N[İI]SABI", r"MEVCUT\s+TOPLANTI\s+N[İI]SABI",
+            r"K[ÂA]T[İI]P", r"TUTANAK\s+YAZMAN[Iİ]", r"D[İI]VAN\s+BA[ŞS]KANI",
         ]
-        for c in cores:
-            pats.append(re.compile(rf"\b{c}\b", flags=re.IGNORECASE))
-        for w in ROLE_WORD_SET:
-            pats.append(re.compile(rf"\b{re.escape(w)}\b", flags=re.IGNORECASE))
+        for c in cores: pats.append(re.compile(rf"\b{c}\b", flags=re.IGNORECASE))
+        for w in ROLE_WORD_SET: pats.append(re.compile(rf"\b{re.escape(w)}\b", flags=re.IGNORECASE))
         return pats
-
     ROLE_PATTERNS = build_role_patterns()
     STOP_SHORT = {"DR","SN","PZ","MR","MRS","MS","DR.","SN.","AV","AV."}
 
     def scrub_roles(text: str) -> str:
         t = normalize_text(text or "")
         for pat in ROLE_PATTERNS: t = pat.sub(" ", t)
+        t = re.sub(r"^\s*TOPLANT[İI]\b(?=\s+[A-ZÇĞİÖŞÜ]{2,}\s+[A-ZÇĞİÖŞÜ]{2,}\b)", " ", t)
         t = re.sub(r"\bBAŞI\b"," ", t)
         t = re.sub(r"\b\d{6,}\b"," ", t)
         return norm_space(t)
@@ -285,58 +233,61 @@ def extract_roles_and_bottom(
     def clean_tokens(toks: List[str]) -> List[str]:
         out=[]
         for t in toks:
-            tu = tr_upper(t)
+            tu=tr_upper(t)
             if tu in STOP_SHORT or tu in ROLE_WORD_SET: continue
             if len(strip_diac(t)) < 2: continue
             out.append(t)
         return out
 
     def strict_candidates(text: str) -> List[str]:
-        txt = scrub_roles(text)
-        out=[]
+        txt=scrub_roles(text); out=[]
         for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ]{2,}(?:\s+[A-ZÇĞIİÖŞÜ]{2,}){1,2})\b", tr_upper(txt)):
-            toks = clean_tokens(m.group(1).split())
-            if 2 <= len(toks) <= 3: out.append(" ".join(toks))
+            toks=clean_tokens(m.group(1).split()); if 2<=len(toks)<=3: out.append(" ".join(toks))
         for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+(?:\s+[A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+){1,2})\b", txt):
-            toks = clean_tokens(m.group(1).split())
-            if 2 <= len(toks) <= 3: out.append(" ".join(toks))
+            toks=clean_tokens(m.group(1).split()); if 2<=len(toks)<=3: out.append(" ".join(toks))
         seen=set(); res=[]
         for n in out:
             k=canon_key(n)
-            if k and k not in seen:
-                seen.add(k); res.append(n)
+            if k and k not in seen: seen.add(k); res.append(n)
         return res
 
-    def promote_and_format(name: str, ctx: str, KN_CANON: Dict[str,str], name_sim_threshold: float) -> Optional[str]:
+    def promote_and_format(name: str, ctx: str, KN_CANON: Dict[str,str], thr: float) -> Optional[str]:
         if not name: return None
-        key = canon_key(name)
-        best = KN_CANON.get(key)
+        key=canon_key(name); best=KN_CANON.get(key)
         if not best:
             for k,v in KN_CANON.items():
-                if fuzz.token_set_ratio(key, k)/100.0 >= name_sim_threshold:
-                    best = v; break
+                if fuzz.token_set_ratio(key, k)/100.0 >= thr: best=v; break
         if not best:
-            toks = clean_tokens(name.split())
-            if not (2 <= len(toks) <= 3): return None
-            best = tr_title(" ".join(toks))
+            toks=clean_tokens(name.split()); if not (2<=len(toks)<=3): return None
+            best=tr_title(" ".join(toks))
         return tr_upper(best) if is_all_caps_ctx(ctx) else best
 
-    # ========= Main =========
-
-    # known names -> canon
+    # ========= known-names kanon
     if known_names is None:
         pools=[]
         for c in ["pay_sahibinin_ad_soyadi_unvani","temsilci_adi_soyadi_unvani"]:
-            if c in table_df_final.columns:
-                pools.append(table_df_final[c].dropna().astype(str))
+            if c in table_df_final.columns: pools.append(table_df_final[c].dropna().astype(str))
         known_names = pd.concat(pools).dropna().astype(str).unique().tolist() if pools else []
-    KN_CANON: Dict[str,str] = {}
+    KN_CANON={}
     for kn in known_names:
-        k = canon_key(kn)
-        if k and (k not in KN_CANON or len(KN_CANON[k]) < len(kn)):
-            KN_CANON[k] = kn
+        k=canon_key(kn)
+        if k and (k not in KN_CANON or len(KN_CANON[k])<len(kn)): KN_CANON[k]=kn
 
-    # normalize refs
+    # ========= role_areas: result["roles"] başlıklarını sınıflandır
+    role_blocks = []
+    for rb in (result.get("roles") or []):
+        b = to_xywh(rb if not (isinstance(rb,dict) and "bbox" in rb) else rb["bbox"])
+        if not b: continue
+        txt = None
+        if isinstance(rb, dict): txt = rb.get("txt")
+        if (txt is None) and hasattr(rb, "__dict__"): txt = getattr(rb, "txt", None)
+        if not txt or not txt.strip():
+            txt = ocr_text(lower_img, b, lang, psm_list, oem_list, new_url)
+        rs = classify_text_role(txt, b, lower_img.shape[:2])
+        if rs.role:  # yalnızca anlamlı rolse alan olarak kullan
+            role_blocks.append({"bbox": b, "role": rs.role, "score": rs.score, "txt": txt})
+
+    # ========= final kutuları oku
     def normalize_with_ref(seq):
         out=[]
         if seq is None: return out
@@ -348,8 +299,7 @@ def extract_roles_and_bottom(
         return out
 
     pairs = normalize_with_ref(result.get("final") or result.get("roles") or [])
-    boxes_xywh = [p[0] for p in pairs]
-    objs        = [p[1] for p in pairs]
+    boxes_xywh = [p[0] for p in pairs]; objs=[p[1] for p in pairs]
     boxes_xyxy  = [to_xyxy(b) for b in boxes_xywh]
 
     sigs=[]
@@ -358,60 +308,75 @@ def extract_roles_and_bottom(
         if b: sigs.append(to_xyxy(b))
 
     H,W = lower_img.shape[:2]
-
-    # per_box_df
     rows=[]
     for i,(xywh,xyxy,obj) in enumerate(zip(boxes_xywh, boxes_xyxy, objs)):
         # text
-        obj_txt = None
-        try: obj_txt = getattr(obj,"txt", None)
-        except: pass
-        if obj_txt is None and isinstance(obj, dict): obj_txt = obj.get("txt")
+        obj_txt=None
+        if isinstance(obj, dict): obj_txt=obj.get("txt")
+        if (obj_txt is None) and hasattr(obj,"txt"): obj_txt=getattr(obj,"txt")
         text = obj_txt if (obj_txt and obj_txt.strip()) else ocr_text(lower_img, xywh, lang, psm_list, oem_list, new_url)
         text = norm_space(text)
 
-        # role
-        rs = classify_box(text, xywh, (H,W))
-        role = rs.role if (rs.role and (rs.score >= role_threshold or "regex" in rs.reasons)) else None
+        # ---- 1) roleblock ile ZORLA ata
+        forced=None; forced_reason=None
+        box_xyxy = to_xyxy(expand(xywh, force_margin_px))
+        candidates=[]
+        for rb in role_blocks:
+            rb_xyxy = to_xyxy(expand(rb["bbox"], 0))
+            if contains(rb_xyxy, box_xyxy, tol=0) or iou(rb_xyxy, box_xyxy) >= 0.25:
+                # içeriyorsa ya da anlamlı örtüşüyorsa aday
+                dist = 0.0
+                # basit merkez uzaklığı (yakın olanı seç)
+                bx=(box_xyxy[0]+box_xyxy[2])/2; by=(box_xyxy[1]+box_xyxy[3])/2
+                rx=(rb_xyxy[0]+rb_xyxy[2])/2; ry=(rb_xyxy[1]+rb_xyxy[3])/2
+                dist = (bx-rx)**2 + (by-ry)**2
+                candidates.append((dist, rb))
+        if candidates:
+            candidates.sort(key=lambda t: (t[0], -t[1][1]["score"]))
+            chosen = candidates[0][1]
+            forced = chosen["role"]
+            forced_reason = "roleblock"
+        # ---- 2) metin fallback
+        if forced:
+            role = forced; role_score = 1.0; reasons = [forced_reason]
+        else:
+            rs = classify_text_role(text, xywh, (H,W))
+            role = rs.role if (rs.role and (rs.score >= role_threshold or "regex" in rs.reasons)) else None
+            role_score = float(rs.score); reasons = rs.reasons
 
-        # names
+        # ---- isim adayları
         cands = strict_candidates(text)
         final=[]
         for c in cands:
             p = promote_and_format(c, text, KN_CANON, name_sim_threshold)
             if p and all(tr_upper(w) not in ROLE_WORD_SET for w in p.split()):
                 final.append(p)
-        # de-dup within box
         seen=set(); uni=[]
         for n in final:
             k=canon_key(n)
             if k not in seen:
                 seen.add(k); uni.append(n)
 
-        # signature overlap
+        # ---- imza örtüşmesi
         sig_hit = any(
             (max(xyxy[0], s[0]) < min(xyxy[2], s[2]) and max(xyxy[1], s[1]) < min(xyxy[3], s[3]))
             for s in sigs
         )
 
         rows.append({
-            "i": i,
-            "bbox": xywh,
-            "sig": sig_hit,
-            "role_best": role,
-            "role_score": float(rs.score),
-            "role_reasons": ";".join(rs.reasons),
+            "i": i, "bbox": xywh, "sig": sig_hit,
+            "role_best": role, "role_score": role_score,
+            "role_reasons": ";".join(reasons) if reasons else "",
             "name_in_box": "; ".join(uni) if uni else None,
-            "text_preview": norm_space(text)[:220],
+            "text_preview": text[:220],
         })
 
     per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_best","role_score","role_reasons","name_in_box","text_preview"])
 
-    # within-role de-dup (strict)
+    # === rol bazında isim de-dup
     def _lastname(s: str) -> str:
         toks = canon_key(s).split()
         return toks[-1] if toks else ""
-
     def dedupe_within_role_strict(df: pd.DataFrame) -> pd.DataFrame:
         out = []; seen = {}
         for _, r in df.iterrows():
@@ -424,8 +389,7 @@ def extract_roles_and_bottom(
                 add = True
                 ck = canon_key(nm); ln = _lastname(nm)
                 for prev in kept:
-                    ck2 = canon_key(prev)
-                    if ck == ck2: add=False; break
+                    if canon_key(prev) == ck: add=False; break
                     if _lastname(prev) == ln:
                         fn1 = " ".join(canon_key(nm).split()[:-1])
                         fn2 = " ".join(canon_key(prev).split()[:-1])
@@ -436,19 +400,10 @@ def extract_roles_and_bottom(
             out.append("; ".join(curr) if curr else None)
         df = df.copy(); df["name_in_box"] = out
         return df
-
     per_box_df = dedupe_within_role_strict(per_box_df)
 
-    if debug:
-        try:
-            from IPython.display import display
-            print(f"[INFO] {len(per_box_df)} box")
-            display(per_box_df)
-        except Exception:
-            pass
-
-    # SERMAYE
-    sermaye = None
+    # === sermaye değerini çek
+    sermaye=None
     if "sermaye" in result and result["sermaye"] is not None:
         s_txt = getattr(result["sermaye"], "txt", None) if hasattr(result["sermaye"], "__dict__") else \
                 (result["sermaye"].get("txt") if isinstance(result["sermaye"], dict) else None)
@@ -465,7 +420,7 @@ def extract_roles_and_bottom(
         except Exception:
             pass
 
-    # bottom_df
+    # === bottom_df kur
     out = {
         "sermaye_toplam_tl": sermaye,
         "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
@@ -486,16 +441,13 @@ def extract_roles_and_bottom(
         "divan_baskani":"divan_baskani_ad_soyad",
     }
     sig_cols = {k: v.replace("_ad_soyad","_imza_var_mi") for k,v in name_cols.items()}
-
     for _,r in per_box_df.iterrows():
         role=r.get("role_best")
-        if not role or role=="sermaye":
-            continue
+        if not role or role=="sermaye": continue
         ncol=name_cols.get(role); scol=sig_cols.get(role)
         raw=r.get("name_in_box")
         parts=[p.strip() for p in raw.split(";")] if isinstance(raw,str) and ";" in raw else ([raw.strip()] if isinstance(raw,str) and raw.strip() else [])
-        if not parts: 
-            continue
+        if not parts: continue
         if role=="yk_uyesi":
             out[ncol] = (out[ncol]+"; "+"; ".join(parts)) if out[ncol] else "; ".join(parts)
         else:
@@ -508,7 +460,10 @@ def extract_roles_and_bottom(
     if debug:
         try:
             from IPython.display import display
-            display(bottom_df)
+            print(f"[INFO] role_blocks={len(role_blocks)}, boxes={len(per_box_df)}")
+            if role_blocks:
+                display(pd.DataFrame([{"role":rb["role"], "score":rb["score"], "bbox":rb["bbox"], "txt":rb["txt"][:80]} for rb in role_blocks]))
+            display(per_box_df); display(bottom_df)
         except Exception:
             pass
 
