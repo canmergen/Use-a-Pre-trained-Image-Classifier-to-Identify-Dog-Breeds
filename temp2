@@ -1,101 +1,133 @@
-import re, copy, unicodedata
-from typing import List, Any, Dict, Tuple, Optional
+# Gereksinim: rapidfuzz
+# pip install rapidfuzz
+import copy, unicodedata, re
+from typing import Any, List, Tuple, Dict, Optional
+from rapidfuzz import fuzz
 
-def split_equal_when_multi_role(
+def split_equal_when_multi_role_fuzzy(
     role_blocks: List[Any],
     *,
     ROLE_ALIASES: Optional[Dict[str, List[str]]] = None,
-    ROLE_WORDS: Optional[List[str]] = None,
-    gap_px: int = 6,          # parçalar arası boşluk (gutter)
-    min_piece_w: int = 12,    # güvenlik: çok dar parça oluşmasın
+    gap_px: int = 6,
+    min_piece_w: int = 12,
+    fuzzy_enable: bool = True,
+    fuzzy_score_thr: int = 85,   # 0-100; 85 iyi bir başlangıç
     debug: bool = False
 ) -> List[Any]:
     """
-    Sadece çoklu rol içeren kutuları eşit genişlikte N parçaya böler.
-    - Tek rol (altında birden çok isim bile olsa) bölünmez.
-    - 'role' alanını parçadaki ilgili başlıkla doldurur (yoksa None).
-    - Girdi/çıktı tipini korur (dict/obj).
+    Çoklu rol içeren kutuları N eşit parçaya böler; tek rol içerenleri bölmez.
+    Rol tespiti:
+      1) Kanonikleştirilmiş metinde exact substring (deterministik)
+      2) Bulunamazsa fuzzy (partial_ratio / token_set_ratio) yedek eşleşme
+
+    Girdi/çıktı: role_blocks (dict/obj; x,y,w,h,txt[,role]).
     """
 
-    # ----- tip yardımcıları -----
+    # -------- dict/obj yardımcıları --------
     def getf(b, k, default=None):
         if isinstance(b, dict): return b.get(k, default)
         return getattr(b, k, default)
-
     def setf(b, k, v):
         if isinstance(b, dict): b[k] = v
         else: setattr(b, k, v)
-
     def new_like(b):
         return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
-
     def xyxy(b) -> Tuple[int,int,int,int]:
         x,y,w,h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
         return x, y, x+w, y+h
 
-    # ----- kanonikleştirme (senin yapına paralel) -----
+    # -------- kanonikleştirme (TR güvenli) --------
     def tr_upper(s: str) -> str:
         return (s or "").replace("i","İ").replace("ı","I").upper()
-
     def strip_diac(s: str) -> str:
         return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
     def canon(s: str) -> str:
         s = tr_upper(strip_diac(s))
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    # ----- rol sözlüğü -----
+    # -------- rol sözlüğü (alias) --------
     if ROLE_ALIASES is None:
         ROLE_ALIASES = {
+            "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
+            "oy_toplama_memuru":["OY TOPLAMA MEMURU","OY TOPLAYICI","TOPLAYICI"],
             "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","TOPLANTI BAŞI"],
             "tutanak_yazmani":  ["TUTANAK YAZMANI","YAZMAN"],
-            "bakanlik_temsilcisi":["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
             "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
             "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
-            "katip":            ["KATİP","KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-            "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BAŞKANI","DIVAN BASKANI"],
+            "mudur":            ["MÜDÜR","MUDUR","GENEL MÜDÜR","GENEL MUDUR"],
+            "baskan":           ["BAŞKAN","BASKAN"],
         }
-    if ROLE_WORDS is None:
-        ROLE_WORDS = sorted({w for vals in ROLE_ALIASES.values() for w in vals}, key=len, reverse=True)
 
-    # Esnek boşluk ve aksansız arama için regex
-    def _flex(w: str) -> str:
-        w = canon(w)
-        return re.sub(r"\s+", r"\\s+", w)
+    # (family, canon_alias) listesi
+    CANON_ALIASES: List[Tuple[str,str]] = []
+    for fam, vals in ROLE_ALIASES.items():
+        for v in vals:
+            CANON_ALIASES.append((fam, canon(v)))
 
-    ROLE_PAT = re.compile(r"\b(" + "|".join(_flex(w) for w in ROLE_WORDS) + r")\b", re.U)
-
-    def extract_roles(text: str) -> List[str]:
+    # -------- rol tespiti: deterministik + fuzzy --------
+    def detect_roles_ordered(text: str) -> List[Tuple[str,int,int]]:
+        """
+        Dönüş: [(family, start_index, confidence)], start_index küçük olan önce.
+        confidence: 100 (exact) veya fuzzy skor (0..100).
+        """
         t = canon(text)
-        return [m.group(0) for m in ROLE_PAT.finditer(t)]
+        hits: Dict[str, Tuple[int,int]] = {}  # fam -> (start, score)
 
-    # ----- ana akış -----
+        # 1) Exact substring
+        for fam, phrase in CANON_ALIASES:
+            idx = t.find(phrase)
+            if idx != -1:
+                if fam not in hits or idx < hits[fam][0]:
+                    hits[fam] = (idx, 100)
+
+        # 2) Fuzzy fallback
+        if fuzzy_enable:
+            for fam, phrase in CANON_ALIASES:
+                if fam in hits: 
+                    continue  # exact bulundu
+                # iki farklı ölçüyü birleştirelim (daha sağlam)
+                s1 = fuzz.partial_ratio(t, phrase)
+                s2 = fuzz.token_set_ratio(t, phrase)
+                sc = max(s1, s2)
+                if sc >= fuzzy_score_thr:
+                    # pozisyonu yaklaşıkla: alias’ın ilk kelimesini ara
+                    key = phrase.split()[0]
+                    idx = t.find(key)
+                    if idx == -1:
+                        idx = len(t) + 10  # en sona at
+                    # varsa daha iyi skor/erken index ile güncelle
+                    if fam not in hits or (sc > hits[fam][1]) or (sc == hits[fam][1] and idx < hits[fam][0]):
+                        hits[fam] = (idx, sc)
+
+        ordered = [(fam, pos, sc) for fam,(pos,sc) in hits.items()]
+        ordered.sort(key=lambda x: x[1])
+        return ordered
+
+    # -------- ana akış --------
     out: List[Any] = []
     for b in role_blocks:
-        text = getf(b, "txt") or ""
-        roles = extract_roles(text)
+        txt = getf(b, "txt") or ""
+        role_hits = detect_roles_ordered(txt)
 
         if debug:
-            print(f"[split_equal] roles_detected={roles} | txt[:80]={text[:80]!r}")
+            print(f"[split_fuzzy] roles={role_hits}  txt[:80]={str(txt)[:80]!r}")
 
-        if len(roles) <= 1:
-            # tek rol: normalize edip bırak
+        if len(role_hits) <= 1:
             nb = new_like(b)
-            if roles:
-                setf(nb, "role", roles[0])
+            if role_hits:
+                setf(nb, "role", role_hits[0][0])  # family adı
             out.append(nb)
             continue
 
-        # N rol -> eşit N dilime böl
-        N = len(roles)
+        # N rol → eşit N parçaya böl (ortası boş için gap uygula)
+        N = len(role_hits)
         x, y, x2, y2 = xyxy(b)
         W = x2 - x
 
         total_gap = gap_px * (N - 1)
         usable_w = max(0, W - total_gap)
-        if N == 0 or usable_w // N < min_piece_w:
-            # çok dar kalıyorsa gap'ı sıfırla
+        if usable_w // N < min_piece_w:
             total_gap = 0
             usable_w = W
 
@@ -110,9 +142,7 @@ def split_equal_when_multi_role(
             setf(nb, "y", y)
             setf(nb, "w", max(1, w_piece))
             setf(nb, "h", y2 - y)
-            setf(nb, "role", roles[i])   # ilgili başlık
-            # İstersen txt’i olduğu gibi bırak; temiz istiyorsan:
-            # setf(nb, "txt", roles[i])
+            setf(nb, "role", role_hits[i][0])   # i’nci rol family
             out.append(nb)
             cur_x += w_piece + (gap_px if total_gap else 0)
 
