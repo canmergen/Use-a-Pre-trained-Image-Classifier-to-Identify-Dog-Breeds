@@ -1,21 +1,23 @@
 import re, copy, unicodedata
-from typing import List, Any, Optional, Tuple
+from typing import List, Any, Dict, Tuple, Optional
 
 def split_equal_when_multi_role(
     role_blocks: List[Any],
     *,
-    role_words: Optional[List[str]] = None,
-    role_aliases: Optional[dict] = None,
-    gap_px: int = 6,               # kutular arası ince boşluk
-    min_piece_w: int = 12          # güvenlik: çok dar parçayı engelle
+    ROLE_ALIASES: Optional[Dict[str, List[str]]] = None,
+    ROLE_WORDS: Optional[List[str]] = None,
+    gap_px: int = 6,          # parçalar arası boşluk (gutter)
+    min_piece_w: int = 12,    # güvenlik: çok dar parça oluşmasın
+    debug: bool = False
 ) -> List[Any]:
     """
-    Sadece çoklu rol içeren kutuları, rolleri sayısı N ise eşit genişlikte N parçaya böler.
-    Tek rol içeren kutular bölünmez (altında birden fazla isim olsa bile).
-    Girdi/çıktı: role_blocks (x,y,w,h,txt[,role]) alanlarına sahip dict ya da obj listesi.
+    Sadece çoklu rol içeren kutuları eşit genişlikte N parçaya böler.
+    - Tek rol (altında birden çok isim bile olsa) bölünmez.
+    - 'role' alanını parçadaki ilgili başlıkla doldurur (yoksa None).
+    - Girdi/çıktı tipini korur (dict/obj).
     """
 
-    # --- yardımcılar (dict/obj uyumu) ---
+    # ----- tip yardımcıları -----
     def getf(b, k, default=None):
         if isinstance(b, dict): return b.get(k, default)
         return getattr(b, k, default)
@@ -28,20 +30,24 @@ def split_equal_when_multi_role(
         return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
 
     def xyxy(b) -> Tuple[int,int,int,int]:
-        x, y, w, h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
+        x,y,w,h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
         return x, y, x+w, y+h
 
+    # ----- kanonikleştirme (senin yapına paralel) -----
+    def tr_upper(s: str) -> str:
+        return (s or "").replace("i","İ").replace("ı","I").upper()
+
+    def strip_diac(s: str) -> str:
+        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
     def canon(s: str) -> str:
-        s = (s or "")
-        s = unicodedata.normalize("NFKD", s)
-        s = "".join(c for c in s if not unicodedata.combining(c))
-        s = s.replace("i","İ").replace("ı","I").upper()
+        s = tr_upper(strip_diac(s))
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    # --- rol sözlüğü ---
-    if role_aliases is None:
-        role_aliases = {
+    # ----- rol sözlüğü -----
+    if ROLE_ALIASES is None:
+        ROLE_ALIASES = {
             "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","TOPLANTI BAŞI"],
             "tutanak_yazmani":  ["TUTANAK YAZMANI","YAZMAN"],
             "bakanlik_temsilcisi":["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
@@ -50,54 +56,64 @@ def split_equal_when_multi_role(
             "katip":            ["KATİP","KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
             "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BAŞKANI","DIVAN BASKANI"],
         }
-    if role_words is None:
-        role_words = sorted({w for lst in role_aliases.values() for w in lst}, key=len, reverse=True)
+    if ROLE_WORDS is None:
+        ROLE_WORDS = sorted({w for vals in ROLE_ALIASES.values() for w in vals}, key=len, reverse=True)
 
-    ROLE_PAT = re.compile(r"\b(" + "|".join(re.escape(canon(w)) for w in role_words) + r")\b", re.U)
+    # Esnek boşluk ve aksansız arama için regex
+    def _flex(w: str) -> str:
+        w = canon(w)
+        return re.sub(r"\s+", r"\\s+", w)
 
-    def extract_roles_in_order(text: str) -> List[str]:
+    ROLE_PAT = re.compile(r"\b(" + "|".join(_flex(w) for w in ROLE_WORDS) + r")\b", re.U)
+
+    def extract_roles(text: str) -> List[str]:
         t = canon(text)
-        roles = [m.group(0) for m in ROLE_PAT.finditer(t)]
-        return roles
+        return [m.group(0) for m in ROLE_PAT.finditer(t)]
 
-    # --- ana akış ---
+    # ----- ana akış -----
     out: List[Any] = []
     for b in role_blocks:
-        roles = extract_roles_in_order(getf(b,"txt") or "")
+        text = getf(b, "txt") or ""
+        roles = extract_roles(text)
+
+        if debug:
+            print(f"[split_equal] roles_detected={roles} | txt[:80]={text[:80]!r}")
+
         if len(roles) <= 1:
-            # tek rol: aynen geç (role alanı normalize edilir)
+            # tek rol: normalize edip bırak
             nb = new_like(b)
             if roles:
                 setf(nb, "role", roles[0])
             out.append(nb)
             continue
 
-        # N rol -> eşit N parçaya böl + aralara sabit boşluk
+        # N rol -> eşit N dilime böl
         N = len(roles)
         x, y, x2, y2 = xyxy(b)
         W = x2 - x
+
         total_gap = gap_px * (N - 1)
         usable_w = max(0, W - total_gap)
-        if usable_w // N < min_piece_w:
-            # parça çok dar kalacaksa: gap'i küçült ya da tamamen kaldır
+        if N == 0 or usable_w // N < min_piece_w:
+            # çok dar kalıyorsa gap'ı sıfırla
             total_gap = 0
             usable_w = W
 
-        base_w = usable_w // N
-        remainder = usable_w % N
+        base = usable_w // N
+        rem  = usable_w % N
 
         cur_x = x
         for i in range(N):
-            w_piece = base_w + (1 if i < remainder else 0)
+            w_piece = base + (1 if i < rem else 0)
             nb = new_like(b)
             setf(nb, "x", cur_x)
             setf(nb, "y", y)
             setf(nb, "w", max(1, w_piece))
             setf(nb, "h", y2 - y)
-            setf(nb, "role", roles[i])     # parçaya i’nci rolü ata
-            # txt’i olduğu gibi bırakabiliriz; istersen boşalt:
+            setf(nb, "role", roles[i])   # ilgili başlık
+            # İstersen txt’i olduğu gibi bırak; temiz istiyorsan:
             # setf(nb, "txt", roles[i])
             out.append(nb)
-            cur_x += w_piece + gap_px  # bir sonraki parçaya geç
+            cur_x += w_piece + (gap_px if total_gap else 0)
 
     return out
