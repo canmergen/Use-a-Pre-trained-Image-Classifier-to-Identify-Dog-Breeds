@@ -1,151 +1,162 @@
-# pip install rapidfuzz
-import copy, unicodedata, re
-from typing import Any, List, Tuple, Dict, Optional
-from rapidfuzz import fuzz
+def expand_sermaye_boxes_if_no_amount(
+    sermaye_boxes: List[Box],
+    all_boxes: List[Any],        # detected_boxes (geometri için)
+    ocr_texts: Iterable[Any],    # (x,y,w,h, txt) veya TextBox
+    dbg: bool = False,
+) -> List[Box]:
+    import re
+    from typing import Tuple, Optional, List
 
-def split_equal_when_multi_role_fuzzy_strict(
-    role_blocks: List[Any],
-    *,
-    ROLE_ALIASES: Optional[Dict[str, List[str]]] = None,
-    gap_px: int = 6,
-    min_piece_w: int = 12,
-    fuzzy_enable: bool = True,
-    fuzzy_score_thr: int = 85,
-    small_space_policy: str = "drop",  # "drop" | "shrink_gap" | "keep_unsplit"
-    debug: bool = False
-) -> List[Any]:
-    """
-    Aynı kutuda 2+ rol varsa kutuyu N eşit parçaya böler.
-    Parçalar arası boşluk `gap_px` kadar bırakılır.
-    Yer yetmezse davranış `small_space_policy` ile belirlenir.
-    Tek rol varsa bölmez.
-    """
+    num_pat = re.compile(r"\d")
 
-    # ---- dict/obj yardımcıları ----
-    def getf(b, k, d=None): return b.get(k, d) if isinstance(b, dict) else getattr(b, k, d)
-    def setf(b, k, v): b.__setitem__(k, v) if isinstance(b, dict) else setattr(b, k, v)
-    def new_like(b): return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
-    def xyxy(b):
-        x,y,w,h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
-        return x, y, x+w, y+h
+    # ---------- temel yardımcılar ----------
+    def _has_number(s: str) -> bool:
+        return bool(num_pat.search(s or ""))
 
-    # ---- kanonikleştirme ----
-    def tr_upper(s:str)->str: return (s or "").replace("i","İ").replace("ı","I").upper()
-    def strip_diac(s:str)->str: return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def canon(s:str)->str: return re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
+    def _to_box(obj: Any) -> Box:
+        if isinstance(obj, Box):
+            return obj
+        if isinstance(obj, (tuple, list)):
+            return as_box(obj)
+        if hasattr(obj, "x") and hasattr(obj, "y"):
+            return as_box(obj)
+        raise TypeError(f"cannot convert {type(obj)} to Box")
 
-    # ---- alias sözlüğü ----
-    if ROLE_ALIASES is None:
-        ROLE_ALIASES = {
-            "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
-            "oy_toplama_memuru":["OY TOPLAMA MEMURU","OY TOPLAYICI","TOPLAYICI"],
-            "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","TOPLANTI BAŞI"],
-            "tutanak_yazmani":  ["TUTANAK YAZMANI","YAZMAN"],
-            "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
-            "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
-            "mudur":            ["MÜDÜR","MUDUR","GENEL MÜDÜR","GENEL MUDUR"],
-            "baskan":           ["BAŞKAN","BASKAN"],
-        }
+    def _xyxy(b: Box) -> Tuple[int,int,int,int]:
+        return b.x, b.y, b.x + b.w, b.y + b.h
 
-    ALIASES = [(fam, canon(v)) for fam, vals in ROLE_ALIASES.items() for v in vals]
-    ALIASES.sort(key=lambda t: len(t[1]), reverse=True)  # uzun alias önce
+    def _overlap_1d(a1: int, a2: int, b1: int, b2: int) -> int:
+        return max(0, min(a2, b2) - max(a1, b1))
 
-    # ---- rol tespiti (exact + fuzzy; non-overlap) ----
-    def detect_roles(text: str) -> List[str]:
-        t = canon(text)
-        taken = [False]*len(t)
-        fams: List[str] = []
+    def _union(a: Box, b: Box) -> Box:
+        ax1, ay1, ax2, ay2 = _xyxy(a)
+        bx1, by1, bx2, by2 = _xyxy(b)
+        x1, y1, x2, y2 = min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2)
+        txt = ((a.txt or "") + " " + (b.txt or "")).strip()
+        return Box(x1, y1, x2 - x1, y2 - y1, txt, a.role or b.role)
 
-        # exact
-        for fam, cv in ALIASES:
-            start = 0
-            while True:
-                idx = t.find(cv, start)
-                if idx == -1: break
-                rng = range(idx, idx+len(cv))
-                if any(taken[i] for i in rng):
-                    start = idx + 1; continue
-                for i in rng: taken[i] = True
-                fams.append(fam)
-                start = idx + len(cv)
+    # OCR metinlerini Box'a çevir
+    text_boxes: List[Box] = []
+    for t in ocr_texts:
+        if hasattr(t, "x") and hasattr(t, "y"):
+            txt = getattr(t, "txt", "") or getattr(t, "text", "") or ""
+            text_boxes.append(Box(int(t.x), int(t.y), int(t.w), int(t.h), str(txt)))
+        elif isinstance(t, (tuple, list)) and len(t) >= 5:
+            x, y, w, h, txt = t[:5]
+            text_boxes.append(Box(int(x), int(y), int(w), int(h), str(txt or "")))
 
-        # fuzzy fallback (yalnızca hiç/tek kaldıysa)
-        if fuzzy_enable and len(fams) <= 1:
-            cands = []
-            for fam, cv in ALIASES:
-                s1 = fuzz.partial_ratio(t, cv)
-                s2 = fuzz.token_set_ratio(t, cv)
-                sc = max(s1, s2)
-                if sc >= fuzzy_score_thr:
-                    key = cv.split()[0]
-                    pos = t.find(key)
-                    if pos == -1: pos = len(t) + 10
-                    cands.append((fam, pos, sc))
-            cands.sort(key=lambda x: (-x[2], x[1]))
-            for fam, _, _ in cands:
-                if fam not in fams:
-                    fams.append(fam)
+    # detected_boxes -> Box (txt’siz de olabilir)
+    geom_boxes: List[Box] = [_to_box(b) for b in all_boxes]
 
-        # daha spesifik aile varsa genel "baskan"ı çıkar
-        if any(f in fams for f in ("divan_baskani","toplanti_baskani","yk_baskani")):
-            fams = [f for f in fams if f != "baskan"]
+    # belirli bir geometriyi (x,y,w,h) key olarak kullan (id yerine)
+    def _gkey(b: Box) -> Tuple[int,int,int,int]:
+        return (b.x, b.y, b.w, b.h)
 
-        # soldan sağa sıralı benzersiz liste
-        seen=set(); ordered=[]
-        for f in fams:
-            if f not in seen:
-                ordered.append(f); seen.add(f)
-        return ordered
+    # ---------- yalnızca OCR metinlerinden komşu arayan seçiciler ----------
+    def _nearest_right_text_with_digits(cur: Box, used_keys: set) -> Optional[Box]:
+        cx1, cy1, cx2, cy2 = _xyxy(cur)
+        cand: List[Tuple[int, Box]] = []
+        for tb in text_boxes:
+            if _gkey(tb) in used_keys:
+                continue
+            if not _has_number(tb.txt):
+                continue
+            tx1, ty1, tx2, ty2 = _xyxy(tb)
+            if tx1 <= cx1:
+                continue
+            if _overlap_1d(cy1, cy2, ty1, ty2) <= 0:  # satır örtüşmesi yok
+                continue
+            dist = max(0, tx1 - cx2)
+            cand.append((dist, tb))
+        cand.sort(key=lambda t: (t[0], t[1].x))
+        return cand[0][1] if cand else None
 
-    # ---- ana akış ----
-    out: List[Any] = []
-    for b in role_blocks:
-        txt = getf(b, "txt") or ""
-        fams = detect_roles(txt)
-        if debug: print(f"[roles] {fams} | txt[:80]={str(txt)[:80]!r}")
+    def _nearest_down_text_with_digits(cur: Box, used_keys: set) -> Optional[Box]:
+        cx1, cy1, cx2, cy2 = _xyxy(cur)
+        cand: List[Tuple[int, Box]] = []
+        for tb in text_boxes:
+            if _gkey(tb) in used_keys:
+                continue
+            if not _has_number(tb.txt):
+                continue
+            tx1, ty1, tx2, ty2 = _xyxy(tb)
+            if ty1 <= cy1:
+                continue
+            if _overlap_1d(cx1, cx2, tx1, tx2) <= 0:  # sütun örtüşmesi yok
+                continue
+            dist = max(0, ty1 - cy2)
+            cand.append((dist, tb))
+        cand.sort(key=lambda t: (t[0], t[1].y))
+        return cand[0][1] if cand else None
 
-        if len(fams) <= 1:
-            nb = new_like(b)
-            if fams: setf(nb, "role", fams[0])
-            out.append(nb)
+    kept: List[Box] = []
+    dropped = 0
+    max_steps = max(1, len(text_boxes))  # güvenlik
+
+    for sb in sermaye_boxes:
+        base = _to_box(sb)
+
+        # base'in txt'sini OCR textlerinden doldurmaya çalış
+        # (aynı satır ve en yakın sağ/alt metin "SERMAYE" gibi sinyal içeriyorsa)
+        # ama şart değil; amount aramasını komşuda yapıyoruz
+        if dbg:
+            print(f"[EXPAND] start :: {base.txt[:70]!r}")
+
+        if _has_number(base.txt):
+            kept.append(base)
+            if dbg:
+                print("[EXPAND] keep-as-is (already has amount)")
             continue
 
-        # N parçaya eşit böl + gap
-        N = len(fams)
-        x,y,x2,y2 = xyxy(b)
-        W = x2 - x
+        # ---- 1) SAĞA doğru zincir: yalnızca RAKAM içeren OCR metinleriyle ilerle ----
+        cur = base
+        used_keys = {_gkey(base)}
+        success = False
+        steps = 0
+        while steps < max_steps:
+            nb = _nearest_right_text_with_digits(cur, used_keys)
+            if not nb:
+                if dbg: print("[EXPAND] RIGHT -> ∅")
+                break
+            if dbg: print(f"[EXPAND] RIGHT + {nb.txt[:40]!r}")
+            used_keys.add(_gkey(nb))
+            cur = _union(cur, nb)  # nb zaten txt’li
+            steps += 1
+            # nb.txt zaten rakamlı; direkt başarı
+            kept.append(cur)
+            success = True
+            if dbg: print("[EXPAND] success via RIGHT chain")
+            break
 
-        needed = N*min_piece_w + (N-1)*gap_px
-        if needed > W:
-            if small_space_policy == "drop":
-                if debug: print(f"[drop] W={W} < needed={needed} (N={N}, gap={gap_px}, minw={min_piece_w})")
-                # Tamamen dropla: hiçbir parça ekleme
-                continue
-            elif small_space_policy == "keep_unsplit":
-                nb = new_like(b)
-                setf(nb, "role", fams[0])  # birincil rolü yaz
-                out.append(nb)
-                continue
-            else:  # "shrink_gap"
-                # boşluğu küçült, yine de parçala
-                possible_gap = max(0, (W - N*min_piece_w)) // max(1, (N-1))
-                gap = possible_gap
-        else:
-            gap = gap_px
+        if success:
+            continue
 
-        usable = W - gap*(N-1)
-        base = usable // N
-        rem  = usable % N
+        # ---- 2) AŞAĞI doğru zincir (ORİJİNAL bazla) ----
+        cur = base
+        used_keys = {_gkey(base)}
+        steps = 0
+        while steps < max_steps:
+            nb = _nearest_down_text_with_digits(cur, used_keys)
+            if not nb:
+                if dbg: print("[EXPAND] DOWN  -> ∅")
+                break
+            if dbg: print(f"[EXPAND] DOWN  + {nb.txt[:40]!r}")
+            used_keys.add(_gkey(nb))
+            cur = _union(cur, nb)
+            steps += 1
+            kept.append(cur)
+            if dbg: print("[EXPAND] success via DOWN chain")
+            success = True
+            break
 
-        cur_x = x
-        for i in range(N):
-            w_piece = max(min_piece_w, base + (1 if i < rem else 0))
-            nb = new_like(b)
-            setf(nb, "x", cur_x); setf(nb, "y", y)
-            setf(nb, "w", w_piece); setf(nb, "h", y2 - y)
-            setf(nb, "role", fams[i])
-            out.append(nb)
-            if i < N-1:
-                cur_x += w_piece + gap
+        if success:
+            continue
 
-    return out
+        # ---- 3) yoksa drop ----
+        dropped += 1
+        if dbg:
+            print("[EXPAND] DROP (no amount)")
+
+    if dbg:
+        print(f"[EXPAND] kept={len(kept)} dropped={dropped}")
+    return kept
