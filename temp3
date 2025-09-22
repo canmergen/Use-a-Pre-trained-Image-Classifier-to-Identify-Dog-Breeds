@@ -10,11 +10,11 @@ def extract_roles_and_bottom(
     psm_list=(11, 6),
     oem_list=(1, 3),
     known_names=None,
-    role_threshold=0.60,            # metin fallback eşiği
-    soft_toplanti_floor=0.50,       # toplanti_baskani soft-assign
-    name_sim_threshold=0.88,        # bilinen isimle eşleme eşiği
-    force_margin_px=10,             # roleblock kapsama toleransı
-    iou_thresh=0.25,                # roleblock IoU eşiği
+    role_threshold=0.60,
+    soft_toplanti_floor=0.50,
+    name_sim_threshold=0.88,
+    force_margin_px=10,
+    iou_thresh=0.25,
     debug=False,
 ):
     import re, unicodedata
@@ -24,9 +24,11 @@ def extract_roles_and_bottom(
     import pandas as pd
     from rapidfuzz import fuzz
 
-    # =========================
-    # Text utilities
-    # =========================
+    # =============== text utils ===============
+    CONFUSION = str.maketrans({"0":"O","1":"I","5":"S","8":"B","€":"E","$":"S","@":"A"})
+    ALT_MAP = {"Ş":"S","Ğ":"G","İ":"I","I":"I","Ü":"U","Ö":"O","Ç":"C",
+               "ş":"s","ğ":"g","ı":"i","i":"i","ü":"u","ö":"o","ç":"c"}
+
     def tr_upper(s: str) -> str:
         return (s or "").replace("i","İ").replace("ı","I").upper()
     def tr_lower(s: str) -> str:
@@ -50,9 +52,26 @@ def extract_roles_and_bottom(
         total   = len(re.findall(r"[A-Za-zÇĞIİÖŞÜçğıişöü]", s or ""))
         return len(letters) >= max(1, int(0.8*total))
 
-    # =========================
-    # Geometry
-    # =========================
+    def normalize_hard(s: str) -> str:
+        if not s: return ""
+        s = "".join(ALT_MAP.get(c, c) for c in s)
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        s = s.translate(CONFUSION).upper()
+        s = re.sub(r"[^A-Z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        # TOPLANTI ve BAŞKAN varyantları
+        s = (s.replace("TOFLANI","TOPLANTI")
+               .replace("TOPLANI","TOPLANTI")
+               .replace("TOPLANT1","TOPLANTI"))
+        s = (s.replace("BAS I","BASKANI")
+               .replace("BASI","BASKANI")
+               .replace("BAS.","BASKANI")
+               .replace("BASKAN.","BASKANI")
+               .replace("BASKAN","BASKANI"))
+        return s
+
+    # =============== geometry ===============
     def to_xywh(obj: Any) -> Optional[Tuple[int,int,int,int]]:
         if isinstance(obj, dict) and "bbox" in obj: obj = obj["bbox"]
         if isinstance(obj, (tuple, list, np.ndarray)) and len(obj)==4:
@@ -89,26 +108,73 @@ def extract_roles_and_bottom(
         ox0,oy0,ox1,oy1=outer; ix0,iy0,ix1,iy1=inner
         return (ix0>=ox0-tol and iy0>=oy0-tol and ix1<=ox1+tol and iy1<=oy1+tol)
 
-    # =========================
-    # OCR helpers
-    # =========================
-    CONFUSION = str.maketrans({"0":"O","1":"I","5":"S","8":"B","€":"E","$":"S","@":"A"})
-    ALT_MAP = {"Ş":"S","Ğ":"G","İ":"I","I":"I","Ü":"U","Ö":"O","Ç":"C",
-               "ş":"s","ğ":"g","ı":"i","i":"i","ü":"u","ö":"o","ç":"c"}
+    # =============== fuzzy role detector ===============
+    ROLE_PRIORITY = ["sermaye","toplanti_baskani","bakanlik_temsilcisi",
+                     "yk_baskani","yk_uyesi","tutanak_yazmani","katip","divan_baskani"]
 
-    def normalize_hard(s: str) -> str:
-        if not s: return ""
-        s = "".join(ALT_MAP.get(c, c) for c in s)
-        s = unicodedata.normalize("NFD", s)
-        s = "".join(c for c in s if not unicodedata.combining(c))
-        s = s.translate(CONFUSION).upper()
-        s = re.sub(r"[^A-Z0-9\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        # sık OCR hataları
-        s = s.replace("TOFLANI","TOPLANTI").replace("TOPLANI","TOPLANTI").replace("TOPLANT1","TOPLANTI")
-        s = s.replace("BAS KANI","BASKANI").replace("BAS I","BASKANI")
-        return s
+    ROLE_ALIASES = {
+        "toplanti_baskani": ["TOPLANTI BASKANI","TOPLANTI BSK","TOPLANTI BASKAN","TOPLANTI BASKAN I"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSILCISI","TICARET BAKANLIGI TEMSILCISI"],
+        "yk_baskani": ["YK BASKANI","YONETIM KURULU BASKANI","YK BSK","YONETIM KURULU BASI","YK BASI","YONETIM KURULU BAS I"],
+        "yk_uyesi": ["YK UYESI","YONETIM KURULU UYESI","YK UYE"],
+        "tutanak_yazmani": ["TUTANAK YAZMANI","YAZMAN"],
+        "katip": ["KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
+        "divan_baskani": ["DIVAN BASKANI","DIVAN BSK"],
+        "sermaye": ["SIRKETIN SERMAYESI","SERMAYESI VE PAYLARIN TOPLAMI ITIBARI DEGERI","ASGARI TOPLANTI NISABI","MEVCUT TOPLANTI NISABI"],
+    }
+    ROLE_WORD_SET = {
+        "TOPLANTI","BASKANI","BAKANLIK","TEMSILCISI","YK","YONETIM","KURULU","UYESI","YAZMAN","KATIP","DIVAN","SERMAYESI","NISABI","PAY","TOPLAMI"
+    }
 
+    def gen_ngrams(tokens, nmin=1, nmax=5):
+        L=len(tokens)
+        for n in range(nmin, min(nmax, L)+1):
+            for i in range(0, L-n+1):
+                yield " ".join(tokens[i:i+n])
+
+    def fuzzy_best_role(text: str):
+        from rapidfuzz import fuzz
+        t = normalize_hard(text)
+        toks = t.split()
+
+        has_top = max(fuzz.partial_ratio("TOPLANTI", t), fuzz.token_set_ratio("TOPLANTI", t))/100.0
+        has_bsk = max(fuzz.partial_ratio("BASKANI", t), fuzz.partial_ratio("BASKAN", t))/100.0
+        has_yk  = max(fuzz.partial_ratio("YK", t), fuzz.token_set_ratio("YONETIM KURULU", t))/100.0
+        has_uye = max(fuzz.partial_ratio("UYESI", t), fuzz.token_set_ratio("UYESI", t))/100.0
+
+        best_role, best_score, why = None, 0.0, ""
+        for role, aliases in ROLE_ALIASES.items():
+            alias_full = max(fuzz.token_set_ratio(t, a) for a in aliases)/100.0
+            ng_best = 0.0
+            for ng in gen_ngrams(toks, 1, 5):
+                ng_best = max(ng_best, max(fuzz.token_set_ratio(ng, a) for a in aliases)/100.0)
+            sc = max(alias_full, ng_best)
+
+            if role == "toplanti_baskani" and min(has_top, has_bsk) >= 0.72:
+                sc = max(sc, 0.92); why = "co-occur(TOPLANTI+BASKAN[I])"
+            if role == "yk_baskani":
+                if min(has_yk, has_bsk) >= 0.70:
+                    sc = max(sc, 0.90); why = "co-occur(YK+BAŞKAN[I])"
+                if has_uye >= 0.70:
+                    sc = max(0.0, sc - 0.15)
+            if role == "yk_uyesi":
+                if has_uye >= 0.75:
+                    sc = max(sc, 0.88); why = "token(UYESI)"
+                if has_bsk >= 0.70:
+                    sc = max(0.0, sc - 0.20)
+            if role == "sermaye" and any(ch.isdigit() for ch in t):
+                sc = max(sc, sc + 0.05)
+
+            if sc > best_score:
+                best_role, best_score, why = role, sc, (why or f"alias/ngram:{sc:.2f}")
+
+        if best_score >= role_threshold:
+            return best_role, best_score, why
+        if best_role == "toplanti_baskani" and best_score >= soft_toplanti_floor and min(has_top, has_bsk) >= 0.70:
+            return best_role, best_score, "soft-assign(toplanti+baskan)"
+        return None, best_score, "low-score"
+
+    # =============== OCR wrapper ===============
     def ocr_text(img, xywh, lang, psm_list, oem_list, url):
         x,y,w,h = xywh
         pad = max(3, int(0.04*max(w,h)))
@@ -126,145 +192,7 @@ def extract_roles_and_bottom(
                 if q>bestq: bestq, best = q, txt
         return best
 
-    # =========================
-    # Role dictionaries and fuzzy role detector
-    # =========================
-    ROLE_PRIORITY = ["sermaye","toplanti_baskani","bakanlik_temsilcisi",
-                     "yk_baskani","yk_uyesi","tutanak_yazmani","katip","divan_baskani"]
-
-    ROLE_ALIASES = {
-        "toplanti_baskani": ["TOPLANTI BASKANI","TOPLANTI BSK","TOPLANTI BASKAN","TOPLANTI BASKAN I"],
-        "bakanlik_temsilcisi": ["BAKANLIK TEMSILCISI","TICARET BAKANLIGI TEMSILCISI"],
-        "yk_baskani": ["YK BASKANI","YONETIM KURULU BASKANI","YK BSK"],
-        "yk_uyesi": ["YK UYESI","YONETIM KURULU UYESI"],
-        "tutanak_yazmani": ["TUTANAK YAZMANI","YAZMAN"],
-        "katip": ["KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-        "divan_baskani": ["DIVAN BASKANI","DIVAN BSK"],
-        "sermaye": [
-            "SIRKETIN SERMAYESI",
-            "SERMAYESI VE PAYLARIN TOPLAMI ITIBARI DEGERI",
-            "ASGARI TOPLANTI NISABI",
-            "MEVCUT TOPLANTI NISABI",
-        ],
-    }
-
-    ROLE_WORD_SET = {
-        "TOPLANTI","BASKAN","BASKANI","BAKANLIK","TEMSILCISI","YK","YONETIM","KURULU",
-        "UYESI","YAZMAN","KATIP","DIVAN","SERMAYESI","NISABI","PAY","TOPLAMI"
-    }
-
-    def gen_ngrams(tokens, nmin=1, nmax=5):
-        L=len(tokens)
-        for n in range(nmin, min(nmax, L)+1):
-            for i in range(0, L-n+1):
-                yield " ".join(tokens[i:i+n])
-
-    def fuzzy_best_role(text: str):
-        """
-        text -> (role or None, score [0..1], reason)
-        n-gram + alias + co-occurrence(TOPLANTI, BASKAN[I])
-        """
-        t = normalize_hard(text)
-        toks = t.split()
-        has_top = max((fuzz.partial_ratio("TOPLANTI", t), fuzz.token_set_ratio("TOPLANTI", t)))/100.0
-        has_bsk = max(fuzz.partial_ratio("BASKAN", t), fuzz.partial_ratio("BASKANI", t))/100.0
-
-        best_role, best_score, why = None, 0.0, ""
-        for role in ROLE_PRIORITY:
-            aliases = ROLE_ALIASES[role]
-            alias_full = max(fuzz.token_set_ratio(t, a) for a in aliases)/100.0
-            ng_best = 0.0
-            for ng in gen_ngrams(toks, 1, 5):
-                ng_best = max(ng_best, max(fuzz.token_set_ratio(ng, a) for a in aliases)/100.0)
-            sc = max(alias_full, ng_best)
-            if role == "toplanti_baskani" and min(has_top, has_bsk) >= 0.75:
-                sc = max(sc, 0.92); why = "co-occur(TOPLANTI+BASKAN[I])"
-            if role == "sermaye" and any(ch.isdigit() for ch in t):
-                sc = max(sc, sc + 0.05)
-            if sc > best_score:
-                best_role, best_score, why = role, sc, why or f"alias/ngram:{sc:.2f}"
-
-        if best_score >= role_threshold:
-            return best_role, best_score, why
-        if best_role == "toplanti_baskani" and best_score >= soft_toplanti_floor and min(has_top, has_bsk) >= 0.70:
-            return best_role, best_score, "soft-assign(toplanti+baskan)"
-        return None, best_score, "low-score"
-
-    # =========================
-    # Name extraction
-    # =========================
-    def build_role_patterns():
-        pats=[]
-        cores=[
-            r"TOPLANTI\s+BASKAN[I]?", r"(?:YK|YONETIM\s+KURULU)\s+BASKANI",
-            r"(?:YK|YONETIM\s+KURULU)\s+UYESI",
-            r"(?:TICARET\s+BAKANLIGI|BAKANLIK)\s+TEMSILCISI",
-            r"SIRKETIN\s+SERMAYESI",
-            r"SERMAYESI\s+VE\s+PAYLARIN\s+TOPLAMI\s+ITIBARI\s+DEGERI",
-            r"ASGARI\s+TOPLANTI\s+NISABI", r"MEVCUT\s+TOPLANTI\s+NISABI",
-            r"KATIP", r"TUTANAK\s+YAZMANI", r"DIVAN\s+BASKANI",
-        ]
-        for c in cores:
-            pats.append(re.compile(rf"\b{c}\b", flags=re.IGNORECASE))
-        for w in ROLE_WORD_SET:
-            pats.append(re.compile(rf"\b{re.escape(w)}\b", flags=re.IGNORECASE))
-        return pats
-
-    ROLE_PATTERNS = build_role_patterns()
-    STOP_SHORT = {"DR","SN","PZ","MR","MRS","MS","DR.","SN.","AV","AV."}
-
-    def scrub_roles(text: str) -> str:
-        t = text or ""
-        # ağır normalize + bilinen rol kelimelerini sil
-        t = normalize_hard(t)
-        for pat in ROLE_PATTERNS: t = pat.sub(" ", t)
-        # kalan 'TOPLANTI' varyantlarını süpür
-        t = re.sub(r"\bT\w*PLANT\w*\b", " ", t)
-        t = re.sub(r"\b\d{6,}\b"," ", t)   # uzun ID
-        return norm_space(t)
-
-    def clean_tokens(toks: List[str]) -> List[str]:
-        out=[]
-        for t in toks:
-            if t in STOP_SHORT or t in ROLE_WORD_SET: continue
-            if len(t) < 2: continue
-            out.append(t)
-        return out
-
-    def strict_candidates(text: str) -> List[str]:
-        txt = scrub_roles(text)
-        out=[]
-        # ALL CAPS 2-3 kelime
-        for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ]{2,}(?:\s+[A-ZÇĞIİÖŞÜ]{2,}){1,2})\b", tr_upper(txt)):
-            toks = clean_tokens(m.group(1).split())
-            if 2 <= len(toks) <= 3: out.append(" ".join(toks))
-        # Baş harf büyük 2-3 kelime
-        for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+(?:\s+[A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+){1,2})\b", txt):
-            toks = clean_tokens(m.group(1).split())
-            if 2 <= len(toks) <= 3: out.append(" ".join(toks))
-        seen=set(); res=[]
-        for n in out:
-            k=canon_key(n)
-            if k and k not in seen: seen.add(k); res.append(n)
-        return res
-
-    def promote_and_format(name: str, ctx: str, KN_CANON: Dict[str,str], thr: float) -> Optional[str]:
-        if not name: return None
-        key = canon_key(name)
-        best = KN_CANON.get(key)
-        if not best:
-            for k,v in KN_CANON.items():
-                if fuzz.token_set_ratio(key, k)/100.0 >= thr:
-                    best = v; break
-        if not best:
-            toks = clean_tokens(name.split())
-            if not (2 <= len(toks) <= 3): return None
-            best = tr_title(" ".join(toks))
-        return tr_upper(best) if is_all_caps_ctx(ctx) else best
-
-    # =========================
-    # Known names canon
-    # =========================
+    # =============== known names ===============
     if known_names is None:
         pools=[]
         for c in ["pay_sahibinin_ad_soyadi_unvani","temsilci_adi_soyadi_unvani"]:
@@ -276,9 +204,7 @@ def extract_roles_and_bottom(
         k=canon_key(kn)
         if k and (k not in KN_CANON or len(KN_CANON[k])<len(kn)): KN_CANON[k]=kn
 
-    # =========================
-    # Role blocks (header boxes) → classify with fuzzy_best_role
-    # =========================
+    # =============== role blocks: classify ===============
     role_blocks=[]
     for rb in (result.get("roles") or []):
         b = to_xywh(rb if not (isinstance(rb,dict) and "bbox" in rb) else rb["bbox"])
@@ -290,9 +216,66 @@ def extract_roles_and_bottom(
         if r:
             role_blocks.append({"bbox": b, "role": r, "score": sc, "txt": txt, "why": why})
 
-    # =========================
-    # Final boxes normalize
-    # =========================
+    # === NEW: row clustering & template-based correction ===
+    def row_cluster(blocks, y_tol_frac=0.05):
+        if not blocks: return []
+        H, W = lower_img.shape[:2]
+        tol = max(6, int(H*y_tol_frac))
+        items=[]
+        for rb in blocks:
+            x,y,w,h = rb["bbox"]; cy = y + h//2; cx = x + w//2
+            items.append((cy, cx, rb))
+        items.sort()
+        rows=[]
+        for cy, cx, rb in items:
+            placed=False
+            for row in rows:
+                if abs(row["cy"]-cy) <= row["tol"]:
+                    row["items"].append((cx, rb)); placed=True; break
+            if not placed:
+                rows.append({"cy": cy, "tol": tol, "items":[(cx, rb)]})
+        # sort left->right
+        for row in rows:
+            row["items"].sort(key=lambda t: t[0])
+        return rows
+
+    def tokens(text):
+        t = normalize_hard(text); ts = set(t.split())
+        return {
+            "TOPLANTI": int("TOPLANTI" in ts),
+            "YK": int(("YK" in ts) or ("YONETIM" in ts and "KURULU" in ts)),
+            "UYESI": int("UYESI" in ts),
+            "BASKANI": int("BASKANI" in ts) or int("BASKAN" in ts),
+        }
+
+    # satır bazlı düzeltme
+    rows = row_cluster(role_blocks)
+    for row in rows:
+        if len(row["items"]) < 2:  # tek başlıkta dokunma
+            continue
+        # sinyaller
+        feats=[]
+        for _, rb in row["items"]:
+            f = tokens(rb.get("txt",""))
+            f["role"] = rb["role"]; f["rb"] = rb
+            feats.append(f)
+        # eğer aynı satırda çok sayıda 'toplanti_baskani' varsa:
+        cnt_tb = sum(1 for f in feats if f["role"]=="toplanti_baskani")
+        if cnt_tb >= 2:
+            # soldaki TB kalsın, en sağda YK sinyali olanı 'yk_baskani' yap
+            idx_right = len(row["items"]) - 1
+            _, rb_right = row["items"][idx_right]
+            f_right = tokens(rb_right.get("txt",""))
+            if f_right["YK"] or f_right["BASKANI"]:
+                rb_right["role"] = "yk_baskani"; rb_right["why"] = "layout(rightmost)"
+        # ortada "BAKANLIK" sinyali varsa onu bakanlik_temsilcisi yap
+        if len(row["items"]) >= 3:
+            _, rb_mid = row["items"][1]
+            txt_mid = normalize_hard(rb_mid.get("txt",""))
+            if "BAKANLIK" in txt_mid or "TICARET" in txt_mid:
+                rb_mid["role"] = "bakanlik_temsilcisi"; rb_mid["why"] = "layout(center)"
+
+    # =============== final boxes normalize ===============
     def normalize_with_ref(seq):
         out=[]
         if seq is None: return out
@@ -315,10 +298,8 @@ def extract_roles_and_bottom(
 
     H,W = lower_img.shape[:2]
 
-    # =========================
-    # Per box scoring
-    # =========================
-    rows=[]
+    # =============== per box scoring ===============
+    rows_out=[]
     for i,(xywh,xyxy,obj) in enumerate(zip(boxes_xywh, boxes_xyxy, objs)):
         # text
         obj_txt=None
@@ -327,7 +308,7 @@ def extract_roles_and_bottom(
         text = obj_txt if (obj_txt and obj_txt.strip()) else ocr_text(lower_img, xywh, lang, psm_list, oem_list, new_url)
         text = norm_space(text)
 
-        # 1) role-block overlap → forced
+        # 1) roleblock overlap → forced
         forced=None; reasons=[]
         box_exp_xyxy = expand_xyxy(xyxy, force_margin_px)
         candidates=[]
@@ -341,7 +322,7 @@ def extract_roles_and_bottom(
         if candidates:
             chosen = min(candidates, key=lambda c: (c["dist"], -c["rb"].get("score", 0.0)))
             forced = chosen["rb"]["role"]
-            reasons.append("roleblock")
+            reasons.append("roleblock:"+chosen["rb"].get("why",""))
 
         # 2) text fallback with fuzzy
         if forced:
@@ -352,12 +333,41 @@ def extract_roles_and_bottom(
             reasons.append(why)
 
         # names
-        cands = strict_candidates(text)
+        def scrub_roles_for_name(t: str) -> str:
+            t = normalize_hard(t)
+            t = re.sub(r"\b(TOPLANTI|BASKANI|YK|YONETIM|KURULU|UYESI|BAKANLIK|TEMSILCISI|KATIP|YAZMANI|DIVAN|SERMAYESI|NISABI|PAY|TOPLAMI)\b"," ", t)
+            t = re.sub(r"\b\d{6,}\b"," ", t)
+            return norm_space(t)
+
+        txt_for_names = scrub_roles_for_name(text)
+        # ALL-CAPS 2-3 kelime
+        cands=[]
+        for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ]{2,}(?:\s+[A-ZÇĞIİÖŞÜ]{2,}){1,2})\b", tr_upper(txt_for_names)):
+            toks = m.group(1).split()
+            if 2 <= len(toks) <= 3: cands.append(" ".join(toks))
+        # Baş harf büyük 2-3 kelime
+        for m in re.finditer(r"\b([A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+(?:\s+[A-ZÇĞIİÖŞÜ][a-zçğıiöşü’']+){1,2})\b", text):
+            toks = m.group(1).split()
+            if 2 <= len(toks) <= 3: cands.append(" ".join(toks))
+
         final=[]
         for c in cands:
-            p = promote_and_format(c, text, KN_CANON, name_sim_threshold)
-            if p and all(tr_upper(w) not in ROLE_WORD_SET for w in p.split()):
-                final.append(p)
+            key = canon_key(c)
+            best = KN_CANON.get(key)
+            if not best:
+                for k,v in KN_CANON.items():
+                    if fuzz.token_set_ratio(key, k)/100.0 >= name_sim_threshold:
+                        best = v; break
+            if not best:
+                toks=c.split()
+                if not (2 <= len(toks) <= 3): continue
+                best = tr_title(" ".join(toks))
+            best = tr_upper(best) if is_all_caps_ctx(text) else best
+            # role kelimesi varsa at
+            if any(tok in ROLE_WORD_SET for tok in normalize_hard(best).split()): 
+                continue
+            final.append(best)
+
         # de-dup in box
         seen=set(); uni=[]
         for n in final:
@@ -366,12 +376,9 @@ def extract_roles_and_bottom(
                 seen.add(k); uni.append(n)
 
         # signature overlap
-        sig_hit = any(
-            (max(xyxy[0], s[0]) < min(xyxy[2], s[2]) and max(xyxy[1], s[1]) < min(xyxy[3], s[3]))
-            for s in sigs
-        )
+        sig_hit = any((max(xyxy[0], s[0]) < min(xyxy[2], s[2]) and max(xyxy[1], s[1]) < min(xyxy[3], s[3])) for s in sigs)
 
-        rows.append({
+        rows_out.append({
             "i": i,
             "bbox": xywh,
             "sig": sig_hit,
@@ -382,9 +389,9 @@ def extract_roles_and_bottom(
             "text_preview": text[:220],
         })
 
-    per_box_df = pd.DataFrame(rows, columns=["i","bbox","sig","role_best","role_score","role_reasons","name_in_box","text_preview"])
+    per_box_df = pd.DataFrame(rows_out, columns=["i","bbox","sig","role_best","role_score","role_reasons","name_in_box","text_preview"])
 
-    # rol bazında isim de-dup
+    # =============== de-dup per role ===============
     def _lastname(s: str) -> str:
         toks = canon_key(s).split()
         return toks[-1] if toks else ""
@@ -412,11 +419,10 @@ def extract_roles_and_bottom(
             out.append("; ".join(curr) if curr else None)
         df = df.copy(); df["name_in_box"] = out
         return df
+
     per_box_df = dedupe_within_role_strict(per_box_df)
 
-    # =========================
-    # Sermaye değeri (çoklu kaynak)
-    # =========================
+    # =============== sermaye ===============
     sermaye=None
     if "sermaye" in result and result["sermaye"] is not None:
         s_txt = getattr(result["sermaye"], "txt", None) if hasattr(result["sermaye"], "__dict__") \
@@ -434,9 +440,7 @@ def extract_roles_and_bottom(
         except Exception:
             pass
 
-    # =========================
-    # bottom_df (tek satır)
-    # =========================
+    # =============== bottom_df ===============
     out = {
         "sermaye_toplam_tl": sermaye,
         "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
@@ -483,7 +487,7 @@ def extract_roles_and_bottom(
             print(f"[INFO] role_blocks={len(role_blocks)}, boxes={len(per_box_df)}")
             if role_blocks:
                 display(pd.DataFrame([{"role":rb["role"], "score":rb["score"], "bbox":rb["bbox"],
-                                       "txt":str(rb.get('txt',''))[:80], "why":rb.get("why","")} for rb in role_blocks]))
+                                       "txt":str(rb.get('txt',''))[:90], "why":rb.get("why","")} for rb in role_blocks]))
             display(per_box_df); display(bottom_df)
         except Exception:
             pass
