@@ -1,122 +1,133 @@
 import re, copy
-from typing import List, Any, Tuple
+from typing import List, Any, Tuple, Optional
 
-def split_multi_role_boxes(role_blocks: List[Any]) -> List[Any]:
+def separate_multi_role_blocks(
+    role_blocks: List[Any],
+    *,
+    role_words: Optional[List[str]] = None,
+    role_aliases: Optional[dict] = None
+) -> List[Any]:
     """
-    Input : role_blocks  -> (x,y,w,h, txt, role) alanlarına sahip kutular listesi
-             - Dataclass/obj/dict olabilir. x,y,w,h,txt,role alanları bulunmalı.
-    Output: role_blocks  -> Çoklu rol içeren kutular bölünmüş halde aynı tipte döner.
+    Input : role_blocks -> (x,y,w,h,txt[,role]) alanlarına sahip kutular listesi (dict veya obj)
+    Output: role_blocks -> Çoklu rol içeren kutular parçalanmış halde (aynı tipte) döner.
 
     Kural:
-      - Aynı kutu içinde birden fazla rol yakalanırsa, rol ifadelerinin
-        metin içindeki sırasına göre kutu yatayda bölünür.
-      - Bölme sınırı, ardışık rol ifadelerinin yatay merkezlerinin orta noktasıdır.
-      - 'role' alanı, ilgili parçanın ilk rol ifadesiyle set edilir.
+      - Kutu metninde 2+ ROL başlığı yakalanırsa, yakalanan rol başlıklarının
+        metin (string) içi pozisyonlarının yatay merkezleri alınır; ardışık merkezlerin
+        tam ortaları kesim sınırı olur. Kutu bu sınırlar ile N parçaya bölünür.
+      - 'role' alanı her parça için o parçadaki İLK rol başlığıyla set edilir.
+      - Tek rol varsa kutu aynen (role alanı normalize edilerek) bırakılır.
     """
 
-    # --- 1) Rol sözlüğü/regex
-    ROLE_WORDS = [
-        "DİVAN BAŞKANI", "TOPLANTI BAŞKANI",
-        "OY TOPLAMA MEMURU", "TUTANAK YAZMANI", "YAZMAN",
-        "YÖNETİM KURULU BAŞKANI", "YK BAŞKANI",
-        "YÖNETİM KURULU ÜYESİ", "ÜYE",
-        "MÜDÜR", "BAŞKAN"
-    ]
-    role_pat = re.compile(r"\b(" + "|".join([re.escape(w) for w in ROLE_WORDS]) + r")\b", re.I | re.U)
+    # --- Türkçe büyük harf / normalizasyon yardımcıları (gerekirse sade)
+    def tr_upper(s: str) -> str:
+        return (s or "").replace("i","İ").replace("ı","I").upper()
 
-    # --- 2) Ortak alan erişim yardımcıları (obj/dict uyumlu)
+    # --- Kullanıcı sözlükleri (varsa) yoksa makul varsayılanlar
+    if role_aliases is None:
+        role_aliases = {
+            "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI","TOPLANTI BAŞI"],
+            "tutanak_yazmani":  ["TUTANAK YAZMANI","YAZMAN"],
+            "bakanlik_temsilcisi":["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ"],
+            "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YÖNETİM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
+            "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
+            "katip":            ["KATİP","KATIP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
+            "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BAŞKANI","DIVAN BASKANI"],
+        }
+
+    if role_words is None:
+        # alias’ları düz listeye aç
+        role_words = sorted({w for lst in role_aliases.values() for w in lst}, key=len, reverse=True)
+
+    # --- Rol regex’i (tüm varyasyonları yakalar)
+    role_pat = re.compile(r"\b(" + "|".join([re.escape(tr_upper(w)) for w in role_words]) + r")\b", re.U)
+
+    # --- Obj/dict alan erişimi
     def getf(b, k, default=None):
         if isinstance(b, dict): return b.get(k, default)
         return getattr(b, k, default)
 
     def setf(b, k, v):
-        if isinstance(b, dict): 
-            b[k] = v
-        else:
-            setattr(b, k, v)
-
-    def xyxy(b) -> Tuple[int,int,int,int]:
-        x,y,w,h = getf(b,"x"),getf(b,"y"),getf(b,"w"),getf(b,"h")
-        return x, y, x+w, y+h
+        if isinstance(b, dict): b[k] = v
+        else: setattr(b, k, v)
 
     def new_like(b):
-        """Input kutusunun tipini koruyarak kopya döndürür."""
-        if isinstance(b, dict):
-            return dict(b)
-        return copy.deepcopy(b)
+        return dict(b) if isinstance(b, dict) else copy.deepcopy(b)
 
-    # --- 3) Metin içindeki rol eşleşmelerini çıkar
+    def xyxy(b) -> Tuple[int,int,int,int]:
+        x, y, w, h = int(getf(b,"x")), int(getf(b,"y")), int(getf(b,"w")), int(getf(b,"h"))
+        return x, y, x+w, y+h
+
+    # --- Metinden rol span’larını çıkar (BÜYÜK harfe çevirerek)
     def extract_role_spans(text: str):
-        spans = []
-        for m in role_pat.finditer(text or ""):
-            spans.append({"text": m.group(0), "span": m.span()})
-        return spans
+        t = tr_upper(text or "")
+        return [ {"text": m.group(0), "span": m.span()} for m in role_pat.finditer(t) ]
 
-    # --- 4) Bölme sınırlarını belirle (merkezlerin ortası)
-    def compute_split_xs(b, spans):
-        """Her ardışık rol çifti için bir kesme x'i üretir."""
-        if len(spans) < 2: 
-            return []
+    # --- Metin indexini piksel x’e kaba eşle (kutu genişliğine orantı)
+    def char_to_x(idx: float, x:int, x2:int, L:int) -> int:
+        if L <= 0 or x2 <= x: return x
+        r = max(0.0, min(1.0, idx / L))
+        return int(round(x + r * (x2 - x)))
+
+    # --- Parçalama sınırlarını üret (merkezlerin ortası)
+    def compute_split_boundaries(b, spans):
+        if len(spans) < 2: return []
         x, y, x2, y2 = xyxy(b)
-        # Metin genişliğini kutu genişliğine izafe eden kaba bir harita:
-        # string index (0..len) -> piksel (x..x2)
-        t = getf(b,"txt") or ""
-        L = max(len(t), 1)
-        def char_to_x(idx):  # [0..L] -> [x..x2]
-            ratio = min(max(idx / L, 0.0), 1.0)
-            return int(x + ratio * (x2 - x))
-
+        t = tr_upper(getf(b,"txt") or "")
+        L = len(t)
         centers = []
         for s in spans:
-            a,b_ = s["span"]
-            c = (a + b_) / 2.0
-            centers.append(char_to_x(c))
-        split_xs = []
+            a, b_ = s["span"]
+            c = 0.5*(a+b_)
+            centers.append(char_to_x(c, x, x2, L))
+        centers.sort()
+        # ardışık merkezlerin ortaları sınırdır
+        splits = []
         for i in range(len(centers)-1):
-            split_xs.append(int((centers[i] + centers[i+1]) / 2))
-        # çiftlenmiş sınırlar (soldan sağa sıralı)
-        split_xs = sorted(list({sx for sx in split_xs if x < sx < x2}))
-        return split_xs
+            sx = (centers[i] + centers[i+1]) // 2
+            if x < sx < x2:
+                splits.append(sx)
+        # uniq + sıralı
+        return sorted(set(splits))
 
-    # --- 5) Asıl akış
-    output: List[Any] = []
+    # --- Ana akış
+    out: List[Any] = []
     for b in role_blocks:
-        txt = (getf(b,"txt") or "").strip()
+        txt = getf(b,"txt") or ""
         spans = extract_role_spans(txt)
 
+        # Tek ya da hiç rol: dokunma; varsa role alanını normalize et
         if len(spans) <= 1:
-            # Tek rol: varsa role alanını normalize et, kutuyu direkt ekle
+            nb = new_like(b)
             if spans:
-                nb = new_like(b)
                 setf(nb, "role", spans[0]["text"])
-                output.append(nb)
-            else:
-                output.append(b)
+            out.append(nb)
             continue
 
-        # Çoklu rol: yatay böl
+        # Çoklu rol: N parçaya böl
         x, y, x2, y2 = xyxy(b)
-        split_xs = compute_split_xs(b, spans)
-        # parça aralıkları: [x .. s1], [s1 .. s2], ..., [slast .. x2]
-        cuts = [x] + split_xs + [x2]
+        t_up = tr_upper(txt)
+        L = len(t_up)
 
-        # Metin parçalama: karakter aralıklarını aynı oranda böl
-        t = txt
-        L = max(len(t), 1)
-        def x_to_char(px):
-            # x..x2 -> 0..L
-            return int(round((px - x) / max(1, (x2-x)) * L))
+        split_xs = compute_split_boundaries(b, spans)
+        cuts_px = [x] + split_xs + [x2]
 
-        char_cuts = [0] + [min(max(x_to_char(px),0), L) for px in split_xs] + [L]
+        # metni aynı oranda bölmek için px->char index dönüşümü
+        def x_to_char(px:int) -> int:
+            if x2 <= x: return 0
+            r = (px - x) / (x2 - x)
+            return max(0, min(L, int(round(r * L))))
 
-        for i in range(len(cuts)-1):
-            px1, px2 = cuts[i], cuts[i+1]
-            cx1, cx2 = char_cuts[i], char_cuts[i+1]
-            piece_txt = t[cx1:cx2].strip()
+        cuts_ch = [0] + [x_to_char(px) for px in split_xs] + [L]
 
-            # bu parçadaki ilk rolü role alanına yaz
-            piece_spans = extract_role_spans(piece_txt)
-            piece_role  = piece_spans[0]["text"] if piece_spans else getf(b,"role")
+        for i in range(len(cuts_px)-1):
+            px1, px2 = cuts_px[i], cuts_px[i+1]
+            cx1, cx2 = cuts_ch[i], cuts_ch[i+1]
+            piece_txt = (getf(b,"txt") or "")[cx1:cx2].strip()
+
+            # parça içindeki ilk rolü role alanına ata
+            p_spans = extract_role_spans(piece_txt)
+            piece_role = p_spans[0]["text"] if p_spans else None
 
             nb = new_like(b)
             setf(nb, "x", px1)
@@ -125,6 +136,6 @@ def split_multi_role_boxes(role_blocks: List[Any]) -> List[Any]:
             setf(nb, "h", y2 - y)
             setf(nb, "txt", piece_txt)
             setf(nb, "role", piece_role)
-            output.append(nb)
+            out.append(nb)
 
-    return output
+    return out
