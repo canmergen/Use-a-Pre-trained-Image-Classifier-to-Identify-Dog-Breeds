@@ -23,13 +23,9 @@ def run_role_pipeline(
     dbg=False
 ):
     """
-    Tek çağrıda: rol tespiti -> dikey ad-soyad birleştirme -> (gerekirse) çoklu rol split -> filtre.
-    Girdi:
-      - detected_boxes: x,y,w,h alanları olan kutular (attr ya da dict); ocr_texts ile bire bir sıralı.
-      - ocr_texts: her kutunun OCR metni.
-      - sig_boxes/sermaye_boxes: varsa, aynı tipte kutu listeleri.
-    Çıkış:
-      - [{'x','y','w','h','txt','role'}, ...] listesi.
+    Tek çağrıda: rol tespiti -> dikey ad-soyad birleştirme -> (gerekirse) çoklu rol split ->
+    sermaye/İmza filtreleri -> final containment dedup -> (opsiyonel) çizim.
+    Çıktı: [{'x','y','w','h','txt','role'}, ...]
     """
     # ----------------
     # Imports & helpers (içeride tut)
@@ -95,6 +91,15 @@ def run_role_pipeline(
     def _rect(x,y,w,h, txt="", role=None):
         return {"x":int(x),"y":int(y),"w":int(w),"h":int(h),"txt":txt,"role":role}
 
+    def _area(b):
+        x,y,w,h = _as_box_tuple(b)
+        return max(1,w) * max(1,h)
+
+    def _is_inside(inner, outer, pad: int = 0) -> bool:
+        ix1,iy1,ix2,iy2 = _xyxy(inner)
+        ox1,oy1,ox2,oy2 = _xyxy(outer)
+        return (ix1 >= ox1 - pad) and (iy1 >= oy1 - pad) and (ix2 <= ox2 + pad) and (iy2 <= oy2 + pad)
+
     # --- text utils
     def tr_upper(s):
         return (s or "").replace("i","İ").replace("ı","I").upper()
@@ -103,8 +108,7 @@ def run_role_pipeline(
         return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
     def canon(s):
-        import re as _re
-        return _re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
+        return re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
 
     TR = "A-Za-zÇĞİÖŞÜçğıöşü"
     NAME_LINE_RE = re.compile(rf"\b[{TR}][{TR}'-]+\s+[{TR}][{TR}'-]+(\s+[{TR}][{TR}'-]+)?\b")
@@ -124,6 +128,10 @@ def run_role_pipeline(
         if len("".join(letters)) < 4: return False
         return bool(re.compile(rf"(?i)\b[{TR}]{{2,}}\b(?:[\s\W]+?\b[{TR}]{{2,}}\b)+").search(txt))
 
+    def _has_namey(b) -> bool:
+        t = b.get("txt","")
+        return looks_like_person_line(t) or has_inline_name(t)
+
     # --- aliases
     ROLE_ALIASES_DEFAULT = {
         "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
@@ -133,7 +141,6 @@ def run_role_pipeline(
         "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YONETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
         "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
         "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
-        # "baskan":            ["BAŞKAN"],  # çok genel, gerekirse eklenir.
     }
 
     def prepare_aliases(ROLE_ALIASES):
@@ -172,6 +179,7 @@ def run_role_pipeline(
     pool = [b for b in det_boxes if b not in role_boxes]
     merged_blocks = []
     taken_ids = set()
+    merged_rb_ids = set()   # bu rol satırı birleştirildi mi?
 
     for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
         best, best_score = None, None
@@ -213,30 +221,41 @@ def run_role_pipeline(
                 nx1, nx2 = rx1, rx2
             else:
                 raise ValueError("x_policy must be 'max' or 'role'")
-            merged_blocks.append(_rect(nx1, ny1, nx2-nx1, ny2-ny1, txt=f"{rb['txt']} + {best['txt']}", role=rb["role"]))
+            merged_blocks.append(_rect(nx1, ny1, nx2-nx1, ny2-ny1,
+                                       txt=f"{rb['txt']} + {best['txt']}", role=rb["role"]))
             taken_ids.add(id(best))
+            merged_rb_ids.add(id(rb))
             if dbg: print(f"[ROLE+NAME] {rb['role']} -> {best['txt'][:60]}")
         else:
             # rol tek başına kalsın
             merged_blocks.append(_rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"]))
 
-    # inline name içeren saf rol satırlarını da ekle
+    # inline name içeren saf rol satırlarını da ekle (eğer zaten birleştirilmemişse)
     for b in role_boxes:
         if b.get("inline_name"):
+            if id(b) in merged_rb_ids:
+                continue
             merged_blocks.append(_rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"]))
 
-    # aynı role için role-only kutuyu, role+name ile büyük oranda çakışıyorsa sil
+    # ---- CLEANUP 1: sadece AYNI role ve MERGED varsa role-only dubleleri at
+    role_to_merged = {}
+    for b in merged_blocks:
+        if _has_namey(b) and b["role"] is not None:
+            role_to_merged.setdefault(b["role"], []).append(b)
+
     cleaned = []
     for b in merged_blocks:
-        is_role_only = not (looks_like_person_line(b["txt"]) or has_inline_name(b["txt"]))
-        if not is_role_only:
-            cleaned.append(b); continue
-        keep = True
-        for c in merged_blocks:
-            if c is b: continue
-            if c["role"] == b["role"] and _iou(b,c) > 0.5:
-                keep = False; break
-        if keep: cleaned.append(b)
+        is_role_only = (not _has_namey(b))
+        r = b["role"]
+        if is_role_only and r in role_to_merged:
+            drop = False
+            for big in role_to_merged[r]:
+                if _is_inside(b, big, pad=1) or _iou(b, big) >= 0.75:
+                    drop = True
+                    break
+            if drop:
+                continue
+        cleaned.append(b)
     merged_blocks = cleaned
 
     # ----------------
@@ -362,16 +381,60 @@ def run_role_pipeline(
         splitted = keep
 
     # ----------------
+    # 5) FINAL: içiçe kutular varsa en büyüğü bırak; containment yoksa dokunma
+    # (yalnızca "containment" ilişkisine bakar; sırf overlap olanlara dokunmaz)
+    def _final_containment_dedup(boxes: list, pad: int = 1) -> list:
+        n = len(boxes)
+        if n <= 1:
+            return boxes
+
+        parent = list(range(n))
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        contains = [[False]*n for _ in range(n)]
+        for i in range(n):
+            for j in range(i+1, n):
+                bi, bj = boxes[i], boxes[j]
+                if _is_inside(bi, bj, pad) or _is_inside(bj, bi, pad):
+                    contains[i][j] = contains[j][i] = True
+                    union(i, j)
+
+        comps = {}
+        for i in range(n):
+            r = find(i)
+            comps.setdefault(r, []).append(i)
+
+        out = []
+        for comp in comps.values():
+            any_containment = any(
+                contains[u][v] for u in comp for v in comp if u < v
+            )
+            if not any_containment:
+                out.extend(boxes[i] for i in comp)
+                continue
+            keep_idx = max(comp, key=lambda k: _area(boxes[k]))
+            out.append(boxes[keep_idx])
+
+        return out
+
+    splitted = _final_containment_dedup(splitted, pad=1)
+
     # (opsiyonel) çizim
-    # ----------------
     if lower_img is not None:
         try:
             import cv2
             vis = lower_img.copy()
             for b in splitted:
-                x,y,w,h = b["x"],b["y"],b["w"],b["h"]
-                cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
-            # geri döndürmüyoruz; dışarıda göster
+                x,y,w,h = b["x"], b["y"], b["w"], b["h"]
+                cv2.rectangle(vis, (x, y), (x+w, y+h), (0,255,0), 2)
         except Exception:
             pass
 
