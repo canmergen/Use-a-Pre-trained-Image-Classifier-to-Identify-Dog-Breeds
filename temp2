@@ -1,86 +1,513 @@
-from typing import List, Tuple, Optional
-
-BoxXYWH = Tuple[int,int,int,int]
-BoxLTRB = Tuple[int,int,int,int]
-
-def build_final_boxes_all(
-    role_blocks: List[BoxXYWH],
-    sig_boxes: List[BoxXYWH],
-    sermaye_boxes: Optional[List[BoxXYWH]] = None,
+def detect_merge_signatures_onecall(
+    img_bgr,
     *,
-    near_px: int = 3,               # temas/≤near_px yakın say
-    band_pad_scale: float = 0.35,   # rol yüksekliğinin oranı kadar dikey bant
-    band_center_scale: float = 1.0, # bandın yatay toleransı
-    corridor_pad_px: int = 8,       # koridor yan payı
-    forbid_crossing: bool = True,   # koridor çarpışırsa eşleşmeyi iptal et
-    include_unpaired_roles: bool = True,
-    include_unpaired_sigs: bool = True,
-    dedup_iou: float = 0.90,        # final setinde neredeyse aynı kutuları tekilleştir
-    dbg: bool = False
+    top_k: int = 10,
+    include_stamps: bool = False,
+    near_px: int = 3,
+    debug: bool = False,
+    draw: bool = False,
+    draw_color=(255, 0, 0),
+    draw_title: str = "IMZALAR"
 ):
     """
-    role_blocks, sig_boxes, sermaye_boxes -> (x,y,w,h) kutular.
-    Döner: dict {"final","pairs","roles","sigs","sermaye"}
-
-    'final' = birleştirilmiş EŞLEŞMELER  + sermaye  + (opsiyonel) eşleşmeyen rol/sig.
+    Tek çağrıda imza kutularını tespit eder, filtreler ve birleştirir.
+    Girdi  : img_bgr (BGR, BGRA veya gri np.uint8)
+    Çıktı  : List[(x,y,w,h)]  -> final imza kutuları (orijinal ölçekte)
     """
-    # ------------- helpers -------------
-    def to_ltrb(b: BoxXYWH) -> BoxLTRB:
-        x,y,w,h = b
-        return (int(x), int(y), int(x+w), int(y+h))
 
-    def to_xywh(bb: BoxLTRB) -> BoxXYWH:
-        l,t,r,b = bb
-        return (int(l), int(t), int(max(0, r-l)), int(max(0, b-t)))
+    # -- imports (fonksiyon self-contained)
+    import math
+    from typing import List, Tuple
+    import numpy as np
+    import cv2
 
-    def union(a: BoxLTRB, b: BoxLTRB) -> BoxLTRB:
-        return (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3]))
+    # ========= UTILITIES =========
 
-    def expand(bb: BoxLTRB, pad: int) -> BoxLTRB:
-        l,t,r,b = bb
-        return (l-pad, t-pad, r+pad, b+pad)
+    def _to_gray_any(img):
+        if img is None:
+            raise ValueError("img is None")
+        if img.dtype != np.uint8:
+            if img.dtype in (np.float32, np.float64):
+                img = np.clip(img, 0, 1)
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+        if img.ndim == 2:
+            return img
+        if img.ndim == 3 and img.shape[2] == 3:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if img.ndim == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+        raise ValueError(f"Unsupported image shape: {img.shape}")
 
-    def intersects(a: BoxLTRB, b: BoxLTRB) -> bool:
-        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+    def _resize_keep_aspect(img, target_h: int):
+        h, w = img.shape[:2]
+        scale = target_h / float(h)
+        if abs(scale - 1.0) < 1e-3:
+            return img.copy(), 1.0
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR), scale
 
-    def center(bb: BoxLTRB) -> Tuple[float,float]:
-        l,t,r,b = bb
-        return ((l+r)/2.0, (t+b)/2.0)
+    def _binarize_clahe(gray):
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        g2 = clahe.apply(gray)
+        g2 = cv2.GaussianBlur(g2, (3, 3), 0)
+        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return 255 - bw  # ink=255
 
-    def area(bb: BoxLTRB) -> int:
-        l,t,r,b = bb
-        return max(0, r-l) * max(0, b-t)
+    def _remove_lines(ink):
+        work = ink.copy()
+        edges = cv2.Canny(work, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=120, minLineLength=80, maxLineGap=4)
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                cv2.line(work, (x1, y1), (x2, y2), 0, 5)
+        return work
 
-    def iou(a: BoxLTRB, b: BoxLTRB) -> float:
-        if not intersects(a,b):
+    def _morph_refine(ink, dilate_iter: int = 0):
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k_close, 1)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open, 1)
+        if dilate_iter > 0:
+            k_d = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            m = cv2.dilate(m, k_d, iterations=dilate_iter)
+        return m
+
+    def _estimate_min_area(mask):
+        binm = (mask > 0).astype(np.uint8)
+        num, _, stats, _ = cv2.connectedComponentsWithStats(binm, connectivity=8)
+        areas, dims = [], []
+        for i in range(1, num):
+            x, y, w, h, a = stats[i]
+            if w > 1 and h > 1:
+                areas.append(int(a))
+                dims.append((w, h))
+        if not areas:
+            return 96
+        areas = np.array(areas, np.float32)
+        loga = np.log(areas + 1.0).astype(np.float32)
+        loga_norm = cv2.normalize(loga, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        otsu, _ = cv2.threshold(loga_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        alpha = float(otsu) / 255.0
+        log_thr = float(loga.min()) + (float(loga.max()) - float(loga.min())) * alpha
+        area_otsu = max(1.0, float(np.exp(log_thr) - 1.0))
+        dims_arr = np.array(dims, np.float32)
+        sw_est = float(np.median(dims_arr.min(1)))
+        area_floor = (max(1.0, sw_est) * 6.0) ** 2
+        return int(max(area_otsu * 1.3, area_floor, 96.0))
+
+    def _component_features(mask, x, y, w, h):
+        roi = mask[y:y + h, x:x + w]
+        area = int(np.count_nonzero(roi))
+        ink_ratio = area / float(max(1, w * h))
+        cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return area, ink_ratio, 1.0, 1.0
+        cnt = max(cnts, key=cv2.contourArea)
+        hull = cv2.convexHull(cnt)
+        ca = cv2.contourArea(cnt)
+        ha = max(1.0, cv2.contourArea(hull))
+        solidity = ca / ha
+        per = cv2.arcLength(cnt, True)
+        circularity = (4.0 * math.pi * ca) / (per * per + 1e-6)
+        return area, ink_ratio, solidity, circularity
+
+    def _nms_xyxy_local(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_thr: float = 0.25):
+        if boxes_xyxy.size == 0:
+            return []
+        x1, y1, x2, y2 = boxes_xyxy.T
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0, xx2 - xx1 + 1)
+            h = np.maximum(0, yy2 - yy1 + 1)
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+            inds = np.where(iou <= iou_thr)[0]
+            order = order[inds + 1]
+        return keep
+
+    def _binarize_union(gray, target_h: int):
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        g = clahe.apply(gray)
+        g = cv2.GaussianBlur(g, (3, 3), 0)
+        _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        otsu = 255 - otsu
+        adp = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY_INV, 31, 7)
+        k = max(21, int(round(target_h / 64)))
+        if k % 2 == 0:
+            k += 1
+        bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+        _, bh = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return np.maximum(np.maximum(otsu, adp), bh)
+
+    def _estimate_char_h(bin_img):
+        num, _, st, _ = cv2.connectedComponentsWithStats((bin_img > 0).astype(np.uint8), 8)
+        hs = []
+        for i in range(1, num):
+            x, y, w, h, a = st[i]
+            if 3 <= h <= 60 and 3 <= w <= 60:
+                hs.append(h)
+        if not hs:
+            return 12.0
+        return float(np.percentile(np.array(hs), 60))
+
+    def _edge_orientation_entropy(roi_gray):
+        gx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(roi_gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
+        mask = mag > np.percentile(mag, 60)
+        ang = ang[mask]
+        if ang.size == 0:
             return 0.0
-        l = max(a[0], b[0]); t = max(a[1], b[1])
-        r = min(a[2], b[2]); btm = min(a[3], b[3])
-        inter = max(0, r-l) * max(0, btm-t)
-        if inter <= 0:
-            return 0.0
-        return inter / float(area(a) + area(b) - inter + 1e-6)
+        hist, _ = np.histogram(ang, bins=16, range=(0, 2 * np.pi), density=True)
+        hist = hist + 1e-8
+        return float(-np.sum(hist * np.log(hist)))  # [0..ln(16)]
 
-    def dedup_merge_close(boxes_xywh: List[BoxXYWH]) -> List[BoxXYWH]:
-        """Yakın (≤near_px) ya da IoU≥dedup_iou olanları tekilleştir."""
-        rects = [to_ltrb(b) for b in boxes_xywh]
+    def _stroke_stats(roi_bin):
+        dt = cv2.distanceTransform((roi_bin > 0).astype(np.uint8), cv2.DIST_L2, 3)
+        vals = dt[dt > 0] * 2.0
+        if vals.size == 0:
+            return 0.0, 0.0
+        return float(vals.mean()), float(vals.std())
+
+    def _is_single_text_row(roi_bin, est_char_h):
+        if roi_bin.size == 0:
+            return False
+        h, w = roi_bin.shape[:2]
+        binm = (roi_bin > 0).astype(np.uint8)
+        k = max(1, int(round(est_char_h * 0.10)))
+        merged = cv2.dilate(binm, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)), iterations=1)
+        num, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+        small_words = 0
+        for i in range(1, num):
+            x, y, ww, hh, a = stats[i]
+            if ww < 0.30 * w and hh < 1.6 * est_char_h:
+                small_words += 1
+        return bool(small_words >= 3 and h <= 1.8 * est_char_h)
+
+    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr=0.25):
+        if boxes.size == 0:
+            return []
+        x1, y1, x2, y2 = boxes.T
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0, xx2 - xx1 + 1)
+            h = np.maximum(0, yy2 - yy1 + 1)
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+            inds = np.where(iou <= iou_thr)[0]
+            order = order[inds + 1]
+        return keep
+
+    # ========= CORE STEPS =========
+
+    def _detect_once(img, *, target_height, min_aspect, max_aspect, dilate_iter,
+                     min_area_scale, min_ink_ratio, nms_iou):
+        work, scale = _resize_keep_aspect(img, target_height)
+        gray = _to_gray_any(work)
+        ink = _binarize_clahe(gray)         # ink=255
+        ink = _remove_lines(ink)
+        ink = _morph_refine(ink, dilate_iter)
+
+        min_area = int(max(32, _estimate_min_area(ink)) * float(min_area_scale))
+        H, W = ink.shape[:2]
+        page_area = H * W
+
+        num, _, stats, _ = cv2.connectedComponentsWithStats((ink > 0).astype(np.uint8), 8)
+        cand_xyxy, cand_scores = [], []
+
+        for i in range(1, num):
+            x, y, w, h, a = stats[i]
+            if w <= 2 or h <= 2:
+                continue
+            A = w * h
+            if A < min_area or A > 0.40 * page_area:
+                continue
+            aspect = w / float(h)
+            if not (min_aspect <= aspect <= max_aspect):
+                continue
+            area, ink_ratio, solidity, circularity = _component_features(ink, x, y, w, h)
+            if ink_ratio < min_ink_ratio:
+                continue
+            per = max(1e-6, 2 * (w + h))
+            iq = (4.0 * math.pi * area) / (per * per)
+            complexity = 1.0 - min(1.0, iq)
+            score = float(ink_ratio * (0.6 * complexity + 0.4 * (1.0 - min(1.0, circularity))))
+            cand_xyxy.append((x, y, x + w, y + h))
+            cand_scores.append(score)
+
+        if not cand_xyxy:
+            return []
+
+        cand_xyxy = np.array(cand_xyxy, np.int32)
+        cand_scores = np.array(cand_scores, np.float32)
+        keep = _nms_xyxy_local(cand_xyxy, cand_scores, iou_thr=nms_iou)
+        cand_xyxy = cand_xyxy[keep]
+
+        inv = 1.0 / scale
+        out = []
+        for (x1, y1, x2, y2) in cand_xyxy:
+            x = int(round(x1 * inv))
+            y = int(round(y1 * inv))
+            w = int(round((x2 - x1) * inv))
+            h = int(round((y2 - y1) * inv))
+            out.append((x, y, w, h))
+        return out
+
+    def _detect_signatures_pro(img):
+        H, W = img.shape[:2]
+        scales = [1600, 2000, 2400] if H >= 1800 else [1400, 1700, 2000]
+        cfgs = []
+
+        # normal
+        for th in scales:
+            cfgs.append(dict(target_height=th, min_aspect=0.6, max_aspect=22.0,
+                             dilate_iter=0, min_area_scale=1.0, min_ink_ratio=0.010, nms_iou=0.15))
+        # agresif
+        for th in scales:
+            cfgs.append(dict(target_height=th, min_aspect=0.5, max_aspect=22.0,
+                             dilate_iter=1, min_area_scale=0.7, min_ink_ratio=0.006, nms_iou=0.15))
+        # ultra
+        cfgs.append(dict(target_height=max(2600, int(1.2 * H)), min_aspect=0.35, max_aspect=22.0,
+                         dilate_iter=3, min_area_scale=0.35, min_ink_ratio=0.0025, nms_iou=0.15))
+
+        all_boxes: List[Tuple[int, int, int, int]] = []
+        for p in cfgs:
+            all_boxes += _detect_once(img, **p)
+
+        if not all_boxes:
+            return []
+
+        xyxy = np.array([(x, y, x + w, y + h) for (x, y, w, h) in all_boxes], np.int32)
+        shrunk = xyxy.copy()
+        shrunk[:, 0] += 2; shrunk[:, 1] += 2
+        shrunk[:, 2] -= 2; shrunk[:, 3] -= 2
+        shrunk[:, 0] = np.maximum(shrunk[:, 0], 0)
+        shrunk[:, 1] = np.maximum(shrunk[:, 1], 0)
+        shrunk[:, 2] = np.maximum(shrunk[:, 2], shrunk[:, 0] + 1)
+        shrunk[:, 3] = np.maximum(shrunk[:, 3], shrunk[:, 1] + 1)
+
+        keep = _nms_xyxy_local(shrunk, np.ones(len(shrunk), np.float32), iou_thr=0.15)
+        xyxy_kept = xyxy[keep]
+        return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1)) for (x1, y1, x2, y2) in xyxy_kept]
+
+    def _keep_top_signatures(img, boxes, top_k: int = 3):
+        if not boxes:
+            return []
+        H, W = img.shape[:2]
+        gray = _to_gray_any(img)
+        ink = _binarize_union(gray, target_h=max(1600, H))
+        ch = _estimate_char_h(ink)
+        page_area = H * W
+        scored = []
+        for (x, y, w, h) in boxes:
+            if w < 8 or h < 8:
+                continue
+            A = w * h
+            if A < 0.0015 * page_area or A > 0.20 * page_area:
+                continue
+            aspect = w / float(h)
+            if aspect > 14.0 or aspect < 0.6:
+                continue
+            roi_bin = ink[y:y + h, x:x + w]
+            roi_g = gray[y:y + h, x:x + w]
+            if roi_bin.size == 0:
+                continue
+
+            # agresif metin filtresi
+            if h < 1.2 * ch:
+                continue
+            if h < 1.6 * ch and aspect > 6.0:
+                continue
+            if _is_single_text_row(roi_bin, ch):
+                continue
+
+            ink_ratio = float(np.count_nonzero(roi_bin)) / float(A)
+            if not (0.003 <= ink_ratio <= 0.35):
+                continue
+
+            cnts, _ = cv2.findContours(roi_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+            ca = cv2.contourArea(cnt)
+            per = cv2.arcLength(cnt, True)
+            iq = (4.0 * math.pi * ca) / (per * per + 1e-6)
+            complexity = max(0.0, 1.0 - iq)
+            mean_sw, std_sw = _stroke_stats(roi_bin)
+            sw_var = std_sw / (mean_sw + 1e-6)
+            ent = _edge_orientation_entropy(roi_g)
+            ent_n = min(1.0, ent / math.log(16))
+            if complexity < 0.22 or sw_var < 0.25 or ent_n < 0.25:
+                continue
+
+            cy = y + h / 2.0
+            loc_w = 0.8 if cy < 0.45 * H else 1.0
+            score = loc_w * (
+                0.60 * complexity +
+                0.25 * min(1.5, sw_var) / 1.5 +
+                0.10 * min(1.0, ink_ratio / 0.12) +
+                0.05 * ent_n
+            )
+            scored.append((score, (x, y, w, h)))
+
+        if not scored:
+            return []
+        scored.sort(key=lambda t: t[0], reverse=True)
+        order_boxes = [b for _, b in scored]
+
+        xyxy = np.array([(x, y, x + w, y + h) for (x, y, w, h) in order_boxes], np.int32)
+        def _shrink_xyxy(a: np.ndarray, pad: int = 2) -> np.ndarray:
+            b = a.copy()
+            b[:, 0] += pad; b[:, 1] += pad
+            b[:, 2] -= pad; b[:, 3] -= pad
+            b[:, 0] = np.minimum(b[:, 0], b[:, 2] - 1)
+            b[:, 1] = np.minimum(b[:, 1], b[:, 3] - 1)
+            return b
+
+        xyxy_shrunk = _shrink_xyxy(xyxy, pad=2)
+        keep_idx = _nms_xyxy(xyxy_shrunk, np.arange(len(order_boxes))[::-1].astype(np.float32), iou_thr=0.10)
+        return [order_boxes[i] for i in keep_idx][:top_k]
+
+    def _filter_sigboxes_remove_stamps(img_bgr, sig_boxes,
+                                       include_stamps=True, debug=False,
+                                       band_thr=0.32, ang_thr=0.37, inner_thr=0.12,
+                                       aniso_max=2.10, keep_aniso_min=2.20, keep_inner_max=0.10,
+                                       rmin_rel=0.18, rmax_rel=0.62, hough_p1=90, hough_p2=18):
+        if include_stamps or not sig_boxes:
+            return sig_boxes
+
+        def _bin(gray):
+            g = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+            g = cv2.GaussianBlur(g, (3, 3), 0)
+            return cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+        gray = _to_gray_any(img_bgr)
+        bin_page = _bin(gray)
+        kept = []
+
+        def _score_roi(roi_u8):
+            H, W = roi_u8.shape[:2]
+            aniso = max(H, W) / (min(H, W) + 1e-6)
+            edges = cv2.Canny(cv2.GaussianBlur(roi_u8, (3, 3), 0), 60, 120)
+            minR = int(rmin_rel * min(H, W))
+            maxR = int(rmax_rel * min(H, W))
+            hough = False; band = ang = inner = 0.0
+            if maxR > minR and min(H, W) >= 24:
+                circles = cv2.HoughCircles(edges, cv2.HOUGH_GRADIENT, dp=1.2,
+                                           minDist=min(H, W)//3, param1=hough_p1, param2=hough_p2,
+                                           minRadius=minR, maxRadius=maxR)
+                if circles is not None and len(circles[0]) > 0:
+                    hough = True
+                    x0, y0, r = circles[0][0].astype(int)
+                    yy, xx = np.ogrid[:H, :W]
+                    dist = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
+                    band_mask = (dist >= 0.85 * r) & (dist <= 1.15 * r)
+                    band_edge = band_mask & (edges > 0)
+                    all_edge = max((edges > 0).sum(), 1)
+                    band = float(band_edge.sum()) / float(all_edge)
+                    theta = (np.rad2deg(np.arctan2((yy - y0), (xx - x0))) + 360.0) % 360.0
+                    covered = np.zeros(360, np.uint8)
+                    if band_edge.any():
+                        covered[np.unique(theta[band_edge].astype(int))] = 1
+                    ang = covered.mean()
+                    inner_mask = dist <= 0.70 * r
+                    inner = float((roi_u8 > 0)[inner_mask].sum()) / float(max(inner_mask.sum(), 1))
+            return dict(hough=hough, band=band, ang=ang, inner=inner, aniso=aniso)
+
+        for (x, y, w, h) in sig_boxes:
+            y0, x0 = max(0, y), max(0, x)
+            roi = bin_page[y0:y + h, x0:x + w]
+            if roi.size == 0:
+                kept.append((x, y, w, h))
+                continue
+            sc = _score_roi(roi)
+
+            # İmza-koruma (önce)
+            if sc["aniso"] >= keep_aniso_min and sc["inner"] <= keep_inner_max:
+                if debug:
+                    print(f"KEEP(sig-like) {(x,y,w,h)} -> aniso={sc['aniso']:.2f} inner={sc['inner']:.2f}")
+                kept.append((x, y, w, h))
+                continue
+
+            # Güçlü halka kanıtı varsa DROP (damga)
+            is_stamp = False
+            if sc["hough"] and sc["aniso"] < aniso_max and sc["band"] >= band_thr and (sc["ang"] >= ang_thr or sc["inner"] >= inner_thr):
+                is_stamp = True
+                if debug:
+                    print(f"DROP(stamp) {(x,y,w,h)} -> aniso={sc['aniso']:.2f} "
+                          f"band={sc['band']:.2f} ang={sc['ang']:.2f} inner={sc['inner']:.2f}")
+            if not is_stamp:
+                kept.append((x, y, w, h))
+        return kept
+
+    def _filter_tiny(sig_boxes):
+        out = []
+        for (x, y, w, h) in sig_boxes:
+            if x == 0 and y == 0:
+                continue
+            if w < 20 or h < 20:
+                continue
+            out.append((x, y, w, h))
+        return out
+
+    def _merge_sigboxes_nearby(sig_boxes: List[Tuple[int, int, int, int]], near_px: int = 3):
+        if not sig_boxes:
+            return []
+        def to_xyxy(b):
+            x, y, w, h = b
+            return (x, y, x + w, y + h)
+        def to_xywh(b):
+            x1, y1, x2, y2 = b
+            return (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+        def expand(b, pad):
+            x1, y1, x2, y2 = b
+            return (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
+        def intersect(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+        def union(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            return (min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2))
+
+        rects = [to_xyxy(b) for b in sig_boxes]
         changed = True
         while changed:
             changed = False
-            rects.sort(key=lambda r: (r[0], r[1], r[2]-r[0], r[3]-r[1]))
-            used = [False]*len(rects)
-            merged: List[BoxLTRB] = []
+            rects.sort(key=lambda r: (r[0], r[1]))
+            used = [False] * len(rects)
+            merged = []
             for i in range(len(rects)):
-                if used[i]: 
+                if used[i]:
                     continue
                 cur = rects[i]
                 used[i] = True
                 j = 0
                 while j < len(rects):
                     if not used[j]:
-                        a = expand(cur, near_px)
-                        b = expand(rects[j], near_px)
-                        if intersects(a,b) or iou(cur, rects[j]) >= dedup_iou:
+                        if intersect(expand(cur, near_px), expand(rects[j], near_px)):
                             cur = union(cur, rects[j])
                             used[j] = True
                             changed = True
@@ -91,110 +518,43 @@ def build_final_boxes_all(
             rects = merged
         return [to_xywh(r) for r in rects]
 
-    # ------------- normalize inputs -------------
-    roles_ltrb   = [to_ltrb(b) for b in role_blocks]
-    sigs_ltrb    = [to_ltrb(b) for b in sig_boxes]
-    sermaye_ltrb = [to_ltrb(b) for b in (sermaye_boxes or [])]
+    def _draw_only_kept_boxes(img, boxes, color=(255, 0, 0), title="IMZALAR"):
+        vis = img.copy()
+        if vis.ndim == 2:
+            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+        for (x, y, w, h) in boxes:
+            cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+        if debug:
+            print(f"{title}: {len(boxes)} kutu")
+        return vis
 
-    # ------------- pairing (role ↔ sig) -------------
-    if near_px > 0:
-        sigs_grown = [expand(s, near_px) for s in sigs_ltrb]
-    else:
-        sigs_grown = list(sigs_ltrb)
+    # ========= PIPELINE =========
 
-    used_roles, used_sigs = set(), set()
-    pairs: List[Tuple[int,int]] = []
+    # 1) Adaylar
+    candidates = _detect_signatures_pro(img_bgr)
 
-    for ri, rb in enumerate(roles_ltrb):
-        if ri in used_roles:
-            continue
-        rl,rt,rr,rbottom = rb
-        rh = rbottom - rt
-        rcx, rcy = center(rb)
+    # 2) En iyi imzalar (skor + NMS)
+    sig_boxes = _keep_top_signatures(img_bgr, candidates, top_k=top_k)
 
-        # dikey bant
-        band_top = int(rcy - rh * band_pad_scale)
-        band_bot = int(rcy + rh * band_pad_scale)
-        band_l   = int(rl - (rr-rl) * band_center_scale)
-        band_r   = int(rr + (rr-rl) * band_center_scale)
-        band = (band_l, band_top, band_r, band_bot)
+    # 3) Damga eleme (opsiyonel)
+    if not include_stamps:
+        sig_boxes = _filter_sigboxes_remove_stamps(
+            img_bgr, sig_boxes,
+            include_stamps=False,
+            debug=debug,
+            band_thr=0.34, ang_thr=0.85, inner_thr=0.19,
+            aniso_max=2.10, keep_aniso_min=2.20, keep_inner_max=0.15,
+            rmin_rel=0.18, rmax_rel=0.62, hough_p1=90, hough_p2=18
+        )
 
-        best = None  # (score, si)
-        for si, sb in enumerate(sigs_grown):
-            if si in used_sigs:
-                continue
-            if not intersects(band, sb):
-                continue
+    # 4) Min-boyut filtresi
+    sig_boxes = _filter_tiny(sig_boxes)
 
-            # koridor kontrolü (rol.bottom ↔ sig.top)
-            blocked = False
-            if forbid_crossing:
-                sl,st,sr,sbtt = sigs_ltrb[si]
-                cl = min(rl, sl) - corridor_pad_px
-                cr = max(rr, sr) + corridor_pad_px
-                ct = min(rbottom, st)
-                cb = max(rbottom, st)
-                corridor = (cl, ct, cr, cb)
-                # diğer roller
-                for rj, ob in enumerate(roles_ltrb):
-                    if rj == ri: 
-                        continue
-                    if intersects(corridor, ob):
-                        blocked = True
-                        break
-                # diğer imzalar
-                if not blocked:
-                    for sj, ob in enumerate(sigs_ltrb):
-                        if sj == si: 
-                            continue
-                        if intersects(corridor, ob):
-                            blocked = True
-                            break
-            if blocked:
-                if dbg: 
-                    print(f"[SKIP] ri={ri} si={si} -> corridor blocked")
-                continue
+    # 5) Yakın kutuları birleştir
+    sig_boxes = _merge_sigboxes_nearby(sig_boxes, near_px=near_px)
 
-            # skor: dikey merkez mesafesi (küçük daha iyi)
-            _, scy = center(sigs_ltrb[si])
-            gap = abs(scy - rcy) + 1e-6
-            score = 1.0 / gap
-            if (best is None) or (score > best[0]):
-                best = (score, si)
+    # 6) Opsiyonel çizim
+    if draw:
+        _ = _draw_only_kept_boxes(img_bgr, sig_boxes, color=draw_color, title=draw_title)
 
-        if best is not None:
-            si = best[1]
-            pairs.append((ri, si))
-            used_roles.add(ri)
-            used_sigs.add(si)
-
-    # ------------- compose final set -------------
-    final_ltrb: List[BoxLTRB] = []
-
-    # 1) eşleşen rol∪imza
-    for ri, si in pairs:
-        final_ltrb.append(union(roles_ltrb[ri], sigs_ltrb[si]))
-
-    # 2) sermaye kutularını doğrudan ekle
-    final_ltrb.extend(sermaye_ltrb)
-
-    # 3) isteğe bağlı: eşleşmemiş rol/sig kutuları
-    if include_unpaired_roles:
-        for ri, rb in enumerate(roles_ltrb):
-            if ri not in used_roles:
-                final_ltrb.append(rb)
-    if include_unpaired_sigs:
-        for si, sb in enumerate(sigs_ltrb):
-            if si not in used_sigs:
-                final_ltrb.append(sb)
-
-    # 4) dedup / yakın olanları birleştir
-    final_xywh = dedup_merge_close([to_xywh(bb) for bb in final_ltrb])
-
-    return {
-        "final": final_xywh,                         # hepsi bir arada
-        "pairs": pairs,
-        "roles": [to_xywh(b) for b in roles_ltrb],
-        "sigs":  [to_xywh(b) for b in sigs_ltrb],
-        "sermaye": [to_xywh(b) for b in sermaye_ltrb],
-    }
+    return sig_boxes
