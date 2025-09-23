@@ -1,35 +1,33 @@
-def expand_sermaye_boxes_if_no_amount(
-    sermaye_boxes,
-    all_boxes,
-    ocr_texts=None,
-    *,
-    keep_all_numbered=True,
-    max_steps_right=3,
-    max_steps_down=2,
-    v_min=0.55,
-    h_min=0.55,
-    gap_right_max=400,
-    gap_down_max=250,
-    dbg=False,
-):
-    from dataclasses import dataclass
-    from typing import Any, Iterable, List, Optional, Tuple
-    import re
+from dataclasses import dataclass
+from typing import Any, Iterable, List, Optional, Tuple
+import re
 
-    # ---- İç tip ----
+def expand_sermaye_boxes_if_no_amount(
+    sermaye_boxes: Iterable[Any],
+    all_boxes: Iterable[Any],
+    ocr_texts: Optional[Iterable[Any]] = None,
+    *,
+    keep_all_numbered: bool = True,
+    max_steps_right: int = 3,
+    max_steps_down: int = 2,
+    v_min: float = 0.40,          # daha toleranslı
+    h_min: float = 0.55,
+    gap_right_max: int = 600,     # 400→600
+    gap_down_max: int = 300,
+    allow_right_fallback: bool = True,  # overlap yoksa en yakın sağ komşuya düş
+    dbg: bool = False,
+) -> List[Any]:
     @dataclass(frozen=True)
     class Box:
         x: int; y: int; w: int; h: int
         txt: str = ""
         role: Optional[str] = None
 
-    # ---- Regexler ----
     _num_pat      = re.compile(r"\d")
     _amount_pat   = re.compile(r"(?:^|[^%])(?:(\d{1,3}(?:[.\s’’,]\d{3})+(?:,\d+)?)|\d{5,})")
     _currency_pat = re.compile(r"\b(?:TL|TRY|₺)\b", re.IGNORECASE)
     _percent_pat  = re.compile(r"%\s*\d+")
 
-    # ---- Yardımcılar ----
     def _get_txt(obj):
         for k in ("txt","text","string"):
             if hasattr(obj, k):
@@ -41,14 +39,12 @@ def expand_sermaye_boxes_if_no_amount(
         return str(obj or "")
 
     def _to_box(obj):
-        if isinstance(obj, Box):
-            return obj
+        if isinstance(obj, Box): return obj
         if isinstance(obj, (tuple, list)) and len(obj) >= 4:
             return Box(int(obj[0]), int(obj[1]), int(obj[2]), int(obj[3]), _get_txt(obj))
         if all(hasattr(obj, k) for k in ("x","y","w","h")):
             return Box(int(obj.x), int(obj.y), int(obj.w), int(obj.h), _get_txt(obj))
-        # Eğer string ise Box’a çevirme (skip et)
-        if isinstance(obj, str):
+        if isinstance(obj, str):  # koordinatsız metin: pool'a ekleme
             return None
         raise TypeError(f"cannot convert {type(obj)} to Box")
 
@@ -57,52 +53,95 @@ def expand_sermaye_boxes_if_no_amount(
     def _v_overlap_ratio(a,b): return _overlap_1d(a.y,a.y+a.h,b.y,b.y+b.h)/max(1,min(a.h,b.h))
     def _h_overlap_ratio(a,b): return _overlap_1d(a.x,a.x+a.w,b.x,b.x+b.w)/max(1,min(a.w,b.w))
     def _gap_right(a,b): return b.x-(a.x+a.w)
-    def _gap_down(a,b): return b.y-(a.y+a.h)
+    def _gap_down(a,b):  return b.y-(a.y+a.h)
+
     def _merge(a,b):
-        x1,y1,x2,y2=_xyxy(a); X1,Y1,X2,Y2=_xyxy(b)
-        return Box(min(x1,X1),min(y1,Y1),max(x2,X2)-min(x1,X1),max(y2,Y2)-min(y1,Y1),(a.txt+" "+b.txt).strip())
+        ax1,ay1,ax2,ay2=_xyxy(a); bx1,by1,bx2,by2=_xyxy(b)
+        nx1,ny1,nx2,ny2=min(ax1,bx1),min(ay1,by1),max(ax2,bx2),max(ay2,by2)
+        return Box(nx1,ny1,nx2-nx1,ny2-ny1,(a.txt+" "+b.txt).strip(), a.role or b.role)
+
     def has_number(s): return bool(_num_pat.search(s or ""))
     def amount_score(s):
-        sc=0
-        if _amount_pat.search(s): sc+=2
-        if _currency_pat.search(s): sc+=2
+        sc=0.0
+        if _amount_pat.search(s): sc+=2.0
+        if _currency_pat.search(s): sc+=2.0
         if _percent_pat.search(s): sc-=1.5
-        sc+=min(1.0,sum(c.isdigit() for c in s)/8.0)
+        sc+=min(1.0, sum(c.isdigit() for c in (s or ""))/8.0)
         return sc
     def contains_amount(s,thr=2.0): return amount_score(s)>=thr
 
-    def _best_right(cur,pool):
-        cand=[]
+    # ---- Sağ komşu seçici (yakınlık öncelikli) ----
+    def _best_right_neighbor(cur, pool):
+        cand=[]; dumped=False
         cx1,cy1,cx2,cy2=_xyxy(cur)
         for b in pool:
             bx1,by1,bx2,by2=_xyxy(b)
-            if bx1<=cx2: continue
+            if bx1<=cx2: 
+                continue
             vovl=_v_overlap_ratio(cur,b)
-            if vovl<v_min: continue
             gap=_gap_right(cur,b)
-            if gap<0 or gap>gap_right_max: continue
-            cand.append((-amount_score(b.txt), gap, -vovl, b))
-        return min(cand)[-1] if cand else None
+            if dbg and not dumped:
+                dumped=True
+            if vovl<v_min or gap<0 or gap>gap_right_max:
+                if dbg:
+                    # Aday reddini raporla
+                    print(f"[RIGHT-REJECT] gap={gap} vovl={vovl:.2f} txt='{b.txt[:40]}'")
+                continue
+            sc=amount_score(b.txt)
+            # en yakın -> gap, sonra yüksek skor -> -sc, sonra yüksek vovl -> -vovl
+            cand.append((gap, -sc, -vovl, b))
+        if cand:
+            cand.sort()
+            if dbg:
+                g,ns,ov,bx=cand[0]
+                print(f"[RIGHT-PICK] gap={g} vovl={-ov:.2f} score={-ns:.2f} txt='{bx.txt[:60]}'")
+            return cand[0][-1]
 
-    def _best_down(cur,pool):
+        # Fallback: overlap aramadın ama en yakın sağdaki kutuya git
+        if allow_right_fallback:
+            fb=[]
+            for b in pool:
+                bx1,by1,bx2,by2=_xyxy(b)
+                if bx1<=cx2: 
+                    continue
+                gap=_gap_right(cur,b)
+                if gap<0 or gap>gap_right_max: 
+                    continue
+                fb.append((gap, -amount_score(b.txt), b))
+            if fb:
+                fb.sort()
+                if dbg:
+                    g,ns,bx=fb[0]
+                    print(f"[RIGHT-FALLBACK] gap={g} score={-ns:.2f} txt='{bx.txt[:60]}'")
+                return fb[0][-1]
+        return None
+
+    def _best_down_neighbor(cur, pool):
         cand=[]
         cx1,cy1,cx2,cy2=_xyxy(cur)
         for b in pool:
             bx1,by1,bx2,by2=_xyxy(b)
-            if by1<=cy2: continue
+            if by1<=cy2: 
+                continue
             hovl=_h_overlap_ratio(cur,b)
-            if hovl<h_min: continue
             gap=_gap_down(cur,b)
-            if gap<0 or gap>gap_down_max: continue
-            cand.append((-amount_score(b.txt), gap, -hovl, b))
-        return min(cand)[-1] if cand else None
+            if hovl<h_min or gap<0 or gap>gap_down_max:
+                if dbg:
+                    print(f"[DOWN-REJECT] gap={gap} hovl={hovl:.2f} txt='{b.txt[:40]}'")
+                continue
+            cand.append((gap, -amount_score(b.txt), -hovl, b))
+        if not cand:
+            return None
+        cand.sort()
+        if dbg:
+            g,ns,ov,bx=cand[0]
+            print(f"[DOWN-PICK] gap={g} hovl={-ov:.2f} score={-ns:.2f} txt='{bx.txt[:60]}'")
+        return cand[0][-1]
 
-    # ---- Havuz hazırla ----
-    pool=[_to_box(b) for b in all_boxes]
-    pool=[b for b in pool if b]  # None'ları at
+    # ---- Havuz ----
+    pool=[_to_box(b) for b in all_boxes]; pool=[b for b in pool if b]
     if ocr_texts:
-        tmp=[_to_box(t) for t in ocr_texts]
-        pool.extend([b for b in tmp if b])
+        pool.extend([_to_box(t) for t in ocr_texts if _to_box(t)])
 
     uniq={(b.x,b.y,b.w,b.h,b.txt):b for b in pool}
     pool=list(uniq.values())
@@ -110,42 +149,48 @@ def expand_sermaye_boxes_if_no_amount(
     out=[]
     for s in sermaye_boxes:
         base=_to_box(s)
-        if not base: continue
+        if not base: 
+            continue
 
         if contains_amount(base.txt):
-            out.append(base); 
-            if dbg: print("[SERMAYE] already has amount", base.txt)
+            out.append(base)
+            if dbg: print("[SERMAYE] already has amount ::", base.txt[:120])
             continue
 
         cur=base; used=set()
 
-        # RIGHT zinciri
+        # ---- RIGHT zinciri
         steps=0
         while not contains_amount(cur.txt) and steps<max_steps_right:
-            nb=_best_right(cur,[b for b in pool if (b.x,b.y,b.w,b.h) not in used])
-            if not nb: break
-            if dbg: print("RIGHT ->",nb.txt)
+            nb=_best_right_neighbor(cur, [b for b in pool if (b.x,b.y,b.w,b.h) not in used])
+            if not nb:
+                break
+            if dbg: print(f"[EXPAND] RIGHT -> '{nb.txt[:80]}'")
             used.add((nb.x,nb.y,nb.w,nb.h))
             cur=_merge(cur,nb)
             steps+=1
 
         if contains_amount(cur.txt):
-            out.append(cur); continue
+            if dbg: print("[EXPAND] success via RIGHT chain")
+            out.append(cur)
+            continue
 
-        # DOWN zinciri
+        # ---- DOWN zinciri
         steps=0
         while not contains_amount(cur.txt) and steps<max_steps_down:
-            nb=_best_down(cur,[b for b in pool if (b.x,b.y,b.w,b.h) not in used])
-            if not nb: break
-            if dbg: print("DOWN ->",nb.txt)
+            nb=_best_down_neighbor(cur, [b for b in pool if (b.x,b.y,b.w,b.h) not in used])
+            if not nb:
+                break
+            if dbg: print(f"[EXPAND] DOWN -> '{nb.txt[:80]}'")
             used.add((nb.x,nb.y,nb.w,nb.h))
             cur=_merge(cur,nb)
             steps+=1
 
         if contains_amount(cur.txt):
+            if dbg: print("[EXPAND] success via DOWN chain")
             out.append(cur)
         else:
-            if dbg: print("DROP",base.txt)
+            if dbg: print("[EXPAND] DROP (no amount) ::", base.txt[:120])
             if keep_all_numbered or has_number(base.txt):
                 out.append(base)
 
