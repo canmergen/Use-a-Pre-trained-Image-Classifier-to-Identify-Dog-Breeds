@@ -5,37 +5,31 @@ def run_role_pipeline(
     sig_boxes=None,
     sermaye_boxes=None,
     lower_img=None,
-    # augment (dikey birleştirme)
+    # augment
     x_policy="max",                 # "max" | "role"
     min_x_overlap_ratio=0.10,
     min_dy_px=0,
     max_dy_px=165,
     require_name_below=True,
-    # split (çoklu rol ayırma)
+    # split
     ROLE_ALIASES=None,
     gap_px=8,
     min_piece_w=14,
     fuzzy_enable=True,
-    fuzzy_score_thr=86,
+    fuzzy_score_thr=86,             # split için
     small_space_policy="drop",      # "drop" | "keep_unsplit" | "shrink_gap"
     min_char_gap_between_roles=2,
     require_separator_for_split=True,
-    # teşhis / opsiyon bayrakları
-    apply_roleonly_cleanup=True,    # rol+isim varsa rol-only’leri at
-    apply_split=True,               # çoklu rol split çalışsın mı
-    apply_sermaye_filter=True,      # sermaye/imza IoU filtresi çalışsın mı
-    stage_debug=True,               # aşama logları
+    # yeni: DETECT aşaması için fuzzy
+    detect_fuzzy_enable=True,
+    detect_fuzzy_thr=80,
+    # teşhis / opsiyon
+    apply_roleonly_cleanup=True,
+    apply_split=True,
+    apply_sermaye_filter=True,
+    stage_debug=True,
     dbg=False
 ):
-    """
-    Tek çağrıda: rol tespiti -> dikey ad-soyad birleştirme -> (opsiyonel) role-only cleanup ->
-    (opsiyonel) çoklu rol split -> (opsiyonel) sermaye/imza filtresi ->
-    role-bilinçli final containment dedup -> (opsiyonel) çizim.
-    Çıkış: [(x,y,w,h), ...]
-    """
-    # ----------------
-    # Imports & helpers
-    # ----------------
     import re, copy, unicodedata
 
     try:
@@ -43,13 +37,14 @@ def run_role_pipeline(
         _FUZZY_OK = True
     except Exception:
         _FUZZY_OK = False
-        class _F:
+        class _F:  # dummy
             @staticmethod
             def partial_ratio(a,b): return 0
             @staticmethod
             def token_set_ratio(a,b): return 0
         fuzz = _F()
 
+    # ---------- helpers ----------
     def _get(b, k, d=None):
         if isinstance(b, dict): return b.get(k, d)
         return getattr(b, k, d)
@@ -102,7 +97,7 @@ def run_role_pipeline(
         ox1,oy1,ox2,oy2 = _xyxy(outer)
         return (ix1 >= ox1 - pad) and (iy1 >= oy1 - pad) and (ix2 <= ox2 + pad) and (iy2 <= oy2 + pad)
 
-    # --- text utils
+    # text utils
     def tr_upper(s):  return (s or "").replace("i","İ").replace("ı","I").upper()
     def strip_diac(s): return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     def canon(s):     return re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
@@ -110,7 +105,6 @@ def run_role_pipeline(
     TR = "A-Za-zÇĞİÖŞÜçğıöşü"
     NAME_LINE_RE = re.compile(rf"\b[{TR}][{TR}'-]+\s+[{TR}][{TR}'-]+(\s+[{TR}][{TR}'-]+)?\b")
     AD_SOYAD_HINT_RE = re.compile(r"\bad\s*[-:]?\s*soyad[ıi]?\b", re.I)
-
     def looks_like_person_line(t):
         if not t: return False
         if sum(ch.isdigit() for ch in t) > 2 and "T.C" not in t and "TC" not in t:
@@ -119,24 +113,22 @@ def run_role_pipeline(
         if AD_SOYAD_HINT_RE.search(t_clean): 
             return True
         return bool(NAME_LINE_RE.search(t_clean))
-
     def has_inline_name(txt):
         if not txt: return False
         letters = re.findall(rf"[{TR}]", txt)
         if len("".join(letters)) < 4: return False
         return bool(re.compile(rf"(?i)\b[{TR}]{{2,}}\b(?:[\s\W]+?\b[{TR}]{{2,}}\b)+").search(txt))
-
     def _has_namey(b) -> bool:
         t = b.get("txt","")
         return looks_like_person_line(t) or has_inline_name(t)
 
-    # --- aliases
+    # aliases
     ROLE_ALIASES_DEFAULT = {
         "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
         "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
         "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
-        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETİM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
-        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YONETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETIM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YÖNETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
         "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
         "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
     }
@@ -147,35 +139,52 @@ def run_role_pipeline(
         return ROLE_ALIASES, ALIASES
     ROLE_ALIASES, ALIASES = prepare_aliases(ROLE_ALIASES)
 
-    # ----------------
-    # 0) detected -> internal copy with text
-    # ----------------
+    # 0) copy
     det_boxes = []
     for b, t in zip(detected_boxes, ocr_texts):
         x,y,w,h = _as_box_tuple(b)
         det_boxes.append({"x":x,"y":y,"w":w,"h":h,"txt":(t or ""), "role":None, "inline_name":has_inline_name(t or "")})
     if stage_debug: print(f"[STAGE] init_boxes={len(det_boxes)}")
 
-    # ----------------
-    # 1) detect roles
-    # ----------------
-    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}
+    # 1) DETECT (kanonik + fuzzy)
+    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}           # display strings
+    CANON_TO_FAMILY = {canon(v): fam for fam, vals in ROLE_ALIASES.items() for v in vals}  # canonical map
     role_boxes = []
     for b in det_boxes:
-        T = (b["txt"] or "").upper()
-        hit = next((k for k in ALL_KEY_STR if k in T), None)
+        raw = b["txt"] or ""
+        tU = tr_upper(strip_diac(raw))    # üst/diakritiksiz
+        tC = canon(raw)
+
+        # 1a) hızlı exact: hem normal hem canonical
+        hit = next((k for k in ALL_KEY_STR if k in tU), None)
+        fam = None
         if hit:
-            b["role"] = hit
+            fam = CANON_TO_FAMILY.get(canon(hit))
+        else:
+            for cv, fam_try in [(cv, fam) for fam, vals in ROLE_ALIASES.items() for cv in vals]:
+                if canon(cv) in tC:
+                    fam = CANON_TO_FAMILY[canon(cv)]
+                    break
+
+        # 1b) fuzzy fallback
+        if fam is None and detect_fuzzy_enable and _FUZZY_OK:
+            best = None
+            for cv, fam_try in [(cv, fam) for fam, vals in ROLE_ALIASES.items() for cv in vals]:
+                sc = max(fuzz.partial_ratio(tC, canon(cv)), fuzz.token_set_ratio(tC, canon(cv)))
+                if sc >= detect_fuzzy_thr and (best is None or sc > best[0]):
+                    best = (sc, fam_try)
+            if best:
+                fam = best[1]
+
+        if fam:
+            b["role"] = fam
             role_boxes.append(b)
-            if dbg: print(f"[ROLE] {hit} @({b['x']},{b['y']},{b['w']},{b['h']}) :: {b['txt'][:80]}")
+            if dbg: print(f"[ROLE] {fam} @({b['x']},{b['y']},{b['w']},{b['h']}) :: {raw[:80]}")
     if stage_debug: print(f"[STAGE] role_boxes={len(role_boxes)}")
 
-    # ----------------
-    # 2) dikey birleştirme (sadece alttan + isim satırı şartı opsiyonel)
-    # ----------------
+    # 2) augment (vertical)
     pool = [b for b in det_boxes if b not in role_boxes]
     merged_blocks, taken_ids, merged_rb_ids = [], set(), set()
-
     for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
         best, best_score = None, None
         for cb in pool:
@@ -189,17 +198,12 @@ def run_role_pipeline(
                 continue
             if sig_boxes:
                 if _overlaps_any_iou(cb, sig_boxes, thr=0.02): 
-                    if dbg: print("[SKIP] candidate hits signature"); 
                     continue
-                # birleştirme önizleme
                 rx1,ry1,rx2,ry2 = _xyxy(rb); cx1,cy1,cx2,cy2 = _xyxy(cb)
-                if x_policy == "role": 
-                    mx1, mx2 = rx1, rx2
-                else:
-                    mx1, mx2 = min(rx1,cx1), max(rx2,cx2)
+                if x_policy == "role": mx1, mx2 = rx1, rx2
+                else:                  mx1, mx2 = min(rx1,cx1), max(rx2,cx2)
                 my1, my2 = min(ry1,cy1), max(ry2,cy2)
                 if _overlaps_any_iou({"x":mx1,"y":my1,"w":mx2-mx1,"h":my2-my1}, sig_boxes, thr=0.02):
-                    if dbg: print("[SKIP] merged hits signature"); 
                     continue
             score = (-abs(dy), _x_overlap_ratio(rb, cb))
             if best_score is None or score > best_score:
@@ -219,18 +223,16 @@ def run_role_pipeline(
                                        txt=f"{rb['txt']} + {best['txt']}", role=rb["role"]))
             taken_ids.add(id(best))
             merged_rb_ids.add(id(rb))
-            if dbg: print(f"[ROLE+NAME] {rb['role']} -> {best['txt'][:60]}")
         else:
             merged_blocks.append(_rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"]))
-    # inline name içeren saf rol satırlarını da ekle (eğer zaten birleştirilmemişse)
+
     for b in role_boxes:
         if b.get("inline_name") and id(b) not in merged_rb_ids:
             merged_blocks.append(_rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"]))
+
     if stage_debug: print(f"[STAGE] merged_blocks={len(merged_blocks)}")
 
-    # ----------------
     # 2b) role-only cleanup (opsiyonel)
-    # ----------------
     if apply_roleonly_cleanup:
         role_to_merged = {}
         for b in merged_blocks:
@@ -245,29 +247,23 @@ def run_role_pipeline(
                 drop = False
                 for big in role_to_merged[r]:
                     if _is_inside(b, big, pad=1) or _iou(b, big) >= 0.75:
-                        drop = True
-                        break
-                if drop:
+                        drop = True; break
+                if drop: 
                     continue
             cleaned.append(b)
         merged_blocks = cleaned
     if stage_debug: print(f"[STAGE] after roleonly_cleanup={len(merged_blocks)} (applied={apply_roleonly_cleanup})")
 
-    # ----------------
-    # 3) çoklu rol split (konservatif / opsiyonel)
-    # ----------------
+    # 3) split (opsiyonel)
     SEP_RE = re.compile(r"(?:\s*[;,/|]\s*|\s+\bVE\b\s+|\s*/\s*)", re.I)
-
     def detect_roles_with_positions(text):
         t = canon(text)
         taken = [False]*len(t)
         spans = []
-
-        # exact
         for fam, cv in ALIASES:
             start = 0
             while True:
-                idx = t.find(cv, start)
+                idx = t.find(cv, start); 
                 if idx == -1: break
                 rng = range(idx, idx+len(cv))
                 if any(taken[i] for i in rng):
@@ -275,30 +271,21 @@ def run_role_pipeline(
                 for i in rng: taken[i] = True
                 spans.append((fam, (idx, idx+len(cv))))
                 start = idx + len(cv)
-
-        # fuzzy (gerekirse)
         if fuzzy_enable and _FUZZY_OK and len(spans) <= 1:
             cands = []
             for fam, cv in ALIASES:
-                s1 = fuzz.partial_ratio(t, cv)
-                s2 = fuzz.token_set_ratio(t, cv)
-                sc = max(s1, s2)
+                sc = max(fuzz.partial_ratio(t, cv), fuzz.token_set_ratio(t, cv))
                 if sc >= fuzzy_score_thr:
-                    key = cv.split()[0]
-                    pos = t.find(key)
-                    if pos == -1: pos = len(t) + 10
-                    cands.append((fam, pos, sc, cv))
+                    key = cv.split()[0]; pos = t.find(key); 
+                    if pos == -1: pos = len(t)+10
+                    cands.append((fam, pos, sc))
             cands.sort(key=lambda x: (-x[2], x[1]))
-            for fam, pos, _, cv in cands:
-                if any(f==fam for f,_ in spans): 
-                    continue
+            for fam, pos, _ in cands:
+                if any(f==fam for f,_ in spans): continue
                 spans.append((fam, (max(0,pos), min(len(t), pos+len(cv)))))
-
-        # genel "BAŞKAN" varsa ve spesifikler de varsa, geneli at
         fams = [f for f,_ in spans]
         if any(f in fams for f in ("divan_baskani","toplanti_baskani","yk_baskani")):
             spans = [(f,xy) for f,xy in spans if f!="baskan"]
-
         spans.sort(key=lambda kv: kv[1][0])
         return spans
 
@@ -308,17 +295,10 @@ def run_role_pipeline(
             txt = b["txt"] or ""
             spans = detect_roles_with_positions(txt)
             fams = [fam for fam,_ in spans]
-
-            if dbg: print(f"[roles?] {fams} :: {txt[:80]!r}")
-
-            # tek/0 rol: bölme yok
             if len(fams) <= 1:
                 nb = copy.deepcopy(b)
                 if fams: nb["role"] = fams[0]
-                splitted.append(nb)
-                continue
-
-            # split kararı
+                splitted.append(nb); continue
             t_canon = canon(txt)
             has_sep = bool(SEP_RE.search(t_canon))
             spans_ok = True
@@ -327,49 +307,32 @@ def run_role_pipeline(
                     spans_ok = False; break
             if require_separator_for_split and not has_sep:
                 spans_ok = False
-
             if not spans_ok:
-                nb = copy.deepcopy(b)
-                nb["role"] = fams[0]
-                splitted.append(nb)
-                if dbg: print("[no-split] weak evidence; kept unsplit.")
-                continue
-
-            # parçalara böl (genişlik paylaştır)
+                nb = copy.deepcopy(b); nb["role"] = fams[0]; splitted.append(nb); continue
             N = len(fams)
-            x,y,x2,y2 = _xyxy(b)
-            W = x2 - x
+            x,y,x2,y2 = _xyxy(b); W = x2-x
             needed = N*min_piece_w + (N-1)*gap_px
             if needed > W:
-                if small_space_policy == "drop":
-                    if dbg: print(f"[drop] W={W} < needed={needed} (N={N})")
-                    continue
+                if small_space_policy == "drop":   continue
                 elif small_space_policy == "keep_unsplit":
                     nb = copy.deepcopy(b); nb["role"]=fams[0]; splitted.append(nb); continue
                 else:
-                    possible_gap = max(0, (W - N*min_piece_w)) // max(1,(N-1))
-                    gap = possible_gap
+                    gap = max(0,(W - N*min_piece_w)) // max(1,(N-1))
             else:
                 gap = gap_px
-
-            usable = W - gap*(N-1)
-            base = usable // N
-            rem  = usable % N
+            usable = W - gap*(N-1); base = usable // N; rem = usable % N
             cur_x = x
             for i in range(N):
                 w_piece = max(min_piece_w, base + (1 if i < rem else 0))
                 nb = _rect(cur_x, y, w_piece, y2-y, txt=b["txt"], role=fams[i])
                 splitted.append(nb)
-                if i < N-1:
-                    cur_x += w_piece + gap
+                if i < N-1: cur_x += w_piece + gap
         if stage_debug: print(f"[STAGE] splitted(after split)={len(splitted)}")
     else:
         splitted = [copy.deepcopy(b) for b in merged_blocks]
         if stage_debug: print(f"[STAGE] splitted(no-split)={len(splitted)}")
 
-    # ----------------
-    # 4) sermaye çakışmaları (opsiyonel)
-    # ----------------
+    # 4) sermaye/imza filtresi (opsiyonel)
     if apply_sermaye_filter and sermaye_boxes:
         sb = [{"x":_get(s,"x"),"y":_get(s,"y"),"w":_get(s,"w"),"h":_get(s,"h")} for s in sermaye_boxes]
         keep = []
@@ -382,31 +345,17 @@ def run_role_pipeline(
     else:
         if stage_debug: print(f"[STAGE] after sermaye_filter={len(splitted)} (applied=False)")
 
-    # ----------------
     # 5) FINAL: role-bilinçli containment dedup
-    # ----------------
     def _final_containment_dedup_role_aware(boxes: list, pad: int = 1) -> list:
-        """
-        Containment dedup sadece AYNI ROLE grubu içinde yapılır.
-        Farklı role’ler birbirini düşürmez.
-        Bir role grubunda containment kenarı varsa en büyük alanlı kutu kalır;
-        yoksa grup aynen korunur.
-        """
         from collections import defaultdict
-
         def area(b): return max(1, int(b["w"])) * max(1, int(b["h"]))
-
         role_to_idxs = defaultdict(list)
         for i, b in enumerate(boxes):
             role_to_idxs[b.get("role")].append(i)
-
         keep_flags = [True] * len(boxes)
-
         for role, idxs in role_to_idxs.items():
             n = len(idxs)
-            if n <= 1: 
-                continue
-
+            if n <= 1: continue
             parent = {i: i for i in idxs}
             def find(i):
                 while parent[i] != i:
@@ -415,9 +364,7 @@ def run_role_pipeline(
                 return i
             def union(a, b):
                 ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
-
+                if ra != rb: parent[rb] = ra
             contains_edge = set()
             for a_i in range(n):
                 for b_i in range(a_i+1, n):
@@ -429,21 +376,16 @@ def run_role_pipeline(
                     inside_ji = (ox1 >= ix1 - pad) and (oy1 >= iy1 - pad) and (ox2 <= ix2 + pad) and (oy2 <= iy2 + pad)
                     if inside_ij or inside_ji:
                         union(i, j); contains_edge.add((min(i,j), max(i,j)))
-
             comps = {}
             for i in idxs:
-                r = find(i)
-                comps.setdefault(r, []).append(i)
-
+                r = find(i); comps.setdefault(r, []).append(i)
             for comp in comps.values():
                 comp_set = set(comp)
                 any_containment = any((u in comp_set and v in comp_set) for (u,v) in contains_edge)
-                if not any_containment:
-                    continue
+                if not any_containment: continue
                 keep_idx = max(comp, key=lambda k: area(boxes[k]))
                 for k in comp:
                     keep_flags[k] = (k == keep_idx)
-
         return [b for k, b in enumerate(boxes) if keep_flags[k]]
 
     if stage_debug: print(f"[STAGE] before final_dedup={len(splitted)}")
