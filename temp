@@ -1,127 +1,299 @@
-def find_best_sermaye_box(detected_boxes, ocr_texts, *, 
-                          thr=0.78, thr_partial=0.70, 
-                          y_band_ratio=0.55, max_concat=2, dbg=False):
+def expand_sermaye_boxes_if_no_amount(
+    sermaye_boxes,
+    all_boxes,
+    ocr_texts=None,                    # str listesi veya (x,y,w,h,txt) nesneleri
+    *,
+    keep_all_numbered=True,
+    max_steps_right=3,
+    max_steps_down=2,
+    v_min=0.40,                         # sağ komşu için min dikey örtüşme oranı
+    h_min=0.55,                         # aşağı komşu için min yatay örtüşme oranı
+    gap_right_max=700,                  # sağdaki max piksel mesafe
+    gap_down_max=320,                   # aşağıdaki max piksel mesafe
+    allow_right_fallback=True,          # overlap olmasa da en yakın sağ komşuyu dene
+    expand_when_has_amount=False,       # kutuda zaten amount varsa yine de genişlet?
+    expand_currency_if_missing=True,    # amount var ama para birimi yoksa sağ etiket ekle
+    currency_right_window=220,          # sağda para birimi etiketi arama penceresi
+    dbg=False,
+):
     """
     Girdi:
-      detected_boxes : [(x,y,w,h), Box-like, ...]  # indis = lokasyon
-      ocr_texts      : [str, ...]                  # indis = metin
+      sermaye_boxes : [Box-like | (x,y,w,h,txt?) ...]   # başlangıç kutuları
+      all_boxes     : [Box-like | (x,y,w,h,txt?) ...]   # tüm tespitli kutular
+      ocr_texts     : None | [str ...] | [(x,y,w,h,txt) ...]
     Çıktı:
-      (x, y, w, h, text, score)  # en iyi tek 'sermaye' başlık penceresi
-      Hiç kutu yoksa None
+      [Box-like] listesi; her eleman: dataclass benzeri (x,y,w,h,txt,role)
+    Not:
+      - ocr_texts yalnızca 'str' ise strings-only moduna geçer; metin var/yok
+        kontrolünde indeks eşlemesi yapılır.
     """
+    # --------- import ve iç sınıf ---------
+    import re
+    from dataclasses import dataclass
+    from typing import Any, Iterable, List, Optional, Tuple
 
-    # ---- küçük yardımcılar (class/dataclass yok) ----
-    import re, unicodedata
-    from difflib import SequenceMatcher
+    @dataclass(frozen=True)
+    class Box:
+        x: int; y: int; w: int; h: int
+        txt: str = ""
+        role: Optional[str] = None
 
-    def _to_xywh(b):
-        if isinstance(b, (tuple, list)) and len(b) >= 4:
-            return int(b[0]), int(b[1]), int(b[2]), int(b[3])
-        # obj.x,y,w,h destekle
-        for k in ("x","y","w","h"):
-            if not hasattr(b, k):
-                raise TypeError(f"Unsupported box type: {type(b)}")
-        return int(b.x), int(b.y), int(b.w), int(b.h)
+    # --------- regexler ---------
+    _num_pat      = re.compile(r"\d")
+    _amount_pat   = re.compile(r"(?:^|[^%])(?:(\d{1,3}(?:[.\s’’,]\d{3})+(?:,\d+)?)|\d{4,})")
+    _currency_pat = re.compile(r"\b(?:TL|TRY|₺)\b", re.IGNORECASE)
+    _percent_pat  = re.compile(r"%\s*\d+")
 
-    def _normalize(s: str) -> str:
-        s = (s or "")
-        s = unicodedata.normalize("NFKD", s)
-        s = s.replace("İ","I").replace("ı","i")
-        s = "".join(ch for ch in s if not unicodedata.combining(ch))
-        s = s.upper()
-        s = re.sub(r"[^\w%₺ĞÜŞİÖÇ\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    # --------- yardımcılar ---------
+    def _get_txt(obj: Any) -> str:
+        for k in ("txt", "text", "string"):
+            if hasattr(obj, k):
+                return str(getattr(obj, k) or "")
+        if isinstance(obj, (tuple, list)) and len(obj) >= 5:
+            return str(obj[4] or "")
+        return ""  # koordinatları metin sanma
 
-    def _ratio(a: str, b: str) -> float:
-        return SequenceMatcher(None, a, b).ratio()
-
-    def _xyxy(x,y,w,h):
-        return x, y, x+w, y+h
-
-    def _merge_boxes(boxes):
-        xs1, ys1, xs2, ys2 = [], [], [], []
-        for (x,y,w,h) in boxes:
-            X1,Y1,X2,Y2 = _xyxy(x,y,w,h)
-            xs1.append(X1); ys1.append(Y1); xs2.append(X2); ys2.append(Y2)
-        x1, y1 = min(xs1), min(ys1)
-        x2, y2 = max(xs2), max(ys2)
-        return x1, y1, x2-x1, y2-y1
-
-    # ---- hedef pattern seti ----
-    patterns = [
-        "Şirketin sermayesi ve payların toplam itibari değeri",
-        "Şirketin sermayesi",
-        "Sermaye",
-        "Sermayesi",
-        "Sermaye ve payların toplam itibari değeri",
-        "SERMAYE & TUTAR",
-        "SERMAYE TUTARI",
-    ]
-    patterns_n = [_normalize(p) for p in patterns]
-
-    # ---- indis bazlı eşleme (lokasyon <-> metin) ----
-    B = [ _to_xywh(b) for b in detected_boxes ]
-    T = [ str(t or "") for t in ocr_texts ]
-    N = min(len(B), len(T))
-    if N == 0:
+    def _to_box(obj: Any) -> Optional[Box]:
+        if isinstance(obj, Box):
+            return obj
+        if isinstance(obj, (tuple, list)) and len(obj) >= 4:
+            return Box(int(obj[0]), int(obj[1]), int(obj[2]), int(obj[3]), _get_txt(obj))
+        if all(hasattr(obj, k) for k in ("x", "y", "w", "h")):
+            return Box(int(obj.x), int(obj.y), int(obj.w), int(obj.h), _get_txt(obj))
         return None
 
-    # ---- satır gruplama (yaklaşık y-bandı) ----
-    mean_h = max(1, sum(B[i][3] for i in range(N)) // max(1, N))
-    band    = max(8, int(mean_h * y_band_ratio))  # min 8 px
+    def _xyxy(b: Box) -> Tuple[int,int,int,int]:
+        return b.x, b.y, b.x + b.w, b.y + b.h
 
-    def _y_center(xywh): 
-        return xywh[1] + xywh[3]//2
+    def _overlap_1d(a1, a2, b1, b2) -> int:
+        return max(0, min(a2, b2) - max(a1, b1))
 
-    # key = y-merkez // band
-    lines = {}
-    for i in range(N):
-        key = _y_center(B[i]) // band
-        lines.setdefault(key, []).append(i)
-    for key in lines:
-        lines[key].sort(key=lambda i: B[i][0])  # soldan sağa
+    def _v_overlap_ratio(a: Box, b: Box) -> float:
+        return _overlap_1d(a.y, a.y+a.h, b.y, b.y+b.h) / max(1, min(a.h, b.h))
 
-    # ---- satır içinde pencere tarama ve skor hesap ----
-    best = None  # (score, (x,y,w,h), text, (i_start,i_end))
-    for key, idxs in lines.items():
-        line_txt_norm = " ".join(_normalize(T[i]) for i in idxs if T[i])
-        hint = "SERMAY" in line_txt_norm
+    def _h_overlap_ratio(a: Box, b: Box) -> float:
+        return _overlap_1d(a.x, a.x+a.w, b.x, b.x+b.w) / max(1, min(a.w, b.w))
 
-        for pos, i in enumerate(idxs):
-            for k in range(0, max_concat+1):
-                j = min(len(idxs)-1, pos+k)
-                win = idxs[pos:j+1]
-                # metni sırayla birleştir
-                raw_txt = " ".join(T[t] for t in win if T[t])
-                norm_txt = _normalize(raw_txt)
-                if not norm_txt:
+    def _gap_right(a: Box, b: Box) -> int:
+        return b.x - (a.x + a.w)
+
+    def _gap_down(a: Box, b: Box) -> int:
+        return b.y - (a.y + a.h)
+
+    def _merge(a: Box, b: Box) -> Box:
+        ax1, ay1, ax2, ay2 = _xyxy(a)
+        bx1, by1, bx2, by2 = _xyxy(b)
+        nx1, ny1 = min(ax1, bx1), min(ay1, by1)
+        nx2, ny2 = max(ax2, bx2), max(ay2, by2)
+        return Box(nx1, ny1, nx2-nx1, ny2-ny1, (a.txt + " " + b.txt).strip(), a.role or b.role)
+
+    def has_number(s: str) -> bool:
+        return bool(_num_pat.search(s or ""))
+
+    def amount_score(s: str) -> float:
+        sc = 0.0
+        if _amount_pat.search(s): sc += 2.0
+        if _currency_pat.search(s): sc += 2.0
+        if _percent_pat.search(s): sc -= 1.5
+        sc += min(1.0, sum(c.isdigit() for c in (s or "")) / 8.0)
+        return sc
+
+    def contains_amount(s: str, thr: float = 2.0) -> bool:
+        return amount_score(s) >= thr
+
+    def has_currency(s: str) -> bool:
+        return bool(_currency_pat.search(s or ""))
+
+    # --------- OCR havuzu ve mod belirleme ---------
+    strings_only_mode = bool(ocr_texts) and all(isinstance(t, str) for t in ocr_texts)
+    if dbg and strings_only_mode:
+        print("[MODE] strings_only_mode=True (ocr_texts koordinatsız) → geometri ve indeks eşleşmesi kullanılacak.")
+
+    # (x,y,w,h,txt) içeren OCR havuzu (koordinatlı ise)
+    ocr_pool: List[Box] = []
+    if ocr_texts and not strings_only_mode:
+        tmp = [_to_box(t) for t in ocr_texts]
+        ocr_pool = [b for b in tmp if b and b.txt]
+
+    # strings-only modunda indis bazlı metin eşlemesi için sözlük kur
+    text_by_loc = {}
+    if strings_only_mode:
+        # all_boxes ve/veya sermaye_boxes ile indeks eşlemesi için all_boxes esas alınır
+        raw_all = list(all_boxes)
+        conv_all = [_to_box(b) for b in raw_all]
+        conv_all = [b for b in conv_all if b]
+        N = min(len(conv_all), len(ocr_texts))
+        for i in range(N):
+            key = (conv_all[i].x, conv_all[i].y, conv_all[i].w, conv_all[i].h)
+            txt = (ocr_texts[i] or "").strip()
+            if txt:
+                text_by_loc[key] = txt
+        if dbg:
+            print(f"[INDEX-PAIR] mapped {len(text_by_loc)} boxes by index.")
+
+    def _inject_index_text(b: Box) -> Box:
+        """strings_only_mode'da aynı indeksten gelen metni enjekte et."""
+        if not strings_only_mode or b.txt:
+            return b
+        key = (b.x, b.y, b.w, b.h)
+        if key in text_by_loc:
+            return Box(b.x, b.y, b.w, b.h, text_by_loc[key], b.role)
+        return b
+
+    def _augment_text(b: Box) -> Box:
+        """Koordinatlı OCR varsa IOU/center-in ile en iyi metni enjekte eder; strings-only modunda index metnini enjekte eder."""
+        b = _inject_index_text(b)
+        if not ocr_pool or b.txt:
+            return b
+        # IOU ile en iyi OCR metni
+        bx1, by1, bx2, by2 = _xyxy(b)
+        best = b; best_sc = amount_score(b.txt)
+        for tb in ocr_pool:
+            tx1, ty1, tx2, ty2 = _xyxy(tb)
+            ix = _overlap_1d(bx1, bx2, tx1, tx2)
+            iy = _overlap_1d(by1, by2, ty1, ty2)
+            inter = ix * iy
+            if inter <= 0:
+                continue
+            area = b.w*b.h + tb.w*tb.h - inter
+            iou = inter / max(1, area)
+            if iou <= 0:
+                continue
+            sc = amount_score(tb.txt)
+            if sc > best_sc:
+                best = Box(b.x, b.y, b.w, b.h, (b.txt + " " + tb.txt).strip(), b.role)
+                best_sc = sc
+        if best is not b and dbg:
+            print(f"[AUGMENT] +txt '{best.txt[:60]}'")
+        return best
+
+    # --------- komşu seçiciler ---------
+    def _best_right_neighbor(cur: Box, pool: List[Box]) -> Optional[Box]:
+        cand = []
+        for b in pool:
+            if b.x <= cur.x + cur.w:
+                continue
+            vovl = _v_overlap_ratio(cur, b)
+            gap  = _gap_right(cur, b)
+            if vovl < v_min or gap < 0 or gap > gap_right_max:
+                if dbg: print(f"[RIGHT-REJECT] gap={gap} vovl={vovl:.2f} txt='{(b.txt or '')[:40]}'")
+                continue
+            bx = _augment_text(b)
+            sc = amount_score(bx.txt) if bx.txt else 0.0
+            cand.append((gap, -vovl, -sc, bx))
+        if cand:
+            cand.sort()
+            g, ov, ns, bx = cand[0]
+            if dbg: print(f"[RIGHT-PICK] gap={g} vovl={-ov:.2f} txt='{(bx.txt or '')[:60]}'")
+            return bx
+        if allow_right_fallback:
+            fb=[]
+            for b in pool:
+                if b.x <= cur.x + cur.w:
                     continue
-
-                # pattern’lara karşı en iyi skor
-                score = max(_ratio(norm_txt, pat) for pat in patterns_n)
-                # kısa pencere pattern içinde tam geçiyorsa min bonus
-                if any(norm_txt in pat for pat in patterns_n):
-                    score = min(1.0, score + 0.05)
-
-                if dbg and k == 0:
-                    print(f"[SCAN] i={i} score={score:.2f} txt='{norm_txt[:60]}'")
-
-                # en iyiyi güncelle
-                if (best is None) or (score > best[0]):
-                    x,y,w,h = _merge_boxes([B[t] for t in win])
-                    best = (score, (x,y,w,h), raw_txt.strip(), (i, j))
-
-    if best is None:
+                gap = _gap_right(cur, b)
+                if gap < 0 or gap > gap_right_max:
+                    continue
+                fb.append((gap, b))
+            if fb:
+                fb.sort()
+                b = fb[0][1]
+                b = _augment_text(b)
+                if dbg: print(f"[RIGHT-FALLBACK] gap={fb[0][0]} txt='{(b.txt or '')[:60]}'")
+                return b
         return None
 
-    score, (x,y,w,h), text, (i,j) = best
-    # eşik altı olsa bile en iyi sonucu döndürüyoruz;
-    # ama istersen burada zorunlu eşik uygula:
-    # pass_thr = thr_partial if "SERMAY" in _normalize(text) else thr
-    # if score < pass_thr: return None
+    def _best_down_neighbor(cur: Box, pool: List[Box]) -> Optional[Box]:
+        cand=[]
+        for b in pool:
+            if b.y <= cur.y + cur.h:
+                continue
+            hovl = _h_overlap_ratio(cur, b)
+            gap  = _gap_down(cur, b)
+            if hovl < h_min or gap < 0 or gap > gap_down_max:
+                if dbg: print(f"[DOWN-REJECT] gap={gap} hovl={hovl:.2f} txt='{(b.txt or '')[:40]}'")
+                continue
+            bx = _augment_text(b)
+            sc = amount_score(bx.txt) if bx.txt else 0.0
+            cand.append((gap, -hovl, -sc, bx))
+        if not cand:
+            return None
+        cand.sort()
+        g, ov, ns, bx = cand[0]
+        if dbg: print(f"[DOWN-PICK] gap={g} hovl={-ov:.2f} txt='{(bx.txt or '')[:60]}'")
+        return bx
 
-    if dbg:
-        print(f"[BEST] score={score:.2f} range=({i}->{j}) box=({x},{y},{w},{h}) txt='{_normalize(text)[:80]}'")
+    # --------- havuz ---------
+    pool = [_to_box(b) for b in all_boxes]
+    pool = [b for b in pool if b]
+    # uniq
+    uniq = {(b.x, b.y, b.w, b.h, b.txt): b for b in pool}
+    pool = list(uniq.values())
 
-    return (x, y, w, h, text, score)
+    # --------- ana akış ---------
+    out: List[Box] = []
+    for s in sermaye_boxes:
+        base = _to_box(s)
+        if not base:
+            continue
+        base = _augment_text(base)
+
+        # erken kontrol: amount varsa genişletme (isteğe bağlı)
+        base_has_amount   = contains_amount(base.txt)
+        base_has_currency = has_currency(base.txt)
+
+        if base_has_amount and not expand_when_has_amount:
+            if expand_currency_if_missing and (not base_has_currency):
+                nb = _best_right_neighbor(
+                    base,
+                    [b for b in pool if (b.x, b.y, b.w, b.h) != (base.x, base.y, base.w, base.h)]
+                )
+                if nb:
+                    if _gap_right(base, nb) <= currency_right_window and len((nb.txt or "").strip()) <= 6:
+                        merged = _augment_text(_merge(base, nb))
+                        if dbg: print("[CURRENCY-FIX] merged right label ->", (nb.txt or "")[:20])
+                        out.append(merged)
+                        continue
+            if dbg: print("[SKIP] already has amount; keep as-is.")
+            out.append(base)
+            continue
+
+        cur = base
+        used = set()
+
+        # RIGHT zinciri
+        steps = 0
+        while not contains_amount(cur.txt) and steps < max_steps_right:
+            nb = _best_right_neighbor(cur, [b for b in pool if (b.x, b.y, b.w, b.h) not in used])
+            if not nb:
+                break
+            if dbg: print(f"[EXPAND] RIGHT -> '{(nb.txt or '')[:80]}'")
+            used.add((nb.x, nb.y, nb.w, nb.h))
+            cur = _augment_text(_merge(cur, nb))
+            steps += 1
+
+        if contains_amount(cur.txt):
+            if dbg: print("[EXPAND] success via RIGHT chain")
+            out.append(cur)
+            continue
+
+        # DOWN zinciri
+        steps = 0
+        while not contains_amount(cur.txt) and steps < max_steps_down:
+            nb = _best_down_neighbor(cur, [b for b in pool if (b.x, b.y, b.w, b.h) not in used])
+            if not nb:
+                break
+            if dbg: print(f"[EXPAND] DOWN -> '{(nb.txt or '')[:80]}'")
+            used.add((nb.x, nb.y, nb.w, nb.h))
+            cur = _augment_text(_merge(cur, nb))
+            steps += 1
+
+        if contains_amount(cur.txt):
+            if dbg: print("[EXPAND] success via DOWN chain")
+            out.append(cur)
+        else:
+            if dbg: print("[EXPAND] DROP (no amount) ::", base.txt[:120])
+            if keep_all_numbered or has_number(base.txt):
+                out.append(base)
+
+    return out
