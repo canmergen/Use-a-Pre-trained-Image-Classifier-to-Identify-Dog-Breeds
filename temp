@@ -1,170 +1,127 @@
-# -*- coding: utf-8 -*-
-import re, json, base64, requests, numpy as np, pandas as pd
-import unicodedata
-from typing import List, Tuple, Dict, Optional
-
-# ============ Metin normalizasyonu & benzerlik ============
-
-def _strip_diacritics(s: str) -> str:
-    return ''.join(c for c in unicodedata.normalize('NFKD', s or "") if not unicodedata.combining(c))
-
-def _norm_text(s: str) -> str:
-    s = _strip_diacritics((s or "").upper())
-    s = re.sub(r"[^A-Z0-9ÇĞİÖŞÜ\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def _bigrams(s: str) -> set:
-    s = _norm_text(s).replace(" ", "")
-    return {s[i:i+2] for i in range(max(0, len(s)-1))} if s else set()
-
-def _levenshtein(a: str, b: str) -> int:
-    a, b = _norm_text(a), _norm_text(b)
-    if not a: return len(b)
-    if not b: return len(a)
-    dp = list(range(len(b)+1))
-    for i, ca in enumerate(a, 1):
-        prev, dp[0] = dp[0], i
-        for j, cb in enumerate(b, 1):
-            ins = dp[j-1] + 1
-            dele = dp[j] + 1
-            sub = prev + (ca != cb)
-            prev, dp[j] = dp[j], min(ins, dele, sub)
-    return dp[-1]
-
-def _sim(a: str, b: str) -> float:
-    """Jaccard(bigram) ile Levenshtein oranını harmanlar."""
-    A, B = _bigrams(a), _bigrams(b)
-    j = (len(A & B) / len(A | B)) if (A or B) else 0.0
-    lev = 1.0 - (_levenshtein(a, b) / max(1, len(_norm_text(a)), len(_norm_text(b))))
-    return 0.6*j + 0.4*lev
-
-def match_known_names_in_text(text: str, known_names: List[str], threshold: float=0.75) -> List[str]:
+def find_best_sermaye_box(detected_boxes, ocr_texts, *, 
+                          thr=0.78, thr_partial=0.70, 
+                          y_band_ratio=0.55, max_concat=2, dbg=False):
     """
-    OCR metni içinde, verilen known_names listesine fuzzy bakar.
-    Eşik üzerindeki tüm kanonik isimleri (listede yazdığı gibi) döner.
-    Birden fazla isim bulunabilir; tekrarı kaldırır, orijinal sıra korunur.
+    Girdi:
+      detected_boxes : [(x,y,w,h), Box-like, ...]  # indis = lokasyon
+      ocr_texts      : [str, ...]                  # indis = metin
+    Çıktı:
+      (x, y, w, h, text, score)  # en iyi tek 'sermaye' başlık penceresi
+      Hiç kutu yoksa None
     """
-    t = _norm_text(text)
-    hits = []
-    seen = set()
-    for name in known_names:
-        if not name: 
-            continue
-        score = _sim(t, name)
-        # çok uzun listelerde hız için kısa bir hızlı yol: ad soyadın her iki parçası da metinde kısmen geçiyorsa puanı artırır
-        parts = [p for p in _norm_text(name).split() if p]
-        if len(parts) >= 2 and all(p[:3] in t for p in parts):  # üç harflik tohumlar
-            score = max(score, 0.85)
-        if score >= threshold and name not in seen:
-            hits.append(name)
-            seen.add(name)
-    return hits
 
-# ============ TL sayısı yakalama ============
+    # ---- küçük yardımcılar (class/dataclass yok) ----
+    import re, unicodedata
+    from difflib import SequenceMatcher
 
-_TL_NUM = re.compile(r"(?<!\d)(\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?\s*(?:TL|₺)?", re.IGNORECASE)
+    def _to_xywh(b):
+        if isinstance(b, (tuple, list)) and len(b) >= 4:
+            return int(b[0]), int(b[1]), int(b[2]), int(b[3])
+        # obj.x,y,w,h destekle
+        for k in ("x","y","w","h"):
+            if not hasattr(b, k):
+                raise TypeError(f"Unsupported box type: {type(b)}")
+        return int(b.x), int(b.y), int(b.w), int(b.h)
 
-def _parse_tl_int(text: str) -> Optional[int]:
-    """
-    Metinden TL sayısı yakalar: 1.000.000,00 -> 1000000 (int)
-    Birden fazla varsa en büyüğünü döner.
-    """
-    best = None
-    for m in _TL_NUM.finditer(text or ""):
-        raw = m.group(1)
-        v = raw.replace(".", "").replace(" ", "")
-        try:
-            val = int(v)
-            best = val if (best is None or val > best) else best
-        except:
-            pass
-    return best
+    def _normalize(s: str) -> str:
+        s = (s or "")
+        s = unicodedata.normalize("NFKD", s)
+        s = s.replace("İ","I").replace("ı","i")
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.upper()
+        s = re.sub(r"[^\w%₺ĞÜŞİÖÇ\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-# ============ Rapor: sadece kutu içi imza, isimler fuzzy-known, sermaye komşuya bakabilir ============
+    def _ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio()
 
-ROLE_KEYS = ["toplanti_baskani", "tutanak_yazmani", "bakanlik_temsilcisi",
-             "yk_uyesi", "yk_baskani", "katip", "divan_baskani"]
+    def _xyxy(x,y,w,h):
+        return x, y, x+w, y+h
 
-CAP_HINTS = ["ŞİRKETİN SERMAYESİ", "SERMAYESİ VE PAYLARIN",
-             "TOPLAMI İTİBARİ DEĞERİ", "SERMAYE"]
+    def _merge_boxes(boxes):
+        xs1, ys1, xs2, ys2 = [], [], [], []
+        for (x,y,w,h) in boxes:
+            X1,Y1,X2,Y2 = _xyxy(x,y,w,h)
+            xs1.append(X1); ys1.append(Y1); xs2.append(X2); ys2.append(Y2)
+        x1, y1 = min(xs1), min(ys1)
+        x2, y2 = max(xs2), max(ys2)
+        return x1, y1, x2-x1, y2-y1
 
-def build_bottom_df_from_report(lower_img: np.ndarray,
-                                boxes: List[Tuple[int,int,int,int]],
-                                per_box_df: pd.DataFrame,
-                                known_names: List[str],
-                                name_sim_threshold: float = 0.75) -> pd.DataFrame:
-    """
-    - İsim: sadece o kutunun OCR metninden, fuzzy known_names ile
-    - İmza: sadece o kutunun 'sig' değeri
-    - Sermaye: başlık kutusu ve komşuları (i-1, i, i+1) içinden en büyük sayı
-    """
-    n = len(per_box_df)
-    texts = [str(per_box_df.loc[i, "text_preview"] or "") for i in range(n)]
-    roles  = [per_box_df.loc[i, "role_best"] if "role_best" in per_box_df.columns else None for i in range(n)]
-    sigs   = [bool(per_box_df.loc[i, "sig"]) for i in range(n)]
+    # ---- hedef pattern seti ----
+    patterns = [
+        "Şirketin sermayesi ve payların toplam itibari değeri",
+        "Şirketin sermayesi",
+        "Sermaye",
+        "Sermayesi",
+        "Sermaye ve payların toplam itibari değeri",
+        "SERMAYE & TUTAR",
+        "SERMAYE TUTARI",
+    ]
+    patterns_n = [_normalize(p) for p in patterns]
 
-    # --- Sermaye ---
-    sermaye = None
-    # önce başlık ipuçlarını içeren kutulara yakın bak
-    scored = []
-    for i, t in enumerate(texts):
-        score = sum(hint in _norm_text(t) for hint in CAP_HINTS)
-        if score:
-            scored.append((score, i))
-    for _, i in sorted(scored, reverse=True):
-        for j in [i-1, i, i+1]:
-            if 0 <= j < n:
-                val = _parse_tl_int(texts[j])
-                if val is not None:
-                    sermaye = val if sermaye is None else max(sermaye, val)
-        if sermaye is not None:
-            break
-    # hala yoksa: tüm kutuların en büyüğü
-    if sermaye is None:
-        vals = [_parse_tl_int(t) for t in texts]
-        sermaye = max([v for v in vals if v is not None], default=None)
+    # ---- indis bazlı eşleme (lokasyon <-> metin) ----
+    B = [ _to_xywh(b) for b in detected_boxes ]
+    T = [ str(t or "") for t in ocr_texts ]
+    N = min(len(B), len(T))
+    if N == 0:
+        return None
 
-    out = {
-        "sermaye_toplam_tl": sermaye,
-        "toplanti_baskani_ad_soyad": None, "toplanti_baskani_imza_var_mi": None,
-        "tutanak_yazmani_ad_soyad": None,  "tutanak_yazmani_imza_var_mi": None,
-        "bakanlik_temsilcisi_ad_soyad": None, "bakanlik_temsilcisi_imza_var_mi": None,
-        "yk_uyesi_ad_soyad": None, "yk_uyesi_imza_var_mi": None,
-        "yk_baskani_ad_soyad": None, "yk_baskani_imza_var_mi": None,
-        "katip_ad_soyad": None, "katip_imza_var_mi": None,
-        "divan_baskani_ad_soyad": None, "divan_baskani_imza_var_mi": None,
-    }
+    # ---- satır gruplama (yaklaşık y-bandı) ----
+    mean_h = max(1, sum(B[i][3] for i in range(N)) // max(1, N))
+    band    = max(8, int(mean_h * y_band_ratio))  # min 8 px
 
-    key_map = {
-        "toplanti_baskani": ("toplanti_baskani_ad_soyad", "toplanti_baskani_imza_var_mi"),
-        "tutanak_yazmani":  ("tutanak_yazmani_ad_soyad",  "tutanak_yazmani_imza_var_mi"),
-        "bakanlik_temsilcisi": ("bakanlik_temsilcisi_ad_soyad","bakanlik_temsilcisi_imza_var_mi"),
-        "yk_uyesi": ("yk_uyesi_ad_soyad", "yk_uyesi_imza_var_mi"),
-        "yk_baskani": ("yk_baskani_ad_soyad", "yk_baskani_imza_var_mi"),
-        "katip": ("katip_ad_soyad", "katip_imza_var_mi"),
-        "divan_baskani": ("divan_baskani_ad_soyad", "divan_baskani_imza_var_mi"),
-    }
+    def _y_center(xywh): 
+        return xywh[1] + xywh[3]//2
 
-    def _set(role_key: str, i: int):
-        """Sadece kendi kutusunun isim/imza bilgisi."""
-        if role_key not in key_map: 
-            return
-        k_name, k_sig = key_map[role_key]
-        text_here = texts[i]
-        sig_here  = sigs[i]
+    # key = y-merkez // band
+    lines = {}
+    for i in range(N):
+        key = _y_center(B[i]) // band
+        lines.setdefault(key, []).append(i)
+    for key in lines:
+        lines[key].sort(key=lambda i: B[i][0])  # soldan sağa
 
-        # isimler: fuzzy-known (çoklu olabilir)
-        names = match_known_names_in_text(text_here, known_names, threshold=name_sim_threshold)
-        name_val = "; ".join(names) if names else None
+    # ---- satır içinde pencere tarama ve skor hesap ----
+    best = None  # (score, (x,y,w,h), text, (i_start,i_end))
+    for key, idxs in lines.items():
+        line_txt_norm = " ".join(_normalize(T[i]) for i in idxs if T[i])
+        hint = "SERMAY" in line_txt_norm
 
-        if name_val is not None:
-            out[k_name] = name_val
-        if sig_here is not None:
-            out[k_sig] = bool(sig_here)
+        for pos, i in enumerate(idxs):
+            for k in range(0, max_concat+1):
+                j = min(len(idxs)-1, pos+k)
+                win = idxs[pos:j+1]
+                # metni sırayla birleştir
+                raw_txt = " ".join(T[t] for t in win if T[t])
+                norm_txt = _normalize(raw_txt)
+                if not norm_txt:
+                    continue
 
-    # kutu bazında rolleri işle
-    for i, rk in enumerate(roles):
-        if rk in ROLE_KEYS:
-            _set(rk, i)
+                # pattern’lara karşı en iyi skor
+                score = max(_ratio(norm_txt, pat) for pat in patterns_n)
+                # kısa pencere pattern içinde tam geçiyorsa min bonus
+                if any(norm_txt in pat for pat in patterns_n):
+                    score = min(1.0, score + 0.05)
 
-    return pd.DataFrame([out])
+                if dbg and k == 0:
+                    print(f"[SCAN] i={i} score={score:.2f} txt='{norm_txt[:60]}'")
+
+                # en iyiyi güncelle
+                if (best is None) or (score > best[0]):
+                    x,y,w,h = _merge_boxes([B[t] for t in win])
+                    best = (score, (x,y,w,h), raw_txt.strip(), (i, j))
+
+    if best is None:
+        return None
+
+    score, (x,y,w,h), text, (i,j) = best
+    # eşik altı olsa bile en iyi sonucu döndürüyoruz;
+    # ama istersen burada zorunlu eşik uygula:
+    # pass_thr = thr_partial if "SERMAY" in _normalize(text) else thr
+    # if score < pass_thr: return None
+
+    if dbg:
+        print(f"[BEST] score={score:.2f} range=({i}->{j}) box=({x},{y},{w},{h}) txt='{_normalize(text)[:80]}'")
+
+    return (x, y, w, h, text, score)
