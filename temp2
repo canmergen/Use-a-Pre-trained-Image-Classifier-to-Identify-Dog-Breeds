@@ -1,239 +1,189 @@
-from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
-import re
+from typing import Any, List, Tuple, Optional
 
-def expand_sermaye_boxes_if_no_amount(
-    sermaye_boxes: Iterable[Any],
-    all_boxes: Iterable[Any],
-    ocr_texts: Optional[Iterable[Any]] = None,   # str listesi (indis eşli) veya (x,y,w,h,txt) nesneleri
+def link_and_build_final(
+    role_blocks: List[Any],
+    sig_boxes: List[Any],
+    sermaye_boxes: Optional[List[Any]] = None,
     *,
-    keep_all_numbered: bool = True,
-    max_steps_right: int = 3,
-    max_steps_down: int = 2,
-    v_min: float = 0.40,
-    h_min: float = 0.55,
-    gap_right_max: int = 700,
-    gap_down_max: int = 320,
-    allow_right_fallback: bool = True,
-    dbg: bool = False,
-) -> List[Any]:
-    @dataclass(frozen=True)
-    class Box:
-        x: int; y: int; w: int; h: int
-        txt: str = ""
-        role: Optional[str] = None
+    near_px: int = 3,            # "yakınsa birleştir" eşiği (rol∪imza union yapılırken kullanılır)
+    band_pad_scale: float = 0.35, # dikey bant genişliği: rol yüksekliğinin şu oranı
+    band_center_scale: float = 1.0, # merkez ofset toleransı
+    corridor_pad_px: int = 8,     # dikey koridora sağ/sol pay
+    forbid_crossing: bool = True, # koridor başka kutuya çarpıyorsa o eşleşmeyi iptal et
+    dbg: bool = False
+):
+    """
+    Girdi kutu formatı esnek: (x,y,w,h) | (l,t,r,b) | .rect/.bbox attr'lı objeler.
+    Çıktı: dict(keys: pairs, final, roles, sigs, sermaye)
+    """
+    # ---------- Helpers ----------
+    Box = Tuple[int,int,int,int]  # (l,t,r,b)
 
-    # ----- regexler -----
-    _num_pat      = re.compile(r"\d")
-    _amount_pat   = re.compile(r"(?:^|[^%])(?:(\d{1,3}(?:[.\s’’,]\d{3})+(?:,\d+)?)|\d{5,})")
-    _currency_pat = re.compile(r"\b(?:TL|TRY|₺)\b", re.IGNORECASE)
-    _percent_pat  = re.compile(r"%\s*\d+")
+    def _as_int(v): return int(round(float(v)))
 
-    # ----- yardımcılar -----
-    def _get_txt(obj: Any) -> str:
-        for k in ("txt","text","string"):
-            if hasattr(obj, k):
-                return str(getattr(obj, k) or "")
-        if isinstance(obj, (tuple, list)) and len(obj) >= 5:
-            return str(obj[4] or "")
-        return ""  # koordinatlar metin sanılmasın
+    def _to_ltrb(b: Any) -> Box:
+        # tuple/list (x,y,w,h) veya (l,t,r,b)
+        if hasattr(b, "rect"):
+            x,y,w,h = b.rect
+            return (_as_int(x), _as_int(y), _as_int(x+w), _as_int(y+h))
+        if hasattr(b, "bbox"):
+            bb = b.bbox
+            if len(bb) == 4:
+                # hem (x,y,w,h) hem (l,t,r,b) olabilir; karar ver
+                x,y,z,w = map(_as_int, bb)
+                # w/h negatif olmayacağı varsayımıyla sez: (l,t,r,b) ise r>l & b>t zaten sağlanır
+                if z > x and w > y:
+                    # bu (l,t,r,b) de olabilir; ama (x,y,w,h) de olabilir. Heuristik:
+                    # genişlik/yükseklik gibi görünen son iki değeri r/b'ye dönüştürelim.
+                    # Eğer (x,y,w,h) ise w/h genelde küçük olur; (l,t,r,b) ise r,b çok büyük olabilir.
+                    # Deterministik yapmak için "genişlik/yükseklik" yorumlamayı deneyelim:
+                    if (z - x) <= 0 or (w - y) <= 0:  # güvenlik
+                        return (x,y,z,w)
+                    # İki yorumu da geçerli; tercih: eğer (z<=x or w<=y) değilse ve
+                    # (z-x, w-y) tipik w,h aralığında: yine de (l,t,r,b) kabul et
+                    # Basit ve sağlam: önce (l,t,r,b) olarak dene
+                    return (x,y,z,w)
+            # dizi/tuple değilse aşağı devam
+        if isinstance(b, (tuple, list)) and len(b) == 4:
+            a,b2,c,d = b
+            a,b2,c,d = map(_as_int, (a,b2,c,d))
+            # (x,y,w,h) mi?
+            if c >= 0 and d >= 0 and (a <= c and b2 <= d) and (c - a) < 50000 and (d - b2) < 50000:
+                # karışmasın diye, ikisini de normalize et
+                # Eğer (l,t,r,b) verildiyse w/h negatif çıkar; o zaman aşağıdaki clamp düzeltir.
+                pass
+            # Heuristik: (x,y,w,h) ise r=a+c, b=b2+d yap
+            if (a <= c and b2 <= d) and (c - a) > 0 and (d - b2) > 0:
+                # bu haliyle (l,t,r,b) olabilir; yine de emin olmak için iki yorum:
+                # 1) (l,t,r,b) olarak geç
+                # 2) Eğer "c-a" veya "d-b2" çok küçükse (x,y,w,h) olabilir
+                # Basitleştirelim: önce (x,y,w,h) kabul et, r/b'yi hesapla; eğer r<b gibi saçma olursa (l,t,r,b) kal.
+                x,y,w,h = a,b2,c,d
+                r,b3 = x+w, y+h
+                if r > x and b3 > y:
+                    return (x,y,r,b3)
+                else:
+                    return (a,b2,c,d)
+        # Objede named attr
+        for names in (("left","top","right","bottom"), ("l","t","r","b")):
+            if all(hasattr(b, n) for n in names):
+                l,t,r,b3 = (getattr(b, n) for n in names)
+                return (_as_int(l), _as_int(t), _as_int(r), _as_int(b3))
+        # Son çare: .x,.y,.w,.h
+        if all(hasattr(b, n) for n in ("x","y","w","h")):
+            x,y,w,h = b.x,b.y,b.w,b.h
+            return (_as_int(x), _as_int(y), _as_int(x+w), _as_int(y+h))
+        raise TypeError(f"Desteklenmeyen box tipi: {type(b)}")
 
-    def _to_box(obj: Any) -> Optional[Box]:
-        if isinstance(obj, Box): return obj
-        if isinstance(obj, (tuple, list)) and len(obj) >= 4:
-            return Box(int(obj[0]), int(obj[1]), int(obj[2]), int(obj[3]), _get_txt(obj))
-        if all(hasattr(obj, k) for k in ("x","y","w","h")):
-            return Box(int(obj.x), int(obj.y), int(obj.w), int(obj.h), _get_txt(obj))
-        return None
+    def _to_xywh(bb: Box) -> Tuple[int,int,int,int]:
+        l,t,r,b = bb
+        return (l,t, max(0, r-l), max(0, b-t))
 
-    def _xyxy(b: Box) -> Tuple[int,int,int,int]: return b.x, b.y, b.x+b.w, b.y+b.h
-    def _overlap_1d(a1,a2,b1,b2): return max(0, min(a2,b2)-max(a1,b1))
-    def _v_overlap_ratio(a: Box,b: Box) -> float:
-        return _overlap_1d(a.y,a.y+a.h,b.y,b.y+b.h)/max(1,min(a.h,b.h))
-    def _h_overlap_ratio(a: Box,b: Box) -> float:
-        return _overlap_1d(a.x,a.x+a.w,b.x,b.x+b.w)/max(1,min(a.w,b.w))
-    def _gap_right(a: Box,b: Box) -> int: return b.x-(a.x+a.w)
-    def _gap_down(a: Box,b: Box) -> int:  return b.y-(a.y+a.h)
+    def _union(a: Box, b: Box) -> Box:
+        return (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3]))
 
-    def _merge(a: Box,b: Box) -> Box:
-        ax1,ay1,ax2,ay2=_xyxy(a); bx1,by1,bx2,by2=_xyxy(b)
-        nx1,ny1,nx2,ny2=min(ax1,bx1),min(ay1,by1),max(ax2,bx2),max(ay2,by2)
-        return Box(nx1,ny1,nx2-nx1,ny2-ny1,(a.txt+" "+b.txt).strip(), a.role or b.role)
+    def _expand(bb: Box, pad: int) -> Box:
+        l,t,r,b = bb
+        return (l-pad, t-pad, r+pad, b+pad)
 
-    def has_number(s: str) -> bool: return bool(_num_pat.search(s or ""))
+    def _intersects(a: Box, b: Box) -> bool:
+        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
-    def amount_score(s: str) -> float:
-        sc=0.0
-        if _amount_pat.search(s): sc+=2.0
-        if _currency_pat.search(s): sc+=2.0
-        if _percent_pat.search(s): sc-=1.5
-        sc+=min(1.0, sum(c.isdigit() for c in (s or ""))/8.0)
-        return sc
+    def _center(bb: Box) -> Tuple[float,float]:
+        l,t,r,b = bb
+        return ((l+r)/2.0, (t+b)/2.0)
 
-    def contains_amount(s: str, thr: float = 2.0) -> bool:
-        return amount_score(s) >= thr
+    # ---------- Normalize inputs ----------
+    roles_ltrb = [_to_ltrb(b) for b in role_blocks]
+    sigs_ltrb  = [_to_ltrb(b) for b in sig_boxes]
+    sermaye_ltrb = [_to_ltrb(b) for b in (sermaye_boxes or [])]
 
-    # ----- 1) Havuzu sırayı koruyarak oluştur -----
-    raw_list = list(all_boxes)                      # indis korunsun
-    pool = [_to_box(b) for b in raw_list]
-    pool = [b for b in pool if b is not None]
+    # ---------- Pairing (dikey bant + koridor) ----------
+    used_roles = set()
+    used_sigs  = set()
+    pairs: List[Tuple[int,int]] = []
 
-    # ----- 2) İndis bazlı harita (location -> text) -----
-    index_pair_mode = bool(ocr_texts) and all(isinstance(t, str) for t in ocr_texts)
-    text_by_loc = {}
-    if index_pair_mode:
-        N = min(len(pool), len(ocr_texts))
-        for i in range(N):
-            b = pool[i]
-            t = (ocr_texts[i] or "").strip()
-            if t:
-                text_by_loc[(b.x, b.y, b.w, b.h)] = t
-        if dbg:
-            print(f"[INDEX-PAIR] mapped {len(text_by_loc)}/{len(pool)} boxes by index.")
+    # Sig kutularını olası yakın birleşim ile hafifçe büyüt (near_px)
+    if near_px > 0:
+        sigs_grown = [_expand(s, near_px) for s in sigs_ltrb]
     else:
-        # koordinatlı OCR kutuları varsa ileride IOU ile kullanılacak
-        pass
+        sigs_grown = list(sigs_ltrb)
 
-    # ----- 3) Koordinatlı OCR havuzu (varsa) -----
-    ocr_pool: List[Box] = []
-    if ocr_texts and not index_pair_mode:
-        tmp = [_to_box(t) for t in ocr_texts]
-        ocr_pool = [b for b in tmp if b and b.txt]
-
-    # ----- 4) Metni enjekte et: önce index-map, sonra IOU fallback -----
-    def _ensure_text(b: Box) -> Box:
-        if not b.txt:
-            key = (b.x, b.y, b.w, b.h)
-            if key in text_by_loc:
-                txt = text_by_loc[key]
-                if dbg: print(f"[INJECT-INDEX] ({key}) -> '{txt[:50]}'")
-                return Box(b.x,b.y,b.w,b.h,txt,b.role)
-        # IOU fallback (yalnızca koordinatlı OCR varsa)
-        if not b.txt and ocr_pool:
-            bx1,by1,bx2,by2=_xyxy(b)
-            best = None
-            best_iou = 0.0
-            for tb in ocr_pool:
-                tx1,ty1,tx2,ty2=_xyxy(tb)
-                ix=_overlap_1d(bx1,bx2,tx1,tx2); iy=_overlap_1d(by1,by2,ty1,ty2)
-                inter = ix*iy
-                if inter<=0: 
-                    continue
-                area = b.w*b.h + tb.w*tb.h - inter
-                iou = inter/max(1,area)
-                if iou > best_iou:
-                    best_iou = iou; best = tb
-            if best:
-                if dbg: print(f"[INJECT-IOU] iou={best_iou:.2f} txt='{best.txt[:50]}'")
-                return Box(b.x,b.y,b.w,b.h,(b.txt+" "+best.txt).strip(), b.role)
-        return b
-
-    # ----- 5) Komşu seçiciler -----
-    def _best_right_neighbor(cur: Box, candidates: List[Box]) -> Optional[Box]:
-        cand=[]
-        for b in candidates:
-            if b.x <= cur.x+cur.w:
-                continue
-            vovl=_v_overlap_ratio(cur,b); gap=_gap_right(cur,b)
-            if vovl<v_min or gap<0 or gap>gap_right_max:
-                if dbg: print(f"[RIGHT-REJECT] gap={gap} vovl={vovl:.2f}")
-                continue
-            bx=_ensure_text(b)
-            cand.append((gap, -vovl, -amount_score(bx.txt), bx))
-        if cand:
-            cand.sort()
-            if dbg: 
-                g,ov,ns,bb=cand[0]
-                print(f"[RIGHT-PICK] gap={g} vovl={-ov:.2f} txt='{bb.txt[:60]}'")
-            return cand[0][-1]
-        if allow_right_fallback:
-            fb=[]
-            for b in candidates:
-                if b.x <= cur.x+cur.w: 
-                    continue
-                gap=_gap_right(cur,b)
-                if gap<0 or gap>gap_right_max: 
-                    continue
-                fb.append((gap,b))
-            if fb:
-                fb.sort()
-                b=fb[0][1]
-                b=_ensure_text(b)
-                if dbg: print(f"[RIGHT-FALLBACK] gap={fb[0][0]} txt='{b.txt[:60]}'")
-                return b
-        return None
-
-    def _best_down_neighbor(cur: Box, candidates: List[Box]) -> Optional[Box]:
-        cand=[]
-        for b in candidates:
-            if b.y <= cur.y+cur.h:
-                continue
-            hovl=_h_overlap_ratio(cur,b); gap=_gap_down(cur,b)
-            if hovl<h_min or gap<0 or gap>gap_down_max:
-                if dbg: print(f"[DOWN-REJECT] gap={gap} hovl={hovl:.2f}")
-                continue
-            bx=_ensure_text(b)
-            cand.append((gap, -hovl, -amount_score(bx.txt), bx))
-        if not cand:
-            return None
-        cand.sort()
-        if dbg:
-            g,ov,ns,bb=cand[0]
-            print(f"[DOWN-PICK] gap={g} hovl={-ov:.2f} txt='{bb.txt[:60]}'")
-        return cand[0][-1]
-
-    # ----- 6) Tekrarlı kutuları at -----
-    uniq={(b.x,b.y,b.w,b.h,b.txt):b for b in pool}
-    pool=list(uniq.values())
-
-    # ----- 7) Ana döngü -----
-    out=[]
-    for s in sermaye_boxes:
-        base=_to_box(s)
-        if not base: 
+    for ri, rb in enumerate(roles_ltrb):
+        if ri in used_roles: 
             continue
-        base=_ensure_text(base)
+        rl,rt,rr,rbottom = rb
+        rh = rbottom - rt
+        # rol merkezine göre dikey bant
+        rcx, rcy = _center(rb)
+        band_top = int(rcy - (rh*band_pad_scale))
+        band_bot = int(rcy + (rh*band_pad_scale))
+        band_l   = int(rl - (rr-rl)*band_center_scale)
+        band_r   = int(rr + (rr-rl)*band_center_scale)
+        band = (band_l, band_top, band_r, band_bot)
 
-        if contains_amount(base.txt):
-            out.append(base)
-            if dbg: print("[SERMAYE] already has amount ::", base.txt[:120])
-            continue
+        best = None  # (score, si)
+        for si, sb in enumerate(sigs_grown):
+            if si in used_sigs:
+                continue
+            # sadece dikey hizalı/aynı bantta olanlar
+            if not _intersects(band, sb):
+                continue
 
-        cur=base; used=set()
+            # İsteğe bağlı: koridor kontrolü (rol.bottom → sig.top arası dikey dikdörtgen)
+            blocked = False
+            if forbid_crossing:
+                sl,st,sr,sbtt = sigs_ltrb[si]
+                # koridoru oluştur
+                cl = min(rl, sl) - corridor_pad_px
+                cr = max(rr, sr) + corridor_pad_px
+                ct = min(rbottom, st)
+                cb = max(rbottom, st)
+                corridor = (cl, ct, cr, cb)
+                # diğer kutularla çarpışma testi
+                for oj, ob in enumerate(roles_ltrb):
+                    if oj == ri: 
+                        continue
+                    if _intersects(corridor, ob):
+                        blocked = True
+                        break
+                if not blocked:
+                    for oj, ob in enumerate(sigs_ltrb):
+                        if oj == si: 
+                            continue
+                        if _intersects(corridor, ob):
+                            blocked = True
+                            break
+            if blocked:
+                if dbg: 
+                    print(f"[SKIP] ri={ri} si={si} -> corridor blocked")
+                continue
 
-        # RIGHT zinciri
-        steps=0
-        while not contains_amount(cur.txt) and steps<max_steps_right:
-            nb=_best_right_neighbor(cur, [b for b in pool if (b.x,b.y,b.w,b.h) not in used])
-            if not nb:
-                break
-            if dbg: print(f"[EXPAND] RIGHT -> '{nb.txt[:80]}'")
-            used.add((nb.x,nb.y,nb.w,nb.h))
-            cur=_ensure_text(_merge(cur,nb))
-            steps+=1
+            # basit skor: merkez mesafesi (yakın olan daha iyi)
+            scx, scy = _center(sigs_ltrb[si])
+            gap = abs(scy - rcy) + 1e-6
+            score = 1.0 / gap
+            if (best is None) or (score > best[0]):
+                best = (score, si)
 
-        if contains_amount(cur.txt):
-            if dbg: print("[EXPAND] success via RIGHT chain")
-            out.append(cur)
-            continue
+        if best is not None:
+            si = best[1]
+            pairs.append((ri, si))
+            used_roles.add(ri)
+            used_sigs.add(si)
 
-        # DOWN zinciri
-        steps=0
-        while not contains_amount(cur.txt) and steps<max_steps_down:
-            nb=_best_down_neighbor(cur, [b for b in pool if (b.x,b.y,b.w,b.h) not in used])
-            if not nb:
-                break
-            if dbg: print(f"[EXPAND] DOWN -> '{nb.txt[:80]}'")
-            used.add((nb.x,nb.y,nb.w,nb.h))
-            cur=_ensure_text(_merge(cur,nb))
-            steps+=1
+    # ---------- Final kutuları oluştur (rol ∪ imza) ----------
+    final_boxes_ltrb: List[Box] = []
+    for ri, si in pairs:
+        u = _union(roles_ltrb[ri], sigs_ltrb[si])
+        final_boxes_ltrb.append(u)
 
-        if contains_amount(cur.txt):
-            if dbg: print("[EXPAND] success via DOWN chain")
-            out.append(cur)
-        else:
-            if dbg: print("[EXPAND] DROP (no amount) ::", base.txt[:120])
-            if keep_all_numbered or has_number(base.txt):
-                out.append(base)
-
-    return out
+    # ---------- Sonuç ----------
+    result = {
+        "pairs": pairs,
+        "final": [_to_xywh(bb) for bb in final_boxes_ltrb],
+        "roles": [_to_xywh(bb) for bb in roles_ltrb],
+        "sigs":  [_to_xywh(bb) for bb in sigs_ltrb],
+        "sermaye": [_to_xywh(bb) for bb in sermaye_ltrb],
+    }
+    return result
