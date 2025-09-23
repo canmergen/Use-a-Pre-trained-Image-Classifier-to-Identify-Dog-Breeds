@@ -1,299 +1,378 @@
-def expand_sermaye_boxes_if_no_amount(
-    sermaye_boxes,
-    all_boxes,
-    ocr_texts=None,                    # str listesi veya (x,y,w,h,txt) nesneleri
+def run_role_pipeline(
+    detected_boxes,
+    ocr_texts,
     *,
-    keep_all_numbered=True,
-    max_steps_right=3,
-    max_steps_down=2,
-    v_min=0.40,                         # sağ komşu için min dikey örtüşme oranı
-    h_min=0.55,                         # aşağı komşu için min yatay örtüşme oranı
-    gap_right_max=700,                  # sağdaki max piksel mesafe
-    gap_down_max=320,                   # aşağıdaki max piksel mesafe
-    allow_right_fallback=True,          # overlap olmasa da en yakın sağ komşuyu dene
-    expand_when_has_amount=False,       # kutuda zaten amount varsa yine de genişlet?
-    expand_currency_if_missing=True,    # amount var ama para birimi yoksa sağ etiket ekle
-    currency_right_window=220,          # sağda para birimi etiketi arama penceresi
-    dbg=False,
+    sig_boxes=None,
+    sermaye_boxes=None,
+    lower_img=None,
+    # augment (dikey birleştirme) ayarları
+    x_policy="max",                 # "max" | "role"
+    min_x_overlap_ratio=0.10,
+    min_dy_px=0,
+    max_dy_px=165,
+    require_name_below=True,
+    # split (çoklu rol ayırma) ayarları
+    ROLE_ALIASES=None,
+    gap_px=8,
+    min_piece_w=14,
+    fuzzy_enable=True,
+    fuzzy_score_thr=86,
+    small_space_policy="drop",      # "drop" | "keep_unsplit" | "shrink_gap"
+    min_char_gap_between_roles=2,
+    require_separator_for_split=True,
+    dbg=False
 ):
     """
+    Tek çağrıda: rol tespiti -> dikey ad-soyad birleştirme -> (gerekirse) çoklu rol split -> filtre.
     Girdi:
-      sermaye_boxes : [Box-like | (x,y,w,h,txt?) ...]   # başlangıç kutuları
-      all_boxes     : [Box-like | (x,y,w,h,txt?) ...]   # tüm tespitli kutular
-      ocr_texts     : None | [str ...] | [(x,y,w,h,txt) ...]
-    Çıktı:
-      [Box-like] listesi; her eleman: dataclass benzeri (x,y,w,h,txt,role)
-    Not:
-      - ocr_texts yalnızca 'str' ise strings-only moduna geçer; metin var/yok
-        kontrolünde indeks eşlemesi yapılır.
+      - detected_boxes: x,y,w,h alanları olan kutular (attr ya da dict); ocr_texts ile bire bir sıralı.
+      - ocr_texts: her kutunun OCR metni.
+      - sig_boxes/sermaye_boxes: varsa, aynı tipte kutu listeleri.
+    Çıkış:
+      - [{'x','y','w','h','txt','role'}, ...] listesi.
     """
-    # --------- import ve iç sınıf ---------
-    import re
-    from dataclasses import dataclass
-    from typing import Any, Iterable, List, Optional, Tuple
+    # ----------------
+    # Imports & helpers (içeride tut)
+    # ----------------
+    import re, copy, unicodedata
 
-    @dataclass(frozen=True)
-    class Box:
-        x: int; y: int; w: int; h: int
-        txt: str = ""
-        role: Optional[str] = None
+    try:
+        from rapidfuzz import fuzz
+        _FUZZY_OK = True
+    except Exception:
+        _FUZZY_OK = False
+        class _F:
+            @staticmethod
+            def partial_ratio(a,b): return 0
+            @staticmethod
+            def token_set_ratio(a,b): return 0
+        fuzz = _F()
 
-    # --------- regexler ---------
-    _num_pat      = re.compile(r"\d")
-    _amount_pat   = re.compile(r"(?:^|[^%])(?:(\d{1,3}(?:[.\s’’,]\d{3})+(?:,\d+)?)|\d{4,})")
-    _currency_pat = re.compile(r"\b(?:TL|TRY|₺)\b", re.IGNORECASE)
-    _percent_pat  = re.compile(r"%\s*\d+")
+    def _get(b, k, d=None):
+        if isinstance(b, dict): return b.get(k, d)
+        return getattr(b, k, d)
 
-    # --------- yardımcılar ---------
-    def _get_txt(obj: Any) -> str:
-        for k in ("txt", "text", "string"):
-            if hasattr(obj, k):
-                return str(getattr(obj, k) or "")
-        if isinstance(obj, (tuple, list)) and len(obj) >= 5:
-            return str(obj[4] or "")
-        return ""  # koordinatları metin sanma
+    def _set(b, k, v):
+        if isinstance(b, dict): b[k] = v
+        else: setattr(b, k, v)
 
-    def _to_box(obj: Any) -> Optional[Box]:
-        if isinstance(obj, Box):
-            return obj
-        if isinstance(obj, (tuple, list)) and len(obj) >= 4:
-            return Box(int(obj[0]), int(obj[1]), int(obj[2]), int(obj[3]), _get_txt(obj))
-        if all(hasattr(obj, k) for k in ("x", "y", "w", "h")):
-            return Box(int(obj.x), int(obj.y), int(obj.w), int(obj.h), _get_txt(obj))
-        return None
+    def _as_box_tuple(b):
+        return int(_get(b,"x")), int(_get(b,"y")), int(_get(b,"w")), int(_get(b,"h"))
 
-    def _xyxy(b: Box) -> Tuple[int,int,int,int]:
-        return b.x, b.y, b.x + b.w, b.y + b.h
+    def _xyxy(b):
+        x,y,w,h = _as_box_tuple(b)
+        return x, y, x+w, y+h
 
-    def _overlap_1d(a1, a2, b1, b2) -> int:
-        return max(0, min(a2, b2) - max(a1, b1))
+    def _y_gap(top, bottom):
+        _, _, _, ty2 = _xyxy(top)
+        _, by1, _, _ = _xyxy(bottom)
+        return by1 - ty2
 
-    def _v_overlap_ratio(a: Box, b: Box) -> float:
-        return _overlap_1d(a.y, a.y+a.h, b.y, b.y+b.h) / max(1, min(a.h, b.h))
+    def _x_overlap_ratio(a,b):
+        ax1,_,ax2,_ = _xyxy(a)
+        bx1,_,bx2,_ = _xyxy(b)
+        inter = max(0, min(ax2,bx2) - max(ax1,bx1))
+        base  = max(1, min(_get(a,"w"), _get(b,"w")))
+        return inter / base
 
-    def _h_overlap_ratio(a: Box, b: Box) -> float:
-        return _overlap_1d(a.x, a.x+a.w, b.x, b.x+b.w) / max(1, min(a.w, b.w))
+    def _iou(a,b):
+        ax1,ay1,ax2,ay2 = _xyxy(a)
+        bx1,by1,bx2,by2 = _xyxy(b)
+        ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+        ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+        if ix2<=ix1 or iy2<=iy1: return 0.0
+        inter = (ix2-ix1)*(iy2-iy1)
+        area  = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+        return inter / max(area,1)
 
-    def _gap_right(a: Box, b: Box) -> int:
-        return b.x - (a.x + a.w)
+    def _overlaps_any_iou(candidate, boxes, thr=0.03):
+        if not boxes: return False
+        for b in boxes:
+            if _iou(candidate, b) >= thr:
+                return True
+        return False
 
-    def _gap_down(a: Box, b: Box) -> int:
-        return b.y - (a.y + a.h)
+    def _rect(x,y,w,h, txt="", role=None):
+        return {"x":int(x),"y":int(y),"w":int(w),"h":int(h),"txt":txt,"role":role}
 
-    def _merge(a: Box, b: Box) -> Box:
-        ax1, ay1, ax2, ay2 = _xyxy(a)
-        bx1, by1, bx2, by2 = _xyxy(b)
-        nx1, ny1 = min(ax1, bx1), min(ay1, by1)
-        nx2, ny2 = max(ax2, bx2), max(ay2, by2)
-        return Box(nx1, ny1, nx2-nx1, ny2-ny1, (a.txt + " " + b.txt).strip(), a.role or b.role)
+    # --- text utils
+    def tr_upper(s):
+        return (s or "").replace("i","İ").replace("ı","I").upper()
 
-    def has_number(s: str) -> bool:
-        return bool(_num_pat.search(s or ""))
+    def strip_diac(s):
+        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
-    def amount_score(s: str) -> float:
-        sc = 0.0
-        if _amount_pat.search(s): sc += 2.0
-        if _currency_pat.search(s): sc += 2.0
-        if _percent_pat.search(s): sc -= 1.5
-        sc += min(1.0, sum(c.isdigit() for c in (s or "")) / 8.0)
-        return sc
+    def canon(s):
+        import re as _re
+        return _re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
 
-    def contains_amount(s: str, thr: float = 2.0) -> bool:
-        return amount_score(s) >= thr
+    TR = "A-Za-zÇĞİÖŞÜçğıöşü"
+    NAME_LINE_RE = re.compile(rf"\b[{TR}][{TR}'-]+\s+[{TR}][{TR}'-]+(\s+[{TR}][{TR}'-]+)?\b")
+    AD_SOYAD_HINT_RE = re.compile(r"\bad\s*[-:]?\s*soyad[ıi]?\b", re.I)
+    def looks_like_person_line(t):
+        if not t: return False
+        if sum(ch.isdigit() for ch in t) > 2 and "T.C" not in t and "TC" not in t:
+            return False
+        t_clean = " ".join(t.split())
+        if AD_SOYAD_HINT_RE.search(t_clean): 
+            return True
+        return bool(NAME_LINE_RE.search(t_clean))
 
-    def has_currency(s: str) -> bool:
-        return bool(_currency_pat.search(s or ""))
+    def has_inline_name(txt):
+        if not txt: return False
+        letters = re.findall(rf"[{TR}]", txt)
+        if len("".join(letters)) < 4: return False
+        return bool(re.compile(rf"(?i)\b[{TR}]{{2,}}\b(?:[\s\W]+?\b[{TR}]{{2,}}\b)+").search(txt))
 
-    # --------- OCR havuzu ve mod belirleme ---------
-    strings_only_mode = bool(ocr_texts) and all(isinstance(t, str) for t in ocr_texts)
-    if dbg and strings_only_mode:
-        print("[MODE] strings_only_mode=True (ocr_texts koordinatsız) → geometri ve indeks eşleşmesi kullanılacak.")
+    # --- aliases
+    ROLE_ALIASES_DEFAULT = {
+        "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
+        "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETİM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YONETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
+        "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
+        "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
+        # "baskan":            ["BAŞKAN"],  # çok genel, gerekirse eklenir.
+    }
 
-    # (x,y,w,h,txt) içeren OCR havuzu (koordinatlı ise)
-    ocr_pool: List[Box] = []
-    if ocr_texts and not strings_only_mode:
-        tmp = [_to_box(t) for t in ocr_texts]
-        ocr_pool = [b for b in tmp if b and b.txt]
+    def prepare_aliases(ROLE_ALIASES):
+        if ROLE_ALIASES is None: ROLE_ALIASES = ROLE_ALIASES_DEFAULT
+        ALIASES = [(fam, canon(v)) for fam, vals in ROLE_ALIASES.items() for v in vals]
+        ALIASES.sort(key=lambda t: len(t[1]), reverse=True)
+        return ROLE_ALIASES, ALIASES
 
-    # strings-only modunda indis bazlı metin eşlemesi için sözlük kur
-    text_by_loc = {}
-    if strings_only_mode:
-        # all_boxes ve/veya sermaye_boxes ile indeks eşlemesi için all_boxes esas alınır
-        raw_all = list(all_boxes)
-        conv_all = [_to_box(b) for b in raw_all]
-        conv_all = [b for b in conv_all if b]
-        N = min(len(conv_all), len(ocr_texts))
-        for i in range(N):
-            key = (conv_all[i].x, conv_all[i].y, conv_all[i].w, conv_all[i].h)
-            txt = (ocr_texts[i] or "").strip()
-            if txt:
-                text_by_loc[key] = txt
-        if dbg:
-            print(f"[INDEX-PAIR] mapped {len(text_by_loc)} boxes by index.")
+    ROLE_ALIASES, ALIASES = prepare_aliases(ROLE_ALIASES)
 
-    def _inject_index_text(b: Box) -> Box:
-        """strings_only_mode'da aynı indeksten gelen metni enjekte et."""
-        if not strings_only_mode or b.txt:
-            return b
-        key = (b.x, b.y, b.w, b.h)
-        if key in text_by_loc:
-            return Box(b.x, b.y, b.w, b.h, text_by_loc[key], b.role)
-        return b
+    # ----------------
+    # 0) detected -> internal copy with text
+    # ----------------
+    det_boxes = []
+    for b, t in zip(detected_boxes, ocr_texts):
+        x,y,w,h = _as_box_tuple(b)
+        det_boxes.append({"x":x,"y":y,"w":w,"h":h,"txt":(t or ""), "role":None, "inline_name":has_inline_name(t or "")})
+    if dbg: print(f"[INIT] {len(det_boxes)} boxes.")
 
-    def _augment_text(b: Box) -> Box:
-        """Koordinatlı OCR varsa IOU/center-in ile en iyi metni enjekte eder; strings-only modunda index metnini enjekte eder."""
-        b = _inject_index_text(b)
-        if not ocr_pool or b.txt:
-            return b
-        # IOU ile en iyi OCR metni
-        bx1, by1, bx2, by2 = _xyxy(b)
-        best = b; best_sc = amount_score(b.txt)
-        for tb in ocr_pool:
-            tx1, ty1, tx2, ty2 = _xyxy(tb)
-            ix = _overlap_1d(bx1, bx2, tx1, tx2)
-            iy = _overlap_1d(by1, by2, ty1, ty2)
-            inter = ix * iy
-            if inter <= 0:
+    # ----------------
+    # 1) detect roles
+    # ----------------
+    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}
+    role_boxes = []
+    for b in det_boxes:
+        T = (b["txt"] or "").upper()
+        hit = next((k for k in ALL_KEY_STR if k in T), None)
+        if hit:
+            b["role"] = hit
+            role_boxes.append(b)
+            if dbg: print(f"[ROLE] {hit} @({b['x']},{b['y']},{b['w']},{b['h']}) :: {b['txt'][:80]}")
+
+    # ----------------
+    # 2) dikey birleştirme (sadece alttan + isim satırı şartı opsiyonel)
+    # ----------------
+    pool = [b for b in det_boxes if b not in role_boxes]
+    merged_blocks = []
+    taken_ids = set()
+
+    for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
+        best, best_score = None, None
+        for cb in pool:
+            if id(cb) in taken_ids: 
                 continue
-            area = b.w*b.h + tb.w*tb.h - inter
-            iou = inter / max(1, area)
-            if iou <= 0:
+            dy = _y_gap(rb, cb)
+            if dy < -min_dy_px: continue
+            if max_dy_px is not None and dy > max_dy_px: continue
+            xov = _x_overlap_ratio(rb, cb)
+            if xov < min_x_overlap_ratio: continue
+            if require_name_below and not (looks_like_person_line(cb["txt"]) or has_inline_name(cb["txt"])):
                 continue
-            sc = amount_score(tb.txt)
-            if sc > best_sc:
-                best = Box(b.x, b.y, b.w, b.h, (b.txt + " " + tb.txt).strip(), b.role)
-                best_sc = sc
-        if best is not b and dbg:
-            print(f"[AUGMENT] +txt '{best.txt[:60]}'")
-        return best
-
-    # --------- komşu seçiciler ---------
-    def _best_right_neighbor(cur: Box, pool: List[Box]) -> Optional[Box]:
-        cand = []
-        for b in pool:
-            if b.x <= cur.x + cur.w:
-                continue
-            vovl = _v_overlap_ratio(cur, b)
-            gap  = _gap_right(cur, b)
-            if vovl < v_min or gap < 0 or gap > gap_right_max:
-                if dbg: print(f"[RIGHT-REJECT] gap={gap} vovl={vovl:.2f} txt='{(b.txt or '')[:40]}'")
-                continue
-            bx = _augment_text(b)
-            sc = amount_score(bx.txt) if bx.txt else 0.0
-            cand.append((gap, -vovl, -sc, bx))
-        if cand:
-            cand.sort()
-            g, ov, ns, bx = cand[0]
-            if dbg: print(f"[RIGHT-PICK] gap={g} vovl={-ov:.2f} txt='{(bx.txt or '')[:60]}'")
-            return bx
-        if allow_right_fallback:
-            fb=[]
-            for b in pool:
-                if b.x <= cur.x + cur.w:
+            if sig_boxes:
+                if _overlaps_any_iou(cb, sig_boxes, thr=0.02): 
+                    if dbg: print("[SKIP] candidate hits signature"); 
                     continue
-                gap = _gap_right(cur, b)
-                if gap < 0 or gap > gap_right_max:
+                # birleştirme önizleme
+                rx1,ry1,rx2,ry2 = _xyxy(rb); cx1,cy1,cx2,cy2 = _xyxy(cb)
+                if x_policy == "role":
+                    mx1, mx2 = rx1, rx2
+                else:
+                    mx1, mx2 = min(rx1,cx1), max(rx2,cx2)
+                my1, my2 = min(ry1,cy1), max(ry2,cy2)
+                if _overlaps_any_iou({"x":mx1,"y":my1,"w":mx2-mx1,"h":my2-my1}, sig_boxes, thr=0.02):
+                    if dbg: print("[SKIP] merged hits signature"); 
                     continue
-                fb.append((gap, b))
-            if fb:
-                fb.sort()
-                b = fb[0][1]
-                b = _augment_text(b)
-                if dbg: print(f"[RIGHT-FALLBACK] gap={fb[0][0]} txt='{(b.txt or '')[:60]}'")
-                return b
-        return None
+            score = (-abs(dy), xov)
+            if best_score is None or score > best_score:
+                best, best_score = cb, score
 
-    def _best_down_neighbor(cur: Box, pool: List[Box]) -> Optional[Box]:
-        cand=[]
-        for b in pool:
-            if b.y <= cur.y + cur.h:
-                continue
-            hovl = _h_overlap_ratio(cur, b)
-            gap  = _gap_down(cur, b)
-            if hovl < h_min or gap < 0 or gap > gap_down_max:
-                if dbg: print(f"[DOWN-REJECT] gap={gap} hovl={hovl:.2f} txt='{(b.txt or '')[:40]}'")
-                continue
-            bx = _augment_text(b)
-            sc = amount_score(bx.txt) if bx.txt else 0.0
-            cand.append((gap, -hovl, -sc, bx))
-        if not cand:
-            return None
-        cand.sort()
-        g, ov, ns, bx = cand[0]
-        if dbg: print(f"[DOWN-PICK] gap={g} hovl={-ov:.2f} txt='{(bx.txt or '')[:60]}'")
-        return bx
-
-    # --------- havuz ---------
-    pool = [_to_box(b) for b in all_boxes]
-    pool = [b for b in pool if b]
-    # uniq
-    uniq = {(b.x, b.y, b.w, b.h, b.txt): b for b in pool}
-    pool = list(uniq.values())
-
-    # --------- ana akış ---------
-    out: List[Box] = []
-    for s in sermaye_boxes:
-        base = _to_box(s)
-        if not base:
-            continue
-        base = _augment_text(base)
-
-        # erken kontrol: amount varsa genişletme (isteğe bağlı)
-        base_has_amount   = contains_amount(base.txt)
-        base_has_currency = has_currency(base.txt)
-
-        if base_has_amount and not expand_when_has_amount:
-            if expand_currency_if_missing and (not base_has_currency):
-                nb = _best_right_neighbor(
-                    base,
-                    [b for b in pool if (b.x, b.y, b.w, b.h) != (base.x, base.y, base.w, base.h)]
-                )
-                if nb:
-                    if _gap_right(base, nb) <= currency_right_window and len((nb.txt or "").strip()) <= 6:
-                        merged = _augment_text(_merge(base, nb))
-                        if dbg: print("[CURRENCY-FIX] merged right label ->", (nb.txt or "")[:20])
-                        out.append(merged)
-                        continue
-            if dbg: print("[SKIP] already has amount; keep as-is.")
-            out.append(base)
-            continue
-
-        cur = base
-        used = set()
-
-        # RIGHT zinciri
-        steps = 0
-        while not contains_amount(cur.txt) and steps < max_steps_right:
-            nb = _best_right_neighbor(cur, [b for b in pool if (b.x, b.y, b.w, b.h) not in used])
-            if not nb:
-                break
-            if dbg: print(f"[EXPAND] RIGHT -> '{(nb.txt or '')[:80]}'")
-            used.add((nb.x, nb.y, nb.w, nb.h))
-            cur = _augment_text(_merge(cur, nb))
-            steps += 1
-
-        if contains_amount(cur.txt):
-            if dbg: print("[EXPAND] success via RIGHT chain")
-            out.append(cur)
-            continue
-
-        # DOWN zinciri
-        steps = 0
-        while not contains_amount(cur.txt) and steps < max_steps_down:
-            nb = _best_down_neighbor(cur, [b for b in pool if (b.x, b.y, b.w, b.h) not in used])
-            if not nb:
-                break
-            if dbg: print(f"[EXPAND] DOWN -> '{(nb.txt or '')[:80]}'")
-            used.add((nb.x, nb.y, nb.w, nb.h))
-            cur = _augment_text(_merge(cur, nb))
-            steps += 1
-
-        if contains_amount(cur.txt):
-            if dbg: print("[EXPAND] success via DOWN chain")
-            out.append(cur)
+        if best is not None:
+            rx1,ry1,rx2,ry2 = _xyxy(rb)
+            cx1,cy1,cx2,cy2 = _xyxy(best)
+            ny1, ny2 = ry1, max(ry2, cy2)
+            if x_policy == "max":
+                nx1, nx2 = min(rx1, cx1), max(rx2, cx2)
+            elif x_policy == "role":
+                nx1, nx2 = rx1, rx2
+            else:
+                raise ValueError("x_policy must be 'max' or 'role'")
+            merged_blocks.append(_rect(nx1, ny1, nx2-nx1, ny2-ny1, txt=f"{rb['txt']} + {best['txt']}", role=rb["role"]))
+            taken_ids.add(id(best))
+            if dbg: print(f"[ROLE+NAME] {rb['role']} -> {best['txt'][:60]}")
         else:
-            if dbg: print("[EXPAND] DROP (no amount) ::", base.txt[:120])
-            if keep_all_numbered or has_number(base.txt):
-                out.append(base)
+            # rol tek başına kalsın
+            merged_blocks.append(_rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"]))
 
-    return out
+    # inline name içeren saf rol satırlarını da ekle
+    for b in role_boxes:
+        if b.get("inline_name"):
+            merged_blocks.append(_rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"]))
+
+    # aynı role için role-only kutuyu, role+name ile büyük oranda çakışıyorsa sil
+    cleaned = []
+    for b in merged_blocks:
+        is_role_only = not (looks_like_person_line(b["txt"]) or has_inline_name(b["txt"]))
+        if not is_role_only:
+            cleaned.append(b); continue
+        keep = True
+        for c in merged_blocks:
+            if c is b: continue
+            if c["role"] == b["role"] and _iou(b,c) > 0.5:
+                keep = False; break
+        if keep: cleaned.append(b)
+    merged_blocks = cleaned
+
+    # ----------------
+    # 3) çoklu rol split (konservatif)
+    # ----------------
+    SEP_RE = re.compile(r"(?:\s*[;,/|]\s*|\s+\bVE\b\s+|\s*/\s*)", re.I)
+
+    def detect_roles_with_positions(text):
+        t = canon(text)
+        taken = [False]*len(t)
+        spans = []
+
+        # exact
+        for fam, cv in ALIASES:
+            start = 0
+            while True:
+                idx = t.find(cv, start)
+                if idx == -1: break
+                rng = range(idx, idx+len(cv))
+                if any(taken[i] for i in rng):
+                    start = idx + 1; continue
+                for i in rng: taken[i] = True
+                spans.append((fam, (idx, idx+len(cv))))
+                start = idx + len(cv)
+
+        # fuzzy (gerekirse)
+        if fuzzy_enable and _FUZZY_OK and len(spans) <= 1:
+            cands = []
+            for fam, cv in ALIASES:
+                s1 = fuzz.partial_ratio(t, cv)
+                s2 = fuzz.token_set_ratio(t, cv)
+                sc = max(s1, s2)
+                if sc >= fuzzy_score_thr:
+                    key = cv.split()[0]
+                    pos = t.find(key)
+                    if pos == -1: pos = len(t) + 10
+                    cands.append((fam, pos, sc, cv))
+            cands.sort(key=lambda x: (-x[2], x[1]))
+            for fam, pos, _, cv in cands:
+                if any(f==fam for f,_ in spans): 
+                    continue
+                spans.append((fam, (max(0,pos), min(len(t), pos+len(cv)))))
+
+        # genel "BAŞKAN" varsa ve spesifikler de varsa, geneli at
+        fams = [f for f,_ in spans]
+        if any(f in fams for f in ("divan_baskani","toplanti_baskani","yk_baskani")):
+            spans = [(f,xy) for f,xy in spans if f!="baskan"]
+
+        spans.sort(key=lambda kv: kv[1][0])
+        return spans
+
+    splitted = []
+    for b in merged_blocks:
+        txt = b["txt"] or ""
+        spans = detect_roles_with_positions(txt)
+        fams = [fam for fam,_ in spans]
+
+        if dbg:
+            print(f"[roles?] {fams} :: {txt[:80]!r}")
+
+        # tek/0 rol: bölme yok
+        if len(fams) <= 1:
+            nb = copy.deepcopy(b)
+            if fams: nb["role"] = fams[0]
+            splitted.append(nb)
+            continue
+
+        # split kararı: ayraç + alias pozisyonları arasında boşluk kontrolü
+        t_canon = canon(txt)
+        has_sep = bool(SEP_RE.search(t_canon))
+        spans_ok = True
+        for (_, (s1,e1)), (_, (s2,e2)) in zip(spans, spans[1:]):
+            if s2 - e1 < min_char_gap_between_roles:
+                spans_ok = False; break
+        if require_separator_for_split and not has_sep:
+            spans_ok = False
+
+        if not spans_ok:
+            nb = copy.deepcopy(b)
+            nb["role"] = fams[0]
+            splitted.append(nb)
+            if dbg: print("[no-split] weak evidence; kept unsplit.")
+            continue
+
+        # parçalara böl (genişlik paylaştır)
+        N = len(fams)
+        x,y,x2,y2 = _xyxy(b)
+        W = x2 - x
+        needed = N*min_piece_w + (N-1)*gap_px
+        if needed > W:
+            if small_space_policy == "drop":
+                if dbg: print(f"[drop] W={W} < needed={needed} (N={N})")
+                continue
+            elif small_space_policy == "keep_unsplit":
+                nb = copy.deepcopy(b); nb["role"]=fams[0]; splitted.append(nb); continue
+            else:
+                possible_gap = max(0, (W - N*min_piece_w)) // max(1,(N-1))
+                gap = possible_gap
+        else:
+            gap = gap_px
+
+        usable = W - gap*(N-1)
+        base = usable // N
+        rem  = usable % N
+        cur_x = x
+        for i in range(N):
+            w_piece = max(min_piece_w, base + (1 if i < rem else 0))
+            nb = _rect(cur_x, y, w_piece, y2-y, txt=b["txt"], role=fams[i])
+            splitted.append(nb)
+            if i < N-1:
+                cur_x += w_piece + gap
+
+    # ----------------
+    # 4) sermaye çakışmalarını ele
+    # ----------------
+    if sermaye_boxes:
+        sb = [{"x":_get(s,"x"),"y":_get(s,"y"),"w":_get(s,"w"),"h":_get(s,"h")} for s in sermaye_boxes]
+        keep = []
+        for b in splitted:
+            if any(_iou(b, s) >= 0.08 for s in sb):
+                continue
+            keep.append(b)
+        splitted = keep
+
+    # ----------------
+    # (opsiyonel) çizim
+    # ----------------
+    if lower_img is not None:
+        try:
+            import cv2
+            vis = lower_img.copy()
+            for b in splitted:
+                x,y,w,h = b["x"],b["y"],b["w"],b["h"]
+                cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
+            # geri döndürmüyoruz; dışarıda göster
+        except Exception:
+            pass
+
+    return splitted
