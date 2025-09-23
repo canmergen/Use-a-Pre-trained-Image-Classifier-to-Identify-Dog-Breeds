@@ -5,22 +5,22 @@ def run_role_pipeline(
     sig_boxes=None,
     sermaye_boxes=None,
     lower_img=None,
-    # augment
+    # augment (dikey birleştirme)
     x_policy="max",                 # "max" | "role"
     min_x_overlap_ratio=0.10,
     min_dy_px=0,
     max_dy_px=165,
     require_name_below=True,
-    # split
+    # split (çoklu rol ayırma)
     ROLE_ALIASES=None,
     gap_px=8,
     min_piece_w=14,
     fuzzy_enable=True,
-    fuzzy_score_thr=86,             # split için
+    fuzzy_score_thr=86,
     small_space_policy="drop",      # "drop" | "keep_unsplit" | "shrink_gap"
     min_char_gap_between_roles=2,
     require_separator_for_split=True,
-    # yeni: DETECT aşaması için fuzzy
+    # detect aşaması için fuzzy
     detect_fuzzy_enable=True,
     detect_fuzzy_thr=80,
     # teşhis / opsiyon
@@ -32,12 +32,13 @@ def run_role_pipeline(
 ):
     import re, copy, unicodedata
 
+    # ---------- fuzzy ----------
     try:
         from rapidfuzz import fuzz
         _FUZZY_OK = True
     except Exception:
         _FUZZY_OK = False
-        class _F:  # dummy
+        class _F:
             @staticmethod
             def partial_ratio(a,b): return 0
             @staticmethod
@@ -122,12 +123,12 @@ def run_role_pipeline(
         t = b.get("txt","")
         return looks_like_person_line(t) or has_inline_name(t)
 
-    # aliases
+    # ----- role aliases -----
     ROLE_ALIASES_DEFAULT = {
         "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
         "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
         "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
-        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETIM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETİM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
         "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YÖNETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
         "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
         "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
@@ -139,6 +140,30 @@ def run_role_pipeline(
         return ROLE_ALIASES, ALIASES
     ROLE_ALIASES, ALIASES = prepare_aliases(ROLE_ALIASES)
 
+    # ---- SIG limit helpers ----
+    def _sig_limit_for_role_like(b_role, sigs, x_ov_thr=0.10):
+        """Role satırına/role-bloka x-örtüşen ve altta olan en yakın imza kutusunun alt kenarı."""
+        if not sigs: return None
+        rx1,ry1,rx2,ry2 = _xyxy(b_role)
+        best = None
+        for s in sigs:
+            sx1,sy1,sx2,sy2 = _xyxy(s)
+            inter = max(0, min(rx2,sx2) - max(rx1,sx1))
+            base  = max(1, min(_get(b_role,"w"), _get(s,"w")))
+            xov   = inter / base
+            if sy1 >= ry1 and xov >= x_ov_thr:
+                if best is None or sy2 < best:  # en yakının alt kenarı
+                    best = sy2
+        return best  # None ya da int
+
+    def _cap_bottom_to_sig_if_needed(box, sigs, x_ov_thr=0.10):
+        lim = _sig_limit_for_role_like(box, sigs, x_ov_thr=x_ov_thr)
+        if lim is not None:
+            x,y,w,h = box["x"], box["y"], box["w"], box["h"]
+            new_h = max(1, min(y+h, lim) - y)  # imza dahil, altına inmiyor
+            box["h"] = new_h
+        return box
+
     # 0) copy
     det_boxes = []
     for b, t in zip(detected_boxes, ocr_texts):
@@ -147,34 +172,30 @@ def run_role_pipeline(
     if stage_debug: print(f"[STAGE] init_boxes={len(det_boxes)}")
 
     # 1) DETECT (kanonik + fuzzy)
-    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}           # display strings
-    CANON_TO_FAMILY = {canon(v): fam for fam, vals in ROLE_ALIASES.items() for v in vals}  # canonical map
+    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}
+    CANON_TO_FAMILY = {canon(v): fam for fam, vals in ROLE_ALIASES.items() for v in vals}
     role_boxes = []
     for b in det_boxes:
         raw = b["txt"] or ""
-        tU = tr_upper(strip_diac(raw))    # üst/diakritiksiz
+        tU = tr_upper(strip_diac(raw))
         tC = canon(raw)
 
-        # 1a) hızlı exact: hem normal hem canonical
         hit = next((k for k in ALL_KEY_STR if k in tU), None)
         fam = None
         if hit:
             fam = CANON_TO_FAMILY.get(canon(hit))
         else:
-            for cv, fam_try in [(cv, fam) for fam, vals in ROLE_ALIASES.items() for cv in vals]:
+            for cv in ALL_KEY_STR:
                 if canon(cv) in tC:
                     fam = CANON_TO_FAMILY[canon(cv)]
                     break
-
-        # 1b) fuzzy fallback
         if fam is None and detect_fuzzy_enable and _FUZZY_OK:
             best = None
             for cv, fam_try in [(cv, fam) for fam, vals in ROLE_ALIASES.items() for cv in vals]:
                 sc = max(fuzz.partial_ratio(tC, canon(cv)), fuzz.token_set_ratio(tC, canon(cv)))
                 if sc >= detect_fuzzy_thr and (best is None or sc > best[0]):
                     best = (sc, fam_try)
-            if best:
-                fam = best[1]
+            if best: fam = best[1]
 
         if fam:
             b["role"] = fam
@@ -182,10 +203,14 @@ def run_role_pipeline(
             if dbg: print(f"[ROLE] {fam} @({b['x']},{b['y']},{b['w']},{b['h']}) :: {raw[:80]}")
     if stage_debug: print(f"[STAGE] role_boxes={len(role_boxes)}")
 
-    # 2) augment (vertical)
+    # 2) augment (vertical) + SIG LIMIT
     pool = [b for b in det_boxes if b not in role_boxes]
     merged_blocks, taken_ids, merged_rb_ids = [], set(), set()
+
     for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
+        # bu role satırı için imza alt limiti (varsa)
+        sig_limit_y2 = _sig_limit_for_role_like(rb, sig_boxes, x_ov_thr=min_x_overlap_ratio) if sig_boxes else None
+
         best, best_score = None, None
         for cb in pool:
             if id(cb) in taken_ids: 
@@ -196,15 +221,29 @@ def run_role_pipeline(
             if _x_overlap_ratio(rb, cb) < min_x_overlap_ratio: continue
             if require_name_below and not (looks_like_person_line(cb["txt"]) or has_inline_name(cb["txt"])):
                 continue
+
+            # SIG LIMIT: aday cb'nin altı imza alt limitini aşmasın
+            if sig_limit_y2 is not None:
+                _, _, _, cy2 = _xyxy(cb)
+                if cy2 > sig_limit_y2:
+                    continue
+
             if sig_boxes:
                 if _overlaps_any_iou(cb, sig_boxes, thr=0.02): 
-                    continue
-                rx1,ry1,rx2,ry2 = _xyxy(rb); cx1,cy1,cx2,cy2 = _xyxy(cb)
-                if x_policy == "role": mx1, mx2 = rx1, rx2
-                else:                  mx1, mx2 = min(rx1,cx1), max(rx2,cx2)
+                    # cb imza kutusunun ta kendisi ise yine de kabul edilebilir;
+                    # ama farklı imza bloklarıyla birleşmesin diye aşağıda cap yapacağız.
+                    pass
+
+                # birleştirme önizleme ve imza çakışmasına karşı kontrol
+                rx1,ry1,rx2,ry2 = _xyxy(rb)
+                cx1,cy1,cx2,cy2 = _xyxy(cb)
+                if x_policy == "role":
+                    mx1, mx2 = rx1, rx2
+                else:
+                    mx1, mx2 = min(rx1,cx1), max(rx2,cx2)
                 my1, my2 = min(ry1,cy1), max(ry2,cy2)
-                if _overlaps_any_iou({"x":mx1,"y":my1,"w":mx2-mx1,"h":my2-my1}, sig_boxes, thr=0.02):
-                    continue
+
+                # merged kutunun altını da sig limitine CAP edeceğiz; burada sadece skorlayalım
             score = (-abs(dy), _x_overlap_ratio(rb, cb))
             if best_score is None or score > best_score:
                 best, best_score = cb, score
@@ -212,23 +251,42 @@ def run_role_pipeline(
         if best is not None:
             rx1,ry1,rx2,ry2 = _xyxy(rb)
             cx1,cy1,cx2,cy2 = _xyxy(best)
-            ny1, ny2 = ry1, max(ry2, cy2)
+            ny1 = ry1
+            ny2 = max(ry2, cy2)
+
+            # SIG LIMIT: birleşmiş kutunun altını limite CAP et
+            if sig_limit_y2 is not None:
+                ny2 = min(ny2, sig_limit_y2)
+
             if x_policy == "max":
                 nx1, nx2 = min(rx1, cx1), max(rx2, cx2)
             elif x_policy == "role":
                 nx1, nx2 = rx1, rx2
             else:
                 raise ValueError("x_policy must be 'max' or 'role'")
-            merged_blocks.append(_rect(nx1, ny1, nx2-nx1, ny2-ny1,
-                                       txt=f"{rb['txt']} + {best['txt']}", role=rb["role"]))
+
+            merged = _rect(nx1, ny1, nx2-nx1, max(1, ny2-ny1), txt=f"{rb['txt']} + {best['txt']}", role=rb["role"])
+            # güvenlik: CAP tekrar
+            if sig_boxes:
+                merged = _cap_bottom_to_sig_if_needed(merged, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+
+            merged_blocks.append(merged)
             taken_ids.add(id(best))
             merged_rb_ids.add(id(rb))
         else:
-            merged_blocks.append(_rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"]))
+            # tek rol kutusu; SIG varsa CAP et
+            only_role = _rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"])
+            if sig_boxes:
+                only_role = _cap_bottom_to_sig_if_needed(only_role, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(only_role)
 
+    # inline name içeren saf rol satırlarını da ekle (birleştirilmediyse)
     for b in role_boxes:
         if b.get("inline_name") and id(b) not in merged_rb_ids:
-            merged_blocks.append(_rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"]))
+            nb = _rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"])
+            if sig_boxes:
+                nb = _cap_bottom_to_sig_if_needed(nb, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(nb)
 
     if stage_debug: print(f"[STAGE] merged_blocks={len(merged_blocks)}")
 
@@ -254,16 +312,15 @@ def run_role_pipeline(
         merged_blocks = cleaned
     if stage_debug: print(f"[STAGE] after roleonly_cleanup={len(merged_blocks)} (applied={apply_roleonly_cleanup})")
 
-    # 3) split (opsiyonel)
+    # 3) split (opsiyonel, konservatif)
     SEP_RE = re.compile(r"(?:\s*[;,/|]\s*|\s+\bVE\b\s+|\s*/\s*)", re.I)
+
     def detect_roles_with_positions(text):
-        t = canon(text)
-        taken = [False]*len(t)
-        spans = []
+        t = canon(text); taken = [False]*len(t); spans = []
         for fam, cv in ALIASES:
             start = 0
             while True:
-                idx = t.find(cv, start); 
+                idx = t.find(cv, start)
                 if idx == -1: break
                 rng = range(idx, idx+len(cv))
                 if any(taken[i] for i in rng):
@@ -295,10 +352,12 @@ def run_role_pipeline(
             txt = b["txt"] or ""
             spans = detect_roles_with_positions(txt)
             fams = [fam for fam,_ in spans]
+
             if len(fams) <= 1:
                 nb = copy.deepcopy(b)
                 if fams: nb["role"] = fams[0]
                 splitted.append(nb); continue
+
             t_canon = canon(txt)
             has_sep = bool(SEP_RE.search(t_canon))
             spans_ok = True
@@ -307,32 +366,43 @@ def run_role_pipeline(
                     spans_ok = False; break
             if require_separator_for_split and not has_sep:
                 spans_ok = False
+
             if not spans_ok:
-                nb = copy.deepcopy(b); nb["role"] = fams[0]; splitted.append(nb); continue
+                nb = copy.deepcopy(b); nb["role"] = fams[0]
+                splitted.append(nb); continue
+
             N = len(fams)
-            x,y,x2,y2 = _xyxy(b); W = x2-x
+            x,y,x2,y2 = _xyxy(b); W = x2 - x
             needed = N*min_piece_w + (N-1)*gap_px
             if needed > W:
-                if small_space_policy == "drop":   continue
+                if small_space_policy == "drop":
+                    continue
                 elif small_space_policy == "keep_unsplit":
                     nb = copy.deepcopy(b); nb["role"]=fams[0]; splitted.append(nb); continue
                 else:
-                    gap = max(0,(W - N*min_piece_w)) // max(1,(N-1))
+                    gap = max(0, (W - N*min_piece_w)) // max(1,(N-1))
             else:
                 gap = gap_px
-            usable = W - gap*(N-1); base = usable // N; rem = usable % N
+
+            usable = W - gap*(N-1)
+            base = usable // N
+            rem  = usable % N
             cur_x = x
             for i in range(N):
                 w_piece = max(min_piece_w, base + (1 if i < rem else 0))
                 nb = _rect(cur_x, y, w_piece, y2-y, txt=b["txt"], role=fams[i])
+                # güvenlik: split parçalarının altını da sig ile CAP et
+                if sig_boxes:
+                    nb = _cap_bottom_to_sig_if_needed(nb, sig_boxes, x_ov_thr=min_x_overlap_ratio)
                 splitted.append(nb)
-                if i < N-1: cur_x += w_piece + gap
+                if i < N-1:
+                    cur_x += w_piece + gap
         if stage_debug: print(f"[STAGE] splitted(after split)={len(splitted)}")
     else:
         splitted = [copy.deepcopy(b) for b in merged_blocks]
         if stage_debug: print(f"[STAGE] splitted(no-split)={len(splitted)}")
 
-    # 4) sermaye/imza filtresi (opsiyonel)
+    # 4) sermaye/imza filtresi (opsiyonel; yalnızca sermaye kutularına karşı)
     if apply_sermaye_filter and sermaye_boxes:
         sb = [{"x":_get(s,"x"),"y":_get(s,"y"),"w":_get(s,"w"),"h":_get(s,"h")} for s in sermaye_boxes]
         keep = []
@@ -403,5 +473,5 @@ def run_role_pipeline(
         except Exception:
             pass
 
-    # tuple formatında döndür
+    # tuple formatı
     return [(b["x"], b["y"], b["w"], b["h"]) for b in splitted]
