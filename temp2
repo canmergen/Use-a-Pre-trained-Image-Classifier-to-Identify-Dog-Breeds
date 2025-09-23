@@ -1,79 +1,132 @@
-from typing import Any, List, Tuple, Optional
+from typing import List, Tuple, Optional
 
-def link_and_build_final(
-    role_blocks: List[Tuple[int,int,int,int]],
-    sig_boxes: List[Tuple[int,int,int,int]],
-    sermaye_boxes: Optional[List[Tuple[int,int,int,int]]] = None,
+BoxXYWH = Tuple[int,int,int,int]
+BoxLTRB = Tuple[int,int,int,int]
+
+def build_final_boxes_all(
+    role_blocks: List[BoxXYWH],
+    sig_boxes: List[BoxXYWH],
+    sermaye_boxes: Optional[List[BoxXYWH]] = None,
     *,
-    near_px: int = 3,
-    band_pad_scale: float = 0.35,
-    band_center_scale: float = 1.0,
-    corridor_pad_px: int = 8,
-    forbid_crossing: bool = True,
+    near_px: int = 3,               # temas/≤near_px yakın say
+    band_pad_scale: float = 0.35,   # rol yüksekliğinin oranı kadar dikey bant
+    band_center_scale: float = 1.0, # bandın yatay toleransı
+    corridor_pad_px: int = 8,       # koridor yan payı
+    forbid_crossing: bool = True,   # koridor çarpışırsa eşleşmeyi iptal et
+    include_unpaired_roles: bool = True,
+    include_unpaired_sigs: bool = True,
+    dedup_iou: float = 0.90,        # final setinde neredeyse aynı kutuları tekilleştir
     dbg: bool = False
 ):
     """
-    role_blocks, sig_boxes, sermaye_boxes -> (x,y,w,h) formatında kutular.
-    Dönen: dict {"pairs","final","roles","sigs","sermaye"}
+    role_blocks, sig_boxes, sermaye_boxes -> (x,y,w,h) kutular.
+    Döner: dict {"final","pairs","roles","sigs","sermaye"}
+
+    'final' = birleştirilmiş EŞLEŞMELER  + sermaye  + (opsiyonel) eşleşmeyen rol/sig.
     """
-    Box = Tuple[int,int,int,int]  # (l,t,r,b)
-
-    def to_ltrb(b: Tuple[int,int,int,int]) -> Box:
-        # Giriş her zaman (x,y,w,h)
+    # ------------- helpers -------------
+    def to_ltrb(b: BoxXYWH) -> BoxLTRB:
         x,y,w,h = b
-        return (x, y, x+w, y+h)
+        return (int(x), int(y), int(x+w), int(y+h))
 
-    def to_xywh(bb: Box) -> Tuple[int,int,int,int]:
+    def to_xywh(bb: BoxLTRB) -> BoxXYWH:
         l,t,r,b = bb
-        return (l,t, r-l, b-t)
+        return (int(l), int(t), int(max(0, r-l)), int(max(0, b-t)))
 
-    def union(a: Box, b: Box) -> Box:
+    def union(a: BoxLTRB, b: BoxLTRB) -> BoxLTRB:
         return (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3]))
 
-    def expand(bb: Box, pad: int) -> Box:
+    def expand(bb: BoxLTRB, pad: int) -> BoxLTRB:
         l,t,r,b = bb
         return (l-pad, t-pad, r+pad, b+pad)
 
-    def intersects(a: Box, b: Box) -> bool:
+    def intersects(a: BoxLTRB, b: BoxLTRB) -> bool:
         return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
-    def center(bb: Box) -> Tuple[float,float]:
+    def center(bb: BoxLTRB) -> Tuple[float,float]:
         l,t,r,b = bb
         return ((l+r)/2.0, (t+b)/2.0)
 
-    # --- Normalize inputs ---
+    def area(bb: BoxLTRB) -> int:
+        l,t,r,b = bb
+        return max(0, r-l) * max(0, b-t)
+
+    def iou(a: BoxLTRB, b: BoxLTRB) -> float:
+        if not intersects(a,b):
+            return 0.0
+        l = max(a[0], b[0]); t = max(a[1], b[1])
+        r = min(a[2], b[2]); btm = min(a[3], b[3])
+        inter = max(0, r-l) * max(0, btm-t)
+        if inter <= 0:
+            return 0.0
+        return inter / float(area(a) + area(b) - inter + 1e-6)
+
+    def dedup_merge_close(boxes_xywh: List[BoxXYWH]) -> List[BoxXYWH]:
+        """Yakın (≤near_px) ya da IoU≥dedup_iou olanları tekilleştir."""
+        rects = [to_ltrb(b) for b in boxes_xywh]
+        changed = True
+        while changed:
+            changed = False
+            rects.sort(key=lambda r: (r[0], r[1], r[2]-r[0], r[3]-r[1]))
+            used = [False]*len(rects)
+            merged: List[BoxLTRB] = []
+            for i in range(len(rects)):
+                if used[i]: 
+                    continue
+                cur = rects[i]
+                used[i] = True
+                j = 0
+                while j < len(rects):
+                    if not used[j]:
+                        a = expand(cur, near_px)
+                        b = expand(rects[j], near_px)
+                        if intersects(a,b) or iou(cur, rects[j]) >= dedup_iou:
+                            cur = union(cur, rects[j])
+                            used[j] = True
+                            changed = True
+                            j = 0
+                            continue
+                    j += 1
+                merged.append(cur)
+            rects = merged
+        return [to_xywh(r) for r in rects]
+
+    # ------------- normalize inputs -------------
     roles_ltrb   = [to_ltrb(b) for b in role_blocks]
     sigs_ltrb    = [to_ltrb(b) for b in sig_boxes]
     sermaye_ltrb = [to_ltrb(b) for b in (sermaye_boxes or [])]
 
-    if near_px>0:
+    # ------------- pairing (role ↔ sig) -------------
+    if near_px > 0:
         sigs_grown = [expand(s, near_px) for s in sigs_ltrb]
     else:
         sigs_grown = list(sigs_ltrb)
 
-    # --- Role-Sig eşleşmesi ---
     used_roles, used_sigs = set(), set()
     pairs: List[Tuple[int,int]] = []
 
     for ri, rb in enumerate(roles_ltrb):
-        if ri in used_roles: 
+        if ri in used_roles:
             continue
         rl,rt,rr,rbottom = rb
         rh = rbottom - rt
         rcx, rcy = center(rb)
-        band_top = int(rcy - (rh*band_pad_scale))
-        band_bot = int(rcy + (rh*band_pad_scale))
-        band_l   = int(rl - (rr-rl)*band_center_scale)
-        band_r   = int(rr + (rr-rl)*band_center_scale)
+
+        # dikey bant
+        band_top = int(rcy - rh * band_pad_scale)
+        band_bot = int(rcy + rh * band_pad_scale)
+        band_l   = int(rl - (rr-rl) * band_center_scale)
+        band_r   = int(rr + (rr-rl) * band_center_scale)
         band = (band_l, band_top, band_r, band_bot)
 
-        best = None
+        best = None  # (score, si)
         for si, sb in enumerate(sigs_grown):
-            if si in used_sigs: 
+            if si in used_sigs:
                 continue
             if not intersects(band, sb):
                 continue
 
+            # koridor kontrolü (rol.bottom ↔ sig.top)
             blocked = False
             if forbid_crossing:
                 sl,st,sr,sbtt = sigs_ltrb[si]
@@ -82,18 +135,28 @@ def link_and_build_final(
                 ct = min(rbottom, st)
                 cb = max(rbottom, st)
                 corridor = (cl, ct, cr, cb)
-                for oj, ob in enumerate(roles_ltrb):
-                    if oj==ri: continue
-                    if intersects(corridor, ob): blocked=True; break
+                # diğer roller
+                for rj, ob in enumerate(roles_ltrb):
+                    if rj == ri: 
+                        continue
+                    if intersects(corridor, ob):
+                        blocked = True
+                        break
+                # diğer imzalar
                 if not blocked:
-                    for oj, ob in enumerate(sigs_ltrb):
-                        if oj==si: continue
-                        if intersects(corridor, ob): blocked=True; break
+                    for sj, ob in enumerate(sigs_ltrb):
+                        if sj == si: 
+                            continue
+                        if intersects(corridor, ob):
+                            blocked = True
+                            break
             if blocked:
-                if dbg: print(f"[SKIP] ri={ri} si={si} -> corridor blocked")
+                if dbg: 
+                    print(f"[SKIP] ri={ri} si={si} -> corridor blocked")
                 continue
 
-            scx, scy = center(sigs_ltrb[si])
+            # skor: dikey merkez mesafesi (küçük daha iyi)
+            _, scy = center(sigs_ltrb[si])
             gap = abs(scy - rcy) + 1e-6
             score = 1.0 / gap
             if (best is None) or (score > best[0]):
@@ -105,13 +168,33 @@ def link_and_build_final(
             used_roles.add(ri)
             used_sigs.add(si)
 
-    # --- Final kutular ---
-    final_boxes_ltrb = [union(roles_ltrb[ri], sigs_ltrb[si]) for ri,si in pairs]
+    # ------------- compose final set -------------
+    final_ltrb: List[BoxLTRB] = []
+
+    # 1) eşleşen rol∪imza
+    for ri, si in pairs:
+        final_ltrb.append(union(roles_ltrb[ri], sigs_ltrb[si]))
+
+    # 2) sermaye kutularını doğrudan ekle
+    final_ltrb.extend(sermaye_ltrb)
+
+    # 3) isteğe bağlı: eşleşmemiş rol/sig kutuları
+    if include_unpaired_roles:
+        for ri, rb in enumerate(roles_ltrb):
+            if ri not in used_roles:
+                final_ltrb.append(rb)
+    if include_unpaired_sigs:
+        for si, sb in enumerate(sigs_ltrb):
+            if si not in used_sigs:
+                final_ltrb.append(sb)
+
+    # 4) dedup / yakın olanları birleştir
+    final_xywh = dedup_merge_close([to_xywh(bb) for bb in final_ltrb])
 
     return {
+        "final": final_xywh,                         # hepsi bir arada
         "pairs": pairs,
-        "final": [to_xywh(bb) for bb in final_boxes_ltrb],
-        "roles": [to_xywh(bb) for bb in roles_ltrb],
-        "sigs":  [to_xywh(bb) for bb in sigs_ltrb],
-        "sermaye": [to_xywh(bb) for bb in sermaye_ltrb],
+        "roles": [to_xywh(b) for b in roles_ltrb],
+        "sigs":  [to_xywh(b) for b in sigs_ltrb],
+        "sermaye": [to_xywh(b) for b in sermaye_ltrb],
     }
