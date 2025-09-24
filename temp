@@ -1,197 +1,200 @@
-def build_final_boxes_onecall(
-    role_blocks,          # List[(x,y,w,h)]
-    sig_boxes,            # List[(x,y,w,h)]
-    sermaye_boxes=None,   # Optional[List[(x,y,w,h)]]
+from typing import List, Tuple, Optional, Set, Dict
+
+# Tek fonksiyon: role + imza + (opsiyonel) sermaye kutularını nihai hale getirir.
+# "Rolü aşağı imza ile birleştirirken union başka bir ROL'ü de içine alıyorsa merge İPTAL" kuralı dahil.
+
+def build_final_boxes_onceall(
+    role_blocks: List[Tuple[int,int,int,int]],       # [(x,y,w,h)]
+    sig_boxes:   List[Tuple[int,int,int,int]],       # [(x,y,w,h)]
+    sermaye_boxes: Optional[List[Tuple[int,int,int,int]]] = None,  # [(x,y,w,h)]
     *,
-    include_unpaired_roles=True,
-    include_unpaired_sigs=True,
-    dedup_iou=0.90,       # final set için katı tekilleştirme
-    near_px=3,            # ~yakın kutuları da tekilleştir (opsiyonel)
-    require_x_overlap=True # "aynı boylam" tanımı: yatay projeksiyonlar kesişsin
-):
+    include_unpaired_roles: bool = True,             # eşleşmeyen role kutularını da ekle
+    include_unpaired_sigs:  bool = True,             # eşleşmeyen imza kutularını da ekle
+    dedup_near_px: int = 2,                          # final set için yakın kutu tekilleştirme
+    near_px: int = 2,                                # yakınlık (touch) için px toleransı
+    require_x_overlap: float = 0.10,                 # role & imza yatay projeksiyon min kesişim oranı
+    max_vertical_gap: Optional[int] = None,          # None: sınırsız; aksi halde role.bottom→sig.top azami boşluk
+    block_mode: str = "center",                      # "center" | "iou" | "full" (başka rol içerirse merge iptal)
+    iou_block_th: float = 0.10                       # block_mode="iou" için eşik
+) -> Dict[str, List]:
     """
     Çıktı:
       {
-        "final":   List[(x,y,w,h)]   # birleşmiş+tekilleşmiş tüm kutular
-        "pairs":   List[(role_idx, sig_idx)]
-        "roles":   List[(x,y,w,h)]
-        "sigs":    List[(x,y,w,h)]
-        "sermaye": List[(x,y,w,h)]
+        "final":   List[(x,y,w,h)],    # birleşmiş/tekilleşmiş tüm kutular
+        "pairs":   List[(role_idx, sig_idx)],  # eşleşen role-imza indeksleri
+        "roles":   List[(x,y,w,h)],    # (nihai sette görünen role kutuları; union olanlar dahil)
+        "sigs":    List[(x,y,w,h)],    # (nihai sette görünen imza kutuları; union olanlar dahil)
+        "sermaye": List[(x,y,w,h)],    # aynen eklenir (varsa)
       }
     """
-    # ---- import & type hints (fonksiyon içi, self-contained) ----
-    from typing import List, Tuple, Optional, Set
-    import math
 
-    BOXXYWH = Tuple[int,int,int,int]
-    BOXLTRB = Tuple[int,int,int,int]
+    # ---------- helpers (tamamı fonksiyon içinde, self-contained) ----------
+    BoxXYWH = Tuple[int,int,int,int]
+    BoxLTRB = Tuple[int,int,int,int]
 
-    # -------------- helpers (tamamı fonksiyon içinde) --------------
-    def to_ltrb(b: BOXXYWH) -> BOXLTRB:
-        x,y,w,h = b
-        return (int(x), int(y), int(x+w), int(y+h))
+    def to_ltrb(b: BoxXYWH) -> BoxLTRB:
+        x,y,w,h = b; return (int(x), int(y), int(x+w), int(y+h))
 
-    def to_xywh(b: BOXLTRB) -> BOXXYWH:
-        l,t,r,bm = b
-        return (int(l), int(t), max(0, int(r-l)), max(0, int(bm-t)))
+    def to_xywh(b: BoxLTRB) -> BoxXYWH:
+        l,t,r,bm = b; return (int(l), int(t), int(r-l), int(bm-t))
 
-    def union(a: BOXLTRB, b: BOXLTRB) -> BOXLTRB:
+    def union(a: BoxLTRB, b: BoxLTRB) -> BoxLTRB:
         return (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3]))
 
-    def expand(bb: BOXLTRB, pad: int) -> BOXLTRB:
-        l,t,r,bm = bb
-        return (l-pad, t-pad, r+pad, bm+pad)
-
-    def intersects(a: BOXLTRB, b: BOXLTRB) -> bool:
+    def intersects(a: BoxLTRB, b: BoxLTRB) -> bool:
         return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
-    def contains(a: BOXLTRB, b: BOXLTRB) -> bool:
-        # a b'yi tamamen kapsıyor mu?
-        return (a[0] <= b[0]) and (a[1] <= b[1]) and (a[2] >= b[2]) and (a[3] >= b[3])
+    def contains(big: BoxLTRB, small: BoxLTRB) -> bool:
+        return (big[0] <= small[0]) and (big[1] <= small[1]) and (big[2] >= small[2]) and (big[3] >= small[3])
 
-    def area(bb: BOXLTRB) -> int:
-        l,t,r,bm = bb
-        return max(0, r-l) * max(0, bm-t)
+    def area(bb: BoxLTRB) -> int:
+        return max(0, bb[2]-bb[0]) * max(0, bb[3]-bb[1])
 
-    def iou(a: BOXLTRB, b: BOXLTRB) -> float:
-        if not intersects(a,b):
-            return 0.0
-        l = max(a[0], b[0]); t = max(a[1], b[1])
-        r = min(a[2], b[2]); bm = min(a[3], b[3])
-        inter = max(0, r-l) * max(0, bm-t)
-        return inter / float(area(a) + area(b) - inter + 1e-6)
+    def inter_box(a: BoxLTRB, b: BoxLTRB) -> Optional[BoxLTRB]:
+        l = max(a[0], b[0]); t = max(a[1], b[1]); r = min(a[2], b[2]); bm = min(a[3], b[3])
+        if r > l and bm > t: return (l,t,r,bm)
+        return None
 
-    def horiz_overlap_ratio(a: BOXLTRB, b: BOXLTRB) -> float:
-        # yatay eksende projeksiyon kesişiminin min(genişlik) oranı
+    def iou(a: BoxLTRB, b: BoxLTRB) -> float:
+        I = inter_box(a,b)
+        if not I: return 0.0
+        ai, bi = area(a), area(b)
+        ii = area(I)
+        return ii / float(ai + bi - ii + 1e-6)
+
+    def x_overlap_ratio(a: BoxLTRB, b: BoxLTRB) -> float:
+        # yatay projeksiyon kesişimi / min genişlik
         l = max(a[0], b[0]); r = min(a[2], b[2])
-        inter_w = max(0, r-l)
+        if r <= l: return 0.0
+        inter_w = r - l
         min_w = max(1, min(a[2]-a[0], b[2]-b[0]))
-        return inter_w / float(min_w)
+        return float(inter_w) / float(min_w)
 
-    def dedup_merge_close(boxes_xywh: List[BOXXYWH]) -> List[BOXXYWH]:
-        """IoU >= dedup_iou olanları veya near_px ile temas edenleri tekilleştirir."""
-        rects = [to_ltrb(b) for b in boxes_xywh]
+    def center_inside(big: BoxLTRB, small: BoxLTRB) -> bool:
+        cx = (small[0] + small[2]) // 2
+        cy = (small[1] + small[3]) // 2
+        return (big[0] <= cx <= big[2]) and (big[1] <= cy <= big[3])
+
+    def is_below(role: BoxLTRB, sig: BoxLTRB) -> bool:
+        return sig[1] >= role[3]
+
+    def vgap(role: BoxLTRB, sig: BoxLTRB) -> int:
+        return max(0, sig[1] - role[3])
+
+    def touch_or_close(a: BoxLTRB, b: BoxLTRB, px: int) -> bool:
+        # yakınlık toleransı ile temas / çakışma kontrolü
+        return not (a[2] < b[0]-px or b[2] < a[0]-px or a[3] < b[1]-px or b[3] < a[1]-px)
+
+    def dedup_merge_close(boxes_ltrb: List[BoxLTRB], px: int) -> List[BoxLTRB]:
+        if not boxes_ltrb: return []
+        boxes = boxes_ltrb[:]
         changed = True
         while changed:
             changed = False
-            rects.sort(key=lambda r: (r[0], r[1], r[2]-r[0], r[3]-r[1]))
-            used = [False]*len(rects)
-            merged: List[BOXLTRB] = []
-            for i in range(len(rects)):
+            out: List[BoxLTRB] = []
+            used = [False]*len(boxes)
+            for i in range(len(boxes)):
                 if used[i]: continue
-                cur = rects[i]; used[i] = True
-                j = 0
-                while j < len(rects):
-                    if not used[j]:
-                        a = expand(cur, near_px)
-                        b = expand(rects[j], near_px)
-                        if intersects(a,b) or iou(cur, rects[j]) >= dedup_iou:
-                            cur = union(cur, rects[j])
-                            used[j] = True
-                            changed = True
-                            j = 0
-                            continue
-                    j += 1
-                merged.append(cur)
-            rects = merged
-        return [to_xywh(r) for r in rects]
+                a = boxes[i]
+                for j in range(i+1, len(boxes)):
+                    if used[j]: continue
+                    b = boxes[j]
+                    if touch_or_close(a,b,px):
+                        a = union(a,b)
+                        used[j] = True
+                        changed = True
+                out.append(a)
+                used[i] = True
+            boxes = out
+        return boxes
 
-    # ---------------- normalize inputs ----------------
-    roles_ltrb   = [to_ltrb(b) for b in (role_blocks or [])]
-    sigs_ltrb    = [to_ltrb(b) for b in (sig_boxes or [])]
-    sermaye_ltrb = [to_ltrb(b) for b in (sermaye_boxes or [])]
+    # ---------- normalize inputs ----------
+    roles_l: List[BoxLTRB] = [to_ltrb(b) for b in (role_blocks or [])]
+    sigs_l:  List[BoxLTRB] = [to_ltrb(b) for b in (sig_boxes or [])]
+    serm_l:  List[BoxLTRB] = [to_ltrb(b) for b in (sermaye_boxes or [])]
 
     used_roles: Set[int] = set()
     used_sigs:  Set[int] = set()
     pairs: List[Tuple[int,int]] = []
 
-    # ---------------- pairing (rol + imza) ----------------
-    # KURAL (senin talebin):
-    # 1) İmza rol kutusunun İÇİNDE ise zaten birleşik sayılır (ek kural yok).
-    # 2) İmza rolün ALTINDA ise (sig.top >= role.bottom) VE
-    #    "Aynı boylam": yatay projeksiyonlar kesişiyorsa -> MESAFE ÖNEMSİZ, MUTLAKA BİRLEŞ.
-    # Çoklu imza varsa deterministik olmak için en çok yatay-örtüşen (bağıl) ve sonra en küçük dikey boşluk seçilir.
+    roles_out_l: List[BoxLTRB] = []
+    sigs_out_l:  List[BoxLTRB] = []
 
-    for ri, rb in enumerate(roles_ltrb):
-        if ri in used_roles:
-            continue
-        rl,rt,rr,rbm = rb
-
-        # 0) Eğer herhangi bir imza role TAMAMEN içerideyse onu tercih et (doğal birleşik durum)
-        inside_best = None
-        for si, sb in enumerate(sigs_ltrb):
+    # ---------- 1) ROL → aşağı İMZA ile güvenli birleştirme ----------
+    for ri, r in enumerate(roles_l):
+        # imza adayları
+        cands: List[Tuple[Tuple[float,int,int], int, BoxLTRB, BoxLTRB]] = []
+        for si, s in enumerate(sigs_l):
             if si in used_sigs: 
                 continue
-            if contains(rb, sb):
-                # içeridekilerden en büyük alanı seçelim
-                score = area(sb)
-                if (inside_best is None) or (score > inside_best[0]):
-                    inside_best = (score, si)
-        if inside_best is not None:
-            si = inside_best[1]
-            pairs.append((ri, si))
-            used_roles.add(ri)
-            used_sigs.add(si)
-            continue
-
-        # 1) Role ALTTA ve "aynı boylam" (yatay projeksiyon kesişimi > 0) olan tüm imzaları aday yap
-        cands = []
-        for si, sb in enumerate(sigs_ltrb):
-            if si in used_sigs: 
+            if not is_below(r, s): 
                 continue
-            sl,st,sr,sb2 = sb
-            # altta mı?
-            if st < rbm:
+            if max_vertical_gap is not None and vgap(r,s) > max_vertical_gap:
                 continue
-            # aynı boylam mı?
-            if require_x_overlap:
-                xo = horiz_overlap_ratio(rb, sb)
-                if xo <= 0.0:
-                    continue
-            else:
-                xo = 1.0  # kapalıysa merkez farkı vb. kullanabilirdik; gerek yok.
-
-            # MESAFE ÖNEMSİZ -> sadece seçim kriterinde (tie-breaker) kullan
-            vgap = st - rbm  # küçük olanı tercih ederiz ama şart değildir
-            cands.append((xo, -vgap, si))  # daha fazla yatay örtüşme, daha az gap
+            xo = x_overlap_ratio(r, s)
+            if xo < require_x_overlap:
+                continue
+            score = (xo, -(vgap(r,s)), -(s[3]-s[1]))  # daha çok xo, daha az gap, büyük kutu
+            cands.append((score, si, s, union(r,s)))
 
         if not cands:
             continue
 
-        cands.sort(reverse=True)          # (xo büyük, gap küçük) öncelik
-        best_si = cands[0][2]
+        cands.sort(reverse=True)
+        _, best_si, best_s, best_union = cands[0]
 
-        pairs.append((ri, best_si))
+        # ---- BLOK KONTROLÜ: union başka bir ROL'ü de içine alıyor mu? ----
+        blocks = False
+        for rj, other in enumerate(roles_l):
+            if rj == ri: 
+                continue
+            if block_mode == "center":
+                if center_inside(best_union, other):
+                    blocks = True; break
+            elif block_mode == "iou":
+                if iou(best_union, other) > iou_block_th:
+                    blocks = True; break
+            else:  # "full"
+                if contains(best_union, other):
+                    blocks = True; break
+
+        if blocks:
+            # Bu rol için merge iptal. Rol, ileride tekli olarak eklenecek.
+            continue
+
+        # Merge serbest
+        roles_out_l.append(best_union)   # union role-sig tek kutu
         used_roles.add(ri)
         used_sigs.add(best_si)
+        pairs.append((ri, best_si))
 
-    # ---------------- compose final set ----------------
-    final_ltrb: List[BOXLTRB] = []
-
-    # 1) Eşleşen rol+imza -> TEK KUTU (union)
-    for ri, si in pairs:
-        final_ltrb.append( union(roles_ltrb[ri], sigs_ltrb[si]) )
-
-    # 2) Sermaye kutularını direkt ekle
-    final_ltrb.extend(sermaye_ltrb)
-
-    # 3) İsteğe bağlı: eşleşmemiş rol/sig kutuları
+    # ---------- 2) Eşleşmeyenleri (isteğe bağlı) ekle ----------
     if include_unpaired_roles:
-        for ri, rb in enumerate(roles_ltrb):
+        for ri, r in enumerate(roles_l):
             if ri not in used_roles:
-                final_ltrb.append(rb)
-    if include_unpaired_sigs:
-        for si, sb in enumerate(sigs_ltrb):
-            if si not in used_sigs:
-                final_ltrb.append(sb)
+                roles_out_l.append(r)
 
-    # 4) Dedup/tekilleştirme
-    final_xywh = dedup_merge_close([to_xywh(bb) for bb in final_ltrb])
+    if include_unpaired_sigs:
+        for si, s in enumerate(sigs_l):
+            if si not in used_sigs:
+                sigs_out_l.append(s)
+
+    # ---------- 3) Sermaye kutularını aynen ekle ----------
+    sermaye_out_l = serm_l[:] if serm_l else []
+
+    # ---------- 4) Nihai seti oluştur + tekilleştir ----------
+    final_l = roles_out_l + sigs_out_l + sermaye_out_l
+    final_l = dedup_merge_close(final_l, dedup_near_px)
+
+    final_xywh = [to_xywh(b) for b in final_l]
+    roles_xywh = [to_xywh(b) for b in roles_out_l]
+    sigs_xywh  = [to_xywh(b) for b in sigs_out_l]
+    serm_xywh  = [to_xywh(b) for b in sermaye_out_l]
 
     return {
         "final":   final_xywh,
         "pairs":   pairs,
-        "roles":   [to_xywh(b) for b in roles_ltrb],
-        "sigs":    [to_xywh(b) for b in sigs_ltrb],
-        "sermaye": [to_xywh(b) for b in sermaye_ltrb],
+        "roles":   roles_xywh,
+        "sigs":    sigs_xywh,
+        "sermaye": serm_xywh,
     }
