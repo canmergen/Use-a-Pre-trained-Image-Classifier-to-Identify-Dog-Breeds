@@ -1,164 +1,524 @@
-from typing import List, Tuple, Optional, Dict, Set
-
-def build_final_boxes_onceall(
-    role_boxes: List[Tuple[int,int,int,int]],          # [(x,y,w,h)]
-    sig_boxes:  List[Tuple[int,int,int,int]],          # [(x,y,w,h)]
-    sermaye_boxes: Optional[List[Tuple[int,int,int,int]]] = None,
+def run_role_pipeline(
+    detected_boxes,
+    ocr_texts,
     *,
-    require_x_overlap: float = 0.20,       # rol–imza min X-örtüşme (min(width) bazında)
-    stop_x_overlap: float = 0.12,          # koridorda başka rol tespiti için min X-örtüşme
-    max_vertical_gap: Optional[int] = 120, # None: sınırsız
-    dedup_near_px: int = 2                 # kategori-içi tekilleştirme toleransı
-) -> Dict[str, List[Tuple[int,int,int,int]]]:
+    sig_boxes=None,
+    sermaye_boxes=None,
+    lower_img=None,
+    # augment (dikey birleştirme)
+    x_policy="max",                 # "max" | "role"
+    min_x_overlap_ratio=0.10,
+    min_dy_px=0,
+    max_dy_px=165,
+    require_name_below=True,
+    # split (çoklu rol ayırma)
+    ROLE_ALIASES=None,
+    gap_px=8,
+    min_piece_w=14,
+    fuzzy_enable=True,
+    fuzzy_score_thr=86,
+    small_space_policy="drop",      # "drop" | "keep_unsplit" | "shrink_gap"
+    min_char_gap_between_roles=2,
+    require_separator_for_split=True,
+    # detect aşaması için fuzzy
+    detect_fuzzy_enable=True,
+    detect_fuzzy_thr=80,
+    # opsiyon / teşhis
+    apply_roleonly_cleanup=True,    # rol+isim varsa role-only’leri at
+    apply_split=True,               # çoklu rol split
+    apply_sermaye_filter=True,      # sermaye IoU filtresi
+    stage_debug=True,               # aşama logları
+    dbg=False
+):
+    import re, copy, unicodedata
+    from collections import defaultdict
+
+    # ---------- fuzzy ----------
+    try:
+        from rapidfuzz import fuzz
+        _FUZZY_OK = True
+    except Exception:
+        _FUZZY_OK = False
+        class _F:
+            @staticmethod
+            def partial_ratio(a,b): return 0
+            @staticmethod
+            def token_set_ratio(a,b): return 0
+        fuzz = _F()
 
     # ---------- helpers ----------
-    Box = Tuple[int,int,int,int]
-    LTRB = Tuple[int,int,int,int]
+    def _get(b, k, d=None):
+        if isinstance(b, dict): return b.get(k, d)
+        if hasattr(b, k): return getattr(b, k)
+        if isinstance(b, (tuple, list)):
+            m = {"x": 0, "y": 1, "w": 2, "h": 3}
+            if k in m and len(b) > m[k]: return b[m[k]]
+        return d
 
-    def to_ltrb(b: Box) -> LTRB:
-        x,y,w,h = b; return (int(x), int(y), int(x+w), int(y+h))
+    def _as_box_tuple(b):
+        if isinstance(b, (tuple, list)) and len(b) >= 4:
+            x, y, w, h = b[0], b[1], b[2], b[3]
+            return int(x), int(y), int(w), int(h)
+        return int(_get(b, "x")), int(_get(b, "y")), int(_get(b, "w")), int(_get(b, "h"))
 
-    def to_xywh(b: LTRB) -> Box:
-        l,t,r,bm = b; return (int(l), int(t), int(r-l), int(bm-t))
+    def _xyxy(b):
+        x,y,w,h = _as_box_tuple(b)
+        return x, y, x+w, y+h
 
-    def w(b: LTRB) -> int: return max(0, b[2]-b[0])
-    def h(b: LTRB) -> int: return max(0, b[3]-b[1])
+    def _y_gap(top, bottom):
+        _, _, _, ty2 = _xyxy(top)
+        _, by1, _, _ = _xyxy(bottom)
+        return by1 - ty2
 
-    def union(a: LTRB, b: LTRB) -> LTRB:
-        return (min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3]))
+    def _x_overlap_ratio(a,b):
+        ax1,_,ax2,_ = _xyxy(a)
+        bx1,_,bx2,_ = _xyxy(b)
+        inter = max(0, min(ax2,bx2) - max(ax1,bx1))
+        base  = max(1, min(_get(a,"w"), _get(b,"w")))
+        return inter / base
 
-    def inter(a: LTRB, b: LTRB) -> Optional[LTRB]:
-        l, t = max(a[0], b[0]), max(a[1], b[1])
-        r, bm = min(a[2], b[2]), min(a[3], b[3])
-        return (l,t,r,bm) if (r>l and bm>t) else None
+    def _iou(a,b):
+        ax1,ay1,ax2,ay2 = _xyxy(a)
+        bx1,by1,bx2,by2 = _xyxy(b)
+        ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+        ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+        if ix2<=ix1 or iy2<=iy1: return 0.0
+        inter = (ix2-ix1)*(iy2-iy1)
+        area  = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+        return inter / max(area,1)
 
-    def intersects(a: LTRB, b: LTRB) -> bool:
-        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+    def _overlaps_any_iou(candidate, boxes, thr=0.03):
+        if not boxes: return False
+        for b in boxes:
+            if _iou(candidate, b) >= thr:
+                return True
+        return False
 
-    def inter_w(a: LTRB, b: LTRB) -> int:
-        return max(0, min(a[2],b[2]) - max(a[0],b[0]))
+    def _rect(x,y,w,h, txt="", role=None):
+        return {"x":int(x),"y":int(y),"w":int(w),"h":int(h),"txt":txt,"role":role}
 
-    def x_overlap_ratio(a: LTRB, b: LTRB) -> float:
-        iw = inter_w(a,b)
-        if iw <= 0: return 0.0
-        return iw / float(max(1, min(w(a), w(b))))
+    def _area(b):
+        x,y,w,h = _as_box_tuple(b)
+        return max(1,w) * max(1,h)
 
-    def corridor(role: LTRB, sig: LTRB) -> Optional[LTRB]:
-        # role.bottom → sig.top aralığı ve ortak X bandı
-        if sig[1] < role[3]: return None
-        l, r = max(role[0], sig[0]), min(role[2], sig[2])
-        if r <= l: return None
-        return (l, role[3], r, sig[1])
+    def _is_inside(inner, outer, pad: int = 0) -> bool:
+        ix1,iy1,ix2,iy2 = _xyxy(inner)
+        ox1,oy1,ox2,oy2 = _xyxy(outer)
+        return (ix1 >= ox1 - pad) and (iy1 >= oy1 - pad) and (ix2 <= ox2 + pad) and (iy2 <= oy2 + pad)
 
-    def corridor_blocked(corr: LTRB, other_role: LTRB, th: float) -> bool:
-        # Koridor Y bandı ile rol Y bandı kesişiyor ve X-örtüşme yeterli mi?
-        y_hit = not (other_role[3] <= corr[1] or other_role[1] >= corr[3])
-        if not y_hit: return False
-        xo = x_overlap_ratio((corr[0],0,corr[2],1), (other_role[0],0,other_role[2],1))
-        return xo >= th
+    # text utils
+    def tr_upper(s):  return (s or "").replace("i","İ").replace("ı","I").upper()
+    def strip_diac(s): return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    def canon(s):     return re.sub(r"\s+"," ", tr_upper(strip_diac(s))).strip()
 
-    def contains(big: LTRB, small: LTRB) -> bool:
-        return (big[0] <= small[0] and big[1] <= small[1] and
-                big[2] >= small[2] and big[3] >= small[3])
+    TR = "A-Za-zÇĞİÖŞÜçğıöşü"
+    NAME_LINE_RE = re.compile(rf"\b[{TR}][{TR}'-]+\s+[{TR}][{TR}'-]+(\s+[{TR}][{TR}'-]+)?\b")
+    AD_SOYAD_HINT_RE = re.compile(r"\bad\s*[-:]?\s*soyad[ıi]?\b", re.I)
 
-    def dedup_in_category(boxes: List[LTRB], tol: int = 2) -> List[LTRB]:
-        if not boxes: return []
-        boxes = boxes[:]
-        changed = True
-        while changed:
-            changed = False
-            out: List[LTRB] = []
-            used = [False]*len(boxes)
-            for i in range(len(boxes)):
-                if used[i]: continue
-                a = boxes[i]
-                for j in range(i+1, len(boxes)):
-                    if used[j]: continue
-                    b = boxes[j]
-                    touch = not (a[2] < b[0]-tol or b[2] < a[0]-tol or
-                                 a[3] < b[1]-tol or b[3] < a[1]-tol)
-                    if touch:
-                        a = union(a,b)
-                        used[j] = True
-                        changed = True
-                out.append(a); used[i] = True
-            boxes = out
-        return boxes
+    def looks_like_person_line(t):
+        if not t: return False
+        # çok rakam içeriyorsa isim olma ihtimali düşüktür (TC geçerse serbest bırak)
+        if sum(ch.isdigit() for ch in t) > 2 and "TC" not in t.upper():
+            return False
+        t_clean = " ".join(t.split())
+        if AD_SOYAD_HINT_RE.search(t_clean): 
+            return True
+        return bool(NAME_LINE_RE.search(t_clean))
 
-    # ---------- normalize ----------
-    roles: List[LTRB] = [to_ltrb(b) for b in (role_boxes or [])]
-    sigs:  List[LTRB] = [to_ltrb(b) for b in (sig_boxes  or [])]
-    serm:  List[LTRB] = [to_ltrb(b) for b in (sermaye_boxes or [])]
+    def has_inline_name(txt):
+        if not txt: return False
+        letters = re.findall(rf"[{TR}]", txt)
+        if len("".join(letters)) < 4: return False
+        return bool(re.compile(rf"(?i)\b[{TR}]{{2,}}\b(?:[\s\W]+?\b[{TR}]{{2,}}\b)+").search(txt))
 
-    # (ÖN FİLTRE) Zaten rol/sermaye kutularının İÇİNDE kalan imzaları aday listesinden çıkar
-    if roles or serm:
-        containers0 = roles + serm
-        sigs = [s for s in sigs if not any(contains(k, s) for k in containers0)]
+    def _has_namey(b) -> bool:
+        t = b.get("txt","")
+        return looks_like_person_line(t) or has_inline_name(t)
 
-    used_roles: Set[int] = set()
-    used_sigs:  Set[int] = set()
-    pairs: List[Tuple[int,int]] = []
+    # ---- Paragraf/Dipnot filtresi ----
+    def is_paragraph_like(txt: str) -> bool:
+        if not txt: return False
+        t = " ".join(txt.split())
+        # (*) (**) (***) dipnot
+        if re.search(r"\(\*+\)", t): 
+            return True
+        # tipik paragraf/dipnot anahtarları
+        bad_kw = ["borsa", "pay", "katılım", "temsilci", "temsilcisi",
+                  "asaleten", "temsilen", "organın", "bağımsız", "kurumsal",
+                  "tevdi eden", "ifadesi", "yazılacaktır"]
+        if any(k in t.lower() for k in bad_kw):
+            return True
+        # fazla uzunluk / çok satır / yoğun noktalama
+        if len(t) >= 120:
+            return True
+        if txt.count("\n") >= 3:
+            return True
+        punct = sum(ch in '",.;:!?’“”()[]%' for ch in txt)
+        if punct >= 8:
+            return True
+        return False
 
-    unions: List[LTRB] = []      # rol∪imza
-    roles_left: List[LTRB] = []  # union’a girmeyen roller
-    sigs_left:  List[LTRB] = []  # union’a girmeyen imzalar (kural gereği sonradan drop)
-
-    # ---------- rol→imza eşleştirme (koridor engelli) ----------
-    for ri, rb in enumerate(roles):
-        best = None  # (score, si, union_ltrb)
-        for si, sb in enumerate(sigs):
-            if si in used_sigs: 
-                continue
-            if sb[1] < rb[3]:
-                continue
-            if max_vertical_gap is not None and (sb[1] - rb[3]) > max_vertical_gap:
-                continue
-            if x_overlap_ratio(rb, sb) < require_x_overlap:
-                continue
-
-            cor = corridor(rb, sb)
-            if cor is None:
-                continue
-
-            # koridorda başka rol var mı? → blokla
-            if any(corridor_blocked(cor, other, stop_x_overlap) 
-                   for rj, other in enumerate(roles) if rj != ri):
-                continue
-
-            u = union(rb, sb)
-            score = (x_overlap_ratio(rb, sb), -(sb[1]-rb[3]), -h(sb))
-            if (best is None) or (score > best[0]):
-                best = (score, si, u)
-
-        if best:
-            _, si, u = best
-            unions.append(u); used_roles.add(ri); used_sigs.add(si)
-            pairs.append((ri, si))
-
-    # ---------- kalanlar ----------
-    for ri, rb in enumerate(roles):
-        if ri not in used_roles:
-            roles_left.append(rb)
-    for si, sb in enumerate(sigs):
-        if si not in used_sigs:
-            sigs_left.append(sb)
-
-    # ---------- kategori-içi tekilleştirme ----------
-    unions     = dedup_in_category(unions,     dedup_near_px)
-    roles_left = dedup_in_category(roles_left, dedup_near_px)
-    serm       = dedup_in_category(serm,       dedup_near_px)
-
-    # ---------- contain-or-drop: leftover imzalar ----------
-    # Kural: imza tek başınaysa drop; başka kutu içindeyse de drop (büyük kutu kalır).
-    # Bu nedenle sigs_left listeyi tamamen boşaltıyoruz.
-    sigs_left = []
-
-    # ---------- final ----------
-    final_l = unions + roles_left + serm
-    return {
-        "final":   [to_xywh(b) for b in final_l],
-        "pairs":   pairs,
-        "roles":   [to_xywh(b) for b in roles_left],
-        "sigs":    [],  # kural gereği leftover imzalar droplandı
-        "sermaye": [to_xywh(b) for b in serm],
+    # ---- role aliases ----
+    ROLE_ALIASES_DEFAULT = {
+        "toplanti_baskani":    ["TOPLANTI BAŞKANI", "TOPLANTI BASKANI"],
+        "tutanak_yazmani":     ["TUTANAK YAZMANI", "YAZMAN"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ", "TİCARET BAKANLIĞI TEMSİLCİSİ", "TICARET BAKANLIGI TEMSILCISI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI", "YONETİM KURULU BASKANI", "YK BAŞKANI", "YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ", "YÖNETİM KURULU ÜYELERİ", "YONETIM KURULU UYESI", "YK ÜYESİ", "YK UYESI"],
+        "katip":               ["KÂTİP", "KATİP", "OY TOPLAMA MEMURU", "OY TOPLAYICI"],
+        "divan_baskani":       ["DİVAN BAŞKANI", "DIVAN BASKANI"],
     }
+    def prepare_aliases(ROLE_ALIASES):
+        if ROLE_ALIASES is None: ROLE_ALIASES = ROLE_ALIASES_DEFAULT
+        ALIASES = [(fam, canon(v)) for fam, vals in ROLE_ALIASES.items() for v in vals]
+        ALIASES.sort(key=lambda t: len(t[1]), reverse=True)
+        return ROLE_ALIASES, ALIASES
+    ROLE_ALIASES, ALIASES = prepare_aliases(ROLE_ALIASES)
+
+    # ---- SIG limit helpers ----
+    def _sig_limit_for_role_like(b_role, sigs, x_ov_thr=0.10):
+        """Role satırına x-örtüşen ve altta olan en yakın imza kutusunun alt kenarı."""
+        if not sigs: return None
+        rx1,ry1,rx2,ry2 = _xyxy(b_role)
+        best = None
+        for s in sigs:
+            sx1,sy1,sx2,sy2 = _xyxy(s)
+            inter = max(0, min(rx2,sx2) - max(rx1,sx1))
+            base  = max(1, min(_get(b_role,"w"), _get(s,"w")))
+            xov   = inter / base
+            if sy1 >= ry1 and xov >= x_ov_thr:
+                if best is None or sy2 < best:  # en yakının alt kenarı
+                    best = sy2
+        return best
+
+    def _cap_bottom_to_sig_if_needed(box, sigs, x_ov_thr=0.10):
+        lim = _sig_limit_for_role_like(box, sigs, x_ov_thr=x_ov_thr)
+        if lim is not None:
+            x,y,w,h = box["x"], box["y"], box["w"], box["h"]
+            box["h"] = max(1, min(y+h, lim) - y)  # imza dahil, altına inmez
+        return box
+
+    # ---------- INIT ----------
+    det_boxes = []
+    for b, t in zip(detected_boxes, ocr_texts):
+        x,y,w,h = _as_box_tuple(b)
+        det_boxes.append({"x":x,"y":y,"w":w,"h":h,"txt":(t or ""), "role":None, "inline_name":has_inline_name(t or "")})
+    if stage_debug: print(f"[STAGE] init_boxes={len(det_boxes)}")
+
+    # ---------- 1) DETECT (kanonik + fuzzy) ----------
+    ALL_KEY_STR = {v for vals in ROLE_ALIASES.values() for v in vals}
+    CANON_TO_FAMILY = {canon(v): fam for fam, vals in ROLE_ALIASES.items() for v in vals}
+    role_boxes = []
+    for b in det_boxes:
+        raw = b["txt"] or ""
+        tU = tr_upper(strip_diac(raw))
+        tC = canon(raw)
+
+        hit = next((k for k in ALL_KEY_STR if k in tU), None)
+        fam = None
+        if hit:
+            fam = CANON_TO_FAMILY.get(canon(hit))
+        else:
+            for cv in ALL_KEY_STR:
+                if canon(cv) in tC:
+                    fam = CANON_TO_FAMILY[canon(cv)]
+                    break
+        if fam is None and detect_fuzzy_enable and _FUZZY_OK:
+            best = None
+            for cv, fam_try in [(cv, fam) for fam, vals in ROLE_ALIASES.items() for cv in vals]:
+                sc = max(fuzz.partial_ratio(tC, canon(cv)), fuzz.token_set_ratio(tC, canon(cv)))
+                if sc >= detect_fuzzy_thr and (best is None or sc > best[0]):
+                    best = (sc, fam_try)
+            if best: fam = best[1]
+
+        if fam:
+            b["role"] = fam
+            role_boxes.append(b)
+            if dbg: print(f"[ROLE] {fam} @({b['x']},{b['y']},{b['w']},{b['h']}) :: {raw[:80]}")
+    if stage_debug: print(f"[STAGE] role_boxes={len(role_boxes)}")
+
+    # ---------- 2) AUGMENT (dikey birleştirme + SIG tabanı + paragraf filtresi) ----------
+    pool = [b for b in det_boxes if b not in role_boxes]
+    merged_blocks, taken_ids, merged_rb_ids = [], set(), set()
+
+    for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
+        # bu role satırı için imza alt limiti (varsa)
+        sig_limit_y2 = _sig_limit_for_role_like(rb, sig_boxes, x_ov_thr=min_x_overlap_ratio) if sig_boxes else None
+
+        best, best_score = None, None
+        for cb in pool:
+            if id(cb) in taken_ids: 
+                continue
+            dy = _y_gap(rb, cb)
+            if dy < -min_dy_px: continue
+            if max_dy_px is not None and dy > max_dy_px: continue
+            if _x_overlap_ratio(rb, cb) < min_x_overlap_ratio: continue
+
+            # isim satırı şartı
+            if require_name_below and not (looks_like_person_line(cb["txt"]) or has_inline_name(cb["txt"])):
+                continue
+            # --- paragraf/dipnot ele ---
+            if is_paragraph_like(cb.get("txt","")):
+                continue
+
+            # SIG LIMIT: aday cb'nin altı imza alt limitini aşmasın
+            if sig_limit_y2 is not None:
+                _, _, _, cy2 = _xyxy(cb)
+                if cy2 > sig_limit_y2:
+                    continue
+
+            # imza kutusuyla çakışma: CAP ile düzeltileceği için burada tamamen reddetme
+            if sig_boxes and _overlaps_any_iou(cb, sig_boxes, thr=0.02):
+                # yine de aday olabilir; birleşim sonrası CAP yapılacak
+                pass
+
+            score = (-abs(dy), _x_overlap_ratio(rb, cb))
+            if best_score is None or score > best_score:
+                best, best_score = cb, score
+
+        if best is not None:
+            rx1,ry1,rx2,ry2 = _xyxy(rb)
+            cx1,cy1,cx2,cy2 = _xyxy(best)
+            ny1 = ry1
+            ny2 = max(ry2, cy2)
+            if sig_limit_y2 is not None:
+                ny2 = min(ny2, sig_limit_y2)
+            if x_policy == "max":
+                nx1, nx2 = min(rx1, cx1), max(rx2, cx2)
+            elif x_policy == "role":
+                nx1, nx2 = rx1, rx2
+            else:
+                raise ValueError("x_policy must be 'max' or 'role'")
+            merged = _rect(nx1, ny1, nx2-nx1, max(1, ny2-ny1), txt=f"{rb['txt']} + {best['txt']}", role=rb["role"])
+            if sig_boxes:
+                merged = _cap_bottom_to_sig_if_needed(merged, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(merged)
+            taken_ids.add(id(best))
+            merged_rb_ids.add(id(rb))
+        else:
+            only_role = _rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"])
+            if sig_boxes:
+                only_role = _cap_bottom_to_sig_if_needed(only_role, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(only_role)
+
+    # inline name içeren saf rol satırlarını da ekle (birleştirilmediyse) + paragraf filtresi
+    for b in role_boxes:
+        if b.get("inline_name") and id(b) not in merged_rb_ids:
+            if is_paragraph_like(b.get("txt","")):
+                continue
+            nb = _rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"])
+            if sig_boxes:
+                nb = _cap_bottom_to_sig_if_needed(nb, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(nb)
+
+    if stage_debug: print(f"[STAGE] merged_blocks={len(merged_blocks)}")
+
+    # ---------- 2b) role-only cleanup (opsiyonel) ----------
+    if apply_roleonly_cleanup:
+        role_to_merged = {}
+        for b in merged_blocks:
+            if _has_namey(b) and b["role"] is not None:
+                role_to_merged.setdefault(b["role"], []).append(b)
+
+        cleaned = []
+        for b in merged_blocks:
+            is_role_only = (not _has_namey(b))
+            r = b["role"]
+            if is_role_only and r in role_to_merged:
+                drop = False
+                for big in role_to_merged[r]:
+                    if _is_inside(b, big, pad=1) or _iou(b, big) >= 0.75:
+                        drop = True; break
+                if drop: 
+                    continue
+            cleaned.append(b)
+        merged_blocks = cleaned
+    if stage_debug: print(f"[STAGE] after roleonly_cleanup={len(merged_blocks)} (applied={apply_roleonly_cleanup})")
+
+    # ---------- 3) split (opsiyonel, konservatif) ----------
+    SEP_RE = re.compile(r"(?:\s*[;,/|]\s*|\s+\bVE\b\s+|\s*/\s*)", re.I)
+
+    def detect_roles_with_positions(text):
+        t = canon(text); taken = [False]*len(t); spans = []
+        # exact
+        for fam, cv in ALIASES:
+            start = 0
+            while True:
+                idx = t.find(cv, start)
+                if idx == -1: break
+                rng = range(idx, idx+len(cv))
+                if any(taken[i] for i in rng):
+                    start = idx + 1; continue
+                for i in rng: taken[i] = True
+                spans.append((fam, (idx, idx+len(cv))))
+                start = idx + len(cv)
+        # fuzzy fallback
+        if fuzzy_enable and _FUZZY_OK and len(spans) <= 1:
+            cands = []
+            for fam, cv in ALIASES:
+                sc = max(fuzz.partial_ratio(t, cv), fuzz.token_set_ratio(t, cv))
+                if sc >= fuzzy_score_thr:
+                    key = cv.split()[0]; pos = t.find(key); 
+                    if pos == -1: pos = len(t)+10
+                    cands.append((fam, pos, sc))
+            cands.sort(key=lambda x: (-x[2], x[1]))
+            for fam, pos, _ in cands:
+                if any(f==fam for f,_ in spans): continue
+                spans.append((fam, (max(0,pos), min(len(t), pos+len(cv)))))
+        # genel "BAŞKAN" vs varsa geneli at
+        fams = [f for f,_ in spans]
+        if any(f in fams for f in ("divan_baskani","toplanti_baskani","yk_baskani")):
+            spans = [(f,xy) for f,xy in spans if f!="baskan"]
+        spans.sort(key=lambda kv: kv[1][0])
+        return spans
+
+    splitted = []
+    if apply_split:
+        for b in merged_blocks:
+            txt = b["txt"] or ""
+            # --- paragraf/dipnot bloklarını tamamen at ---
+            if is_paragraph_like(txt):
+                continue
+
+            spans = detect_roles_with_positions(txt)
+            fams = [fam for fam,_ in spans]
+
+            # tek/0 rol: bölme yok
+            if len(fams) <= 1:
+                nb = copy.deepcopy(b)
+                if fams: nb["role"] = fams[0]
+                splitted.append(nb)
+                continue
+
+            # split kararı
+            t_canon = canon(txt)
+            has_sep = bool(SEP_RE.search(t_canon))
+            spans_ok = True
+            for (_, (s1,e1)), (_, (s2,e2)) in zip(spans, spans[1:]):
+                if s2 - e1 < min_char_gap_between_roles:
+                    spans_ok = False; break
+            if require_separator_for_split and not has_sep:
+                spans_ok = False
+
+            if not spans_ok:
+                nb = copy.deepcopy(b); nb["role"] = fams[0]
+                splitted.append(nb)
+                continue
+
+            # parçalara böl (genişlik paylaştır)
+            N = len(fams)
+            x,y,x2,y2 = _xyxy(b)
+            W = x2 - x
+            needed = N*min_piece_w + (N-1)*gap_px
+            if needed > W:
+                if small_space_policy == "drop":
+                    continue
+                elif small_space_policy == "keep_unsplit":
+                    nb = copy.deepcopy(b); nb["role"]=fams[0]; splitted.append(nb); continue
+                else:
+                    gap = max(0, (W - N*min_piece_w)) // max(1,(N-1))
+            else:
+                gap = gap_px
+
+            usable = W - gap*(N-1)
+            base = usable // N
+            rem  = usable % N
+            cur_x = x
+            for i in range(N):
+                w_piece = max(min_piece_w, base + (1 if i < rem else 0))
+                nb = _rect(cur_x, y, w_piece, y2-y, txt=b["txt"], role=fams[i])
+                if sig_boxes:
+                    nb = _cap_bottom_to_sig_if_needed(nb, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+                splitted.append(nb)
+                if i < N-1:
+                    cur_x += w_piece + gap
+        if stage_debug: print(f"[STAGE] splitted(after split)={len(splitted)}")
+    else:
+        # split kapalıysa doğrudan geç
+        for b in merged_blocks:
+            txt = b["txt"] or ""
+            if is_paragraph_like(txt):
+                continue
+            splitted.append(copy.deepcopy(b))
+        if stage_debug: print(f"[STAGE] splitted(no-split)={len(splitted)}")
+
+    # ---------- 4) sermaye çakışmaları (opsiyonel) ----------
+    if apply_sermaye_filter and sermaye_boxes:
+        sb = [{"x":_get(s,"x"),"y":_get(s,"y"),"w":_get(s,"w"),"h":_get(s,"h")} for s in sermaye_boxes]
+        keep = []
+        for b in splitted:
+            if any(_iou(b, s) >= 0.08 for s in sb):
+                continue
+            keep.append(b)
+        splitted = keep
+        if stage_debug: print(f"[STAGE] after sermaye_filter={len(splitted)} (applied=True)")
+    else:
+        if stage_debug: print(f"[STAGE] after sermaye_filter={len(splitted)} (applied=False)")
+
+    # ---------- 5) FINAL: role-bilinçli containment dedup ----------
+    def _final_containment_dedup_role_aware(boxes: list, pad: int = 1) -> list:
+        def area(b): return max(1, int(b["w"])) * max(1, int(b["h"]))
+        role_to_idxs = defaultdict(list)
+        for i, b in enumerate(boxes):
+            role_to_idxs[b.get("role")].append(i)
+        keep_flags = [True] * len(boxes)
+
+        # Her role grubu için containment bağlı bileşenlerde yalnızca en büyük kutu kalsın
+        for role, idxs in role_to_idxs.items():
+            n = len(idxs)
+            if n <= 1: 
+                continue
+            parent = {i: i for i in idxs}
+            def find(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+            def union(a, b):
+                ra, rb = find(a), find(b)
+                if ra != rb: parent[rb] = ra
+
+            contains_edge = set()
+            for a_i in range(n):
+                for b_i in range(a_i+1, n):
+                    i, j = idxs[a_i], idxs[b_i]
+                    bi, bj = boxes[i], boxes[j]
+                    ix1,iy1,ix2,iy2 = bi["x"],bi["y"],bi["x"]+bi["w"],bi["y"]+bi["h"]
+                    ox1,oy1,ox2,oy2 = bj["x"],bj["y"],bj["x"]+bj["w"],bj["y"]+bj["h"]
+                    inside_ij = (ix1 >= ox1 - pad) and (iy1 >= oy1 - pad) and (ix2 <= ox2 + pad) and (iy2 <= oy2 + pad)
+                    inside_ji = (ox1 >= ix1 - pad) and (oy1 >= iy1 - pad) and (ox2 <= ix2 + pad) and (oy2 <= iy2 + pad)
+                    if inside_ij or inside_ji:
+                        union(i, j); contains_edge.add((min(i,j), max(i,j)))
+
+            comps = {}
+            for i in idxs:
+                r = find(i); comps.setdefault(r, []).append(i)
+
+            for comp in comps.values():
+                comp_set = set(comp)
+                any_containment = any((u in comp_set and v in comp_set) for (u,v) in contains_edge)
+                if not any_containment:
+                    continue
+                keep_idx = max(comp, key=lambda k: area(boxes[k]))
+                for k in comp:
+                    keep_flags[k] = (k == keep_idx)
+
+        return [b for k, b in enumerate(boxes) if keep_flags[k]]
+
+    if stage_debug: print(f"[STAGE] before final_dedup={len(splitted)}")
+    splitted = _final_containment_dedup_role_aware(splitted, pad=1)
+    if stage_debug: print(f"[STAGE] after  final_dedup={len(splitted)}")
+
+    # (opsiyonel) çizim (sadece görsel amaçlı)
+    if lower_img is not None:
+        try:
+            import cv2
+            vis = lower_img.copy()
+            for b in splitted:
+                x,y,w,h = b["x"], b["y"], b["w"], b["h"]
+                cv2.rectangle(vis, (x, y), (x+w, y+h), (0,255,0), 2)
+        except Exception:
+            pass
+
+    # tuple formatında döndür
+    return [(b["x"], b["y"], b["w"], b["h"]) for b in splitted]
