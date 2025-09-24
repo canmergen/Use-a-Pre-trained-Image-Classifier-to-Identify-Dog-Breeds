@@ -1,7 +1,14 @@
 from typing import List, Tuple, Optional, Set, Dict
 
-# Tek fonksiyon — GÜNCEL: Rol→İmza merge, union başka bir ROL kutusuyla
-# en ufak ÖRTÜŞME (intersect) dahi yapıyorsa MERGE İPTAL (varsayılan).
+# Tek fonksiyon — GÜNCEL v2
+# “Rol ↓ İmza” merge yalnızca union başka bir ROL kutusuyla EN KÜÇÜK temas dahi yoksa yapılır.
+# Ayrıca artık TEKİLLEŞTİRME (dedup) KATEGORİ-BAĞIMSIZ yapılmıyor:
+#   - union’lar kendi içinde
+#   - kalan role’ler kendi içinde
+#   - imzalar kendi içinde
+#   - sermaye kutuları kendi içinde
+# dedup’ta KATEGORİLER ARASI merge YASAK → rol+imza union’ı yanındaki başka bir rol ile
+# sonradan birleşip “büyük bir sağ kutu”ya dönüşemez.
 
 def build_final_boxes_onceall(
     role_blocks: List[Tuple[int,int,int,int]],       # [(x,y,w,h)]
@@ -10,20 +17,19 @@ def build_final_boxes_onceall(
     *,
     include_unpaired_roles: bool = True,
     include_unpaired_sigs:  bool = True,
-    dedup_near_px: int = 2,
-    near_px: int = 2,
+    # eşleştirme parametreleri
     require_x_overlap: float = 0.10,                 # min yatay projeksiyon oranı
     max_vertical_gap: Optional[int] = None,          # None: sınırsız
-    block_mode: str = "any_overlap",                 # "any_overlap" | "center" | "iou" | "full"
-    iou_block_th: float = 0.10
+    # tekilleştirme toleransı (kategori içi)
+    dedup_near_px: int = 2
 ) -> Dict[str, List]:
     """
-    Çıktı:
+    Döner:
       {
         "final":   List[(x,y,w,h)],
         "pairs":   List[(role_idx, sig_idx)],
-        "roles":   List[(x,y,w,h)],
-        "sigs":    List[(x,y,w,h)],
+        "roles":   List[(x,y,w,h)],      # union’lar HARİÇ yalnızca kalan role’ler
+        "sigs":    List[(x,y,w,h)],      # union’lar HARİÇ yalnızca kalan imzalar
         "sermaye": List[(x,y,w,h)],
       }
     """
@@ -47,21 +53,6 @@ def build_final_boxes_onceall(
     def contains(big: BoxLTRB, small: BoxLTRB) -> bool:
         return (big[0] <= small[0]) and (big[1] <= small[1]) and (big[2] >= small[2]) and (big[3] >= small[3])
 
-    def area(bb: BoxLTRB) -> int:
-        return max(0, bb[2]-bb[0]) * max(0, bb[3]-bb[1])
-
-    def inter_box(a: BoxLTRB, b: BoxLTRB) -> Optional[BoxLTRB]:
-        l = max(a[0], b[0]); t = max(a[1], b[1]); r = min(a[2], b[2]); bm = min(a[3], b[3])
-        if r > l and bm > t: return (l,t,r,bm)
-        return None
-
-    def iou(a: BoxLTRB, b: BoxLTRB) -> float:
-        I = inter_box(a,b)
-        if not I: return 0.0
-        ai, bi = area(a), area(b)
-        ii = area(I)
-        return ii / float(ai + bi - ii + 1e-6)
-
     def x_overlap_ratio(a: BoxLTRB, b: BoxLTRB) -> float:
         l = max(a[0], b[0]); r = min(a[2], b[2])
         if r <= l: return 0.0
@@ -69,19 +60,11 @@ def build_final_boxes_onceall(
         min_w = max(1, min(a[2]-a[0], b[2]-b[0]))
         return float(inter_w) / float(min_w)
 
-    def center_inside(big: BoxLTRB, small: BoxLTRB) -> bool:
-        cx = (small[0] + small[2]) // 2
-        cy = (small[1] + small[3]) // 2
-        return (big[0] <= cx <= big[2]) and (big[1] <= cy <= big[3])
-
     def is_below(role: BoxLTRB, sig: BoxLTRB) -> bool:
         return sig[1] >= role[3]
 
     def vgap(role: BoxLTRB, sig: BoxLTRB) -> int:
         return max(0, sig[1] - role[3])
-
-    def touch_or_close(a: BoxLTRB, b: BoxLTRB, px: int) -> bool:
-        return not (a[2] < b[0]-px or b[2] < a[0]-px or a[3] < b[1]-px or b[3] < a[1]-px)
 
     def dedup_merge_close(boxes_ltrb: List[BoxLTRB], px: int) -> List[BoxLTRB]:
         if not boxes_ltrb: return []
@@ -97,7 +80,10 @@ def build_final_boxes_onceall(
                 for j in range(i+1, len(boxes)):
                     if used[j]: continue
                     b = boxes[j]
-                    if touch_or_close(a,b,px):
+                    # yalın yakınlık/temas (kategori içi!)
+                    touch = not (a[2] < b[0]-px or b[2] < a[0]-px or
+                                 a[3] < b[1]-px or b[3] < a[1]-px)
+                    if touch:
                         a = union(a,b)
                         used[j] = True
                         changed = True
@@ -106,7 +92,7 @@ def build_final_boxes_onceall(
             boxes = out
         return boxes
 
-    # ---------- normalize inputs ----------
+    # ---------- normalize ----------
     roles_l: List[BoxLTRB] = [to_ltrb(b) for b in (role_blocks or [])]
     sigs_l:  List[BoxLTRB] = [to_ltrb(b) for b in (sig_boxes or [])]
     serm_l:  List[BoxLTRB] = [to_ltrb(b) for b in (sermaye_boxes or [])]
@@ -115,12 +101,14 @@ def build_final_boxes_onceall(
     used_sigs:  Set[int] = set()
     pairs: List[Tuple[int,int]] = []
 
-    roles_out_l: List[BoxLTRB] = []
-    sigs_out_l:  List[BoxLTRB] = []
+    unions_l: List[BoxLTRB] = []   # rol∪imza kutuları
+    roles_rem_l: List[BoxLTRB] = []  # union’a girmeyen roller
+    sigs_rem_l:  List[BoxLTRB] = []  # union’a girmeyen imzalar
 
-    # ---------- 1) ROL → aşağı İMZA ile GÜVENLİ birleştirme ----------
+    # ---------- 1) ROL → aşağı İMZA ile güvenli birleştirme ----------
     for ri, r in enumerate(roles_l):
-        cands = []
+        # aday imzalar
+        best = None  # (score_tuple, si, s_ltrb, union_ltrb)
         for si, s in enumerate(sigs_l):
             if si in used_sigs: 
                 continue
@@ -131,69 +119,59 @@ def build_final_boxes_onceall(
             xo = x_overlap_ratio(r, s)
             if xo < require_x_overlap:
                 continue
-            score = (xo, -(vgap(r,s)), -(s[3]-s[1]))
-            cands.append((score, si, s, union(r,s)))
+            u = union(r, s)
 
-        if not cands:
-            continue
-
-        cands.sort(reverse=True)
-        _, best_si, best_s, best_union = cands[0]
-
-        # ---- BLOK KONTROLÜ: union başka bir ROL ile ilişki kuruyor mu? ----
-        blocks = False
-        for rj, other in enumerate(roles_l):
-            if rj == ri: 
+            # *** BLOK KONTROLÜ (EN KATI): union başka bir ROL ile en ufak KESİŞİM yapıyorsa IP TAL ***
+            blocked = False
+            for rj, other in enumerate(roles_l):
+                if rj == ri: 
+                    continue
+                if intersects(u, other):
+                    blocked = True; break
+            if blocked:
                 continue
-            if block_mode == "any_overlap":
-                if intersects(best_union, other):    # EN KATI: en ufak kesişim bile yasak
-                    blocks = True; break
-            elif block_mode == "center":
-                if center_inside(best_union, other):
-                    blocks = True; break
-            elif block_mode == "iou":
-                if iou(best_union, other) > iou_block_th:
-                    blocks = True; break
-            else:  # "full"
-                if contains(best_union, other):
-                    blocks = True; break
 
-        if blocks:
-            continue  # merge iptal
+            score = (xo, -(vgap(r,s)), -(s[3]-s[1]))  # daha iyi hizalanan ve daha yakın olan önce
+            if (best is None) or (score > best[0]):
+                best = (score, si, s, u)
 
-        # Merge serbest
-        roles_out_l.append(best_union)
-        used_roles.add(ri)
-        used_sigs.add(best_si)
-        pairs.append((ri, best_si))
+        if best is not None:
+            _, best_si, best_s, best_u = best
+            unions_l.append(best_u)
+            used_roles.add(ri)
+            used_sigs.add(best_si)
+            pairs.append((ri, best_si))
 
-    # ---------- 2) Eşleşmeyenleri (isteğe bağlı) ekle ----------
+    # ---------- 2) Eşleşmeyenleri kategoriye yaz ----------
     if include_unpaired_roles:
         for ri, r in enumerate(roles_l):
             if ri not in used_roles:
-                roles_out_l.append(r)
+                roles_rem_l.append(r)
 
     if include_unpaired_sigs:
         for si, s in enumerate(sigs_l):
             if si not in used_sigs:
-                sigs_out_l.append(s)
+                sigs_rem_l.append(s)
 
-    # ---------- 3) Sermaye kutularını ekle ----------
-    sermaye_out_l = serm_l[:] if serm_l else []
+    # ---------- 3) KATEGORİ İÇİ tekilleştirme ----------
+    unions_l    = dedup_merge_close(unions_l,    dedup_near_px)
+    roles_rem_l = dedup_merge_close(roles_rem_l, dedup_near_px)
+    sigs_rem_l  = dedup_merge_close(sigs_rem_l,  dedup_near_px)
+    serm_l      = dedup_merge_close(serm_l,      dedup_near_px)
 
-    # ---------- 4) Nihai set + tekilleştirme ----------
-    final_l = roles_out_l + sigs_out_l + sermaye_out_l
-    final_l = dedup_merge_close(final_l, dedup_near_px)
+    # ---------- 4) Nihai set (KATEGORİLER ARASI MERGE YOK) ----------
+    final_l = unions_l + roles_rem_l + sigs_rem_l + serm_l
 
+    # ---------- 5) Export ----------
     final_xywh = [to_xywh(b) for b in final_l]
-    roles_xywh = [to_xywh(b) for b in roles_out_l]
-    sigs_xywh  = [to_xywh(b) for b in sigs_out_l]
-    serm_xywh  = [to_xywh(b) for b in sermaye_out_l]
+    roles_xywh = [to_xywh(b) for b in roles_rem_l]
+    sigs_xywh  = [to_xywh(b) for b in sigs_rem_l]
+    serm_xywh  = [to_xywh(b) for b in serm_l]
 
     return {
         "final":   final_xywh,
         "pairs":   pairs,
-        "roles":   roles_xywh,
-        "sigs":    sigs_xywh,
+        "roles":   roles_xywh,     # union’lar hariç
+        "sigs":    sigs_xywh,      # union’lar hariç
         "sermaye": serm_xywh,
     }
