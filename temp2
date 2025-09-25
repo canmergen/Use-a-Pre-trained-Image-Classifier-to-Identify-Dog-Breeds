@@ -79,7 +79,7 @@ def build_per_box_df_onecall(
             "YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI","YÖNETİM KURULU BAŞI"
         ],
         "yk_uyesi": [
-            "YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"
+            "YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETIM KURULU UYELERI"
         ],
         "bakanlik_temsilcisi": [
             "BAKANLIK TEMSİLCİSİ","BAKANLIK TEMSILCISI","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"
@@ -103,25 +103,31 @@ def build_per_box_df_onecall(
         "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
     }
 
+    # gelişmiş rol skorlayıcı
     def _alias_score(T: str, alias: str) -> float:
         A = _norm_ocr(alias)
         s1 = fuzz.token_set_ratio(T, A) / 100.0
         s2 = fuzz.partial_ratio(T, A) / 100.0
         s3 = fuzz.ratio(T, A) / 100.0
         return 0.5*s1 + 0.35*s2 + 0.15*s3
-
     def _anchor_bonus(T: str, role: str) -> float:
         toks = set(T.split()); ach = ROLE_ANCHORS.get(role, set())
         if not ach: return 0.0
         cov = len(toks & ach) / len(ach)
         return 0.15 * cov
-
     def best_role_for_text(text: str, *, relax: bool=False):
         T = _norm_ocr(text)
         if not T:
             return (None, 0.0)
-        import re as _re
-        meeting_hit = 1 if _re.search(r"TOPLANTI\s+\S{0,6}\s+BASKAN[I]?", T) else 0
+
+        # güçlü desenler (örn. YÖNETİM KURULU ÜYE/ÜYELERİ)
+        if re.search(r"YONETIM\s+KURULU\s+UYE(LERI|SI)?", T):
+            return ("yk_uyesi", 0.99)
+        if re.search(r"TOPLANTI\s+\S{0,6}\s+BASKAN(I)?", T):
+            # toplantı/dîvan kalıbı
+            pass
+
+        meeting_hit = 1 if re.search(r"TOPLANTI\s+\S{0,6}\s+BASKAN[I]?", T) else 0
 
         scores = {}
         for role, aliases in ROLE_ALIASES.items():
@@ -136,7 +142,6 @@ def build_per_box_df_onecall(
         second_score = ranked[1][1] if len(ranked) > 1 else 0.0
         margin = best_score - second_score
 
-        # marj/threshold: roles bölgesinde daha toleranslı
         margin_thr = 0.08 if not relax else 0.05
         abs_thr = 0.85 if not relax else 0.70
         if margin < margin_thr and best_score < abs_thr:
@@ -161,7 +166,28 @@ def build_per_box_df_onecall(
             if n == 1: out.append(toks[0])
         return list(dict.fromkeys(out))
 
-    # --- ad + kısmi soyad ile known map ---
+    # --- çoklu isim eşleme: metnin tamamına karşı known_names taraması ---
+    def match_known_names_in_text(text: str, pool: List[str], thr: float) -> List[str]:
+        T = _norm_ocr(remove_role_words(text))
+        if not T or not pool: return []
+        hits = []
+        for kn in pool:
+            K = _norm_ocr(kn)
+            # metin içinde partial + token_set skorları
+            s1 = fuzz.partial_ratio(T, K) / 100.0
+            s2 = fuzz.token_set_ratio(T, K) / 100.0
+            score = 0.6*s1 + 0.4*s2
+            if score >= thr:
+                hits.append((kn, score))
+        # skorla sırala, tekrarları at
+        hits.sort(key=lambda x: -x[1])
+        out, seen = [], set()
+        for name, _ in hits:
+            if name not in seen:
+                seen.add(name); out.append(name)
+        return out
+
+    # ad + kısmi soyad güçlü kural (tek isim çıkarmada)
     def map_by_first_and_partial_last(text: str, pool: List[str]) -> Optional[str]:
         if not pool: return None
         toks = [t for t in re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", remove_role_words(text)) if len(t) >= 2]
@@ -180,20 +206,19 @@ def build_per_box_df_onecall(
                 best_combo, best_name = combo, kn
         return best_name
 
-    def map_to_known_fallback(name: str, pool: List[str], thr: float) -> Optional[str]:
-        if not pool: return None
-        best = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
-        if best and best[1] >= thr*100: return best[0]
-        return None
-
     def pick_name_from_text(text: str, pool: List[str]) -> Optional[str]:
+        multi = match_known_names_in_text(text, pool, name_sim_threshold)
+        if multi:
+            return "; ".join(multi)
         direct = map_by_first_and_partial_last(text, pool)
-        if direct: return direct
+        if direct:
+            return direct
+        # fallback: n-gram adayları (tek/çok)
         cands = raw_name_candidates(remove_role_words(text))
-        seen, chosen = set(), []
+        chosen, seen = [], set()
         for c in cands:
-            mapped = map_to_known_fallback(c, pool, name_sim_threshold)
-            name = mapped or c
+            mapped = process.extractOne(c, pool, scorer=fuzz.token_set_ratio)
+            name = mapped[0] if (mapped and mapped[1] >= name_sim_threshold*100) else c
             if name not in seen:
                 seen.add(name); chosen.append(name)
         return "; ".join(chosen) if chosen else None
@@ -300,7 +325,6 @@ def build_per_box_df_onecall(
                 if len(text1) > len(text0):
                     text_preview = re.sub(r"\s+"," ",text1)[:200]
                 amount_val = extract_amount_float(text1) or extract_amount_float(text_preview)
-            # tam sayı ise int, değilse float bırak
             if amount_val is not None and float(amount_val).is_integer():
                 amount_val = int(amount_val)
             name_in_box = amount_val
