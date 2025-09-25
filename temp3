@@ -1,405 +1,458 @@
-def build_per_box_df_onecall(
-    lower_img,
-    final_boxes,
+def run_role_pipeline_safe(
+    detected_boxes,              # [(x,y,w,h) | dict], OCR'dan gelen tüm kutular
+    ocr_texts,                   # [str], her kutunun metni (aynı sırada)
     *,
-    sig_boxes,
-    role_blocks,
-    sermaye_boxes,
-    known_names,
-    ocr_url: str,
-    lang: str = "tur+eng+lat",
-    role_threshold: float = 0.80,      # sadece loc!="roles" için kullanılır
-    name_sim_threshold: float = 0.82,  # isim benzerlik eşiği
+    sig_boxes=None,              # imza kutuları (opsiyonel)
+    sermaye_boxes=None,          # sermaye kutuları (opsiyonel)
+    lower_img=None,              # BGR/gri görsel (opsiyonel; split projeksiyon için faydalı)
+    # ---- augment (dikey birleştirme) ----
+    x_policy="max",              # "max" | "role"  (birleşimde genişlik)
+    min_x_overlap_ratio=0.06,    # rol-altı adayla x-örtüşme oranı eşiği
+    min_dy_px=0,                 # rol→isim min dikey fark
+    max_dy_px=260,               # rol→isim max dikey fark
+    require_name_below=True,     # rol altında kişi satırı zorunlu mu
+    # ---- split (çoklu rol ayırma; güvenli) ----
+    apply_split=True,
+    split_mode="projection",     # "projection" | "none"
+    split_min_piece_w=90,        # split parça min genişlik (px)
+    split_min_piece_h=28,        # split parça min yükseklik (px)
+    split_min_cover_ratio=0.55,  # parçaların toplam alanı / ebeveyn alanı
+    split_smooth_w=17,           # projeksiyon yumuşatma penceresi
+    split_min_gap=10,            # yakın vadileri grupla
+    # ---- alias & fuzzy ----
+    ROLE_ALIASES=None,           # None→default
+    fuzzy_enable=True,
+    fuzzy_score_thr=82,          # split ve detect için kullanılacak
+    detect_fuzzy_enable=True,
+    detect_fuzzy_thr=72,         # rol tespitinde tolerans
+    # ---- paragraf filtresi (güvenli) ----
+    apply_paragraph_filter=True,
+    para_min_len=260,
+    para_max_lines_for_non_para=12,
+    para_min_punct=10,
+    para_min_stopword_ratio=0.06,
+    para_min_avg_line_len=28,
+    # ---- sermaye filtresi (güvenli) ----
+    apply_sermaye_filter=True,
+    sermaye_center_iou_thr=0.20,   # merkez içerideyse bu IoU ile drop
+    sermaye_yov_iou_thr=(0.75, 0.12), # (y_overlap_ratio, IoU) birlikte olursa drop
+    # ---- son temizlik ----
+    apply_roleonly_cleanup=True,   # rol+isim varsa role-only'leri ata
+    stage_debug=True,
+    dbg=False,
+    return_dict=False
 ):
     """
-    - text_preview: roles -> ilgili role_block OCR; diğerleri -> final_box OCR (gerekirse fallback)
-    - name_in_box: HER ZAMAN text_preview bazlı.
-      * İsimler rollerden ÖNCEKİ metinden alınmaz (kırpılır).
-      * Çoklu isim destekli, sıra korunur, '; ' ile ayrılır.
-      * Gibberish/boilerplate metinler filtrelenir.
-      * known_names varsa, sadece havuzdan eşleşen isimler kabul edilir (gibberish'i kesmek için).
-    - sermaye: amount öncelik text_preview; fallback text0/text1.
+    Tek fonksiyon, dahili yardımcılarla.
     """
-    import re, json, base64, unicodedata
-    from typing import Any, Tuple, List, Dict, Optional
-    import numpy as np
-    import pandas as pd
-    import cv2, requests
-    from rapidfuzz import fuzz
 
-    # ---------- geometry ----------
-    def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
-        if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
-            x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
-        if isinstance(b, dict):
-            if all(k in b for k in ("x","y","w","h")):  return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-            if all(k in b for k in ("x0","y0","x1","y1")):  return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
-            if all(k in b for k in ("left","top","right","bottom")):  return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
-        return None
-    def _to_xyxy(b: Any) -> Tuple[int,int,int,int]:
-        x,y,w,h = _to_xywh(b); return (x, y, x+w, y+h)
-    def _iou(a, b) -> float:
-        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-        ix1,iy1 = max(ax1,bx1), max(ay1,by1); ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-        iw, ih = max(0, ix2-ix1), max(0, iy2-iy1); inter = iw*ih
-        if inter == 0: return 0.0
-        aarea = (ax2-ax1)*(ay2-ay1); barea = (bx2-bx1)*(by2-by1)
-        return inter / (aarea + barea - inter + 1e-9)
-    def _contains(outer, inner, pad=2) -> bool:
-        ox1,oy1,ox2,oy2 = outer; ix1,iy1,ix2,iy2 = inner
-        return (ix1 >= ox1-pad) and (iy1 >= oy1-pad) and (ix2 <= ox2+pad) and (iy2 <= oy2+pad)
-    def _any_overlap(a, group) -> bool:
-        for g in group:
-            if _iou(a, g) > 0 or _contains(a, g) or _contains(g, a): return True
-        return False
-    def _area(bxyxy) -> int:
-        x1,y1,x2,y2 = bxyxy
-        return max(0, x2-x1) * max(0, y2-y1)
-    def _xyxy_to_xywh(bxyxy: Tuple[int,int,int,int]) -> Tuple[int,int,int,int]:
-        x1,y1,x2,y2 = bxyxy
-        return (x1, y1, max(0, x2-x1), max(0, y2-y1))
+    # ---------- bağımlılıklar / yardımcılar ----------
+    import re, unicodedata, copy
+    from collections import defaultdict
 
-    # ---------- normalize ----------
-    def _strip_diac(s: str) -> str:
-        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def _U(s: str) -> str:
-        s = (s or "").upper(); return re.sub(r"\s+"," ",_strip_diac(s)).strip()
-    _OCR_SUBS = {"!":"I","|":"I","ı":"i","İ":"I","1":"I","l":"I","0":"O","€":"E"}
-    def _norm_ocr(s: str) -> str:
-        if not s: return ""
-        s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-        s = "".join(_OCR_SUBS.get(c, c) for c in s)
-        s = s.upper()
-        s = re.sub(r"[^A-Z0-9\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    try:
+        from rapidfuzz import fuzz
+        _FUZZY_OK = True
+    except Exception:
+        _FUZZY_OK = False
+        class _F:
+            @staticmethod
+            def partial_ratio(a,b): return 0
+            @staticmethod
+            def token_set_ratio(a,b): return 0
+        fuzz = _F()
 
-    # ---------- roles ----------
-    ROLE_ALIASES: Dict[str, List[str]] = {
-        "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
-        "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
-        "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI","YÖNETİM KURULU BAŞI"],
-        "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETİM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETİM KURULU UYELERI"],
-        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","BAKANLIK TEMSILCISI","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
-        "katip": ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-        "tutanak_yazmani": ["IUIANAK","TUTANAK YAZMANI","YAZMAN"],
-    }
-    ROLE_ANCHORS = {
-        "toplanti_baskani": {"TOPLANTI","BASKAN","BASKANI"},
-        "divan_baskani":    {"DIVAN","BASKANI"},
-        "yk_baskani":       {"YONETIM","KURULU","BASKANI","YK","BAŞKANI"},
-        "yk_uyesi":         {"YONETIM","KURULU","UYESI","UYE","UYELERI","YK"},
-        "bakanlik_temsilcisi": {"BAKANLIK","TEMSILCISI","TICARET"},
-        "katip": {"KATIP","KÂTIP","KATİP","OY","TOPLAMA","MEMURU"},
-        "tutanak_yazmani": {"TUTANAK","YAZMANI","YAZMAN"},
-    }
-    ROLE_PRIORITY = ["toplanti_baskani","divan_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","tutanak_yazmani"]
-    ROLE_TOKENS = set(sum([a.split() for v in ROLE_ALIASES.values() for a in v], [])) | {
-        "YÖNETİM","KURULU","ÜYE","ÜYELERİ","ÜYELER","ÜYESİ","BAŞKAN","BAŞKANI","KATİP","KÂTİP",
-        "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
-    }
-    ROLE_TOKENS_U = { _U(t) for t in ROLE_TOKENS }
+    def _get(b, k, d=None):
+        if isinstance(b, dict): return b.get(k, d)
+        if hasattr(b, k): return getattr(b, k)
+        if isinstance(b, (tuple, list)):
+            m = {"x":0,"y":1,"w":2,"h":3}
+            if k in m and len(b)>m[k]: return b[m[k]]
+        return d
 
-    # — rol öncesini buda —
-    ROLE_REGEX = re.compile(
-        r"(YÖNETİM\s+KURULU\s+BAŞKANI|YÖNETİM\s+KURULU\s+ÜYELERİ|YÖNETİM\s+KURULU\s+ÜYESİ|YK\s+BAŞKANI|DIVAN\s+BASKANI|DİVAN\s+BAŞKANI|TOPLANTI\s+BAŞKANI|OY\s+TOPLAMA\s+MEMURU|BAKANLIK\s+TEMSİLCİSİ)",
-        flags=re.IGNORECASE
+    def _as_xywh(b):
+        if isinstance(b, (tuple, list)) and len(b)>=4:
+            x,y,w,h = map(int, b[:4]); return x,y,w,h
+        return int(_get(b,"x",0)), int(_get(b,"y",0)), int(_get(b,"w",0)), int(_get(b,"h",0))
+
+    def _xyxy(b):
+        x,y,w,h = _as_xywh(b); return x,y,x+w,y+h
+
+    def _rect(x,y,w,h, txt="", role=None):
+        return {"x":int(x),"y":int(y),"w":int(w),"h":int(h),"txt":txt,"role":role}
+
+    def _area(b):
+        x,y,w,h = _as_xywh(b); return max(1,w)*max(1,h)
+
+    def _y_gap(top, bottom):
+        _,_,_,ty2 = _xyxy(top); _,by1,_,_ = _xyxy(bottom); return by1 - ty2
+
+    def _x_overlap_ratio(a,b):
+        ax1,_,ax2,_ = _xyxy(a); bx1,_,bx2,_ = _xyxy(b)
+        inter = max(0, min(ax2,bx2)-max(ax1,bx1))
+        base  = max(1, min(_get(a,"w"), _get(b,"w")))
+        return inter/base
+
+    def _iou(a,b):
+        ax1,ay1,ax2,ay2 = _xyxy(a); bx1,by1,bx2,by2 = _xyxy(b)
+        ix1,iy1,ix2,iy2 = max(ax1,bx1), max(ay1,by1), min(ax2,bx2), min(ay2,by2)
+        if ix2<=ix1 or iy2<=iy1: return 0.0
+        inter = (ix2-ix1)*(iy2-iy1)
+        area  = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+        return inter/max(1,area)
+
+    def _is_inside(inner, outer, pad=0):
+        ix1,iy1,ix2,iy2 = _xyxy(inner); ox1,oy1,ox2,oy2 = _xyxy(outer)
+        return (ix1>=ox1-pad) and (iy1>=oy1-pad) and (ix2<=ox2+pad) and (iy2<=oy2+pad)
+
+    def tr_upper(s):  return (s or "").replace("i","İ").replace("ı","I").upper()
+    def strip_diac(s): return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    def canon(s):     return re.sub(r"\s+"," ", tr_upper(strip_diac(s or ""))).strip()
+
+    TR = "A-Za-zÇĞİÖŞÜçğıöşü"
+    NAME_LINE_RE = re.compile(rf"\b[{TR}][{TR}'-]+\s+[{TR}][{TR}'-]+(\s+[{TR}][{TR}'-]+)?\b")
+    AD_SOYAD_HINT_RE = re.compile(r"\bad\s*[-:]?\s*soyad[ıi]?\b", re.I)
+
+    def looks_like_person_line(t):
+        if not t: return False
+        if sum(ch.isdigit() for ch in t) > 2 and "TC" not in t.upper():  # çok sayısal ise
+            return False
+        t_clean = " ".join(t.split())
+        if AD_SOYAD_HINT_RE.search(t_clean): 
+            return True
+        return bool(NAME_LINE_RE.search(t_clean))
+
+    def has_inline_name(txt):
+        if not txt: return False
+        letters = re.findall(rf"[{TR}]", txt)
+        if len("".join(letters)) < 4: return False
+        return bool(re.compile(rf"(?i)\b[{TR}]{{2,}}\b(?:[\s\W]+?\b[{TR}]{{2,}}\b)+").search(txt))
+
+    def _has_namey(b):  # block dict
+        t = b.get("txt","")
+        return looks_like_person_line(t) or has_inline_name(t)
+
+    # ---------- Güvenli paragraf filtresi ----------
+    ROLE_HINT_WORDS = (
+        "divan","başkan","baskan","oy toplama","katip","kâtip",
+        "yönetim kurulu","yonetim kurulu","üyesi","uyesi","genel kurul"
     )
-    def cut_before_first_role(text: str) -> str:
-        if not text: return text
-        m = ROLE_REGEX.search(text)
-        return text[m.start():] if m else text
+    NAME_HINT_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ][a-zçğıöşü']{2,}(?:\s+[A-ZÇĞİÖŞÜ][a-zçğıöşü']{2,}){0,2}\b")
+    TR_STOPWORDS = set("ve veya ancak çünkü fakat ile için gibi yani dahi bile hatta yalnız ayrıca sonra önce bunun bununla böylece".split())
 
-    # ---------- gibberish / token filtre ----------
-    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
-    _BAD_TOKEN = {"VE","VEYA","ILE","İLE"}
-    _NON_NAME_TOKENS = {
-        "TOPLANTIDA","HAZIR","BULUNAN","ŞİRKETİN","ŞİRKET","PAYLARIN","PAYLARI","TOPLAMI","TOPLAM",
-        "NİSAP","NİSABI","MEVCUT","ASGARİ","TİCARİ","MERKEZİ","ADANA","ANKARA","İSTANBUL","MAD","MADDE","SAYI",
-        "KARAR","GÜNDEM","HAKKINDA","HAKKINDAKİ","HANELİ","VERGİ","NO","NOSU","MERKEZ","ADRESİ"
+    def _tokenize(t): return re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", t)
+
+    def is_paragraph_like_v2(txt: str) -> bool:
+        if not apply_paragraph_filter or not txt: return False
+        raw = txt.strip(); t = " ".join(raw.split()); tl = t.lower()
+        # Whitelist: rol/isim ipuçları → paragraf değildir
+        if any(k in tl for k in ROLE_HINT_WORDS): return False
+        if NAME_HINT_RE.search(t): return False
+        # Dipnot paterni
+        if re.search(r"\(\*{1,}\)", t): return True
+        # Metrikler
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        n_lines = len(lines)
+        punct = sum(ch in '",.;:!?’“”()[]%—-' for ch in raw)
+        toks = list(_tokenize(tl))
+        stop = sum(w in TR_STOPWORDS for w in toks)
+        stop_ratio = (stop / max(1,len(toks)))
+        avg_line_len = sum(len(ln) for ln in lines) / max(1, n_lines)
+        # Karar
+        return bool(
+            (len(t) >= para_min_len and n_lines >= 4) or
+            (n_lines > para_max_lines_for_non_para) or
+            (punct >= para_min_punct and stop_ratio >= para_min_stopword_ratio and avg_line_len >= para_min_avg_line_len)
+        )
+
+    # ---------- Role alias ----------
+    ROLE_ALIASES_DEFAULT = {
+        "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
+        "tutanak_yazmani":     ["TUTANAK YAZMANI","YAZMAN"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI","YONETİM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YÖNETİM KURULU ÜYELERİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI"],
+        "katip":               ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
+        "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
     }
-    _NON_NAME_TOKENS_U = { _U(t) for t in _NON_NAME_TOKENS }
-    _VOWELS = set(list("AEIİOÖUÜaeıioöuü"))
-    def _has_vowel(s: str) -> bool:
-        return any(ch in _VOWELS for ch in s)
-    def _long_consonant_run(s: str, k: int = 5) -> bool:
-        run = 0
-        for ch in s:
-            if ch.isalpha() and ch.upper() not in _VOWELS:
-                run += 1
-                if run >= k: return True
-            else:
-                run = 0
-        return False
-    def is_gibberish_token(tok: str) -> bool:
-        U = _U(tok)
-        if U in ROLE_TOKENS_U or U in _NON_NAME_TOKENS_U: return True
-        if any(ch.isdigit() for ch in tok): return True
-        if len(tok) < 2 or len(tok) > 20: return True
-        if not _has_vowel(tok): return True
-        if _long_consonant_run(tok, k=5): return True
-        if re.search(r"[^\wÇĞİÖŞÜçğıöşü]", tok) and len(tok) <= 3: return True
-        return False
-    def filter_name_tokens(tokens: List[str]) -> List[str]:
-        return [t for t in tokens if (not is_gibberish_token(t)) and (_U(t) not in _BAD_TOKEN)]
+    if ROLE_ALIASES is None:
+        ROLE_ALIASES = ROLE_ALIASES_DEFAULT
+    ALL_KEY_STR = [s for vals in ROLE_ALIASES.values() for s in vals]
+    CANON_TO_FAM = {canon(s): fam for fam, vals in ROLE_ALIASES.items() for s in vals}
+    ALIASES_C = [(fam, canon(s)) for fam, vals in ROLE_ALIASES.items() for s in vals]
+    ALIASES_C.sort(key=lambda t: len(t[1]), reverse=True)
 
-    # ---------- role skoru ----------
-    def _alias_score(T: str, alias: str) -> float:
-        A = _norm_ocr(alias)
-        s1 = fuzz.token_set_ratio(T, A) / 100.0
-        s2 = fuzz.partial_ratio(T, A) / 100.0
-        s3 = fuzz.ratio(T, A) / 100.0
-        return 0.5*s1 + 0.35*s2 + 0.15*s3
-    def _anchor_bonus(T: str, role: str) -> float:
-        toks = set(T.split()); ach = ROLE_ANCHORS.get(role, set())
-        if not ach: return 0.0
-        cov = len(toks & ach) / len(ach)
-        return 0.15 * cov
-    def best_role_for_text(text: str):
-        T = _norm_ocr(text)
-        if not T: return (None, 0.0)
-        if re.search(r"\bYONETIM\s+KURULU\s+UYE(LERI|SI)\b", T): return ("yk_uyesi", 0.99)
-        if re.search(r"\bDIVAN\s+BASKAN[I]?\b", T):              return ("divan_baskani", 0.99)
-        meeting_hit = 1 if re.search(r"\bTOPLANTI\s+\S{0,6}\s+BASKAN[I]?\b", T) else 0
-        scores = {}
-        for role, aliases in ROLE_ALIASES.items():
-            s_alias = max(_alias_score(T, a) for a in aliases)
-            s = s_alias + _anchor_bonus(T, role)
-            if role == "toplanti_baskani" and meeting_hit: s += 0.08
-            scores[role] = s
-        ranked = sorted(scores.items(), key=lambda kv: (-kv[1], ROLE_PRIORITY.index(kv[0])))
-        return ranked[0]
-
-    # ---------- TCKN ----------
-    def find_tckn(text: str) -> Optional[str]:
-        m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", (text or "").replace(" ", ""))
-        return "; ".join(list(dict.fromkeys(m))) if m else None
-
-    # ---------- sermaye (float) ----------
-    _SEP = r"[.\,\s\u00A0\u202F\u2009]"
-    _CURR_WORDS = ("TL","TRY","EUR","EURO","₺","€")
-    _NUM_RE = re.compile(rf"(?<!\d)(\d{{1,3}}(?:{_SEP}\d{{3}})+|\d+)(?:{_SEP}?\d{{2}})?(?!\d)")
-    def _clean_amount_context(text: str) -> str:
-        if not text: return ""
-        t = text
-        for w in _CURR_WORDS: t = re.sub(rf"\b{w}\b", " ", t, flags=re.IGNORECASE)
-        t = t.replace("₺"," ").replace("€"," ").replace("\u00A0"," ").replace("\u202F"," ").replace("\u2009"," ")
-        return t
-    def _to_float_from_token(token: str) -> float | None:
-        s = token.replace("\u00A0"," ").replace("\u202F"," ").replace("\u2009"," ").strip().replace(" ","")
-        has_dot, has_com = "." in s, "," in s
-        if has_dot and has_com:
-            last = max(s.rfind("."), s.rfind(","))
-            if (len(s) - last - 1) == 2:
-                dec = s[last]; other = "," if dec=="." else "."
-                s = s.replace(other, "").replace(dec, ".")
-            else:
-                s = s.replace(".","").replace(",","")
-        else:
-            if s.count(",")==1 and len(s.split(",")[-1])==2: s = s.replace(",", ".")
-            else: s = s.replace(",", "")
-            if not (s.count(".")==1 and len(s.split(".")[-1])==2): s = s.replace(".","")
-        try: return float(s)
-        except Exception: return None
-    def extract_amount_float(text: str) -> float | None:
-        t = _clean_amount_context(text)
-        toks = _NUM_RE.findall(t)
+    # ---------- İmza alt limiti ----------
+    def _sig_limit_for_role_like(b_role, sigs, x_ov_thr=0.10):
+        if not sigs: return None
+        rx1,ry1,rx2,ry2 = _xyxy(b_role)
         best = None
-        for tok in toks:
-            v = _to_float_from_token(tok)
-            if v is None: continue
-            if (best is None) or (v > best): best = v
+        for s in sigs:
+            sx1,sy1,sx2,sy2 = _xyxy(s)
+            inter = max(0, min(rx2,sx2) - max(rx1,sx1))
+            base  = max(1, min(_get(b_role,"w"), _get(s,"w")))
+            xov   = inter/base
+            if sy1 >= ry1 and xov >= x_ov_thr:
+                if best is None or sy2 < best:
+                    best = sy2
         return best
 
-    # ---------- OCR ----------
-    def _ocr_remote_png(img_gray, *, psm: int, oem: int) -> str:
-        ok, buf = cv2.imencode(".png", img_gray)
-        if not ok: return ""
-        payload = {"image": base64.b64encode(buf.tobytes()).decode("ascii"), "lang": lang, "config": f"--psm {int(psm)} --oem {int(oem)}"}
-        try:
-            r = requests.post(ocr_url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=60)
-            r.raise_for_status(); j = r.json()
-            return (j.get("text") or "").strip()
-        except Exception:
-            return ""
-    def ocr_box(lower_img, xywh: Tuple[int,int,int,int], psm: int, oem: int) -> str:
-        x,y,w,h = xywh
-        crop = lower_img[max(0,y):y+h, max(0,x):x+w]
-        if crop is None or getattr(crop, "size", 0) == 0: return ""
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim==3 else crop
-        gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return _ocr_remote_png(bw, psm=psm, oem=oem)
+    def _cap_bottom_to_sig_if_needed(box, sigs, x_ov_thr=0.10):
+        lim = _sig_limit_for_role_like(box, sigs, x_ov_thr=x_ov_thr)
+        if lim is not None:
+            x,y,w,h = box["x"], box["y"], box["w"], box["h"]
+            box["h"] = max(1, min(y+h, lim) - y)
+        return box
 
-    # ---------- boxes ----------
-    final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
-    final_xyxy = [_to_xyxy(b) for b in final_xywh]
-    sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
-    role_xyxy  = [_to_xyxy(b) for b in (role_blocks or [])]
-    serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
-    known_pool = list(dict.fromkeys(known_names or []))
+    # ---------- INIT ----------
+    det_boxes = []
+    for b, t in zip(detected_boxes, ocr_texts):
+        x,y,w,h = _as_xywh(b)
+        det_boxes.append({"x":x,"y":y,"w":w,"h":h,"txt":(t or ""), "role":None, "inline_name":has_inline_name(t or "")})
+    if stage_debug: print(f"[STAGE] init_boxes={len(det_boxes)}")
 
-    def decide_psm_oem(loc: str) -> Tuple[int,int]:
-        if loc == "sermaye": return 1, 1
-        if loc == "roles":   return 11, 1
-        return 11, 1
+    # ---------- 1) ROLE DETECT ----------
+    role_boxes = []
+    for b in det_boxes:
+        raw = b["txt"] or ""
+        tU, tC = tr_upper(strip_diac(raw)), canon(raw)
 
-    # ---------- role-block seçimi ----------
-    def _best_role_block_for(bxyxy: Tuple[int,int,int,int]) -> Optional[Tuple[int,int,int,int]]:
-        if not role_xyxy: return None
-        inside = [r for r in role_xyxy if _contains(bxyxy, r, pad=2)]
-        if inside:
-            inside.sort(key=_area, reverse=True); return inside[0]
-        best, best_iou = None, 0.0
-        for r in role_xyxy:
-            i = _iou(bxyxy, r)
-            if i > best_iou: best, best_iou = r, i
-        return best if best_iou > 0 else None
+        fam = None
+        # exact / canonical
+        for s in ALL_KEY_STR:
+            if s in tU or canon(s) in tC:
+                fam = CANON_TO_FAM[canon(s)]; break
+        # fuzzy
+        if fam is None and detect_fuzzy_enable and _FUZZY_OK:
+            best = None
+            for s in ALL_KEY_STR:
+                sc = max(fuzz.partial_ratio(tC, canon(s)), fuzz.token_set_ratio(tC, canon(s)))
+                if sc >= detect_fuzzy_thr and (best is None or sc > best[0]):
+                    best = (sc, CANON_TO_FAM[canon(s)])
+            if best: fam = best[1]
 
-    # ---------- Çoklu & sıralı isim çıkarımı (DP + rol-öncesi kırp + gibberish + known match) ----------
-    def extract_names_multi_dp(text: str, pool: list[str], thr: float = 0.82, require_known_match: bool = True) -> List[str]:
-        if not text:
-            return []
-        text = cut_before_first_role(text)
+        if fam:
+            b["role"] = fam
+            role_boxes.append(b)
+            if dbg: print(f"[ROLE] {fam} @{b['x']},{b['y']},{b['w']},{b['h']} :: {raw[:80]}")
+    if stage_debug: print(f"[STAGE] role_boxes={len(role_boxes)}")
 
-        toks_all = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)]
-        toks = [(t,s,e) for (t,s,e) in toks_all if not is_gibberish_token(t)]
-        if not toks: return []
+    # ---------- 2) AUGMENT (rol + isim birleştirme, güvenli paragraf filtresi) ----------
+    pool = [b for b in det_boxes if b not in role_boxes]
+    merged_blocks, taken_ids, merged_rb_ids = [], set(), set()
 
-        windows = []
-        for L in (3,2):
-            for i in range(0, max(0, len(toks)-L+1)):
-                seg = toks[i:i+L]
-                wtxt = " ".join(t for (t,_,__) in seg)
-                g_rate = np.mean([is_gibberish_token(t) for (t,_,__) in seg])
-                if g_rate > 0.34:  # çok kirliyse at
+    for rb in sorted(role_boxes, key=lambda b: (b["y"], b["x"])):
+        sig_lim = _sig_limit_for_role_like(rb, sig_boxes, x_ov_thr=min_x_overlap_ratio) if sig_boxes else None
+        best, best_score = None, None
+        for cb in pool:
+            if id(cb) in taken_ids: continue
+            dy = _y_gap(rb, cb)
+            if dy < -min_dy_px: continue
+            if max_dy_px is not None and dy > max_dy_px: continue
+            if _x_overlap_ratio(rb, cb) < min_x_overlap_ratio: continue
+            # isim satırı şartı
+            if require_name_below and not _has_namey(cb): continue
+            # paragraf filtresi (güvenli)
+            if is_paragraph_like_v2(cb.get("txt","")): continue
+            # imza limiti
+            if sig_lim is not None:
+                _,_,_,cy2 = _xyxy(cb)
+                if cy2 > sig_lim: continue
+            score = (-abs(dy), _x_overlap_ratio(rb, cb))
+            if best_score is None or score > best_score:
+                best, best_score = cb, score
+
+        if best is not None:
+            rx1,ry1,rx2,ry2 = _xyxy(rb); cx1,cy1,cx2,cy2 = _xyxy(best)
+            ny1, ny2 = ry1, max(ry2, cy2)
+            if sig_lim is not None: ny2 = min(ny2, sig_lim)
+            if x_policy == "max": nx1, nx2 = min(rx1,cx1), max(rx2,cx2)
+            elif x_policy == "role": nx1, nx2 = rx1, rx2
+            else: nx1, nx2 = min(rx1,cx1), max(rx2,cx2)
+            merged = _rect(nx1, ny1, nx2-nx1, max(1, ny2-ny1), txt=f"{rb['txt']} + {best['txt']}", role=rb["role"])
+            if sig_boxes: merged = _cap_bottom_to_sig_if_needed(merged, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(merged); taken_ids.add(id(best)); merged_rb_ids.add(id(rb))
+        else:
+            only_role = _rect(rb["x"],rb["y"],rb["w"],rb["h"], txt=rb["txt"], role=rb["role"])
+            if sig_boxes: only_role = _cap_bottom_to_sig_if_needed(only_role, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+            merged_blocks.append(only_role)
+
+    # inline-name içeren role-only bloklar
+    for b in role_boxes:
+        if b.get("inline_name") and id(b) not in merged_rb_ids:
+            if not is_paragraph_like_v2(b.get("txt","")):
+                nb = _rect(b["x"],b["y"],b["w"],b["h"], txt=b["txt"], role=b["role"])
+                if sig_boxes: nb = _cap_bottom_to_sig_if_needed(nb, sig_boxes, x_ov_thr=min_x_overlap_ratio)
+                merged_blocks.append(nb)
+
+    if stage_debug: print(f"[STAGE] merged_blocks={len(merged_blocks)}")
+
+    # ---------- 2b) role-only cleanup ----------
+    if apply_roleonly_cleanup:
+        role_to_merged = {}
+        for b in merged_blocks:
+            if _has_namey(b) and b["role"] is not None:
+                role_to_merged.setdefault(b["role"], []).append(b)
+        cleaned = []
+        for b in merged_blocks:
+            is_role_only = (not _has_namey(b))
+            r = b["role"]
+            if is_role_only and r in role_to_merged:
+                drop = False
+                for big in role_to_merged[r]:
+                    if _is_inside(b, big, pad=1) or _iou(b, big) >= 0.75:
+                        drop = True; break
+                if drop: 
                     continue
-                s, mapped = 0.0, None
-                if pool:
-                    wN = _U(wtxt)
-                    best_sc, best_nm = 0.0, None
-                    for kn in pool:
-                        kN = _U(kn)
-                        sc = max(fuzz.ratio(wN, kN)/100.0, fuzz.partial_ratio(wN, kN)/100.0)  # sıra koruyan
-                        if sc > best_sc:
-                            best_sc, best_nm = sc, kn
-                    if best_sc >= thr:
-                        s += best_sc; mapped = best_nm
-                if 6 <= len(wtxt) <= 40: s += 0.10
-                if L == 3: s += 0.05
-                windows.append((seg[0][1], seg[-1][2], i, i+L-1, wtxt, mapped, s))
+            cleaned.append(b)
+        merged_blocks = cleaned
+    if stage_debug: print(f"[STAGE] after roleonly_cleanup={len(merged_blocks)} (applied={apply_roleonly_cleanup})")
 
-        if not windows: return []
+    # ---------- 3) Güvenli split (projeksiyon) ----------
+    splitted = []
+    if apply_split and split_mode == "projection":
+        import numpy as np
+        import cv2
 
-        windows.sort(key=lambda x: (x[3], x[0]))
-        n = len(windows)
-        p = []
-        for j in range(n):
-            ti = windows[j][2]
-            k = j-1
-            while k >= 0 and windows[k][3] >= ti:
-                k -= 1
-            p.append(k)
-        dp = [0.0]*n; take = [False]*n
-        for j in range(n):
-            tscore = windows[j][6] + (dp[p[j]] if p[j]>=0 else 0.0)
-            sscore = dp[j-1] if j>0 else 0.0
-            if tscore > sscore:
-                dp[j] = tscore; take[j] = True
-            else:
-                dp[j] = sscore
-        sel=[]; j=n-1
-        while j>=0:
-            if take[j]:
-                sel.append(j); j = p[j]
-            else:
-                j -= 1
-        sel = sel[::-1]
+        def _crop(img, b):
+            x,y,w,h = _as_xywh(b); return img[max(0,y):y+h, max(0,x):x+w]
 
-        names=[]
-        for j in sel:
-            txt = windows[j][5] if (pool and require_known_match) else (windows[j][5] or windows[j][4])
-            if not txt: continue
-            toks2 = filter_name_tokens(_NAME_TOKEN_RE.findall(txt))
-            if len(toks2) < 2:   # en az ad+soyad
+        def _bin_for_projection(img):
+            if img is None or (isinstance(img, (list, tuple)) and len(img)==0):
+                return None
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+            g = cv2.GaussianBlur(g, (3,3), 0)
+            _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+            return (th>0).astype("uint8")
+
+        for i, b in enumerate(merged_blocks):
+            t = b["txt"] or ""
+            if is_paragraph_like_v2(t):
                 continue
-            if any(len(t) == 1 for t in toks2):
+            if lower_img is None:
+                splitted.append(copy.deepcopy(b)); 
+                if dbg: print(f"[SPLIT] #{i}: no image -> keep original")
                 continue
-            nm = " ".join(toks2[:4])
-            if nm and all(fuzz.token_set_ratio(nm, ex) < 92 for ex in names):
-                names.append(nm)
-        return names
+            crop = _crop(lower_img, b)
+            bin_crop = _bin_for_projection(crop)
+            if bin_crop is None or bin_crop.size==0:
+                splitted.append(copy.deepcopy(b))
+                if dbg: print(f"[SPLIT] #{i}: bad crop -> keep original")
+                continue
+            prof = bin_crop.sum(axis=0).astype("float32")
+            if split_smooth_w>1:
+                k = np.ones(split_smooth_w, dtype="float32")/split_smooth_w
+                prof = np.convolve(prof, k, mode="same")
+            med = float(np.median(prof))
+            thr = 0.75*med
+            valleys = np.where(prof < thr)[0].tolist()
+            cuts = []
+            if valleys:
+                run=[valleys[0]]
+                for v in valleys[1:]:
+                    if v-run[-1] <= split_min_gap: run.append(v)
+                    else: cuts.append(int(np.mean(run))); run=[v]
+                cuts.append(int(np.mean(run)))
+                W = bin_crop.shape[1]
+                cuts = [c for c in cuts if 8 < c < W-8]
 
-    # ---------- loop ----------
-    rows = []
-    for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
-        loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
-        sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
+            if not cuts:
+                splitted.append(copy.deepcopy(b))
+                if dbg: print(f"[SPLIT] #{i}: no-cuts -> keep original")
+                continue
 
-        psm0, oem0 = decide_psm_oem(loc)
-        text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
+            xs = [0] + cuts + [bin_crop.shape[1]]
+            parts=[]
+            for j in range(len(xs)-1):
+                x1,x2 = xs[j], xs[j+1]
+                w_piece = x2-x1
+                if w_piece < split_min_piece_w: 
+                    continue
+                parts.append({"x":b["x"]+x1, "y":b["y"], "w":w_piece, "h":b["h"], "txt":b["txt"], "role":b["role"]})
 
-        if loc == "roles":
-            rb_xyxy = _best_role_block_for(b_xyxy)
-            if rb_xyxy is not None:
-                rb_xywh = _xyxy_to_xywh(rb_xyxy)
-                preview_src = ocr_box(lower_img, rb_xywh, psm=11, oem=1)
-                text_preview = re.sub(r"\s+"," ", preview_src)[:800]
+            cover = sum(_area(p) for p in parts) / max(1,_area(b))
+            if parts and cover >= split_min_cover_ratio and b["h"] >= split_min_piece_h:
+                splitted.extend(parts)
+                if dbg: print(f"[SPLIT] #{i}: accepted {len(parts)} parts (cover={cover:.2f})")
             else:
-                text_preview = re.sub(r"\s+"," ", text0)[:800]
-        else:
-            text_preview = re.sub(r"\s+"," ", text0)[:800]
+                splitted.append(copy.deepcopy(b))
+                if dbg:
+                    reason = "no-valid-part" if not parts else f"low-cover({cover:.2f})"
+                    print(f"[SPLIT] #{i}: {reason} -> keep original")
+        if stage_debug: print(f"[STAGE] splitted(after split)={len(splitted)}")
+    else:
+        # split kapalıysa veya mode=none ise
+        for b in merged_blocks:
+            if not is_paragraph_like_v2(b.get("txt","")):
+                splitted.append(copy.deepcopy(b))
+        if stage_debug: print(f"[STAGE] splitted(no-split)={len(splitted)}")
 
-        role_key, role_score = (None, 0.0)
-        if loc == "roles":
-            role_key, role_score = best_role_for_text(text0)
+    # ---------- 4) Sermaye filtresi (güvenli) ----------
+    def _center_inside(b, s):
+        cx = b["x"] + b["w"]//2; cy = b["y"] + b["h"]//2
+        return (s["x"] <= cx <= s["x"]+s["w"]) and (s["y"] <= cy <= s["y"]+s["h"])
+    def _y_overlap_ratio(b, s):
+        by1,by2 = b["y"], b["y"]+b["h"]; sy1,sy2 = s["y"], s["y"]+s["h"]
+        inter = max(0, min(by2,sy2) - max(by1,sy1))
+        base  = max(1, min(b["h"], s["h"]))
+        return inter/base
 
-        if (not text_preview) or len(text_preview) < 6:
-            text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-            if text1 and len(text1) > len(text_preview):
-                if loc == "roles":
-                    rk2, rs2 = best_role_for_text(text1)
-                    role_key, role_score = rk2, rs2
-                text_preview = re.sub(r"\s+"," ", text1)[:800]
+    if apply_sermaye_filter and sermaye_boxes:
+        sb = [{"x":_get(s,"x"),"y":_get(s,"y"),"w":_get(s,"w"),"h":_get(s,"h")} for s in sermaye_boxes]
+        keep=[]
+        for b in splitted:
+            drop=False
+            for s in sb:
+                iou = _iou(b,s); yov = _y_overlap_ratio(b,s)
+                if (_center_inside(b,s) and iou >= sermaye_center_iou_thr) or (yov >= sermaye_yov_iou_thr[0] and iou >= sermaye_yov_iou_thr[1]):
+                    drop=True; break
+            if not drop: keep.append(b)
+        splitted = keep
+        if stage_debug: print(f"[STAGE] after sermaye_filter={len(splitted)} (applied=True, safe)")
+    else:
+        if stage_debug: print(f"[STAGE] after sermaye_filter={len(splitted)} (applied=False)")
 
-        if loc == "sermaye":
-            amount_val = extract_amount_float(text_preview) or extract_amount_float(text0)
-            if amount_val is None:
-                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-                amount_val = extract_amount_float(text1)
-            if amount_val is not None and float(amount_val).is_integer():
-                amount_val = int(amount_val)
-            name_in_box = amount_val
-        else:
-            # isim + TCKN
-            tckn_p = find_tckn(text_preview)
-            multi = extract_names_multi_dp(text_preview, known_pool, thr=name_sim_threshold, require_known_match=bool(known_pool))
-            raw_name = "; ".join(multi) if multi else None
+    # ---------- 5) Role-bilinçli containment dedup ----------
+    def _final_containment_dedup_role_aware(boxes, pad=1):
+        def area(b): return max(1,int(b["w"])) * max(1,int(b["h"]))
+        role_to_idxs = defaultdict(list)
+        for i,b in enumerate(boxes): role_to_idxs[b.get("role")].append(i)
+        keep_flags = [True]*len(boxes)
+        for _, idxs in role_to_idxs.items():
+            if len(idxs)<=1: continue
+            parent = {i:i for i in idxs}
+            def find(i):
+                while parent[i]!=i:
+                    parent[i]=parent[parent[i]]; i=parent[i]
+                return i
+            def union(a,b):
+                ra,rb = find(a),find(b)
+                if ra!=rb: parent[rb]=ra
+            contains=set()
+            for a_i in range(len(idxs)):
+                for b_i in range(a_i+1,len(idxs)):
+                    i,j = idxs[a_i], idxs[b_i]
+                    bi,bj = boxes[i], boxes[j]
+                    inside_ij = _is_inside(bi,bj,pad); inside_ji = _is_inside(bj,bi,pad)
+                    if inside_ij or inside_ji:
+                        union(i,j); contains.add((min(i,j),max(i,j)))
+            comps={}
+            for i in idxs:
+                r=find(i); comps.setdefault(r,[]).append(i)
+            for comp in comps.values():
+                comp_set=set(comp)
+                any_containment = any((u in comp_set and v in comp_set) for (u,v) in contains)
+                if not any_containment: continue
+                keep_idx = max(comp, key=lambda k: area(boxes[k]))
+                for k in comp: keep_flags[k]=(k==keep_idx)
+        return [b for k,b in enumerate(boxes) if keep_flags[k]]
 
-            # yalnız temizlik (sıra korunur, ayraç korunur)
-            def sanitize_names_keep(raw_names: Optional[str], raw_text: str) -> Optional[str]:
-                if not (raw_names or raw_text): return None
-                parts = [p.strip() for p in re.split(r"[;]+", (raw_names or "")) if p.strip()]
-                if not parts: parts = [(raw_text or "").strip()]
-                cleaned=[]
-                for p in parts:
-                    toks = filter_name_tokens(_NAME_TOKEN_RE.findall(p))
-                    if not toks: continue
-                    cleaned.append(" ".join(toks[:4]))
-                # tekrarları azalt
-                out=[]
-                for c in cleaned:
-                    if all(fuzz.token_set_ratio(c, o) < 92 for o in out):
-                        out.append(c)
-                return "; ".join(out) if out else None
+    if stage_debug: print(f"[STAGE] before final_dedup={len(splitted)}")
+    splitted = _final_containment_dedup_role_aware(splitted, pad=1)
+    if stage_debug: print(f"[STAGE] after  final_dedup={len(splitted)}")
 
-            name_clean = sanitize_names_keep(raw_name, raw_name or text_preview)
-            name_in_box = (f"{name_clean} | {tckn_p}" if (name_clean and tckn_p) else (tckn_p if not name_clean else name_clean))
-
-        rows.append({
-            "i": i, "bbox": b_wh, "loc": loc, "sig": bool(sig),
-            "role_best": role_key, "role_score": float(role_score),
-            "name_in_box": name_in_box, "text_preview": text_preview
-        })
-
-    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
+    # ---------- Çıktı ----------
+    if return_dict:
+        return [dict(x=b["x"],y=b["y"],w=b["w"],h=b["h"],role=b.get("role"),txt=b.get("txt")) for b in splitted]
+    else:
+        return [(b["x"], b["y"], b["w"], b["h"]) for b in splitted]
