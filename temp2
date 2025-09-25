@@ -1,560 +1,286 @@
-def detect_merge_signatures_onecall(
-    img_bgr,
+def build_per_box_df_onecall_v2(
+    lower_img,
+    final_boxes,
     *,
-    top_k: int = 10,
-    include_stamps: bool = False,
-    near_px: int = 3,
-    debug: bool = False,
-    draw: bool = False,
-    draw_color=(255, 0, 0),
-    draw_title: str = "IMZALAR"
+    sig_boxes,
+    role_blocks,
+    sermaye_boxes,
+    known_names,
+    ocr_url: str,
+    lang: str = "tur+eng+lat",
+    role_threshold: float = 0.80,
+    name_sim_threshold: float = 0.82,
 ):
     """
-    Tek çağrıda imza kutularını tespit eder, filtreler ve birleştirir.
-    Girdi  : img_bgr (BGR, BGRA veya gri np.uint8)
-    Çıktı  : List[(x,y,w,h)]  -> final imza kutuları (orijinal ölçekte)
+    Tek fonksiyon: OCR (remote) + kutu analizi + per_box_df üretimi.
+    Geliştirmeler:
+      - known_names için ad+(kısmi)soyad bileşik eşleme
+      - sermaye kutusunda name_in_box = tutar
+    Dönüş: DataFrame[i, bbox, loc, sig, role_best, role_score, name_in_box, text_preview]
     """
-
-    # -- imports (fonksiyon self-contained)
-    import math
-    from typing import List, Tuple
+    # ---- imports ----
+    import re, json, base64, unicodedata
+    from typing import Any, Tuple, List, Dict, Optional
     import numpy as np
-    import cv2
+    import pandas as pd
+    import cv2, requests
+    from rapidfuzz import fuzz, process, utils as rf_utils
 
-    # ========= UTILITIES =========
+    # ---------- geometry ----------
+    def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
+        if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
+            x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
+        if isinstance(b, dict):
+            if all(k in b for k in ("x","y","w","h")):
+                return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+            if all(k in b for k in ("x0","y0","x1","y1")):
+                return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
+            if all(k in b for k in ("left","top","right","bottom")):
+                return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
+        return None
 
-    def _to_gray_any(img):
-        if img is None:
-            raise ValueError("img is None")
-        if img.dtype != np.uint8:
-            if img.dtype in (np.float32, np.float64):
-                img = np.clip(img, 0, 1)
-                img = (img * 255).astype(np.uint8)
+    def _to_xyxy(b: Any) -> Tuple[int,int,int,int]:
+        x,y,w,h = _to_xywh(b); return (x, y, x+w, y+h)
+
+    def _iou(a, b) -> float:
+        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
+        ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+        ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+        iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+        inter = iw * ih
+        if inter == 0: return 0.0
+        aarea = (ax2-ax1)*(ay2-ay1); barea = (bx2-bx1)*(by2-by1)
+        return inter / (aarea + barea - inter + 1e-9)
+
+    def _contains(outer, inner, pad=2) -> bool:
+        ox1,oy1,ox2,oy2 = outer; ix1,iy1,ix2,iy2 = inner
+        return (ix1 >= ox1-pad) and (iy1 >= oy1-pad) and (ix2 <= ox2+pad) and (iy2 <= oy2+pad)
+
+    def _any_overlap(a, group) -> bool:
+        for g in group:
+            if _iou(a, g) > 0 or _contains(a, g) or _contains(g, a): return True
+        return False
+
+    # ---------- text / roles / names ----------
+    def _strip_diac(s: str) -> str:
+        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    def _U(s: str) -> str:
+        s = (s or "").upper(); return re.sub(r"\s+"," ",_strip_diac(s)).strip()
+
+    ROLE_ALIASES: Dict[str, List[str]] = {
+        "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
+        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
+        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
+        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
+        "katip":               ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
+        "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
+        "tutanak_yazmani":     ["TUTANAK YAZMANI","YAZMAN"],
+    }
+    ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
+    ROLE_TOKENS = set(sum([a.split() for v in ROLE_ALIASES.values() for a in v], [])) | {
+        "YÖNETİM","KURULU","ÜYE","ÜYELERİ","ÜYELER","ÜYESİ","BAŞKAN","BAŞKANI","KATİP","KÂTİP",
+        "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
+    }
+
+    def best_role_for_text(text: str):
+        tU = _U(text)
+        def _score(alias: str) -> float: return fuzz.token_set_ratio(tU, _U(alias)) / 100.0
+        best_role, best_score = None, 0.0
+        for rk, aliases in ROLE_ALIASES.items():
+            sc = max(_score(a) for a in aliases)
+            if (sc > best_score) or (abs(sc-best_score) < 1e-6 and (best_role is None or ROLE_PRIORITY.index(rk) < ROLE_PRIORITY.index(best_role))):
+                best_role, best_score = rk, sc
+        return best_role, best_score
+
+    def remove_role_words(text: str) -> str:
+        toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)
+        toks = [t for t in toks if _U(t) not in ROLE_TOKENS]
+        return " ".join(toks)
+
+    def raw_name_candidates(text: str) -> List[str]:
+        t = text.replace("\n"," ")
+        segs = [p.strip() for p in re.split(r"\s*(?:[,;/]| ve )\s*", t, flags=re.IGNORECASE) if p.strip()]
+        out: List[str] = []
+        for seg in segs:
+            toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", seg)
+            if not toks: continue
+            n = len(toks)
+            for L in (3,2):
+                for i in range(max(0, n-L+1)): out.append(" ".join(toks[i:i+L]))
+            if n == 1: out.append(toks[0])
+        return list(dict.fromkeys(out))
+
+    # --- yeni: ad + kısmi soyad ile known map ---
+    def map_by_first_and_partial_last(text: str, pool: List[str]) -> Optional[str]:
+        if not pool: return None
+        toks = [t for t in re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", remove_role_words(text)) if len(t) >= 2]
+        if not toks: return None
+        # metinden muhtemel "ad" tokenları
+        first_tokens = toks[:3]  # ilk birkaç kelime en kuvvetli sinyal olur
+        best_name, best_combo = None, 0.0
+        for kn in pool:
+            parts = [p for p in kn.split() if p]
+            if not parts: continue
+            k_first, k_last = parts[0], parts[-1]
+            # ad skoru: token set içinde en iyi eş *yüksek* olmalı
+            ad_scores = [fuzz.token_set_ratio(_U(ft), _U(k_first))/100.0 for ft in first_tokens]
+            ad_score = max(ad_scores) if ad_scores else 0.0
+            # soyad skoru: partial (prefix/substring) toleranslı
+            # örn. BOZGEYIK vs BOZGEYIK, BOZGEY gibi
+            last_score = fuzz.partial_ratio(_U(" ".join(toks)), _U(k_last))/100.0
+            combo = 0.7*ad_score + 0.3*last_score
+            if ad_score >= 0.85 and last_score >= 0.60 and combo > best_combo:
+                best_combo, best_name = combo, kn
+        return best_name
+
+    def map_to_known_fallback(name: str, pool: List[str], thr: float) -> Optional[str]:
+        if not pool: return None
+        best = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
+        if best and best[1] >= thr*100: return best[0]
+        return None
+
+    def pick_name_from_text(text: str, pool: List[str]) -> Optional[str]:
+        # 1) güçlü kural: ad + kısmi soyad
+        direct = map_by_first_and_partial_last(text, pool)
+        if direct: return direct
+        # 2) adaylardan fuzzy
+        cands = raw_name_candidates(remove_role_words(text))
+        seen, chosen = set(), []
+        for c in cands:
+            mapped = map_to_known_fallback(c, pool, name_sim_threshold)
+            name = mapped or c
+            if name not in seen:
+                seen.add(name); chosen.append(name)
+        return "; ".join(chosen) if chosen else None
+
+    def find_tckn(text: str) -> Optional[str]:
+        m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", text.replace(" ", ""))
+        return "; ".join(list(dict.fromkeys(m))) if m else None
+
+    # --- sermaye tutar çıkarımı ---
+    _NUM_RE = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d{2})?(?!\d)")
+    def extract_amount(text: str) -> Optional[str]:
+        # para ile ilgili kelimeleri taşıyan satırlar daha ağırlıklı kabul edilir
+        t = _U(text)
+        nums = _NUM_RE.findall(text)
+        if not nums: return None
+        # sayıları normalize et → saf sayı kıyaslaması
+        def _to_float(s):
+            s = s.replace(" ", "")
+            # 1.234.567,89 veya 1,234,567.89
+            if s.count(",") > 0 and s.count(".") > 0:
+                if s.rfind(",") > s.rfind("."):
+                    s = s.replace(".", "").replace(",", ".")
+                else:
+                    s = s.replace(",", "")
             else:
-                img = img.astype(np.uint8)
-        if img.ndim == 2:
-            return img
-        if img.ndim == 3 and img.shape[2] == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if img.ndim == 3 and img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-        raise ValueError(f"Unsupported image shape: {img.shape}")
+                # tek ayraç varsa: binlik mi ondalık mı heuristik
+                if s.count(",") == 1 and len(s.split(",")[-1]) == 2:
+                    s = s.replace(",", ".")
+                else:
+                    s = s.replace(",", "")
+            try:
+                return float(s)
+            except Exception:
+                return None
+        pairs = [(n, _to_float(n)) for n in nums]
+        pairs = [(raw, val) for (raw,val) in pairs if val is not None]
+        if not pairs: return None
+        # en büyük değer genelde toplamdır
+        raw, _ = max(pairs, key=lambda x: x[1])
+        return raw
 
-    def _resize_keep_aspect(img, target_h: int):
-        h, w = img.shape[:2]
-        scale = target_h / float(h)
-        if abs(scale - 1.0) < 1e-3:
-            return img.copy(), 1.0
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR), scale
+    # ---------- OCR (endpoint payload: image + config) ----------
+    def _ocr_remote_png(img_gray, *, psm: int, oem: int) -> str:
+        ok, buf = cv2.imencode(".png", img_gray)
+        if not ok: return ""
+        payload = {"image": base64.b64encode(buf.tobytes()).decode("ascii"),
+                   "lang": lang,
+                   "config": f"-psm {int(psm)} -oem {int(oem)}"}
+        try:
+            r = requests.post(ocr_url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=60)
+            r.raise_for_status()
+            j = r.json()
+            return (j.get("text") or "").strip()
+        except Exception:
+            return ""
 
-    def _binarize_clahe(gray):
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        g2 = clahe.apply(gray)
-        g2 = cv2.GaussianBlur(g2, (3, 3), 0)
-        _, bw = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return 255 - bw  # ink=255
+    def ocr_box(lower_img, xywh: Tuple[int,int,int,int], psm: int, oem: int) -> str:
+        x,y,w,h = xywh
+        crop = lower_img[max(0,y):y+h, max(0,x):x+w]
+        if crop is None or getattr(crop, "size", 0) == 0: return ""
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return _ocr_remote_png(bw, psm=psm, oem=oem)
 
-    def _remove_lines(ink):
-        work = ink.copy()
-        edges = cv2.Canny(work, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=120, minLineLength=80, maxLineGap=4)
-        if lines is not None:
-            for x1, y1, x2, y2 in lines[:, 0]:
-                cv2.line(work, (x1, y1), (x2, y2), 0, 5)
-        return work
+    # ---------- kutular ----------
+    final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
+    final_xyxy = [_to_xyxy(b) for b in final_xywh]
+    sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
+    role_xyxy  = [_to_xyxy(b) for b in (role_blocks or [])]
+    serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
+    known_pool = list(dict.fromkeys(known_names or []))
 
-    def _morph_refine(ink, dilate_iter: int = 0):
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        m = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k_close, 1)
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k_open, 1)
-        if dilate_iter > 0:
-            k_d = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            m = cv2.dilate(m, k_d, iterations=dilate_iter)
-        return m
+    def decide_psm_oem(loc: str) -> Tuple[int,int]:
+        if loc == "sermaye": return 1, 1
+        if loc == "roles":   return 11, 1
+        return 11, 1
 
-    def _estimate_min_area(mask):
-        binm = (mask > 0).astype(np.uint8)
-        num, _, stats, _ = cv2.connectedComponentsWithStats(binm, connectivity=8)
-        areas, dims = [], []
-        for i in range(1, num):
-            x, y, w, h, a = stats[i]
-            if w > 1 and h > 1:
-                areas.append(int(a))
-                dims.append((w, h))
-        if not areas:
-            return 96
-        areas = np.array(areas, np.float32)
-        loga = np.log(areas + 1.0).astype(np.float32)
-        loga_norm = cv2.normalize(loga, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        otsu, _ = cv2.threshold(loga_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        alpha = float(otsu) / 255.0
-        log_thr = float(loga.min()) + (float(loga.max()) - float(loga.min())) * alpha
-        area_otsu = max(1.0, float(np.exp(log_thr) - 1.0))
-        dims_arr = np.array(dims, np.float32)
-        sw_est = float(np.median(dims_arr.min(1)))
-        area_floor = (max(1.0, sw_est) * 6.0) ** 2
-        return int(max(area_otsu * 1.3, area_floor, 96.0))
+    # ---------- ana döngü ----------
+    rows = []
+    for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
+        loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
+        sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
 
-    def _component_features(mask, x, y, w, h):
-        roi = mask[y:y + h, x:x + w]
-        area = int(np.count_nonzero(roi))
-        ink_ratio = area / float(max(1, w * h))
-        cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return area, ink_ratio, 1.0, 1.0
-        cnt = max(cnts, key=cv2.contourArea)
-        hull = cv2.convexHull(cnt)
-        ca = cv2.contourArea(cnt)
-        ha = max(1.0, cv2.contourArea(hull))
-        solidity = ca / ha
-        per = cv2.arcLength(cnt, True)
-        circularity = (4.0 * math.pi * ca) / (per * per + 1e-6)
-        return area, ink_ratio, solidity, circularity
+        psm0, oem0 = decide_psm_oem(loc)
+        text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
+        text_preview = re.sub(r"\s+"," ",text0)[:200]
 
-    def _nms_xyxy_local(boxes_xyxy: np.ndarray, scores: np.ndarray, iou_thr: float = 0.25):
-        if boxes_xyxy.size == 0:
-            return []
-        x1, y1, x2, y2 = boxes_xyxy.T
-        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = scores.argsort()[::-1]
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-            w = np.maximum(0, xx2 - xx1 + 1)
-            h = np.maximum(0, yy2 - yy1 + 1)
-            inter = w * h
-            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            inds = np.where(iou <= iou_thr)[0]
-            order = order[inds + 1]
-        return keep
+        role_key, role_score = best_role_for_text(text0)
+        role_best = role_key if (role_score >= role_threshold or loc=="roles") else None
 
-    def _binarize_union(gray, target_h: int):
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        g = clahe.apply(gray)
-        g = cv2.GaussianBlur(g, (3, 3), 0)
-        _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        otsu = 255 - otsu
-        adp = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 7)
-        k = max(21, int(round(target_h / 64)))
-        if k % 2 == 0:
-            k += 1
-        bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
-        _, bh = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return np.maximum(np.maximum(otsu, adp), bh)
+        # --- sermaye: amount yakala ve direkt yaz ---
+        if loc == "sermaye":
+            amount = extract_amount(text0)
+            # fallback: okunmadıysa (1,1) ile tekrar dene
+            if not amount:
+                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
+                if len(text1) > len(text0): text_preview = re.sub(r"\s+"," ",text1)[:200]
+                amount = extract_amount(text1)
+            name_in_box = amount
+        else:
+            # --- kişi adı çıkarımı + TCKN
+            name1 = pick_name_from_text(text0, known_pool)
+            tckn0 = find_tckn(text0)
 
-    def _estimate_char_h(bin_img):
-        num, _, st, _ = cv2.connectedComponentsWithStats((bin_img > 0).astype(np.uint8), 8)
-        hs = []
-        for i in range(1, num):
-            x, y, w, h, a = st[i]
-            if 3 <= h <= 60 and 3 <= w <= 60:
-                hs.append(h)
-        if not hs:
-            return 12.0
-        return float(np.percentile(np.array(hs), 60))
+            # Fallback OCR (isim zayıf/boş)
+            need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
+            if need_fallback:
+                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
+                if text1 and (len(text1) > len(text0) or not name1):
+                    role_key2, role_score2 = best_role_for_text(text1)
+                    if role_score2 > role_score:
+                        role_key, role_score = role_key2, role_score2
+                        role_best = role_key if (role_score >= role_threshold or loc=="roles") else role_best
+                    name2 = pick_name_from_text(text1, known_pool)
+                    if name2: name1 = name2
+                    tckn1 = find_tckn(text1)
+                    if tckn1: tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
+                    if len(text1) > len(text0):
+                        text_preview = re.sub(r"\s+"," ",text1)[:200]
 
-    def _edge_orientation_entropy(roi_gray):
-        gx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(roi_gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
-        mask = mag > np.percentile(mag, 60)
-        ang = ang[mask]
-        if ang.size == 0:
-            return 0.0
-        hist, _ = np.histogram(ang, bins=16, range=(0, 2 * np.pi), density=True)
-        hist = hist + 1e-8
-        return float(-np.sum(hist * np.log(hist)))  # [0..ln(16)]
+            name_in_box = (name1 + " | " + tckn0) if (name1 and tckn0) else (tckn0 or name1)
 
-    def _stroke_stats(roi_bin):
-        dt = cv2.distanceTransform((roi_bin > 0).astype(np.uint8), cv2.DIST_L2, 3)
-        vals = dt[dt > 0] * 2.0
-        if vals.size == 0:
-            return 0.0, 0.0
-        return float(vals.mean()), float(vals.std())
+        rows.append({
+            "i": i,
+            "bbox": b_wh,
+            "loc": loc,
+            "sig": bool(sig),
+            "role_best": role_best,
+            "role_score": float(role_score),
+            "name_in_box": name_in_box,
+            "text_preview": text_preview
+        })
 
-    def _is_single_text_row(roi_bin, est_char_h):
-        if roi_bin.size == 0:
-            return False
-        h, w = roi_bin.shape[:2]
-        binm = (roi_bin > 0).astype(np.uint8)
-        k = max(1, int(round(est_char_h * 0.10)))
-        merged = cv2.dilate(binm, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)), iterations=1)
-        num, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
-        small_words = 0
-        for i in range(1, num):
-            x, y, ww, hh, a = stats[i]
-            if ww < 0.30 * w and hh < 1.6 * est_char_h:
-                small_words += 1
-        return bool(small_words >= 3 and h <= 1.8 * est_char_h)
-
-    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_thr=0.25):
-        if boxes.size == 0:
-            return []
-        x1, y1, x2, y2 = boxes.T
-        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = scores.argsort()[::-1]
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-            w = np.maximum(0, xx2 - xx1 + 1)
-            h = np.maximum(0, yy2 - yy1 + 1)
-            inter = w * h
-            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            inds = np.where(iou <= iou_thr)[0]
-            order = order[inds + 1]
-        return keep
-
-    # ========= CORE STEPS =========
-
-    def _detect_once(img, *, target_height, min_aspect, max_aspect, dilate_iter,
-                     min_area_scale, min_ink_ratio, nms_iou):
-        work, scale = _resize_keep_aspect(img, target_height)
-        gray = _to_gray_any(work)
-        ink = _binarize_clahe(gray)         # ink=255
-        ink = _remove_lines(ink)
-        ink = _morph_refine(ink, dilate_iter)
-
-        min_area = int(max(32, _estimate_min_area(ink)) * float(min_area_scale))
-        H, W = ink.shape[:2]
-        page_area = H * W
-
-        num, _, stats, _ = cv2.connectedComponentsWithStats((ink > 0).astype(np.uint8), 8)
-        cand_xyxy, cand_scores = [], []
-
-        for i in range(1, num):
-            x, y, w, h, a = stats[i]
-            if w <= 2 or h <= 2:
-                continue
-            A = w * h
-            if A < min_area or A > 0.40 * page_area:
-                continue
-            aspect = w / float(h)
-            if not (min_aspect <= aspect <= max_aspect):
-                continue
-            area, ink_ratio, solidity, circularity = _component_features(ink, x, y, w, h)
-            if ink_ratio < min_ink_ratio:
-                continue
-            per = max(1e-6, 2 * (w + h))
-            iq = (4.0 * math.pi * area) / (per * per)
-            complexity = 1.0 - min(1.0, iq)
-            score = float(ink_ratio * (0.6 * complexity + 0.4 * (1.0 - min(1.0, circularity))))
-            cand_xyxy.append((x, y, x + w, y + h))
-            cand_scores.append(score)
-
-        if not cand_xyxy:
-            return []
-
-        cand_xyxy = np.array(cand_xyxy, np.int32)
-        cand_scores = np.array(cand_scores, np.float32)
-        keep = _nms_xyxy_local(cand_xyxy, cand_scores, iou_thr=nms_iou)
-        cand_xyxy = cand_xyxy[keep]
-
-        inv = 1.0 / scale
-        out = []
-        for (x1, y1, x2, y2) in cand_xyxy:
-            x = int(round(x1 * inv))
-            y = int(round(y1 * inv))
-            w = int(round((x2 - x1) * inv))
-            h = int(round((y2 - y1) * inv))
-            out.append((x, y, w, h))
-        return out
-
-    def _detect_signatures_pro(img):
-        H, W = img.shape[:2]
-        scales = [1600, 2000, 2400] if H >= 1800 else [1400, 1700, 2000]
-        cfgs = []
-
-        # normal
-        for th in scales:
-            cfgs.append(dict(target_height=th, min_aspect=0.6, max_aspect=22.0,
-                             dilate_iter=0, min_area_scale=1.0, min_ink_ratio=0.010, nms_iou=0.15))
-        # agresif
-        for th in scales:
-            cfgs.append(dict(target_height=th, min_aspect=0.5, max_aspect=22.0,
-                             dilate_iter=1, min_area_scale=0.7, min_ink_ratio=0.006, nms_iou=0.15))
-        # ultra
-        cfgs.append(dict(target_height=max(2600, int(1.2 * H)), min_aspect=0.35, max_aspect=22.0,
-                         dilate_iter=3, min_area_scale=0.35, min_ink_ratio=0.0025, nms_iou=0.15))
-
-        all_boxes: List[Tuple[int, int, int, int]] = []
-        for p in cfgs:
-            all_boxes += _detect_once(img, **p)
-
-        if not all_boxes:
-            return []
-
-        xyxy = np.array([(x, y, x + w, y + h) for (x, y, w, h) in all_boxes], np.int32)
-        shrunk = xyxy.copy()
-        shrunk[:, 0] += 2; shrunk[:, 1] += 2
-        shrunk[:, 2] -= 2; shrunk[:, 3] -= 2
-        shrunk[:, 0] = np.maximum(shrunk[:, 0], 0)
-        shrunk[:, 1] = np.maximum(shrunk[:, 1], 0)
-        shrunk[:, 2] = np.maximum(shrunk[:, 2], shrunk[:, 0] + 1)
-        shrunk[:, 3] = np.maximum(shrunk[:, 3], shrunk[:, 1] + 1)
-
-        keep = _nms_xyxy_local(shrunk, np.ones(len(shrunk), np.float32), iou_thr=0.15)
-        xyxy_kept = xyxy[keep]
-        return [(int(x1), int(y1), int(x2 - x1), int(y2 - y1)) for (x1, y1, x2, y2) in xyxy_kept]
-
-    def _keep_top_signatures(img, boxes, top_k: int = 3):
-        if not boxes:
-            return []
-        H, W = img.shape[:2]
-        gray = _to_gray_any(img)
-        ink = _binarize_union(gray, target_h=max(1600, H))
-        ch = _estimate_char_h(ink)
-        page_area = H * W
-        scored = []
-        for (x, y, w, h) in boxes:
-            if w < 8 or h < 8:
-                continue
-            A = w * h
-            if A < 0.0015 * page_area or A > 0.20 * page_area:
-                continue
-            aspect = w / float(h)
-            if aspect > 14.0 or aspect < 0.6:
-                continue
-            roi_bin = ink[y:y + h, x:x + w]
-            roi_g = gray[y:y + h, x:x + w]
-            if roi_bin.size == 0:
-                continue
-
-            # agresif metin filtresi
-            if h < 1.2 * ch:
-                continue
-            if h < 1.6 * ch and aspect > 6.0:
-                continue
-            if _is_single_text_row(roi_bin, ch):
-                continue
-
-            ink_ratio = float(np.count_nonzero(roi_bin)) / float(A)
-            if not (0.003 <= ink_ratio <= 0.35):
-                continue
-
-            cnts, _ = cv2.findContours(roi_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not cnts:
-                continue
-            cnt = max(cnts, key=cv2.contourArea)
-            ca = cv2.contourArea(cnt)
-            per = cv2.arcLength(cnt, True)
-            iq = (4.0 * math.pi * ca) / (per * per + 1e-6)
-            complexity = max(0.0, 1.0 - iq)
-            mean_sw, std_sw = _stroke_stats(roi_bin)
-            sw_var = std_sw / (mean_sw + 1e-6)
-            ent = _edge_orientation_entropy(roi_g)
-            ent_n = min(1.0, ent / math.log(16))
-            if complexity < 0.22 or sw_var < 0.25 or ent_n < 0.25:
-                continue
-
-            cy = y + h / 2.0
-            loc_w = 0.8 if cy < 0.45 * H else 1.0
-            score = loc_w * (
-                0.60 * complexity +
-                0.25 * min(1.5, sw_var) / 1.5 +
-                0.10 * min(1.0, ink_ratio / 0.12) +
-                0.05 * ent_n
-            )
-            scored.append((score, (x, y, w, h)))
-
-        if not scored:
-            return []
-        scored.sort(key=lambda t: t[0], reverse=True)
-        order_boxes = [b for _, b in scored]
-
-        xyxy = np.array([(x, y, x + w, y + h) for (x, y, w, h) in order_boxes], np.int32)
-        def _shrink_xyxy(a: np.ndarray, pad: int = 2) -> np.ndarray:
-            b = a.copy()
-            b[:, 0] += pad; b[:, 1] += pad
-            b[:, 2] -= pad; b[:, 3] -= pad
-            b[:, 0] = np.minimum(b[:, 0], b[:, 2] - 1)
-            b[:, 1] = np.minimum(b[:, 1], b[:, 3] - 1)
-            return b
-
-        xyxy_shrunk = _shrink_xyxy(xyxy, pad=2)
-        keep_idx = _nms_xyxy(xyxy_shrunk, np.arange(len(order_boxes))[::-1].astype(np.float32), iou_thr=0.10)
-        return [order_boxes[i] for i in keep_idx][:top_k]
-
-    def _filter_sigboxes_remove_stamps(img_bgr, sig_boxes,
-                                       include_stamps=True, debug=False,
-                                       band_thr=0.32, ang_thr=0.37, inner_thr=0.12,
-                                       aniso_max=2.10, keep_aniso_min=2.20, keep_inner_max=0.10,
-                                       rmin_rel=0.18, rmax_rel=0.62, hough_p1=90, hough_p2=18):
-        if include_stamps or not sig_boxes:
-            return sig_boxes
-
-        def _bin(gray):
-            g = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
-            g = cv2.GaussianBlur(g, (3, 3), 0)
-            return cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
-        gray = _to_gray_any(img_bgr)
-        bin_page = _bin(gray)
-        kept = []
-
-        def _score_roi(roi_u8):
-            H, W = roi_u8.shape[:2]
-            aniso = max(H, W) / (min(H, W) + 1e-6)
-            edges = cv2.Canny(cv2.GaussianBlur(roi_u8, (3, 3), 0), 60, 120)
-            minR = int(rmin_rel * min(H, W))
-            maxR = int(rmax_rel * min(H, W))
-            hough = False; band = ang = inner = 0.0
-            if maxR > minR and min(H, W) >= 24:
-                circles = cv2.HoughCircles(edges, cv2.HOUGH_GRADIENT, dp=1.2,
-                                           minDist=min(H, W)//3, param1=hough_p1, param2=hough_p2,
-                                           minRadius=minR, maxRadius=maxR)
-                if circles is not None and len(circles[0]) > 0:
-                    hough = True
-                    x0, y0, r = circles[0][0].astype(int)
-                    yy, xx = np.ogrid[:H, :W]
-                    dist = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2)
-                    band_mask = (dist >= 0.85 * r) & (dist <= 1.15 * r)
-                    band_edge = band_mask & (edges > 0)
-                    all_edge = max((edges > 0).sum(), 1)
-                    band = float(band_edge.sum()) / float(all_edge)
-                    theta = (np.rad2deg(np.arctan2((yy - y0), (xx - x0))) + 360.0) % 360.0
-                    covered = np.zeros(360, np.uint8)
-                    if band_edge.any():
-                        covered[np.unique(theta[band_edge].astype(int))] = 1
-                    ang = covered.mean()
-                    inner_mask = dist <= 0.70 * r
-                    inner = float((roi_u8 > 0)[inner_mask].sum()) / float(max(inner_mask.sum(), 1))
-            return dict(hough=hough, band=band, ang=ang, inner=inner, aniso=aniso)
-
-        for (x, y, w, h) in sig_boxes:
-            y0, x0 = max(0, y), max(0, x)
-            roi = bin_page[y0:y + h, x0:x + w]
-            if roi.size == 0:
-                kept.append((x, y, w, h))
-                continue
-            sc = _score_roi(roi)
-
-            # İmza-koruma (önce)
-            if sc["aniso"] >= keep_aniso_min and sc["inner"] <= keep_inner_max:
-                if debug:
-                    print(f"KEEP(sig-like) {(x,y,w,h)} -> aniso={sc['aniso']:.2f} inner={sc['inner']:.2f}")
-                kept.append((x, y, w, h))
-                continue
-
-            # Güçlü halka kanıtı varsa DROP (damga)
-            is_stamp = False
-            if sc["hough"] and sc["aniso"] < aniso_max and sc["band"] >= band_thr and (sc["ang"] >= ang_thr or sc["inner"] >= inner_thr):
-                is_stamp = True
-                if debug:
-                    print(f"DROP(stamp) {(x,y,w,h)} -> aniso={sc['aniso']:.2f} "
-                          f"band={sc['band']:.2f} ang={sc['ang']:.2f} inner={sc['inner']:.2f}")
-            if not is_stamp:
-                kept.append((x, y, w, h))
-        return kept
-
-    def _filter_tiny(sig_boxes):
-        out = []
-        for (x, y, w, h) in sig_boxes:
-            if x == 0 and y == 0:
-                continue
-            if w < 20 or h < 20:
-                continue
-            out.append((x, y, w, h))
-        return out
-
-    def _merge_sigboxes_nearby(sig_boxes: List[Tuple[int, int, int, int]], near_px: int = 3):
-        if not sig_boxes:
-            return []
-        def to_xyxy(b):
-            x, y, w, h = b
-            return (x, y, x + w, y + h)
-        def to_xywh(b):
-            x1, y1, x2, y2 = b
-            return (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
-        def expand(b, pad):
-            x1, y1, x2, y2 = b
-            return (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
-        def intersect(a, b):
-            ax1, ay1, ax2, ay2 = a
-            bx1, by1, bx2, by2 = b
-            return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
-        def union(a, b):
-            ax1, ay1, ax2, ay2 = a
-            bx1, by1, bx2, by2 = b
-            return (min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2))
-
-        rects = [to_xyxy(b) for b in sig_boxes]
-        changed = True
-        while changed:
-            changed = False
-            rects.sort(key=lambda r: (r[0], r[1]))
-            used = [False] * len(rects)
-            merged = []
-            for i in range(len(rects)):
-                if used[i]:
-                    continue
-                cur = rects[i]
-                used[i] = True
-                j = 0
-                while j < len(rects):
-                    if not used[j]:
-                        if intersect(expand(cur, near_px), expand(rects[j], near_px)):
-                            cur = union(cur, rects[j])
-                            used[j] = True
-                            changed = True
-                            j = 0
-                            continue
-                    j += 1
-                merged.append(cur)
-            rects = merged
-        return [to_xywh(r) for r in rects]
-
-    def _draw_only_kept_boxes(img, boxes, color=(255, 0, 0), title="IMZALAR"):
-        vis = img.copy()
-        if vis.ndim == 2:
-            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-        for (x, y, w, h) in boxes:
-            cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
-        if debug:
-            print(f"{title}: {len(boxes)} kutu")
-        return vis
-
-    # ========= PIPELINE =========
-
-    # 1) Adaylar
-    candidates = _detect_signatures_pro(img_bgr)
-
-    # 2) En iyi imzalar (skor + NMS)
-    sig_boxes = _keep_top_signatures(img_bgr, candidates, top_k=top_k)
-
-    # 3) Damga eleme (opsiyonel)
-    if not include_stamps:
-        sig_boxes = _filter_sigboxes_remove_stamps(
-            img_bgr, sig_boxes,
-            include_stamps=False,
-            debug=debug,
-            band_thr=0.34, ang_thr=0.85, inner_thr=0.19,
-            aniso_max=2.10, keep_aniso_min=2.20, keep_inner_max=0.15,
-            rmin_rel=0.18, rmax_rel=0.62, hough_p1=90, hough_p2=18
-        )
-
-    # 4) Min-boyut filtresi
-    sig_boxes = _filter_tiny(sig_boxes)
-
-    # 5) Yakın kutuları birleştir
-    sig_boxes = _merge_sigboxes_nearby(sig_boxes, near_px=near_px)
-
-    # 6) Opsiyonel çizim
-    if draw:
-        _ = _draw_only_kept_boxes(img_bgr, sig_boxes, color=draw_color, title=draw_title)
-
-    return sig_boxes
+    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
