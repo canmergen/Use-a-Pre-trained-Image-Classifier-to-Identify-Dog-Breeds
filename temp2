@@ -8,7 +8,7 @@ def build_per_box_df_onecall(
     known_names,
     ocr_url: str,
     lang: str = "tur+eng+lat",
-    role_threshold: float = 0.80,
+    role_threshold: float = 0.80,      # sadece loc!="roles" için kullanılır
     name_sim_threshold: float = 0.82,
 ):
     import re, json, base64, unicodedata
@@ -62,7 +62,7 @@ def build_per_box_df_onecall(
 
     # ---------- roles ----------
     ROLE_ALIASES: Dict[str, List[str]] = {
-        "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],   # divan çıkarıldı
+        "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
         "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
         "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI","YÖNETİM KURULU BAŞI"],
         "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETIM KURULU UYELERI"],
@@ -102,30 +102,21 @@ def build_per_box_df_onecall(
         T = _norm_ocr(text)
         if not T:
             return (None, 0.0)
-
-        # Kesin desenler (öncelik)
-        if re.search(r"\bYONETIM\s+KURULU\s+UYE(LERI|SI)\b", T):
-            return ("yk_uyesi", 0.99)
-        if re.search(r"\bDIVAN\s+BASKAN[I]?\b", T):
-            return ("divan_baskani", 0.99)
-        if re.search(r"\bTOPLANTI\s+\S{0,6}\s+BASKAN[I]?\b", T):
-            # sadece toplantı başkanına bonus vereceğiz, aşağıda yine skorlama da yapacağız
-            pass
-
+        # Kesin desenler
+        if re.search(r"\bYONETIM\s+KURULU\s+UYE(LERI|SI)\b", T): return ("yk_uyesi", 0.99)
+        if re.search(r"\bDIVAN\s+BASKAN[I]?\b", T):              return ("divan_baskani", 0.99)
         meeting_hit = 1 if re.search(r"\bTOPLANTI\s+\S{0,6}\s+BASKAN[I]?\b", T) else 0
 
         scores = {}
         for role, aliases in ROLE_ALIASES.items():
             s_alias = max(_alias_score(T, a) for a in aliases)
             s = s_alias + _anchor_bonus(T, role)
-            if role == "toplanti_baskani" and meeting_hit:
-                s += 0.08
+            if role == "toplanti_baskani" and meeting_hit: s += 0.08
             scores[role] = s
-
         ranked = sorted(scores.items(), key=lambda kv: (-kv[1], ROLE_PRIORITY.index(kv[0])))
         return ranked[0]  # (role, score)
 
-    # ---------- names ----------
+    # ---------- names (extraction) ----------
     def remove_role_words(text: str) -> str:
         toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)
         toks = [t for t in toks if _U(t) not in ROLE_TOKENS]
@@ -153,8 +144,7 @@ def build_per_box_df_onecall(
             s1 = fuzz.partial_ratio(T, K) / 100.0
             s2 = fuzz.token_set_ratio(T, K) / 100.0
             score = 0.6*s1 + 0.4*s2
-            if score >= thr:
-                hits.append((kn, score))
+            if score >= thr: hits.append((kn, score))
         hits.sort(key=lambda x: -x[1])
         out, seen = [], set()
         for name, _ in hits:
@@ -193,6 +183,68 @@ def build_per_box_df_onecall(
             if name not in seen:
                 seen.add(name); chosen.append(name)
         return "; ".join(chosen) if chosen else None
+
+    # ---------- names (sanitization & merge) ----------
+    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
+    _BAD_TOKEN = {"VE","VEYA","ILE","İLE"}
+
+    def _normalize_name(s: str) -> str:
+        return re.sub(r"\s+"," ", s.strip())
+
+    def _split_candidates(name_str: str) -> List[str]:
+        if not name_str: return []
+        parts = re.split(r"[;|,/]+", name_str)
+        return [_normalize_name(p) for p in parts if _normalize_name(p)]
+
+    def _clean_tokens(s: str) -> str:
+        toks = _NAME_TOKEN_RE.findall(s)
+        toks = [t for t in toks if len(t) >= 2]
+        toks = [t for t in toks if t.upper() not in _BAD_TOKEN]
+        # en fazla 3 kelime kuralı
+        toks = toks[:3]
+        return " ".join(toks)
+
+    def _dedup_similar(names: List[str], thr: float = 0.92) -> List[str]:
+        out: List[str] = []
+        for n in names:
+            if not out:
+                out.append(n); continue
+            simmax = max(fuzz.token_set_ratio(n, m)/100.0 for m in out)
+            if simmax < thr:
+                out.append(n)
+        return out
+
+    def _prefer_known(names: List[str], known_pool: List[str], hit_thr: float = 0.84) -> List[str]:
+        if not known_pool: return names
+        mapped = []
+        for n in names:
+            best = process.extractOne(n, known_pool, scorer=fuzz.token_set_ratio)
+            mapped.append(best[0] if (best and best[1] >= hit_thr*100) else n)
+        return mapped
+
+    def sanitize_names(raw_names: Optional[str], raw_text: str, known_pool: List[str]) -> Optional[str]:
+        # parçala ve temizle
+        cands = _split_candidates(raw_names) if raw_names else []
+        if not cands:
+            # metinden fallback
+            cands = _split_candidates(_clean_tokens(raw_text))
+        cands = [_clean_tokens(c) for c in cands]
+        cands = [c for c in cands if c]  # boşları at
+        # bilinen isimlere hizala
+        cands = _prefer_known(cands, known_pool)
+        # tek harf/çöp zaten atıldı; aynı kişinin varyantlarını birleştir
+        cands = _dedup_similar(cands, thr=0.92)
+        # aynı ad-soyad tekrarları → teke indir; farklı isimler korunur (tamamını yaz)
+        return "; ".join(cands) if cands else None
+
+    def merge_name_tckn(name: Optional[str], tckn: Optional[str]) -> Optional[str]:
+        if name and tckn:
+            uniq = list(dict.fromkeys([p.strip() for p in re.split(r"[;,\s]+", tckn) if p.strip()]))
+            return f"{name} | {'; '.join(uniq)}"
+        if tckn:
+            uniq = list(dict.fromkeys([p.strip() for p in re.split(r'[;,\s]+', tckn) if p.strip()]))
+            return "; ".join(uniq)
+        return name
 
     def find_tckn(text: str) -> Optional[str]:
         m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", text.replace(" ", ""))
@@ -277,71 +329,51 @@ def build_per_box_df_onecall(
         text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
         text_preview = re.sub(r"\s+"," ",text0)[:200]
 
-        role_key, role_score = best_role_for_text(text0)
+        # ROL: sadece roles kutularında
+        if loc == "roles":
+            role_key, role_score = best_role_for_text(text0)  # en iyi etiket
+            role_best = role_key
+        else:
+            role_key, role_score, role_best = None, 0.0, None
 
-        # loc == roles ise daima en iyi rolü ata (eşik/marj yok)
-        role_best = role_key if (loc == "roles") else (role_key if role_score >= role_threshold else None)
+        if loc == "sermaye":
+            amount_val = extract_amount_float(text0)
+            if amount_val is None:
+                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
+                if len(text1) > len(text0): text_preview = re.sub(r"\s+"," ",text1)[:200]
+                amount_val = extract_amount_float(text1) or extract_amount_float(text_preview)
+            if amount_val is not None and float(amount_val).is_integer():
+                amount_val = int(amount_val)
+            name_in_box = amount_val
+        else:
+            # İSİM + TCKN
+            name1 = pick_name_from_text(text0, known_pool)
+            tckn0 = find_tckn(text0)
 
-        # ---------- ana döngü ----------
-rows = []
-for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
-    loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
-    sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
+            # Fallback OCR sadece isim/TCKN için; ROL sadece roles kutusunda güncellenir
+            need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
+            if need_fallback:
+                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
+                if text1 and (len(text1) > len(text0) or not name1):
+                    if loc == "roles":
+                        role_key2, role_score2 = best_role_for_text(text1)
+                        role_key, role_score = role_key2, role_score2
+                        role_best = role_key
+                    name2 = pick_name_from_text(text1, known_pool)
+                    if name2: name1 = name2
+                    tckn1 = find_tckn(text1)
+                    if tckn1:
+                        tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
+                    if len(text1) > len(text0): text_preview = re.sub(r"\s+"," ",text1)[:200]
 
-    psm0, oem0 = decide_psm_oem(loc)
-    text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
-    text_preview = re.sub(r"\s+"," ",text0)[:200]
+            # SON TEMİZLİK: tek harfleri at, 3 kelimeyi aşma, varyantları birleştir
+            name1 = sanitize_names(name1, text_preview, known_pool)
+            name_in_box = merge_name_tckn(name1, tckn0)
 
-    # --- ROL: sadece loc == "roles" ise ata; diğerlerinde None ---
-    if loc == "roles":
-        role_key, role_score = best_role_for_text(text0)  # eşik/marj yok; en iyi etiket
-        role_best = role_key
-    else:
-        role_key, role_score, role_best = None, 0.0, None
+        rows.append({
+            "i": i, "bbox": b_wh, "loc": loc, "sig": bool(sig),
+            "role_best": role_best, "role_score": float(role_score),
+            "name_in_box": name_in_box, "text_preview": text_preview
+        })
 
-    if loc == "sermaye":
-        amount_val = extract_amount_float(text0)
-        if amount_val is None:
-            text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-            if len(text1) > len(text0):
-                text_preview = re.sub(r"\s+"," ",text1)[:200]
-            amount_val = extract_amount_float(text1) or extract_amount_float(text_preview)
-        if amount_val is not None and float(amount_val).is_integer():
-            amount_val = int(amount_val)
-        name_in_box = amount_val
-
-    else:
-        # --- İSİM + TCKN ---
-        name1 = pick_name_from_text(text0, known_pool)
-        tckn0 = find_tckn(text0)
-
-        # Fallback OCR sadece isim/TCKN için; ROL sadece roles kutusunda güncellenir
-        need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
-        if need_fallback:
-            text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-            if text1 and (len(text1) > len(text0) or not name1):
-                if loc == "roles":
-                    role_key2, role_score2 = best_role_for_text(text1)
-                    role_key, role_score = role_key2, role_score2
-                    role_best = role_key
-                name2 = pick_name_from_text(text1, known_pool)
-                if name2: name1 = name2
-                tckn1 = find_tckn(text1)
-                if tckn1: tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
-                if len(text1) > len(text0):
-                    text_preview = re.sub(r"\s+"," ",text1)[:200]
-
-        name_in_box = (name1 + " | " + tckn0) if (name1 and tckn0) else (tckn0 or name1)
-
-    rows.append({
-        "i": i,
-        "bbox": b_wh,
-        "loc": loc,
-        "sig": bool(sig),
-        "role_best": role_best,
-        "role_score": float(role_score),
-        "name_in_box": name_in_box,
-        "text_preview": text_preview
-    })
-
-return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
+    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
