@@ -17,6 +17,7 @@ def build_per_box_df_onecall(
       - name_in_box: HER ZAMAN text_preview baz alınır.
       - sermaye: amount öncelik text_preview; fallback text0/text1
       - adsoyad içinde rol benzeri kelimeler temizlenir (ROLE_TOKENS).
+      - Çoklu ad-soyad desteklenir (known_names havuzundan çoklu eşleşme + fallback).
     """
     import re, json, base64, unicodedata
     from typing import Any, Tuple, List, Dict, Optional
@@ -78,7 +79,7 @@ def build_per_box_df_onecall(
         "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
         "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
         "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI","YÖNETİM KURULU BAŞI"],
-        "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETIM KURULU UYELERI"],
+        "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETİM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETİM KURULU UYELERI"],
         "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","BAKANLIK TEMSILCISI","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
         "katip": ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
         "tutanak_yazmani": ["IUIANAK", "TUTANAK YAZMANI","YAZMAN"],
@@ -299,6 +300,73 @@ def build_per_box_df_onecall(
                 best, best_iou = r, i
         return best if best_iou > 0 else None
 
+    # ---------- Çoklu ad–soyad yakalama yardımcıları ----------
+    def match_known_names_multi(text: str, pool: list[str], thr: float, ROLE_TOKENS_U: set[str]) -> list[str]:
+        if not text or not pool:
+            return []
+        T_norm = _U(text)
+        hits = []
+        for kn in pool:
+            K_norm = _U(kn)
+            s = max(
+                fuzz.partial_ratio(T_norm, K_norm) / 100.0,
+                fuzz.token_set_ratio(T_norm, K_norm) / 100.0,
+                fuzz.token_sort_ratio(T_norm, K_norm) / 100.0,
+                fuzz.partial_token_set_ratio(T_norm, K_norm) / 100.0,
+            )
+            if s >= thr:
+                first_tok = re.findall(r"[A-ZÇĞİÖŞÜ]+", K_norm)
+                pos = T_norm.find(first_tok[0]) if first_tok else 10**9
+                hits.append((kn, s, pos))
+        if not hits:
+            return []
+        hits.sort(key=lambda x: (x[2], -x[1]))
+        out, seen = [], set()
+        for name, _, _ in hits:
+            n_tokens = [t for t in _NAME_TOKEN_RE.findall(name) if _U(t) not in ROLE_TOKENS_U]
+            if not n_tokens:
+                continue
+            clean = " ".join(n_tokens[:3])
+            is_dup = any(fuzz.token_set_ratio(clean, o) >= 92 for o in out)
+            if (not is_dup) and clean not in seen:
+                seen.add(clean)
+                out.append(clean)
+        return out
+
+    def pick_name_from_text_preview(text: str, pool: list[str], name_sim_threshold: float, ROLE_TOKENS_U: set[str]) -> str | None:
+        if not text:
+            return None
+        # 1) known_names'tan çoklu yakalama
+        multi = match_known_names_multi(text, pool, name_sim_threshold, ROLE_TOKENS_U)
+        if multi:
+            return "; ".join(multi)
+        # 2) fallback: token pencereleri (2–3 token), rol sözcüklerini at
+        toks = [t for t in _NAME_TOKEN_RE.findall(text) if _U(t) not in ROLE_TOKENS_U]
+        toks = [t for t in toks if len(t) >= 2]
+        if not toks:
+            return None
+        wins = []
+        for L in (3, 2):
+            for i in range(0, max(0, len(toks) - L + 1)):
+                wins.append(" ".join(toks[i:i+L]))
+        if pool:
+            best = []
+            for w in wins:
+                m = process.extractOne(w, pool, scorer=fuzz.token_set_ratio)
+                if m and m[1] >= int(name_sim_threshold*100):
+                    best.append(m[0])
+            uniq = []
+            for b in best:
+                if all(fuzz.token_set_ratio(b, u) < 92 for u in uniq):
+                    uniq.append(b)
+            if uniq:
+                return "; ".join(uniq[:6])
+        uniq = []
+        for w in wins:
+            if all(fuzz.token_set_ratio(w, u) < 92 for u in uniq):
+                uniq.append(w)
+        return "; ".join(uniq[:4]) if uniq else None
+
     # ---------- loop ----------
     rows = []
     for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
@@ -325,7 +393,7 @@ def build_per_box_df_onecall(
         # role_best (mevcut davranış: final_box OCR'ı bazlı; istersen preview bazlı da yapabiliriz)
         role_key, role_score = (None, 0.0)
         if loc == "roles":
-            role_key, role_score = best_role_for_text(text0)  # talep dışı, mevcut davranışı korudum
+            role_key, role_score = best_role_for_text(text0)
 
         # Fallback OCR (text_preview çok zayıfsa)
         if (not text_preview) or len(text_preview) < 6:
@@ -340,7 +408,6 @@ def build_per_box_df_onecall(
         if loc == "sermaye":
             amount_val = extract_amount_float(text_preview)
             if amount_val is None:
-                # fallback: text0 -> (gerekirse) text1
                 amount_val = extract_amount_float(text0)
                 if amount_val is None:
                     text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
@@ -351,39 +418,12 @@ def build_per_box_df_onecall(
         else:
             # İSİM + TCKN: preview’den
             tckn_p = find_tckn(text_preview)
-            # ad–soyad çıkarımı preview bazlı
-            def pick_name_from_text_preview(text: str, pool: List[str]) -> Optional[str]:
-                # Basitleştirilmiş: önce known-name eşleşmeleri, sonra token temelli
-                T = _tokens_no_roles(text or "")
-                if not T: return None
-                # known eşleşme
-                hits = []
-                if pool:
-                    N = _norm_ocr(T)
-                    for kn in pool:
-                        K = _norm_ocr(kn)
-                        s = max(
-                            fuzz.partial_ratio(N, K)/100.0,
-                            fuzz.token_set_ratio(N, K)/100.0,
-                            fuzz.token_sort_ratio(N, K)/100.0,
-                            fuzz.partial_token_set_ratio(N, K)/100.0,
-                        )
-                        if s >= name_sim_threshold:
-                            hits.append((kn, s))
-                    hits.sort(key=lambda x: -x[1])
-                if hits:
-                    cand = [h[0] for h in hits]
-                    cand = _dedup_similar(_prefer_known(cand, pool))
-                    return "; ".join(cand)
-                # değilse serbest adaylar
-                toks = _NAME_TOKEN_RE.findall(T)
-                toks = [t for t in toks if len(t) >= 2 and _U(t) not in ROLE_TOKENS_U]
-                if not toks: return None
-                # ilk 2-3 tokenı tercih et
-                cand = [" ".join(toks[:3])]
-                return "; ".join(cand)
-
-            raw_name = pick_name_from_text_preview(text_preview, known_pool)
+            raw_name = pick_name_from_text_preview(
+                text_preview,
+                known_pool,
+                name_sim_threshold=name_sim_threshold,
+                ROLE_TOKENS_U=ROLE_TOKENS_U,
+            )
             # rol kelimelerini temizleyerek normalize et
             name_clean = sanitize_names(raw_name, text_preview, known_pool)
             name_in_box = merge_name_tckn(name_clean, tckn_p)
