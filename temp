@@ -1,31 +1,46 @@
-import re, cv2, json, base64, unicodedata
-import numpy as np
-import pandas as pd
-from typing import Any, List, Tuple, Dict, Optional
-from rapidfuzz import fuzz, process
-
-def build_per_box_df_v2(
-    lower_img: np.ndarray,
-    final_boxes: List[Any],
+def build_per_box_df_onecall(
+    lower_img,
+    final_boxes,
     *,
-    sig_boxes: List[Any],
-    role_blocks: List[Any],
-    sermaye_boxes: List[Any],
-    known_names: Optional[List[str]],
+    sig_boxes,
+    role_blocks,
+    sermaye_boxes,
+    known_names,
     ocr_url: str,
-    lang: str = "tur+eng",
+    lang: str = "tur+eng+lat",
     role_threshold: float = 0.80,
     name_sim_threshold: float = 0.82,
-) -> pd.DataFrame:
+):
     """
-    Final kutulardan per_box_df üretir (dinamik PSM/OEM, rol kelimelerini isimden temizleme,
-    imza dahil olma kontrolü, isim çıkarımı için fallback OCR, TCKN yakalama).
+    Tek fonksiyon: OCR + kutu analizi + per_box_df üretimi.
 
-    Çıktı kolonları:
-      i, bbox, loc, sig, role_best, role_score, name_in_box, text_preview
+    Parametreler
+    ------------
+    lower_img        : cv2 BGR görüntü (np.ndarray)
+    final_boxes      : birleşik kutular (list of (x,y,w,h) / dict)
+    sig_boxes        : sadece imzaları kapsayan kutular
+    role_blocks      : rol yazılarının yer aldığı kutular
+    sermaye_boxes    : sermaye metninin yer aldığı kutular
+    known_names      : fuzzy eşleme havuzu (list[str])
+    ocr_url          : remote Tesseract endpoint (HTTP JSON)
+    lang             : Tesseract dil parametresi (varsayılan "tur+eng+lat")
+    role_threshold   : rol skoru eşiği (0–1)
+    name_sim_threshold: isim fuzzy eşiği (0–1)
+
+    Dönüş
+    -----
+    pandas.DataFrame: kolonlar -> i, bbox, loc, sig, role_best, role_score, name_in_box, text_preview
     """
+    # --- içe aktarımlar (tek fonksiyon içinde tutuyoruz) ---
+    import re, json, base64, unicodedata
+    from typing import Any, Tuple, List, Dict, Optional
+    import numpy as np
+    import pandas as pd
+    import cv2
+    import requests
+    from rapidfuzz import fuzz, process
 
-    # ---------------- utils: geometry ----------------
+    # ---------- geometry helpers ----------
     def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
         if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
             x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
@@ -57,13 +72,13 @@ def build_per_box_df_v2(
         ix1,iy1,ix2,iy2 = inner
         return (ix1 >= ox1-pad) and (iy1 >= oy1-pad) and (ix2 <= ox2+pad) and (iy2 <= oy2+pad)
 
-    def _any_overlap(a: Tuple[int,int,int,int], group: List[Tuple[int,int,int,int]]) -> bool:
+    def _any_overlap(a, group) -> bool:
         for g in group:
             if _iou(a, g) > 0 or _contains(a, g) or _contains(g, a):
                 return True
         return False
 
-    # ---------------- utils: text / roles / names ----------------
+    # ---------- text helpers ----------
     def _strip_diac(s: str) -> str:
         return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
@@ -82,31 +97,28 @@ def build_per_box_df_v2(
     }
     ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
 
-    # rol kelimeleri: isim temizlemede kullanılacak
     ROLE_TOKENS = set(sum([a.split() for v in ROLE_ALIASES.values() for a in v], [])) | {
         "YÖNETİM","KURULU","ÜYE","ÜYESİ","ÜYELERİ","BAŞKAN","BAŞKANI","KATİP","KÂTİP",
         "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
     }
 
-    def best_role_for_text(text: str) -> Tuple[Optional[str], float]:
+    def best_role_for_text(text: str):
         tU = _U(text)
-        def _alias_score(ali: str) -> float:
-            return fuzz.token_set_ratio(tU, _U(ali)) / 100.0
+        def _score(alias: str) -> float:
+            return fuzz.token_set_ratio(tU, _U(alias)) / 100.0
         best_role, best_score = None, 0.0
         for rk, aliases in ROLE_ALIASES.items():
-            sc = max(_alias_score(a) for a in aliases)
+            sc = max(_score(a) for a in aliases)
             if (sc > best_score) or (abs(sc-best_score) < 1e-6 and (best_role is None or ROLE_PRIORITY.index(rk) < ROLE_PRIORITY.index(best_role))):
                 best_role, best_score = rk, sc
         return best_role, best_score
 
     def remove_role_words(text: str) -> str:
-        # rol/ünvan kelimelerini düşür
         toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)
         toks_clean = [t for t in toks if _U(t) not in ROLE_TOKENS]
         return " ".join(toks_clean)
 
     def raw_name_candidates(text: str) -> List[str]:
-        # segmentlere ayır ve 3-gram / 2-gram üret
         t = text.replace("\n"," ")
         segs = [p.strip() for p in re.split(r"\s*(?:[,;/]| ve )\s*", t, flags=re.IGNORECASE) if p.strip()]
         cands: List[str] = []
@@ -117,9 +129,7 @@ def build_per_box_df_v2(
             for L in (3,2):
                 for i in range(max(0, n-L+1)):
                     cands.append(" ".join(toks[i:i+L]))
-            if n == 1:
-                cands.append(toks[0])
-        # tekilleştir
+            if n == 1: cands.append(toks[0])
         return list(dict.fromkeys(cands))
 
     def map_to_known(name: str, pool: List[str]) -> Optional[str]:
@@ -127,44 +137,37 @@ def build_per_box_df_v2(
         best = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
         if best and best[1] >= name_sim_threshold*100:
             return best[0]
-        # tek ad benzersizse tam ada yükselt
         toks = name.split()
         if len(toks) == 1:
-            first = _U(toks[0])
-            by_first: Dict[str, List[str]] = {}
+            first = _U(toks[0]); by_first: Dict[str, List[str]] = {}
             for kn in pool:
                 ts = kn.split()
                 if ts: by_first.setdefault(_U(ts[0]), []).append(kn)
             vals = by_first.get(first, [])
-            if len(vals) == 1:
-                return vals[0]
+            if len(vals) == 1: return vals[0]
         return None
 
-    def pick_name_from_text(text: str, known_pool: List[str]) -> Optional[str]:
+    def pick_name_from_text(text: str, pool: List[str]) -> Optional[str]:
         text_wo_role = remove_role_words(text)
         cands = raw_name_candidates(text_wo_role)
-        chosen: List[str] = []
-        seen = set()
+        chosen, seen = [], set()
         for c in cands:
-            mapped = map_to_known(c, known_pool)
+            mapped = map_to_known(c, pool)
             name = mapped or c
             if name not in seen:
-                seen.add(name)
-                chosen.append(name)
+                seen.add(name); chosen.append(name)
         return "; ".join(chosen) if chosen else None
 
     def find_tckn(text: str) -> Optional[str]:
-        # 10 veya 11 haneli ardışık rakam; başında/sonunda harf yok
         m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", text.replace(" ", ""))
-        if not m: return None
-        # benzersiz sırayı koru
-        return "; ".join(list(dict.fromkeys(m)))
+        return "; ".join(list(dict.fromkeys(m))) if m else None
 
-    # ---------------- utils: OCR ----------------
-    def _ocr_crop(img_bgr: np.ndarray, xywh: Tuple[int,int,int,int], psm: int, oem: int) -> str:
-        x,y,w,h = xywh
-        crop = img_bgr[max(0,y):y+h, max(0,x):x+w]
-        if crop.size == 0: return ""
+    # ---------- OCR (remote) ----------
+    def ocr_text_from_box_remote(img, box_xywh, *, lang: str, psm: int, oem: int, url: str) -> str:
+        x,y,w,h = box_xywh
+        crop = img[max(0,y):y+h, max(0,x):x+w]
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return ""
         ok, buf = cv2.imencode(".png", crop)
         if not ok: return ""
         payload = {
@@ -174,77 +177,65 @@ def build_per_box_df_v2(
             "oem": int(oem),
         }
         try:
-            import requests
-            r = requests.post(ocr_url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=30)
+            r = requests.post(url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=30)
             r.raise_for_status()
             js = r.json()
             return (js.get("text") or "").strip()
         except Exception:
             return ""
 
-    # dinamik PSM/OEM seçici
-    def decide_psm_oem(loc: str) -> Tuple[int,int]:
-        if loc == "sermaye":
-            return 1, 1       # blok/paragrafik metinler için burada iyi çalışıyor
-        if loc == "roles":
-            return 11, 1      # sparse text: rol başlık/isim satırı karışık olabilir
-        return 11, 1          # default
-
-    # ---------------- prepare boxes ----------------
+    # ---------- kutuları hazırla ----------
     final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
     final_xyxy = [_to_xyxy(b) for b in final_xywh]
     sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
     role_xyxy  = [_to_xyxy(b) for b in (role_blocks or [])]
     serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
-    known_pool = list(dict.fromkeys([(known_names or [])]))
+    known_pool = list(dict.fromkeys(known_names or []))
 
-    # ---------------- main loop ----------------
+    def decide_psm_oem(loc: str) -> Tuple[int,int]:
+        if loc == "sermaye": return 1, 1
+        if loc == "roles":   return 11, 1
+        return 11, 1
+
+    # ---------- ana döngü ----------
     rows = []
     for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
-        # loc tespiti
+        # loc & sig
         loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
-
-        # imza: sig_box az da olsa dahil mi?
         sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
 
-        # ilk OCR (loc'a göre)
+        # OCR #1
         psm0, oem0 = decide_psm_oem(loc)
-        text0 = _ocr_crop(lower_img, b_wh, psm=psm0, oem=oem0)
+        text0 = ocr_text_from_box_remote(lower_img, b_wh, lang=lang, psm=psm0, oem=oem0, url=ocr_url) or ""
         text_preview = re.sub(r"\s+"," ",text0)[:200]
 
-        # rol skoru/ata
+        # rol
         role_key, role_score = best_role_for_text(text0)
         role_best = role_key if (role_score >= role_threshold or loc=="roles") else None
 
-        # isim çıkarımı – 1. deneme
-        name1 = pick_name_from_text(text0, known_names or [])
+        # isim
+        name1 = pick_name_from_text(text0, known_pool)
 
-        # TCKN var mı?
+        # TCKN
         tckn0 = find_tckn(text0)
 
-        # isim yoksa veya çok zayıfsa fallback OCR (psm=1,oem=1) ile tekrar dene
-        need_fallback = (not name1) or (name1 and known_names and max((fuzz.token_set_ratio(name1, k) for k in known_names), default=0) < name_sim_threshold*100)
+        # Fallback OCR (isim zayıfsa/boşsa)
+        need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
         if need_fallback:
-            text1 = _ocr_crop(lower_img, b_wh, psm=1, oem=1)
+            text1 = ocr_text_from_box_remote(lower_img, b_wh, lang=lang, psm=1, oem=1, url=ocr_url) or ""
             if text1 and (len(text1) > len(text0) or not name1):
-                # daha iyi olabilir → role yeniden değerlendir, isim yeniden çıkar
                 role_key2, role_score2 = best_role_for_text(text1)
                 if role_score2 > role_score:
                     role_key, role_score = role_key2, role_score2
                     role_best = role_key if (role_score >= role_threshold or loc=="roles") else role_best
-                name2 = pick_name_from_text(text1, known_names or [])
+                name2 = pick_name_from_text(text1, known_pool)
                 if name2: name1 = name2
                 tckn1 = find_tckn(text1)
                 if tckn1: tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
-                # preview olarak daha okunaklı olanı kullan
                 if len(text1) > len(text0):
                     text_preview = re.sub(r"\s+"," ",text1)[:200]
 
-        # name_in_box'e TCKN ekle
-        if tckn0:
-            name_in_box = (name1 + " | " + tckn0) if name1 else tckn0
-        else:
-            name_in_box = name1
+        name_in_box = (name1 + " | " + tckn0) if (name1 and tckn0) else (tckn0 or name1)
 
         rows.append({
             "i": i,
@@ -257,5 +248,4 @@ def build_per_box_df_v2(
             "text_preview": text_preview
         })
 
-    per_box_df = pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
-    return per_box_df
+    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
