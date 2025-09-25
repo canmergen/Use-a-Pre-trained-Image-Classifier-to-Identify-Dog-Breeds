@@ -92,6 +92,55 @@ def build_per_box_df_onecall(
     }
     ROLE_TOKENS_U = { _U(t) for t in ROLE_TOKENS }
 
+    # Rol öncesi metni kırpmak için geniş rol anahtarları (çoğul/çekimli varyantlar dahil)
+    ROLE_REGEX = re.compile(
+        r"(YÖNETİM\s+KURULU\s+BAŞKANI|YÖNETİM\s+KURULU\s+ÜYELERİ|YÖNETİM\s+KURULU\s+ÜYESİ|YK\s+BAŞKANI|DIVAN\s+BASKANI|DİVAN\s+BAŞKANI|TOPLANTI\s+BAŞKANI|OY\s+TOPLAMA\s+MEMURU|BAKANLIK\s+TEMSİLCİSİ)",
+        flags=re.IGNORECASE
+    )
+
+    def cut_before_first_role(text: str) -> str:
+        """İlk rol ifadesine kadar olan kısmı at."""
+        if not text: return text
+        m = ROLE_REGEX.search(text)
+        return text[m.start():] if m else text
+
+    # ---------- name utils & gibberish ----------
+    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
+    _BAD_TOKEN = {"VE","VEYA","ILE","İLE"}
+    # isim değildir (boilerplate) kümesi
+    _NON_NAME_TOKENS = {
+        "TOPLANTIDA","HAZIR","BULUNAN","ŞİRKETİN","ŞİRKET","PAYLARIN","PAYLARI","TOPLAMI","TOPLAM",
+        "NİSAP","NİSABI","MEVCUT","ASGARİ","TİCARİ","MERKEZİ","ADANA","ANKARA","İSTANBUL","MAD.","MADDE","SAYI",
+        "KARAR","GÜNDEM","HAKKINDA","HAKKINDAKİ","VE","VEYA","İLE"
+    }
+    _NON_NAME_TOKENS_U = { _U(t) for t in _NON_NAME_TOKENS }
+
+    _VOWELS = set(list("AEIİOÖUÜaeıioöuü"))
+    def _has_vowel(s: str) -> bool:
+        return any(ch in _VOWELS for ch in s)
+
+    def _long_consonant_run(s: str, k: int = 4) -> bool:
+        run = 0
+        for ch in s:
+            if ch.isalpha() and ch.upper() not in _VOWELS:
+                run += 1
+                if run >= k: return True
+            else:
+                run = 0
+        return False
+
+    def is_gibberish_token(tok: str) -> bool:
+        U = _U(tok)
+        if U in ROLE_TOKENS_U or U in _NON_NAME_TOKENS_U: return True
+        if any(ch.isdigit() for ch in tok): return True
+        if len(tok) < 2 or len(tok) > 25: return True
+        if not _has_vowel(tok): return True
+        if _long_consonant_run(tok, k=5): return True
+        return False
+
+    def filter_name_tokens(tokens: List[str]) -> List[str]:
+        return [t for t in tokens if not is_gibberish_token(t) and _U(t) not in _BAD_TOKEN]
+
     def _alias_score(T: str, alias: str) -> float:
         A = _norm_ocr(alias)
         s1 = fuzz.token_set_ratio(T, A) / 100.0
@@ -118,39 +167,6 @@ def build_per_box_df_onecall(
             scores[role] = s
         ranked = sorted(scores.items(), key=lambda kv: (-kv[1], ROLE_PRIORITY.index(kv[0])))
         return ranked[0]
-
-    # ---------- name utils ----------
-    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
-    _BAD_TOKEN = {"VE","VEYA","ILE","İLE"}
-
-    def _tokens_no_roles(s: str) -> str:
-        if not s: return s
-        toks = _NAME_TOKEN_RE.findall(s)
-        toks = [t for t in toks if _U(t) not in ROLE_TOKENS_U]
-        return " ".join(toks)
-
-    def _dedup_similar(names: List[str], thr: float = 0.92) -> List[str]:
-        out: List[str] = []
-        for n in names:
-            if not out: out.append(n); continue
-            simmax = max(fuzz.token_set_ratio(n, m)/100.0 for m in out)
-            if simmax < thr: out.append(n)
-        return out
-
-    # yalnız temizlik; **kısaltma yok**, sırayı bozmaz
-    def sanitize_names_keep(raw_names: Optional[str], raw_text: str) -> Optional[str]:
-        if not (raw_names or raw_text): return None
-        parts = [p.strip() for p in re.split(r"[;]+", (raw_names or "")) if p.strip()]
-        if not parts:
-            # fallback tek parça
-            parts = [(raw_text or "").strip()]
-        cleaned=[]
-        for p in parts:
-            toks = [t for t in _NAME_TOKEN_RE.findall(p) if len(t)>=2 and _U(t) not in ROLE_TOKENS_U]
-            if not toks: continue
-            cleaned.append(" ".join(toks[:4]))  # güvenli üst sınır
-        cleaned = _dedup_similar(cleaned, thr=0.92)
-        return "; ".join(cleaned) if cleaned else None
 
     def merge_name_tckn(name: Optional[str], tckn: Optional[str]) -> Optional[str]:
         if name and tckn:
@@ -223,6 +239,11 @@ def build_per_box_df_onecall(
         return _ocr_remote_png(bw, psm=psm, oem=oem)
 
     # ---------- boxes ----------
+    def decide_psm_oem(loc: str) -> Tuple[int,int]:
+        if loc == "sermaye": return 1, 1
+        if loc == "roles":   return 11, 1
+        return 11, 1
+
     final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
     final_xyxy = [_to_xyxy(b) for b in final_xywh]
     sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
@@ -230,60 +251,51 @@ def build_per_box_df_onecall(
     serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
     known_pool = list(dict.fromkeys(known_names or []))
 
-    def decide_psm_oem(loc: str) -> Tuple[int,int]:
-        if loc == "sermaye": return 1, 1
-        if loc == "roles":   return 11, 1
-        return 11, 1
-
-    # ---------- role-block seçimi ----------
-    def _best_role_block_for(bxyxy: Tuple[int,int,int,int]) -> Optional[Tuple[int,int,int,int]]:
-        if not role_xyxy: return None
-        inside = [r for r in role_xyxy if _contains(bxyxy, r, pad=2)]
-        if inside:
-            inside.sort(key=_area, reverse=True)
-            return inside[0]
-        best, best_iou = None, 0.0
-        for r in role_xyxy:
-            i = _iou(bxyxy, r)
-            if i > best_iou: best, best_iou = r, i
-        return best if best_iou > 0 else None
-
-    # ---------- SIRALI & ÇOKLU İSİM (DP ile ayrık pencere seçimi) ----------
+    # ---------- Çoklu isim çıkarımı: DP + rol öncesini kırp + gibberish filtre ----------
     def extract_names_multi_dp(text: str, pool: list[str], thr: float = 0.82) -> List[str]:
         if not text:
             return []
-        # token + pozisyon
-        toks = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)]
-        toks = [(t,s,e) for (t,s,e) in toks if len(t)>=2 and _U(t) not in ROLE_TOKENS_U]
+        # 0) rol öncesini at
+        text = cut_before_first_role(text)
+
+        # 1) token + pozisyon (gibberish/stop filtreli)
+        toks_all = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)]
+        toks = [(t,s,e) for (t,s,e) in toks_all if not is_gibberish_token(t)]
         if not toks: return []
 
+        # 2) pencere üret (3 ve 2 token)
         windows = []
         for L in (3,2):
             for i in range(0, max(0, len(toks)-L+1)):
                 seg = toks[i:i+L]
                 wtxt = " ".join(t for (t,_,__) in seg)
+
+                # pencere içi gibberish oranı (ek güvenlik)
+                g_rate = np.mean([is_gibberish_token(t) for (t,_,__) in seg])
+                if g_rate > 0.34:  # çok kirliyse at
+                    continue
+
                 s, mapped = 0.0, None
                 if pool:
                     wN = _U(wtxt)
-                    # order-preserving skor
                     best_sc, best_nm = 0.0, None
                     for kn in pool:
                         kN = _U(kn)
-                        sc = max(fuzz.ratio(wN, kN)/100.0, fuzz.partial_ratio(wN, kN)/100.0)
+                        sc = max(fuzz.ratio(wN, kN)/100.0, fuzz.partial_ratio(wN, kN)/100.0)  # sıra koruyan
                         if sc > best_sc:
                             best_sc, best_nm = sc, kn
                     if best_sc >= thr:
                         s += best_sc; mapped = best_nm
-                # sezgisel bonus
                 if 6 <= len(wtxt) <= 40: s += 0.10
                 if L == 3: s += 0.05
-                windows.append((seg[0][1], seg[-1][2], i, i+L-1, wtxt, mapped, s))  # (start,end,ti,tj,txt,mapped,score)
+                windows.append((seg[0][1], seg[-1][2], i, i+L-1, wtxt, mapped, s))
 
-        # DP: token indexleri ayrık (tj < next.ti)
-        windows.sort(key=lambda x: (x[3], x[0]))  # bitişe göre
+        if not windows:
+            return []
+
+        # 3) DP (ayrık token aralığı maks. skor)
+        windows.sort(key=lambda x: (x[3], x[0]))
         n = len(windows)
-        ends = [w[3] for w in windows]
-        # p[j]: j'den önce çakışmayan son pencere indexi
         p = []
         for j in range(n):
             ti = windows[j][2]
@@ -291,31 +303,27 @@ def build_per_box_df_onecall(
             while k >= 0 and windows[k][3] >= ti:
                 k -= 1
             p.append(k)
-        dp = [0.0]*n
-        choose = [False]*n
+        dp = [0.0]*n; take = [False]*n
         for j in range(n):
-            take = windows[j][6] + (dp[p[j]] if p[j] >= 0 else 0.0)
-            skip = dp[j-1] if j>0 else 0.0
-            if take > skip:
-                dp[j] = take; choose[j] = True
+            tscore = windows[j][6] + (dp[p[j]] if p[j]>=0 else 0.0)
+            sscore = dp[j-1] if j>0 else 0.0
+            if tscore > sscore:
+                dp[j] = tscore; take[j] = True
             else:
-                dp[j] = skip
-        # geri iz
-        sel=[]
-        j = n-1
-        while j >= 0:
-            if choose[j]:
-                sel.append(j)
-                j = p[j]
+                dp[j] = sscore
+        sel=[]; j=n-1
+        while j>=0:
+            if take[j]:
+                sel.append(j); j = p[j]
             else:
                 j -= 1
         sel = sel[::-1]
 
-        # soldan sağa isimler
+        # 4) soldan sağa isimleri topla (kanonik varsa onu kullan)
         names=[]
         for j in sel:
             txt = windows[j][5] or windows[j][4]
-            toks2 = [t for t in _NAME_TOKEN_RE.findall(txt) if _U(t) not in ROLE_TOKENS_U]
+            toks2 = filter_name_tokens(_NAME_TOKEN_RE.findall(txt))
             nm = " ".join(toks2[:4])
             if nm and all(fuzz.token_set_ratio(nm, ex) < 92 for ex in names):
                 names.append(nm)
@@ -331,9 +339,13 @@ def build_per_box_df_onecall(
         text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
 
         if loc == "roles":
-            rb_xyxy = _best_role_block_for(b_xyxy)
+            rb_xyxy = None
+            if role_xyxy:
+                inside = [r for r in role_xyxy if _contains(b_xyxy, r, pad=2)]
+                if inside:
+                    inside.sort(key=_area, reverse=True); rb_xyxy = inside[0]
             if rb_xyxy is not None:
-                rb_xywh = _xyxy_to_xywh(rb_xyxy)
+                x1,y1,x2,y2 = rb_xyxy; rb_xywh = (x1, y1, x2-x1, y2-y1)
                 preview_src = ocr_box(lower_img, rb_xywh, psm=11, oem=1)
                 text_preview = re.sub(r"\s+"," ", preview_src)[:800]
             else:
@@ -363,10 +375,29 @@ def build_per_box_df_onecall(
             name_in_box = amount_val
         else:
             tckn_p = find_tckn(text_preview)
-            # çoklu + sıralı
-            multi = extract_names_multi_dp(_tokens_no_roles(text_preview), known_pool, thr=name_sim_threshold)
+
+            # Çoklu + sıralı + rol-öncesi kırp + gibberish filtre
+            multi = extract_names_multi_dp(text_preview, known_pool, thr=name_sim_threshold)
             raw_name = "; ".join(multi) if multi else None
-            name_clean = sanitize_names_keep(raw_name, raw_name or text_preview)  # sadece temizlik; sıra korunur
+
+            # Yalnızca temizlik (sıra korunur, kısaltma yok)
+            def sanitize_names_keep(raw_names: Optional[str], raw_text: str) -> Optional[str]:
+                if not (raw_names or raw_text): return None
+                parts = [p.strip() for p in re.split(r"[;]+", (raw_names or "")) if p.strip()]
+                if not parts: parts = [(raw_text or "").strip()]
+                cleaned=[]
+                for p in parts:
+                    toks = filter_name_tokens(_NAME_TOKEN_RE.findall(p))
+                    if not toks: continue
+                    cleaned.append(" ".join(toks[:4]))
+                # tekrarı azalt
+                out=[]
+                for c in cleaned:
+                    if all(fuzz.token_set_ratio(c, o) < 92 for o in out):
+                        out.append(c)
+                return "; ".join(out) if out else None
+
+            name_clean = sanitize_names_keep(raw_name, raw_name or text_preview)
             name_in_box = merge_name_tckn(name_clean, tckn_p)
 
         rows.append({
