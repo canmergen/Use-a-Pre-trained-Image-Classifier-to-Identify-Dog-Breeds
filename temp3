@@ -9,33 +9,31 @@ def apply_finalbox_fallback_for_empty_names(
     name_sim_threshold: float = 0.76,
     psm_final: int = 11,
     oem_final: int = 1,
-    update_even_if_shorter: bool = False
+    update_even_if_shorter: bool = False,
+    preview_name_overrides: bool = True,   # isim bulunursa text_preview = isim
+    max_name_tokens: int = 4,              # isim çıktısında token sınırı
+    single_token_autocomplete: bool = True,
+    single_token_threshold: float = 0.80   # tek kelimeyi tamamlama eşiği
 ) -> pd.DataFrame:
     """
-    Son adım düzeltme (tek fonksiyon).
-    - Koşul: loc=='roles' ve name_in_box boş/NaN/""
-    - Aksiyon: ilgili satırın bbox'ını final_boxes üzerinden OCR edip:
-        * text_preview'ü final box OCR ile güncelle
-        * TCKN + isim çıkarımını bu metinden yap
-    - Diğer alanlara dokunmaz.
+    Son-aşama düzeltme (tek fonksiyon).
+    - loc=='roles' & name_in_box boş ise final_box OCR + isim/TCKN çıkarımı
+    - Gibberish token'lar filtrelenir.
+    - (Yeni) name_clean tek kelimeyse ve known_names içinde güçlü eşleşme varsa otomatik tamamlanır.
     """
-
     import re, json, base64, unicodedata
     import numpy as np
     import cv2, requests
     from rapidfuzz import fuzz
 
-    # ----------------- Yardımcılar (fonksiyon içi) -----------------
+    # ---------- helpers ----------
     def _to_xywh(b: Any) -> Tuple[int,int,int,int]:
         if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
             x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
         if isinstance(b, dict):
-            if all(k in b for k in ("x","y","w","h")):
-                return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-            if all(k in b for k in ("x0","y0","x1","y1")):
-                return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
-            if all(k in b for k in ("left","top","right","bottom")):
-                return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
+            if all(k in b for k in ("x","y","w","h")):  return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+            if all(k in b for k in ("x0","y0","x1","y1")):  return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
+            if all(k in b for k in ("left","top","right","bottom")):  return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
         raise ValueError("bbox format not supported")
 
     def _ocr_remote_png(img_gray, *, ocr_url: str, lang: str, psm: int, oem: int) -> str:
@@ -70,8 +68,8 @@ def apply_finalbox_fallback_for_empty_names(
 
     _NON_NAME_TOKENS = {
         "TOPLANTIDA","HAZIR","BULUNAN","ŞİRKETİN","ŞİRKET","PAYLARIN","PAYLARI","TOPLAMI","TOPLAM",
-        "NİSAP","NİSABI","MEVCUT","ASGARİ","TİCARİ","MERKEZİ","ADANA","ANKARA","İSTANBUL","MAD",
-        "MADDE","SAYI","KARAR","GÜNDEM","HANELİ","VERGİ","NO","NOSU","MERKEZ","ADRESİ"
+        "NİSAP","NİSABI","MEVCUT","ASGARİ","TİCARİ","MERKEZİ","MAD","MADDE","SAYI","KARAR","GÜNDEM",
+        "HANELİ","VERGİ","NO","NOSU","MERKEZ","ADRESİ"
     }
     _NON_NAME_TOKENS_U = { _U(t) for t in _NON_NAME_TOKENS }
 
@@ -86,6 +84,7 @@ def apply_finalbox_fallback_for_empty_names(
             else:
                 run = 0
         return False
+
     def is_gibberish_token(tok: str) -> bool:
         U = _U(tok)
         if U in _NON_NAME_TOKENS_U: return True
@@ -95,11 +94,13 @@ def apply_finalbox_fallback_for_empty_names(
         if _long_consonant_run(tok, k=5): return True
         if re.search(r"[^\wÇĞİÖŞÜçğıöşü]", tok) and len(tok) <= 3: return True
         return False
+
     def filter_name_tokens(tokens: List[str]) -> List[str]:
         return [t for t in tokens if (not is_gibberish_token(t))]
 
     ROLE_REGEX = re.compile(
-        r"(YÖNETİM\s+KURULU\s+BAŞKANI|YÖNETİM\s+KURULU\s+ÜYELERİ|YÖNETİM\s+KURULU\s+ÜYESİ|YK\s+BAŞKANI|DIVAN\s+BASKANI|DİVAN\s+BAŞKANI|TOPLANTI\s+BAŞKANI|OY\s+TOPLAMA\s+MEMURU|BAKANLIK\s+TEMSİLCİSİ)",
+        r"(YÖNETİM\s+KURULU\s+BAŞKANI|YÖNETİM\s+KURULU\s+ÜYESİ|YÖNETİM\s+KURULU\s+ÜYELERİ|YK\s+BAŞKANI|"
+        r"DIVAN\s+BASKANI|DİVAN\s+BAŞKANI|TOPLANTI\s+BAŞKANI|OY\s+TOPLAMA\s+MEMURU|BAKANLIK\s+TEMSİLCİSİ)",
         flags=re.IGNORECASE
     )
     def cut_before_first_role(text: str) -> str:
@@ -137,7 +138,7 @@ def apply_finalbox_fallback_for_empty_names(
             used.append((s,e))
             toks2 = filter_name_tokens(_NAME_TOKEN_RE.findall(mapped or wtxt))
             if len(toks2) >= 2:
-                nm = " ".join(toks2[:4])
+                nm = " ".join(toks2[:max_name_tokens])
                 if nm and all(fuzz.token_set_ratio(nm, ex) < 92 for ex in chosen):
                     chosen.append(nm)
         return chosen
@@ -150,17 +151,46 @@ def apply_finalbox_fallback_for_empty_names(
         for p in parts:
             toks = filter_name_tokens(_NAME_TOKEN_RE.findall(p))
             if not toks: continue
-            cleaned.append(" ".join(toks[:4]))
+            cleaned.append(" ".join(toks[:max_name_tokens]))
         out=[]
         for c in cleaned:
             if all(fuzz.token_set_ratio(c, o) < 92 for o in out):
                 out.append(c)
         return "; ".join(out) if out else None
 
+    def _clean_text_gibberish(text: str) -> str:
+        toks = filter_name_tokens(_NAME_TOKEN_RE.findall(text or ""))
+        return " ".join(toks[:max_name_tokens]) if toks else (text or "")
+
+    def _complete_single_token(tok: str, pool: List[str], thr: float) -> Optional[str]:
+        """Tek kelimeyi known_names içinden en iyi tamamlama."""
+        if not tok or not pool: return None
+        u_tok = _U(tok)
+        best, best_sc = None, 0.0
+        for kn in pool:
+            toks_kn = _NAME_TOKEN_RE.findall(kn)
+            # token bazlı en iyi eşleşmeyi ölç
+            sc_tok = 0.0
+            for t in toks_kn:
+                sc_tok = max(sc_tok,
+                             fuzz.ratio(u_tok, _U(t))/100.0,
+                             fuzz.partial_ratio(u_tok, _U(t))/100.0)
+                if _U(t).startswith(u_tok):
+                    sc_tok = max(sc_tok, 0.99)  # güçlü prefix sinyali
+            # full-name kısmi eşleşme de göz önünde bulundur
+            sc_full = fuzz.partial_ratio(u_tok, _U(kn))/100.0
+            sc = max(sc_tok, sc_full)
+            if sc > best_sc:
+                best_sc, best = sc, kn
+        if best and best_sc >= thr:
+            toks = filter_name_tokens(_NAME_TOKEN_RE.findall(best))
+            return " ".join(toks[:max_name_tokens]) if toks else None
+        return None
+
     def _blank(x):
         return (x is None) or (isinstance(x, float) and np.isnan(x)) or (str(x).strip()=="")
 
-    # ----------------- Ana akış -----------------
+    # ---------- main ----------
     df = per_box_df.copy()
     pool = list(dict.fromkeys(known_names or []))
 
@@ -168,33 +198,43 @@ def apply_finalbox_fallback_for_empty_names(
         if row.get("loc") != "roles" or not _blank(row.get("name_in_box")):
             continue
 
-        # mevcut satır bbox'ı varsa onu, yoksa i->final_boxes
+        # bbox seçimi
         try:
             b_wh = _to_xywh(row.get("bbox") if row.get("bbox") is not None
                             else final_boxes[int(row.get("i"))])
         except Exception:
             b_wh = _to_xywh(final_boxes[int(row.get("i"))])
 
-        # final box OCR
+        # OCR
         text_fb = _ocr_box_raw(lower_img, b_wh, ocr_url=ocr_url, lang=lang,
                                psm=psm_final, oem=oem_final)
         text_fb = re.sub(r"\s+", " ", (text_fb or "")).strip()
         if not text_fb:
             continue
 
-        # text_preview güncelle
-        old_prev = str(row.get("text_preview") or "")
-        if update_even_if_shorter or (len(text_fb) > len(old_prev)):
-            df.at[idx, "text_preview"] = text_fb[:800]
-
-        # isim + TCKN yeniden dene
+        # İsim + TCKN
         tckn_p = find_tckn(text_fb)
         multi = _extract_names_multi(text_fb, pool, thr=name_sim_threshold) if text_fb else []
         raw_name = "; ".join(multi) if multi else None
         name_clean = _sanitize_names_keep(raw_name, raw_name or text_fb)
+
+        # ---- Tek kelime otomatik tamamlama ----
+        if single_token_autocomplete and name_clean:
+            toks_nc = _NAME_TOKEN_RE.findall(name_clean)
+            if len(toks_nc) == 1:
+                maybe = _complete_single_token(toks_nc[0], pool, single_token_threshold)
+                if maybe:
+                    name_clean = maybe  # tek kelimeyi known_names'teki tam adıyla değiştir
+
+        # text_preview: isim varsa isim; yoksa gibberish-temiz OCR
+        new_preview = name_clean if (name_clean and preview_name_overrides) else _clean_text_gibberish(text_fb)
+        old_prev = str(row.get("text_preview") or "")
+        if update_even_if_shorter or (len(new_preview) > len(old_prev)):
+            df.at[idx, "text_preview"] = new_preview[:800]
+
+        # name_in_box yaz
         new_name = (f"{name_clean} | {tckn_p}" if (name_clean and tckn_p)
                     else (tckn_p if not name_clean else name_clean))
-
         if not _blank(new_name):
             df.at[idx, "name_in_box"] = new_name
 
