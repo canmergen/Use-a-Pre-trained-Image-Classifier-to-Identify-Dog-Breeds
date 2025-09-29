@@ -1,262 +1,167 @@
-def apply_finalbox_fallback_for_empty_names(
-    per_box_df: pd.DataFrame,
-    *,
-    lower_img,                 # cv2 BGR
-    final_boxes: List[Any],
-    known_names: Optional[List[str]],
-    ocr_url: str,
-    lang: str = "tur+eng",
-    name_sim_threshold: float = 0.76,
-    psm_final: int = 11,
-    oem_final: int = 1,
-    update_even_if_shorter: bool = False,
-    preview_name_overrides: bool = True,
-    max_name_tokens: int = 4,
-    single_token_autocomplete: bool = True,
-    single_token_threshold: float = 0.80
-) -> pd.DataFrame:
-    """
-    İki durum:
-      A) name_in_box boş → final_box OCR + isim/TCKN çıkarımı
-      B) name_in_box tek kelime → known_names'tan otomatik tamamlama (OCR yok)
-    Ayrıca gibberish temizliği ve opsiyonel text_preview override uygulanır.
-    """
-    import re, json, base64, unicodedata
-    import numpy as np
-    import cv2, requests
-    from rapidfuzz import fuzz
-    # ---------- helpers ----------
-    def _to_xywh(b: Any) -> Tuple[int,int,int,int]:
-        if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
-            x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
-        if isinstance(b, dict):
-            if all(k in b for k in ("x","y","w","h")):  return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-            if all(k in b for k in ("x0","y0","x1","y1")):  return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
-            if all(k in b for k in ("left","top","right","bottom")):  return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
-        raise ValueError("bbox format not supported")
+from __future__ import annotations
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+import numpy as np
+import cv2
+import fitz            # PyMuPDF
+import tifffile as tiff
 
-    def _ocr_remote_png(img_gray, *, ocr_url: str, lang: str, psm: int, oem: int) -> str:
-        ok, buf = cv2.imencode(".png", img_gray)
-        if not ok: return ""
-        payload = {"image": base64.b64encode(buf.tobytes()).decode("ascii"),
-                   "lang": lang, "config": f"--psm {int(psm)} --oem {int(oem)}"}
-        try:
-            r = requests.post(ocr_url, data=json.dumps(payload),
-                              headers={"Content-Type":"application/json"}, timeout=60)
-            r.raise_for_status()
-            return (r.json().get("text") or "").strip()
-        except Exception:
-            return ""
+# -------- Helpers --------
 
-    def _ocr_box_raw(lower_img, xywh: Tuple[int,int,int,int], *, ocr_url: str, lang: str, psm: int=11, oem: int=1) -> str:
-        x,y,w,h = xywh
-        crop = lower_img[max(0,y):y+h, max(0,x):x+w]
-        if crop is None or getattr(crop, "size", 0) == 0: return ""
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim==3 else crop
-        gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return _ocr_remote_png(bw, ocr_url=ocr_url, lang=lang, psm=psm, oem=oem)
+def _cv_imdecode_exact(img_bytes: bytes) -> np.ndarray:
+    """Bayttan görüntüyü yeniden kodlamadan NumPy'a aç (piksel 1:1)."""
+    buf = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("cv2.imdecode başarısız: gömülü format desteklenmiyor.")
+    return img  # dtype ve kanal sayısı korunur (örn. GRAY, RGB(A), vb.)
 
-    def _strip_diac(s: str) -> str:
-        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def _U(s: str) -> str:
-        s = (s or "").upper()
-        return re.sub(r"\s+"," ", _strip_diac(s)).strip()
+def _pixmap_to_numpy_bgr(pix: fitz.Pixmap) -> np.ndarray:
+    """PyMuPDF Pixmap -> np.uint8 HxWxC (BGR)."""
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    if pix.n == 1:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    else:
+        arr = arr[:, :, :3][:, :, ::-1]  # RGB -> BGR
+    return arr
 
-    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
-
-    _NON_NAME_TOKENS = {
-        "TOPLANTIDA","HAZIR","BULUNAN","ŞİRKETİN","ŞİRKET","PAYLARIN","PAYLARI","TOPLAMI","TOPLAM",
-        "NİSAP","NİSABI","MEVCUT","ASGARİ","TİCARİ","MERKEZİ","MAD","MADDE","SAYI","KARAR","GÜNDEM",
-        "HANELİ","VERGİ","NO","NOSU","MERKEZ","ADRESİ","BAKANLIK","TEMSİLCİSİ"
-    }
-    _NON_NAME_TOKENS_U = { _U(t) for t in _NON_NAME_TOKENS }
-
-    _VOWELS = set(list("AEIİOÖUÜaeıioöuü"))
-    def _has_vowel(s: str) -> bool: return any(ch in _VOWELS for ch in s)
-    def _long_consonant_run(s: str, k: int = 5) -> bool:
-        run = 0
-        for ch in s:
-            if ch.isalpha() and ch.upper() not in _VOWELS:
-                run += 1
-                if run >= k: return True
-            else:
-                run = 0
-        return False
-    def is_gibberish_token(tok: str) -> bool:
-        U = _U(tok)
-        if len(U) <= 2: return True
-        if U.isalpha() and U == U.upper() and len(U) <= 3: return True
-        if U in {"AU","SP","PR","PS","PN","AF","PF"}: return True
-        if U in _NON_NAME_TOKENS_U: return True
-        if any(ch.isdigit() for ch in tok): return True
-        if len(tok) > 20: return True
-        if not _has_vowel(tok): return True
-        if _long_consonant_run(tok, k=5): return True
-        if re.search(r"[^\wÇĞİÖŞÜçğıöşü]", tok) and len(tok) <= 3: return True
-        return False
-    def filter_name_tokens(tokens: List[str]) -> List[str]:
-        return [t for t in tokens if (not is_gibberish_token(t))]
-
-    ROLE_REGEX = re.compile(
-        r"(YÖNETİM\s+KURULU\s+BAŞKANI|YÖNETİM\s+KURULU\s+ÜYESİ|YÖNETİM\s+KURULU\s+ÜYELERİ|YK\s+BAŞKANI|"
-        r"DIVAN\s+BASKANI|DİVAN\s+BAŞKANI|TOPLANTI\s+BAŞKANI|OY\s+TOPLAMA\s+MEMURU|BAKANLIK\s+TEMSİLCİSİ)",
-        flags=re.IGNORECASE
-    )
-    def cut_before_first_role(text: str) -> str:
-        if not text: return text
-        m = ROLE_REGEX.search(text)
-        return text[m.start():] if m else text
-
-    def find_tckn(text: str) -> Optional[str]:
-        m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", (text or "").replace(" ", ""))
-        return "; ".join(list(dict.fromkeys(m))) if m else None
-
-    def _extract_names_multi(text: str, pool: List[str], thr: float) -> List[str]:
-        if not text: return []
-        text = cut_before_first_role(text)
-        toks_all = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)]
-        toks = [(t,s,e) for (t,s,e) in toks_all if not is_gibberish_token(t)]
-        if not toks: return []
-        wins=[]
-        for L in (3,2):
-            for i in range(0, max(0, len(toks)-L+1)):
-                wtxt = " ".join(t for (t,_,__) in toks[i:i+L])
-                best_sc, mapped = 0.0, None
-                for kn in (pool or []):
-                    sc = max(fuzz.ratio(_U(wtxt), _U(kn))/100.0, fuzz.partial_ratio(_U(wtxt), _U(kn))/100.0)
-                    if sc > best_sc: best_sc, mapped = sc, kn
-                if (not pool) or best_sc >= thr:
-                    wins.append((toks[i][1], toks[i+L-1][2], wtxt, mapped,
-                                 best_sc + (0.10 if 6 <= len(wtxt) <= 40 else 0.0) + (0.05 if L==3 else 0.0)))
-        if not wins: return []
-        wins.sort(key=lambda x: (x[1]-x[0], -x[0]), reverse=True)
-        chosen=[]; used=[]
-        for s,e,wtxt,mapped,_ in wins:
-            if any(not (e <= us or s >= ue) for (us,ue) in used):
-                continue
-            used.append((s,e))
-            toks2 = filter_name_tokens(_NAME_TOKEN_RE.findall(mapped or wtxt))
-            if len(toks2) >= 2:
-                nm = " ".join(toks2[:max_name_tokens])
-                if nm and all(fuzz.token_set_ratio(nm, ex) < 92 for o in [nm] for ex in chosen):
-                    chosen.append(nm)
-        return chosen
-
-    def _sanitize_names_keep(raw_names: Optional[str], raw_text: str) -> Optional[str]:
-        if not (raw_names or raw_text): return None
-        parts = [p.strip() for p in re.split(r"[;]+", (raw_names or "")) if p.strip()]
-        if not parts: parts = [(raw_text or "").strip()]
-        cleaned=[]
-        for p in parts:
-            toks = filter_name_tokens(_NAME_TOKEN_RE.findall(p))
-            if not toks: continue
-            cleaned.append(" ".join(toks[:max_name_tokens]))
-        out=[]
-        for c in cleaned:
-            if all(fuzz.token_set_ratio(c, o) < 92 for o in out):
-                out.append(c)
-        return "; ".join(out) if out else None
-
-    def _clean_text_gibberish(text: str) -> str:
-        toks = filter_name_tokens(_NAME_TOKEN_RE.findall(text or ""))
-        return " ".join(toks[:max_name_tokens]) if toks else (text or "")
-
-    def _complete_single_token(tok: str, pool: List[str], thr: float) -> Optional[str]:
-        if not tok or not pool: return None
-        u_tok = _U(tok)
-        best, best_sc = None, 0.0
-        for kn in pool:
-            toks_kn = _NAME_TOKEN_RE.findall(kn)
-            sc_tok = 0.0
-            for t in toks_kn:
-                sc_tok = max(sc_tok,
-                             fuzz.ratio(u_tok, _U(t))/100.0,
-                             fuzz.partial_ratio(u_tok, _U(t))/100.0)
-                if _U(t).startswith(u_tok):
-                    sc_tok = max(sc_tok, 0.99)
-            sc_full = fuzz.partial_ratio(u_tok, _U(kn))/100.0
-            sc = max(sc_tok, sc_full)
-            if sc > best_sc:
-                best_sc, best = sc, kn
-        if best and best_sc >= thr:
-            toks = filter_name_tokens(_NAME_TOKEN_RE.findall(best))
-            return " ".join(toks[:max_name_tokens]) if toks else None
+def _tiff_page_dpi(pg: tiff.TiffPage) -> Optional[Tuple[int, int]]:
+    xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
+    if not (xr and yr and ru):
         return None
+    def rat(tag):
+        num, den = tag.value
+        return float(num) / float(den)
+    x, y = rat(xr), rat(yr)
+    if ru.value == 3:  # dpcm -> dpi
+        x *= 2.54
+        y *= 2.54
+    return int(round(x)), int(round(y))
 
-    def _trim_trailing_caps_short(name: str) -> str:
-        toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", name or "")
-        while toks and (len(toks[-1]) <= 2 or (toks[-1].isalpha() and toks[-1].upper()==toks[-1] and len(toks[-1]) <= 3)):
-            toks.pop()
-        return " ".join(toks)
+def _pdf_try_native_page_image(doc: fitz.Document, page: fitz.Page, cover_thresh: float = 0.97) -> Optional[np.ndarray]:
+    """
+    Sayfa tek/kaplayıcı gömülü raster içeriyorsa onu bayt düzeyinde çıkar.
+    Bulamazsa None.
+    """
+    imgs = page.get_images(full=True)
+    if len(imgs) == 1 and not page.get_text("blocks"):
+        xref = imgs[0][0]
+        data = doc.extract_image(xref)["image"]
+        return _cv_imdecode_exact(data)
 
-    def _blank(x):
-        return (x is None) or (isinstance(x, float) and np.isnan(x)) or (str(x).strip()=="")
-
-    def _is_single_token_name(name: str) -> bool:
-        toks = _NAME_TOKEN_RE.findall(name or "")
-        return len(toks) == 1
-
-    # ---------- main ----------
-    df = per_box_df.copy()
-    pool = list(dict.fromkeys(known_names or []))
-
-    for idx, row in df.iterrows():
-        if row.get("loc") != "roles":
+    page_area = page.rect.get_area()
+    for info in page.get_image_info(xrefs=True):
+        bbox = info.get("bbox")
+        if not bbox:
             continue
+        if (bbox.get_area() / page_area) >= cover_thresh:
+            data = doc.extract_image(info["xref"])["image"]
+            return _cv_imdecode_exact(data)
+    return None
 
-        # --- B) Tek kelime mevcut isim → autocomplete ---
-        if single_token_autocomplete and not _blank(row.get("name_in_box")) and _is_single_token_name(row.get("name_in_box")):
-            base = row.get("name_in_box")
-            maybe = _complete_single_token(base, pool, single_token_threshold)
-            if maybe and maybe != base:
-                fixed = _trim_trailing_caps_short(maybe)
-                df.at[idx, "name_in_box"] = fixed
-                if preview_name_overrides:
-                    old_prev = str(row.get("text_preview") or "")
-                    if update_even_if_shorter or (len(fixed) > len(old_prev)):
-                        df.at[idx, "text_preview"] = fixed
-            continue  # bu satır için OCR fallback’e gerek yok
+# -------- Main API --------
 
-        # --- A) Boş isim → OCR fallback + çıkarım ---
-        if _blank(row.get("name_in_box")):
-            # bbox seçimi
-            try:
-                b_wh = _to_xywh(row.get("bbox") if row.get("bbox") is not None
-                                else final_boxes[int(row.get("i"))])
-            except Exception:
-                b_wh = _to_xywh(final_boxes[int(row.get("i"))])
+def load_document_lossless(
+    path: Union[str, Path],
+    *,
+    mode: str = "auto",          # "auto" | "native_only" | "raster_only"
+    raster_dpi: int = 600,       # PDF rasterizasyon DPI'ı (tek sefer)
+    enforce_bgr: bool = False    # True -> renk uzayını BGR'a normalize et
+) -> Dict[str, Any]:
+    """
+    Çok-sayfa PDF/TIFF'i sıfır kalite kaybıyla (mümkün olduğunda) veya tek-sefer rasterizasyonla oku.
 
-            text_fb = _ocr_box_raw(lower_img, b_wh, ocr_url=ocr_url, lang=lang,
-                                   psm=psm_final, oem=oem_final)
-            text_fb = re.sub(r"\s+", " ", (text_fb or "")).strip()
-            if not text_fb:
-                continue
+    - TIFF: her sayfa 1:1 ham piksel (yeniden örnekleme yok), dtype korunur.
+    - PDF:
+        * mode="auto": mümkünse gömülü görüntüyü 1:1 çıkar; yoksa tek rasterizasyon (raster_dpi).
+        * mode="native_only": yalnızca gömülü rasterı kabul et; yoksa hata fırlat.
+        * mode="raster_only": her koşulda raster_dpi ile tek rasterizasyon yap.
 
-            tckn_p = find_tckn(text_fb)
-            multi = _extract_names_multi(text_fb, pool, thr=name_sim_threshold) if text_fb else []
-            raw_name = "; ".join(multi) if multi else None
-            name_clean = _sanitize_names_keep(raw_name, raw_name or text_fb)
+    Returns:
+      {
+        "doc_str": "pdf_doc" | "tiff_doc",
+        "path": "<abs path>",
+        "page_count": N,
+        "pages": [
+           {"index": i, "dpi": int | (int,int) | None, "shape": (H,W[,C]), "dtype": str, "image": np.ndarray},
+           ...
+        ]
+      }
+    """
+    p = Path(path).expanduser().resolve()
+    ext = p.suffix.lower()
+    out: Dict[str, Any] = {"doc_str": None, "path": str(p), "page_count": 0, "pages": []}
 
-            # tek kelime ise burada da autocomplete dene
-            if single_token_autocomplete and name_clean:
-                toks_nc = _NAME_TOKEN_RE.findall(name_clean)
-                if len(toks_nc) == 1:
-                    maybe = _complete_single_token(toks_nc[0], pool, single_token_threshold)
-                    if maybe:
-                        name_clean = maybe
+    if ext == ".pdf":
+        out["doc_str"] = "pdf_doc"
+        doc = fitz.open(p.as_posix())
+        try:
+            for i in range(doc.page_count):
+                page = doc.load_page(i)
+                img_np: Optional[np.ndarray] = None
+                dpi_val: Optional[int] = None
 
-            if name_clean:
-                name_clean = _trim_trailing_caps_short(name_clean)
+                if mode in ("auto", "native_only"):
+                    img_np = _pdf_try_native_page_image(doc, page)
+                    if img_np is not None:
+                        # Native çıkarım: piksel 1:1; DPI etiketi gömülü olmayabilir
+                        dpi_val = None
+                    elif mode == "native_only":
+                        raise RuntimeError(
+                            f"PDF sayfa {i}: Gömülü raster bulunamadı (native_only modunda vazgeçildi)."
+                        )
 
-            new_preview = name_clean if (name_clean and preview_name_overrides) else _clean_text_gibberish(text_fb)
-            old_prev = str(row.get("text_preview") or "")
-            if update_even_if_shorter or (len(new_preview) > len(old_prev)):
-                df.at[idx, "text_preview"] = new_preview[:800]
+                if img_np is None:  # raster zorunlu
+                    scale = raster_dpi / 72.0
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(scale, scale),
+                        alpha=False,
+                        colorspace=fitz.csRGB
+                    )
+                    img_np = _pixmap_to_numpy_bgr(pix) if enforce_bgr else np.frombuffer(
+                        pix.samples, dtype=np.uint8
+                    ).reshape(pix.h, pix.w, pix.n if pix.n < 4 else 3)
+                    if not enforce_bgr and img_np.ndim == 3 and img_np.shape[2] == 4:
+                        img_np = img_np[:, :, :3]  # alfa at
+                    dpi_val = raster_dpi  # üretilen piksel ızgarasının fiziksel ölçeği
 
-            new_name = (f"{name_clean} | {tckn_p}" if (name_clean and tckn_p)
-                        else (tckn_p if not name_clean else name_clean))
-            if not _blank(new_name):
-                df.at[idx, "name_in_box"] = new_name
+                # Renk uzayı normalize etme (isteğe bağlı)
+                if enforce_bgr and img_np.ndim == 3 and img_np.shape[2] == 3:
+                    # Native image RGB geldiyse BGR'a çevir
+                    # Heuristik: assume RGB -> BGR çevir
+                    img_np = img_np[:, :, ::-1] if img_np.flags['C_CONTIGUOUS'] else img_np[..., ::-1]
 
-    return df
+                out["pages"].append({
+                    "index": i,
+                    "dpi": dpi_val,
+                    "shape": tuple(img_np.shape),
+                    "dtype": str(img_np.dtype),
+                    "image": img_np
+                })
+        finally:
+            doc.close()
+
+    elif ext in (".tif", ".tiff"):
+        out["doc_str"] = "tiff_doc"
+        with tiff.TiffFile(p) as tf:
+            for i, pg in enumerate(tf.pages):
+                arr = pg.asarray()  # ham piksel (kayıpsız)
+                dpi_xy = _tiff_page_dpi(pg)
+                if enforce_bgr:
+                    if arr.ndim == 2:
+                        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+                    elif arr.ndim == 3 and arr.shape[2] == 4:  # yaygın RGBA
+                        arr = arr[:, :, :3]
+                out["pages"].append({
+                    "index": i,
+                    "dpi": dpi_xy,
+                    "shape": tuple(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "image": arr
+                })
+
+    else:
+        raise ValueError(f"Desteklenmeyen uzantı: {ext}")
+
+    out["page_count"] = len(out["pages"])
+    return out
