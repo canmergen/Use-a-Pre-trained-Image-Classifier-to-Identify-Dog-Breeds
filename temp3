@@ -1,101 +1,62 @@
-# pip install pymupdf tifffile opencv-python matplotlib
+# tek fonksiyon: PDF + TIFF (CCITT/LZW vb. güvenli), debug gösterimi var
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union, List
-import numpy as np
-import cv2
-import fitz                # PyMuPDF
-import tifffile as tiff
+from typing import Any, Dict, Optional, Tuple, Union
+import numpy as np, cv2, fitz, tifffile as tiff
 import matplotlib.pyplot as plt
+from PIL import Image, TiffImagePlugin
 
 def load_document_lossless(
     path: Union[str, Path],
     *,
-    mode: str = "auto",        # "auto" | "native_only" | "raster_only"
-    raster_dpi: int = 600,     # PDF rasterizasyon DPI (tek sefer)
-    enforce_rgb: bool = False, # True -> çıktı görüntülerini zorla RGB'ye çevir
-    debug: bool = False,       # True -> sayfa sayfa göster + sonda özet
-    cover_thresh: float = 0.97 # PDF sayfayı kaplayan görsel eşiği
+    mode: str = "auto",        # PDF: "auto" | "native_only" | "raster_only"
+    raster_dpi: int = 600,     # PDF rasterizasyon DPI'ı
+    enforce_rgb: bool = False, # Görselleri zorla RGB'ye çevir
+    debug: bool = False,       # Sayfa sayfa göster + özet
+    cover_thresh: float = 0.97 # PDF'te sayfayı kaplayan görsel eşiği
 ) -> Dict[str, Any]:
-    """
-    PDF/TIFF'i çok sayfalı olarak kalite kaybı olmadan (mümkünse native) veya tek sefer
-    rasterizasyonla NumPy görüntülere çevirir.
+    p = Path(path).expanduser().resolve()
+    ext = p.suffix.lower()
+    out: Dict[str, Any] = {"doc_str": None, "path": str(p), "page_count": 0, "pages": []}
 
-    Dönen sözlük:
-    {
-      "doc_str": "pdf_doc"|"tiff_doc",
-      "path": "<abs>",
-      "page_count": N,
-      "pages": [
-        {"index": i, "dpi": int | (int,int) | None, "shape": (H,W[,C]), "dtype": str, "image": np.ndarray}
-      ]
-    }
-    """
+    def _imshow(img: np.ndarray, title: str):
+        if not debug: return
+        plt.figure()
+        if img.ndim == 2: plt.imshow(img, cmap="gray")
+        else:             plt.imshow(img if img.shape[-1] != 3 else img)  # matplotlib RGB bekler
+        plt.title(title); plt.axis("off"); plt.show()
 
-    # --- iç yardımcılar (tek fonksiyon şartı için içe gömülü) ---
-    def _cv_imdecode_exact(img_bytes: bytes) -> np.ndarray:
-        buf = np.frombuffer(img_bytes, dtype=np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError("cv2.imdecode başarısız: gömülü format desteklenmiyor.")
-        return img  # dtype/kanal olduğu gibi korunur
+    def _cv_imdecode_exact(b: bytes) -> np.ndarray:
+        buf = np.frombuffer(b, dtype=np.uint8)
+        im = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if im is None: raise ValueError("cv2.imdecode failed")
+        return im
 
-    def _tiff_page_dpi(pg: tiff.TiffPage) -> Optional[Tuple[int, int]]:
-        xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
-        if not (xr and yr and ru):
-            return None
-        def rat(tag):
-            num, den = tag.value
-            return float(num) / float(den)
-        x, y = rat(xr), rat(yr)
-        # 2=inç, 3=cm
-        if ru.value == 3:  # dpcm -> dpi
-            x *= 2.54
-            y *= 2.54
-        return int(round(x)), int(round(y))
-
-    def _pdf_try_native_page_image(doc: fitz.Document, page: fitz.Page, cover_thresh: float) -> Optional[np.ndarray]:
+    def _pdf_try_native_page_image(doc: fitz.Document, page: fitz.Page) -> Optional[np.ndarray]:
         imgs = page.get_images(full=True)
-        # 1) tek görüntü ve metin yoksa
         if len(imgs) == 1 and not page.get_text("blocks"):
-            xref = imgs[0][0]
-            data = doc.extract_image(xref)["image"]
+            xref = imgs[0][0]; data = doc.extract_image(xref)["image"]
             return _cv_imdecode_exact(data)
-        # 2) sayfayı neredeyse kaplayan görsel(ler)
         page_area = float(page.rect.get_area())
         for info in page.get_image_info(xrefs=True):
             bbox = info.get("bbox")
-            if not bbox:
-                continue
-            if (bbox.get_area() / page_area) >= cover_thresh:
+            if bbox and (bbox.get_area()/page_area) >= cover_thresh:
                 data = doc.extract_image(info["xref"])["image"]
                 return _cv_imdecode_exact(data)
         return None
 
-    def _pixmap_to_ndarray_rgb(pix: fitz.Pixmap) -> np.ndarray:
-        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        if pix.n == 1:
-            return arr  # GRAY
-        return arr[:, :, :3]  # RGB
-
-    def _imshow_any(img: np.ndarray, title: str = ""):
-        plt.figure()
-        if img.ndim == 2:
-            plt.imshow(img, cmap="gray")
-        else:
-            # 3 veya 4 kanal; matplotlib RGB/ARGB bekler
-            if img.shape[2] == 4:
-                plt.imshow(img)
-            else:
-                plt.imshow(img)
-        plt.title(title)
-        plt.axis("off")
-        plt.show()
-
-    # --- ana akış ---
-    p = Path(path).expanduser().resolve()
-    ext = p.suffix.lower()
-    out: Dict[str, Any] = {"doc_str": None, "path": str(p), "page_count": 0, "pages": []}
+    def _tiff_dpi_from_tags_pillow(img: Image.Image) -> Optional[Tuple[int,int]]:
+        # 282=XRes, 283=YRes, 296=ResolutionUnit (2 inch, 3 cm)
+        tags = img.tag_v2
+        xr, yr, ru = tags.get(282), tags.get(283), tags.get(296)
+        if xr is None or yr is None or ru is None: return None
+        def _to_float(v): 
+            if isinstance(v, (tuple, list)) and len(v)==2 and all(isinstance(x,int) for x in v):
+                return v[0]/v[1]
+            return float(v)
+        x = _to_float(xr); y = _to_float(yr)
+        if int(ru) == 3: x*=2.54; y*=2.54  # dpcm->dpi
+        return int(round(x)), int(round(y))
 
     if ext == ".pdf":
         out["doc_str"] = "pdf_doc"
@@ -103,76 +64,79 @@ def load_document_lossless(
         try:
             for i in range(doc.page_count):
                 page = doc.load_page(i)
-                img: Optional[np.ndarray] = None
-                dpi_val: Optional[int] = None
-
-                if mode in ("auto", "native_only"):
-                    img = _pdf_try_native_page_image(doc, page, cover_thresh)
-                    if img is not None:
-                        dpi_val = None  # gömülü resimlerde DPI etiketi olmayabilir
+                img = None; dpi_val = None
+                if mode in ("auto","native_only"):
+                    try: img = _pdf_try_native_page_image(doc, page)
+                    except Exception: img = None
+                    if img is not None: dpi_val = None
                     elif mode == "native_only":
-                        raise RuntimeError(f"PDF sayfa {i}: Gömülü raster bulunamadı (native_only).")
-
+                        raise RuntimeError(f"PDF page {i}: no native raster found (native_only).")
                 if img is None:
-                    # vektör/karma: tek sefer rasterizasyon (RGB)
                     scale = raster_dpi / 72.0
-                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-                    img = _pixmap_to_ndarray_rgb(pix)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False, colorspace=fitz.csRGB)
+                    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                    img = arr if arr.ndim==2 or arr.shape[2]==1 else arr[:, :, :3]  # RGB
                     dpi_val = raster_dpi
-
-                # istenirse zorla RGB (OCR boru hattını standardize eder)
                 if enforce_rgb:
-                    if img.ndim == 2:  # GRAY -> RGB
-                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                    elif img.ndim == 3 and img.shape[2] == 4:  # RGBA -> RGB
-                        img = img[:, :, :3]
-                # debug gösterimi
-                if debug:
-                    _imshow_any(img, title=f"PDF p{i} | shape={img.shape} | dpi={dpi_val}")
-
-                out["pages"].append({
-                    "index": i,
-                    "dpi": dpi_val,
-                    "shape": tuple(img.shape),
-                    "dtype": str(img.dtype),
-                    "image": img
-                })
+                    if img.ndim==2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                    elif img.ndim==3 and img.shape[2]==4: img = img[:, :, :3]
+                _imshow(img, f"PDF p{i} | {img.shape} | dpi={dpi_val}")
+                out["pages"].append({"index": i, "dpi": dpi_val, "shape": tuple(img.shape), "dtype": str(img.dtype), "image": img})
         finally:
             doc.close()
 
     elif ext in (".tif", ".tiff"):
         out["doc_str"] = "tiff_doc"
-        with tiff.TiffFile(p.as_posix()) as tf:
-            for i, pg in enumerate(tf.pages):
-                arr = pg.asarray()            # 1:1 ham piksel, yeniden örnekleme yok
-                dpi_xy = _tiff_page_dpi(pg)   # (x,y) veya None
+        # 1) Önce tifffile + imagecodecs ile dene
+        try:
+            with tiff.TiffFile(p.as_posix()) as tf:
+                for i, pg in enumerate(tf.pages):
+                    arr = pg.asarray()               # 1:1 ham piksel
+                    # enforce_rgb dönüşümü (isteğe bağlı)
+                    if enforce_rgb:
+                        if arr.ndim==2:   arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+                        elif arr.ndim==3 and arr.shape[2]==4: arr = arr[:, :, :3]
+                    # DPI (tifffile tags)
+                    xr = pg.tags.get("XResolution"); yr = pg.tags.get("YResolution"); ru = pg.tags.get("ResolutionUnit")
+                    if xr and yr and ru:
+                        def rat(tag): num, den = tag.value; return float(num)/float(den)
+                        dx, dy = rat(xr), rat(yr)
+                        if ru.value == 3: dx*=2.54; dy*=2.54
+                        dpi_xy = (int(round(dx)), int(round(dy)))
+                    else:
+                        dpi_xy = None
+                    _imshow(arr, f"TIFF p{i} | {arr.shape} | dpi={dpi_xy}")
+                    out["pages"].append({"index": i, "dpi": dpi_xy, "shape": tuple(arr.shape), "dtype": str(arr.dtype), "image": arr})
+        except Exception as e:
+            # 2) Fallback: Pillow ile oku (CCITT G3/G4 dahil)
+            with Image.open(p.as_posix()) as im:
+                n_frames = getattr(im, "n_frames", 1)
+                for i in range(n_frames):
+                    im.seek(i)
+                    frame = im.copy()
+                    dpi_xy = _tiff_dpi_from_tags_pillow(frame)
+                    # Mode '1' (1-bit), 'L', 'RGB', 'RGBA' olabilir
+                    if frame.mode == "1":      # 1-bit: OCR için 0/255'e genişletelim (kayıpsız mantık)
+                        arr = (np.array(frame, dtype=np.uint8) * 255)
+                    elif frame.mode in ("L","P"):
+                        arr = np.array(frame, dtype=np.uint8)
+                        if enforce_rgb: arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+                    elif frame.mode in ("RGB","RGBA"):
+                        arr = np.array(frame)
+                        if enforce_rgb and arr.ndim==3 and arr.shape[2]==4: arr = arr[:, :, :3]
+                    else:
+                        # bilinmeyen modları güvenli bir şekilde RGB'ye çevir
+                        frame = frame.convert("RGB")
+                        arr = np.array(frame)
+                    _imshow(arr, f"TIFF(pillow) p{i} | {arr.shape} | dpi={dpi_xy}")
+                    out["pages"].append({"index": i, "dpi": dpi_xy, "shape": tuple(arr.shape), "dtype": str(arr.dtype), "image": arr})
 
-                if enforce_rgb:
-                    if arr.ndim == 2:
-                        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
-                    elif arr.ndim == 3 and arr.shape[2] == 4:
-                        arr = arr[:, :, :3]
-
-                if debug:
-                    _imshow_any(arr, title=f"TIFF p{i} | shape={arr.shape} | dpi={dpi_xy}")
-
-                out["pages"].append({
-                    "index": i,
-                    "dpi": dpi_xy,
-                    "shape": tuple(arr.shape),
-                    "dtype": str(arr.dtype),
-                    "image": arr
-                })
     else:
-        raise ValueError(f"Desteklenmeyen uzantı: {ext}")
+        raise ValueError(f"Unsupported extension: {ext}")
 
     out["page_count"] = len(out["pages"])
-
     if debug:
-        print(f"\nBelge: {out['path']}")
-        print(f"Tür   : {out['doc_str']}")
-        print(f"Sayfa : {out['page_count']}\n")
+        print(f"\nBelge: {out['path']}\nTür: {out['doc_str']}\nSayfa: {out['page_count']}")
         for pg in out["pages"]:
-            print(f"p{pg['index']:>3}  shape={pg['shape']}  dtype={pg['dtype']}  dpi={pg['dpi']}")
-
+            print(f"p{pg['index']:>3}  shape={pg['shape']} dtype={pg['dtype']} dpi={pg['dpi']}")
     return out
