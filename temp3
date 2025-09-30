@@ -8,11 +8,13 @@ def convert_document_to_images(
 ):
     """
     Çok sayfalı PDF/TIFF'i 'görüldüğü gibi' image'lara çevirir (renk/kanal/dtype'e dokunmadan).
-    CCITT gibi TIFF sıkıştırmaları tifffile+imagecodecs yoksa otomatik Pillow fallback.
+    - PDF: önce native (tek/kaplayan görsel) → yoksa 600 DPI raster.
+    - TIFF: tifffile (varsa) → decode hatasında otomatik Pillow fallback.
+    - DPI metası (1,1)/(0,0) görülürse None'a normalize edilir.
     Dönen:
       {"doc_str","path","page_count","pages":[{"index","dpi","shape","dtype","mode","colorspace","source","image"},...]}
     """
-    # ---- imports (tek fonksiyon için içeri alındı) ----
+    # ---- imports ----
     from pathlib import Path
     from typing import Optional
     import numpy as np
@@ -29,14 +31,14 @@ def convert_document_to_images(
     def _imshow(img, title: str):
         if not debug: return
         import matplotlib.pyplot as plt
-        plt.figure()
+        plt.figure(figsize=(10,10))
         if img.ndim == 2: plt.imshow(img, cmap='gray')
         else:             plt.imshow(img)
         plt.title(title); plt.axis('off'); plt.show()
 
-    def _apply_exif_orientation(arr: np.ndarray, orient: Optional[int]) -> np.ndarray:
+    def _apply_exif_orientation(arr, orient: Optional[int]):
         if orient is None: return arr
-        if orient == 3:  return np.rot90(arr, 2)  # 180°
+        if orient == 3:  return np.rot90(arr, 2)
         if orient == 6:  return np.rot90(arr, 3)  # 90° CW
         if orient == 8:  return np.rot90(arr, 1)  # 90° CCW
         return arr
@@ -52,33 +54,56 @@ def convert_document_to_images(
             return cv2.cvtColor(im, cv2.COLOR_BGR2RGB), "RGB"
         return cv2.cvtColor(im, cv2.COLOR_BGRA2RGBA), "RGBA"
 
+    # --- robust area helpers (Rect | tuple destek) ---
+    def _rect_area(rect_or_tuple) -> float:
+        # fitz.Rect
+        if hasattr(rect_or_tuple, "get_area"):
+            return float(rect_or_tuple.get_area())
+        if hasattr(rect_or_tuple, "width") and hasattr(rect_or_tuple, "height"):
+            return float(rect_or_tuple.width * rect_or_tuple.height)
+        # (x0, y0, x1, y1)
+        if isinstance(rect_or_tuple, (tuple, list)) and len(rect_or_tuple) >= 4:
+            x0, y0, x1, y1 = rect_or_tuple[:4]
+            return float(max(0.0, (x1 - x0)) * max(0.0, (y1 - y0)))
+        return 0.0
+
     def _pdf_try_native_cover(doc, page, cover_thresh: float):
+        # 1) tek görsel + metin yok
         imgs = page.get_images(full=True)
         if len(imgs) == 1 and not page.get_text("blocks"):
             return doc.extract_image(imgs[0][0])["image"]
-        page_area = float(page.rect.get_area())
+        # 2) sayfayı kaplayan görsel(ler)
+        page_area = _rect_area(page.rect)
         covers = []
         for info in page.get_image_info(xrefs=True):
             bbox = info.get("bbox")
-            if bbox and (bbox.get_area() / page_area) >= cover_thresh:
+            if bbox and ( _rect_area(bbox) / max(page_area, 1e-9) ) >= cover_thresh:
                 covers.append(info["xref"])
         if len(covers) == 1:
             return doc.extract_image(covers[0])["image"]
         return None
 
+    def _normalize_dpi(dpi_xy):
+        # (1,1) veya (0,0) gibi anlamsız değerleri None yap
+        if dpi_xy is None: return None
+        try:
+            x, y = int(dpi_xy[0]), int(dpi_xy[1])
+            if x <= 1 and y <= 1: return None
+            return (x, y)
+        except Exception:
+            return None
+
     def _tiff_with_tifffile(p: Path):
-        """tifffile yolu; decode hatasında ValueError fırlatır."""
         pages = []
         with tiff.TiffFile(p.as_posix()) as tf:
             for i, pg in enumerate(tf.pages):
-                arr = pg.asarray()  # CCITT/LZW/J2K için imagecodecs gerekir
+                arr = pg.asarray()  # ham piksel (decoder gerekebilir)
                 # Orientation
                 orient = None
                 if apply_orientation:
                     try:
                         ori_tag = pg.tags.get("Orientation")
-                        if ori_tag is not None:
-                            orient = int(ori_tag.value)
+                        if ori_tag is not None: orient = int(ori_tag.value)
                     except Exception:
                         orient = None
                 if apply_orientation and orient in (3, 6, 8):
@@ -91,8 +116,8 @@ def convert_document_to_images(
                         num, den = tag.value
                         return float(num)/float(den)
                     x, y = _rat(xr), _rat(yr)
-                    if ru.value == 3: x *= 2.54; y *= 2.54
-                    dpi_xy = (int(round(x)), int(round(y)))
+                    if ru.value == 3: x *= 2.54; y *= 2.54  # dpcm->dpi
+                    dpi_xy = _normalize_dpi((int(round(x)), int(round(y))))
                 # mode bilgisi
                 if arr.ndim == 2:
                     mode = "1BIT" if arr.dtype == np.bool_ else "GRAY"
@@ -102,6 +127,7 @@ def convert_document_to_images(
                     mode = "RGBA"
                 else:
                     mode = f"NDIM{arr.ndim}_C{arr.shape[2] if arr.ndim==3 else 1}"
+
                 pages.append({
                     "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
                     "dtype": str(arr.dtype), "mode": mode, "colorspace": mode, "source": "tifffile",
@@ -110,26 +136,26 @@ def convert_document_to_images(
         return pages
 
     def _tiff_with_pillow(p: Path):
-        """Pillow fallback; dönüşüm yapmadan numpy’a çevirir; EXIF Orientation uygular."""
         pages = []
         with Image.open(p.as_posix()) as im:
             n = getattr(im, "n_frames", 1)
             for i in range(n):
                 im.seek(i)
                 frame = im.copy()
+                # Orientation (EXIF 274)
                 orient = None
                 if apply_orientation:
                     try:
                         exif = frame.getexif()
-                        orient = int(exif.get(274) or 1) if exif else 1  # 274=Orientation
+                        orient = int(exif.get(274) or 1) if exif else 1
                     except Exception:
                         orient = 1
-                arr = np.array(frame)  # mode/dtype aynen
+                arr = np.array(frame)
                 if apply_orientation and orient in (3, 6, 8):
                     arr = _apply_exif_orientation(arr, orient)
+                # DPI
                 dpi_xy = frame.info.get("dpi")
-                if not (isinstance(dpi_xy, (tuple, list)) and len(dpi_xy) >= 2):
-                    dpi_xy = None
+                dpi_xy = _normalize_dpi(dpi_xy if isinstance(dpi_xy, (tuple, list)) else None)
                 mode = frame.mode
                 pages.append({
                     "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
@@ -164,7 +190,8 @@ def convert_document_to_images(
                     else:
                         img = buf.reshape(pix.h, pix.w, pix.n)[:, :, :4].copy(); cs = "RGBA"
                     src = "raster"; dpi_val = pdf_dpi
-                _imshow(img, f"PDF p{i} | {src} | {cs} | dpi={dpi_val} | {img.shape}")
+
+                _imshow(img, f"Sayfa {i} | {src} | {cs} | dpi={dpi_val} | {img.shape}")
                 out["pages"].append({
                     "index": i, "dpi": dpi_val, "shape": tuple(img.shape),
                     "dtype": str(img.dtype), "mode": cs, "colorspace": cs, "source": src, "image": img
@@ -178,10 +205,8 @@ def convert_document_to_images(
         if _HAS_TIFFFILE:
             try:
                 out["pages"] = _tiff_with_tifffile(p)
-            except Exception as e:
-                # Örn: ValueError("<COMPRESSION.CCITT ...> not supported")
-                # veya imagecodecs/decoder yokluğu → Pillow fallback
-                # print(f"tifffile decode failed, falling back to Pillow: {e}")
+            except Exception:
+                # Örn: CCITT decoder yokluğu → Pillow fallback
                 out["pages"] = _tiff_with_pillow(p)
         else:
             out["pages"] = _tiff_with_pillow(p)
@@ -190,8 +215,9 @@ def convert_document_to_images(
     else:
         raise ValueError(f"Unsupported extension: {ext}")
 
+    # debug modunda sayfaları ayrıca tek tek göster
     if debug:
-        print(f"\nBelge: {out['path']}\nTür: {out['doc_str']}\nSayfa: {out['page_count']}")
         for pg in out["pages"]:
-            print(f"p{pg['index']:>3}  shape={pg['shape']}  dtype={pg['dtype']}  mode={pg['mode']}  dpi={pg['dpi']}  src={pg['source']}")
+            _imshow(pg["image"], f"Sayfa {pg['index']} | shape={pg['shape']} | dpi={pg['dpi']}")
+
     return out
