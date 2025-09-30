@@ -1,32 +1,22 @@
 def convert_document_to_images(
     path,
     *,
-    pdf_dpi: int = 600,             # PDF raster DPI (kalite hedefin)
-    cover_thresh: float = 0.97,     # PDF: sayfayı kaplayan gömülü görsel eşiği
+    pdf_dpi: int = 600,             # PDF raster DPI
+    cover_thresh: float = 0.97,     # PDF: sayfayı kaplayan görsel eşiği
     apply_orientation: bool = True, # TIFF/EXIF Orientation uygula
     debug: bool = False
 ):
     """
     Çok sayfalı PDF/TIFF'i 'görüldüğü gibi' image'lara çevirir (renk/kanal/dtype'e dokunmadan).
-    - PDF: önce native kaplayan görsel varsa onu çıkarır; yoksa pdf_dpi ile raster.
-    - TIFF: ham piksel (tifffile varsa). Sadece orientation uygular.
+    CCITT gibi TIFF sıkıştırmaları tifffile+imagecodecs yoksa otomatik Pillow fallback.
     Dönen:
-      {
-        "doc_str": "pdf_doc"|"tiff_doc",
-        "path": str,
-        "page_count": int,
-        "pages": [
-           {"index", "dpi", "shape", "dtype", "mode", "colorspace", "source", "image": np.ndarray},
-           ...
-        ]
-      }
+      {"doc_str","path","page_count","pages":[{"index","dpi","shape","dtype","mode","colorspace","source","image"},...]}
     """
-    # ---- imports (tek fonksiyon şartı için burada) ----
+    # ---- imports (tek fonksiyon için içeri alındı) ----
     from pathlib import Path
     from typing import Optional
     import numpy as np
-    import cv2
-    import fitz  # PyMuPDF
+    import cv2, fitz  # PyMuPDF
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = None
     try:
@@ -35,27 +25,20 @@ def convert_document_to_images(
     except Exception:
         _HAS_TIFFFILE = False
 
-    # ---- yardımcı (iç) fonksiyonlar ----
+    # ---- helpers ----
     def _imshow(img, title: str):
-        if not debug:
-            return
+        if not debug: return
         import matplotlib.pyplot as plt
         plt.figure()
-        if img.ndim == 2:
-            plt.imshow(img, cmap='gray')
-        else:
-            plt.imshow(img)
+        if img.ndim == 2: plt.imshow(img, cmap='gray')
+        else:             plt.imshow(img)
         plt.title(title); plt.axis('off'); plt.show()
 
     def _apply_exif_orientation(arr: np.ndarray, orient: Optional[int]) -> np.ndarray:
-        if orient is None:
-            return arr
-        if orient == 3:  # 180°
-            return np.rot90(arr, 2)
-        if orient == 6:  # 90° CW
-            return np.rot90(arr, 3)
-        if orient == 8:  # 90° CCW
-            return np.rot90(arr, 1)
+        if orient is None: return arr
+        if orient == 3:  return np.rot90(arr, 2)  # 180°
+        if orient == 6:  return np.rot90(arr, 3)  # 90° CW
+        if orient == 8:  return np.rot90(arr, 1)  # 90° CCW
         return arr
 
     def _decode_image_bytes_lossless(b: bytes):
@@ -66,16 +49,13 @@ def convert_document_to_images(
         if im.ndim == 2:
             return im, "GRAY"
         if im.shape[2] == 3:
-            im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB); return im, "RGB"
-        im = cv2.cvtColor(im, cv2.COLOR_BGRA2RGBA);   return im, "RGBA"
+            return cv2.cvtColor(im, cv2.COLOR_BGR2RGB), "RGB"
+        return cv2.cvtColor(im, cv2.COLOR_BGRA2RGBA), "RGBA"
 
     def _pdf_try_native_cover(doc, page, cover_thresh: float):
-        # 1) tek görsel + metin yok
         imgs = page.get_images(full=True)
         if len(imgs) == 1 and not page.get_text("blocks"):
-            xref = imgs[0][0]
-            return doc.extract_image(xref)["image"]
-        # 2) sayfayı kaplayan(lar)
+            return doc.extract_image(imgs[0][0])["image"]
         page_area = float(page.rect.get_area())
         covers = []
         for info in page.get_image_info(xrefs=True):
@@ -86,7 +66,79 @@ def convert_document_to_images(
             return doc.extract_image(covers[0])["image"]
         return None
 
-    # ---- çekirdek akış ----
+    def _tiff_with_tifffile(p: Path):
+        """tifffile yolu; decode hatasında ValueError fırlatır."""
+        pages = []
+        with tiff.TiffFile(p.as_posix()) as tf:
+            for i, pg in enumerate(tf.pages):
+                arr = pg.asarray()  # CCITT/LZW/J2K için imagecodecs gerekir
+                # Orientation
+                orient = None
+                if apply_orientation:
+                    try:
+                        ori_tag = pg.tags.get("Orientation")
+                        if ori_tag is not None:
+                            orient = int(ori_tag.value)
+                    except Exception:
+                        orient = None
+                if apply_orientation and orient in (3, 6, 8):
+                    arr = _apply_exif_orientation(arr, orient)
+                # DPI
+                dpi_xy = None
+                xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
+                if xr and yr and ru:
+                    def _rat(tag):
+                        num, den = tag.value
+                        return float(num)/float(den)
+                    x, y = _rat(xr), _rat(yr)
+                    if ru.value == 3: x *= 2.54; y *= 2.54
+                    dpi_xy = (int(round(x)), int(round(y)))
+                # mode bilgisi
+                if arr.ndim == 2:
+                    mode = "1BIT" if arr.dtype == np.bool_ else "GRAY"
+                elif arr.ndim == 3 and arr.shape[2] == 3:
+                    mode = "RGB"
+                elif arr.ndim == 3 and arr.shape[2] == 4:
+                    mode = "RGBA"
+                else:
+                    mode = f"NDIM{arr.ndim}_C{arr.shape[2] if arr.ndim==3 else 1}"
+                pages.append({
+                    "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
+                    "dtype": str(arr.dtype), "mode": mode, "colorspace": mode, "source": "tifffile",
+                    "image": arr
+                })
+        return pages
+
+    def _tiff_with_pillow(p: Path):
+        """Pillow fallback; dönüşüm yapmadan numpy’a çevirir; EXIF Orientation uygular."""
+        pages = []
+        with Image.open(p.as_posix()) as im:
+            n = getattr(im, "n_frames", 1)
+            for i in range(n):
+                im.seek(i)
+                frame = im.copy()
+                orient = None
+                if apply_orientation:
+                    try:
+                        exif = frame.getexif()
+                        orient = int(exif.get(274) or 1) if exif else 1  # 274=Orientation
+                    except Exception:
+                        orient = 1
+                arr = np.array(frame)  # mode/dtype aynen
+                if apply_orientation and orient in (3, 6, 8):
+                    arr = _apply_exif_orientation(arr, orient)
+                dpi_xy = frame.info.get("dpi")
+                if not (isinstance(dpi_xy, (tuple, list)) and len(dpi_xy) >= 2):
+                    dpi_xy = None
+                mode = frame.mode
+                pages.append({
+                    "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
+                    "dtype": str(arr.dtype), "mode": mode, "colorspace": mode, "source": "pillow",
+                    "image": arr
+                })
+        return pages
+
+    # ---- core ----
     p = Path(path).expanduser().resolve()
     ext = p.suffix.lower()
     out = {"doc_str": None, "path": str(p), "page_count": 0, "pages": []}
@@ -97,20 +149,13 @@ def convert_document_to_images(
         try:
             for i in range(doc.page_count):
                 page = doc.load_page(i)
-
-                # Native hızlı yol
                 nb = _pdf_try_native_cover(doc, page, cover_thresh=cover_thresh)
                 if nb is not None:
                     img, cs = _decode_image_bytes_lossless(nb)
                     src = "native"; dpi_val = None
                 else:
-                    # 600 DPI raster (alpha=True → varsa korunur)
                     scale = pdf_dpi / 72.0
-                    pix = page.get_pixmap(
-                        matrix=fitz.Matrix(scale, scale),
-                        alpha=True,
-                        colorspace=fitz.csRGB
-                    )
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=True, colorspace=fitz.csRGB)
                     buf = np.frombuffer(pix.samples, dtype=np.uint8)
                     if pix.n == 1:
                         img = buf.reshape(pix.h, pix.w).copy(); cs = "GRAY"
@@ -119,12 +164,10 @@ def convert_document_to_images(
                     else:
                         img = buf.reshape(pix.h, pix.w, pix.n)[:, :, :4].copy(); cs = "RGBA"
                     src = "raster"; dpi_val = pdf_dpi
-
                 _imshow(img, f"PDF p{i} | {src} | {cs} | dpi={dpi_val} | {img.shape}")
                 out["pages"].append({
                     "index": i, "dpi": dpi_val, "shape": tuple(img.shape),
-                    "dtype": str(img.dtype), "mode": cs, "colorspace": cs, "source": src,
-                    "image": img
+                    "dtype": str(img.dtype), "mode": cs, "colorspace": cs, "source": src, "image": img
                 })
         finally:
             doc.close()
@@ -133,79 +176,15 @@ def convert_document_to_images(
     elif ext in (".tif", ".tiff"):
         out["doc_str"] = "tiff_doc"
         if _HAS_TIFFFILE:
-            # tifffile yolu (hızlı ve ham piksel)
-            with tiff.TiffFile(p.as_posix()) as tf:
-                for i, pg in enumerate(tf.pages):
-                    arr = pg.asarray()  # ham piksel
-                    # Orientation
-                    orient = None
-                    if apply_orientation:
-                        try:
-                            ori_tag = pg.tags.get("Orientation")
-                            if ori_tag is not None:
-                                orient = int(ori_tag.value)
-                        except Exception:
-                            orient = None
-                    if apply_orientation and orient in (3, 6, 8):
-                        arr = _apply_exif_orientation(arr, orient)
-
-                    # DPI
-                    dpi_xy = None
-                    xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
-                    if xr and yr and ru:
-                        def _rat(tag):
-                            num, den = tag.value
-                            return float(num)/float(den)
-                        x, y = _rat(xr), _rat(yr)
-                        if ru.value == 3:  # dpcm -> dpi
-                            x *= 2.54; y *= 2.54
-                        dpi_xy = (int(round(x)), int(round(y)))
-
-                    # mode bilgisi (bilgi amaçlı)
-                    if arr.ndim == 2:
-                        mode = "1BIT" if arr.dtype == np.bool_ else "GRAY"
-                    elif arr.ndim == 3 and arr.shape[2] == 3:
-                        mode = "RGB"
-                    elif arr.ndim == 3 and arr.shape[2] == 4:
-                        mode = "RGBA"
-                    else:
-                        mode = f"NDIM{arr.ndim}_C{arr.shape[2] if arr.ndim==3 else 1}"
-
-                    _imshow(arr, f"TIFF p{i} | tifffile | {mode} | dpi={dpi_xy} | {arr.shape}")
-                    out["pages"].append({
-                        "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
-                        "dtype": str(arr.dtype), "mode": mode, "colorspace": mode, "source": "tifffile",
-                        "image": arr
-                    })
+            try:
+                out["pages"] = _tiff_with_tifffile(p)
+            except Exception as e:
+                # Örn: ValueError("<COMPRESSION.CCITT ...> not supported")
+                # veya imagecodecs/decoder yokluğu → Pillow fallback
+                # print(f"tifffile decode failed, falling back to Pillow: {e}")
+                out["pages"] = _tiff_with_pillow(p)
         else:
-            # Pillow fallback (dönüştürme yok; orientation uygulanır)
-            with Image.open(p.as_posix()) as im:
-                n = getattr(im, "n_frames", 1)
-                for i in range(n):
-                    im.seek(i)
-                    frame = im.copy()
-                    orient = None
-                    if apply_orientation:
-                        try:
-                            exif = frame.getexif()
-                            orient = int(exif.get(274) or 1) if exif else 1  # 274=Orientation
-                        except Exception:
-                            orient = 1
-                    arr = np.array(frame)  # mode/dtype ne ise o
-                    if apply_orientation and orient in (3, 6, 8):
-                        arr = _apply_exif_orientation(arr, orient)
-
-                    dpi_xy = frame.info.get("dpi")
-                    if not (isinstance(dpi_xy, (tuple, list)) and len(dpi_xy) >= 2):
-                        dpi_xy = None
-                    mode = frame.mode
-
-                    _imshow(arr, f"TIFF p{i} | pillow | {mode} | dpi={dpi_xy} | {arr.shape}")
-                    out["pages"].append({
-                        "index": i, "dpi": dpi_xy, "shape": tuple(arr.shape),
-                        "dtype": str(arr.dtype), "mode": mode, "colorspace": mode, "source": "pillow",
-                        "image": arr
-                    })
+            out["pages"] = _tiff_with_pillow(p)
         out["page_count"] = len(out["pages"])
 
     else:
