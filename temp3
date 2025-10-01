@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import os, math, concurrent.futures as cf
 
 import numpy as np, cv2, fitz
 from PIL import Image
@@ -14,25 +15,38 @@ except Exception:
     _HAS_TIFFFILE = False
 
 
-def doc_to_images_autorotate_deskew(
+def doc_to_images_autorotate_deskew_fast(
     path: Union[str, Path],
     *,
     pdf_dpi: int = 600,
     apply_orientation: bool = True,
-    osd_tc: Any = None,          # TesseractClient: .get_osd_ocr(PIL, ...) -> dict
-    osd_conf: float = 0.0,       # OSD güven eşiği (CW derece)
+    osd_tc: Any = None,             # TesseractClient (.get_osd_ocr)
+    osd_conf: float = 0.0,          # OSD güven eşiği
     estimate_skew: bool = True,
-    skew_max_angle: float = 8.0,
     return_bgr: bool = True,
+    # --- Performans ayarları ---
+    angle_estimation_max_side: int = 1600,  # OSD+skew küçük kopya uzun kenar
+    n_jobs: int = 0,                        # 0:auto (çekirdek sayısı)
+    opencv_threads: int = 0,                # 0:auto, >0: sabitle
     debug: bool = False
 ) -> Dict[str, Any]:
+    """
+    Hızlandırılmış tek fonksiyon:
+      - PDF/TIFF raster (lossless)
+      - EXIF/TIFF orientation
+      - OSD ile 0/±90/180 (kayıpsız)
+      - Skew (her zaman uygula; limit yok)
+      - Açı tahmini küçük kopyada, dönüş tam çözünürlükte
+      - Sayfalar paralel işlenir
+    """
 
-    def _imshow(bgr: np.ndarray, title: str):
-        if not debug: return
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(8, 8)); plt.imshow(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        plt.title(title); plt.axis("off"); plt.show()
+    if opencv_threads >= 0:
+        try:
+            cv2.setNumThreads(opencv_threads or 0)
+        except Exception:
+            pass
 
+    # ---------- Yardımcılar ----------
     def _normalize_dpi_tuple(dpi_xy) -> Optional[Tuple[int, int]]:
         if dpi_xy is None: return None
         try:
@@ -49,7 +63,7 @@ def doc_to_images_autorotate_deskew(
         return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
     def _to_uint8_gray(arr: np.ndarray) -> np.ndarray:
-        if arr.dtype == np.bool_: return (arr.astype(np.uint8) * 255)
+        if arr.dtype == np.bool_:  return (arr.astype(np.uint8) * 255)
         if arr.dtype == np.uint16: return cv2.convertScaleAbs(arr, alpha=255.0/65535.0)
         return arr.astype(np.uint8, copy=False)
 
@@ -68,7 +82,6 @@ def doc_to_images_autorotate_deskew(
         raise ValueError(f"Unsupported array: {arr.shape}, {arr.dtype}")
 
     def _apply_exif_orientation(bgr: np.ndarray, orient: Optional[int]) -> Tuple[np.ndarray, int]:
-        # 1: normal, 3: 180, 6: 270 CW (== +90 CCW), 8: 90 CW (== -90 CCW)
         deg = 0
         if orient is None: return bgr, 0
         if orient == 3:   bgr, deg = np.rot90(bgr, 2).copy(), 180
@@ -76,11 +89,11 @@ def doc_to_images_autorotate_deskew(
         elif orient == 8: bgr, deg = np.rot90(bgr, 3).copy(), -90
         return bgr, deg
 
-    def _osd_estimate_angle_cw(bgr: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
-        # Tesseract OSD rotate: CW derece (metin dik olsun diye)
+    # --- OSD (CW) ---
+    def _osd_estimate_angle_cw(bgr_small: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
         if osd_tc is None: return None, None
         try:
-            pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            pil = Image.fromarray(cv2.cvtColor(bgr_small, cv2.COLOR_BGR2RGB))
             raw = osd_tc.get_osd_ocr(pil, config='', model='best', output_type='dict')
         except Exception:
             return None, None
@@ -90,13 +103,11 @@ def doc_to_images_autorotate_deskew(
         conf    = d.get('orientation_conf', d.get('conf', d.get('confidence', None)))
         return (None if deg_cw is None else float(deg_cw)), (None if conf is None else float(conf))
 
-    # --- DÜZELTME: OSD (CW) → right-angle (CCW) eşleme
     def _snap_90k_cw(deg_cw: float) -> int:
         cand = np.array([0, 90, 180, 270], dtype=np.int32)
-        return int(cand[np.argmin(np.abs(cand - (deg_cw % 360)))])  # CW
+        return int(cand[np.argmin(np.abs(cand - (deg_cw % 360)))])
 
     def _cw_to_ccw_right_angle(nearest_cw: int) -> int:
-        # CW→CCW dönüşümü: 0->0, 90->-90, 180->180, 270->+90
         if nearest_cw == 0:   return 0
         if nearest_cw == 90:  return -90
         if nearest_cw == 180: return 180
@@ -104,30 +115,31 @@ def doc_to_images_autorotate_deskew(
         return 0
 
     def _apply_right_angle(bgr: np.ndarray, ra_ccw: int) -> np.ndarray:
-        if ra_ccw == 0:   return bgr.copy()
-        if ra_ccw == 90:  return np.rot90(bgr, 1).copy()   # +90 CCW
-        if ra_ccw == 180: return np.rot90(bgr, 2).copy()
-        if ra_ccw == -90: return np.rot90(bgr, 3).copy()   # -90 CCW == 90 CW
-        # beklenmeyen durum
-        return _rotate_keep_bounds(bgr, float(ra_ccw))
+        if   ra_ccw == 0:   return bgr
+        elif ra_ccw == 90:  return np.rot90(bgr, 1).copy()
+        elif ra_ccw == 180: return np.rot90(bgr, 2).copy()
+        elif ra_ccw == -90: return np.rot90(bgr, 3).copy()
+        else:               return _rotate_keep_bounds(bgr, float(ra_ccw))
 
     def _rotate_keep_bounds(bgr: np.ndarray, angle_deg_ccw: float) -> np.ndarray:
-        if abs(angle_deg_ccw) < 1e-3: return bgr.copy()
-        (h, w) = bgr.shape[:2]; c = (w/2.0, h/2.0)
-        M = cv2.getRotationMatrix2D(c, angle_deg_ccw, 1.0)  # CCW +
+        if angle_deg_ccw == 0.0: return bgr
+        (h, w) = bgr.shape[:2]
+        c = (w/2.0, h/2.0)
+        M = cv2.getRotationMatrix2D(c, angle_deg_ccw, 1.0)
         cos, sin = abs(M[0,0]), abs(M[0,1])
         nW, nH = int(h*sin + w*cos), int(h*cos + w*sin)
         M[0,2] += (nW/2) - c[0]; M[1,2] += (nH/2) - c[1]
         return cv2.warpAffine(bgr, M, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    def _robust_skew_deg(bgr: np.ndarray, max_angle: float = 8.0) -> Optional[float]:
+    def _robust_skew_deg_small(bgr_small: np.ndarray) -> Optional[float]:
+        # Küçük kopyada hızlı skew tahmini
         try:
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
             g = cv2.GaussianBlur(gray, (3,3), 0)
             edges = cv2.Canny(g, 50, 150)
             edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
             lines = cv2.HoughLinesP(edges, 1, np.pi/1800, threshold=120,
-                                    minLineLength=max(30, min(bgr.shape[:2])//15),
+                                    minLineLength=max(30, min(bgr_small.shape[:2])//15),
                                     maxLineGap=10)
             angs: List[float] = []
             if lines is not None:
@@ -137,42 +149,50 @@ def doc_to_images_autorotate_deskew(
                     ang = 90.0 if dx == 0 else np.degrees(np.arctan2(dy, dx))
                     while ang <= -90: ang += 180
                     while ang >   90: ang -= 180
-                    if abs(ang) <= max_angle: angs.append(float(ang))
+                    angs.append(float(ang))
             if angs:
                 a = np.array(angs, dtype=np.float32)
-                med = float(np.median(a)); mad = float(np.median(np.abs(a-med))+1e-6)
-                keep = np.abs(a-med) <= 3.5*mad
+                med = float(np.median(a))
+                mad = float(np.median(np.abs(a - med)) + 1e-6)
+                keep = np.abs(a - med) <= 3.5 * mad
                 a2 = a[keep] if keep.any() else a
                 return float(np.median(a2))
+
             # fallback: minAreaRect
-            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
-            cnts,_ = cv2.findContours(bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            cnts, _ = cv2.findContours(bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             if not cnts: return None
-            areas = [cv2.contourArea(c) for c in cnts]; 
+            areas = [cv2.contourArea(c) for c in cnts]
             if not areas: return None
             thr = max(50.0, np.percentile(areas, 60))
-            angs2 = []
+            angs2: List[float] = []
             for c in cnts:
                 if cv2.contourArea(c) < thr: continue
                 rect = cv2.minAreaRect(c)
-                ang = rect[-1]  # [-90,0)
+                ang = rect[-1]
                 if ang < -45: ang = 90 + ang
-                if abs(ang) <= max_angle: angs2.append(float(ang))
+                angs2.append(float(ang))
             if angs2: return float(np.median(np.array(angs2, dtype=np.float32)))
             return None
         except Exception:
             return None
 
-    # ---- ana akış ----
+    def _make_small(bgr: np.ndarray) -> np.ndarray:
+        h, w = bgr.shape[:2]
+        m = max(h, w)
+        if m <= angle_estimation_max_side: 
+            return bgr
+        scale = angle_estimation_max_side / float(m)
+        return cv2.resize(bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+
+    # ---------- 1) Raster: tüm sayfaları oku ----------
     p = Path(path).expanduser().resolve()
     ext = p.suffix.lower()
-    images: List[np.ndarray] = []
-    metas: List[Dict[str, Any]] = []
-    doc_str = None
+    pages_raw: List[Tuple[int, np.ndarray, Optional[Tuple[int,int]], str, Optional[int]]] = []
+    # tuple: (index, BGR, dpi, source, exif_orientation_tag_if_any)
 
     if ext == ".pdf":
-        doc_str = "pdf_doc"
         doc = fitz.open(p.as_posix())
         try:
             for i in range(doc.page_count):
@@ -187,56 +207,21 @@ def doc_to_images_autorotate_deskew(
                     arr = buf.reshape(pix.h, pix.w, 3).copy()
                 else:
                     rgba = buf.reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
-                    bgr0 = _rgba_to_bgr_on_white(rgba)
-                if pix.n in (1,3):
-                    bgr0 = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if return_bgr else arr
-
-                # EXIF yok
-                exif_deg = 0
-
-                # OSD (CW) -> RA (CCW)
-                osd_deg_cw, osd_c = _osd_estimate_angle_cw(bgr0)
-                if osd_deg_cw is not None and (osd_c or 0) >= osd_conf:
-                    nearest_cw = _snap_90k_cw(osd_deg_cw)
-                    ra_ccw = _cw_to_ccw_right_angle(nearest_cw)
-                else:
-                    nearest_cw, ra_ccw = None, 0
-
-                bgr1 = _apply_right_angle(bgr0, ra_ccw)
-
-                skew_deg = _robust_skew_deg(bgr1, max_angle=skew_max_angle) if estimate_skew else None
-                deskew_deg = float(skew_deg or 0.0)
-                bgr2 = _rotate_keep_bounds(bgr1, deskew_deg) if abs(deskew_deg) > 0.01 else bgr1
-
-                _imshow(bgr2, f"PDF p{i} | RA(CCW)={ra_ccw}°, deskew={deskew_deg:.2f}°")
-
-                images.append(bgr2)
-                metas.append({
-                    "page_index": i,
-                    "dpi": (pdf_dpi, pdf_dpi),
-                    "shape": tuple(bgr2.shape),
-                    "mode": "BGR" if return_bgr else "RGB",
-                    "source": "pdf_raster",
-                    "exif_orientation_applied_deg": int(exif_deg),
-                    "osd_raw_deg_cw": (None if osd_deg_cw is None else float(osd_deg_cw)),
-                    "osd_confidence": (None if osd_c is None else float(osd_c)),
-                    "right_angle_applied_deg": int(ra_ccw),         # CCW (+CCW / -CCW)
-                    "skew_deg": (None if skew_deg is None else float(skew_deg)),
-                    "deskew_applied_deg": float(deskew_deg),
-                    "total_rotation_applied_deg": float(exif_deg + ra_ccw + deskew_deg),
-                })
+                    bgr = _rgba_to_bgr_on_white(rgba)
+                    pages_raw.append((i, bgr, (pdf_dpi, pdf_dpi), "pdf_raster", None))
+                    continue
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if return_bgr else arr
+                pages_raw.append((i, bgr, (pdf_dpi, pdf_dpi), "pdf_raster", None))
         finally:
             doc.close()
 
     elif ext in (".tif", ".tiff"):
-        doc_str = "tiff_doc"
-
-        def _proc_with_tifffile(pth: Path):
-            with tiff.TiffFile(pth.as_posix()) as tf:
+        if _HAS_TIFFFILE:
+            with tiff.TiffFile(p.as_posix()) as tf:
                 for i, pg in enumerate(tf.pages):
                     arr = pg.asarray()
-                    bgr0 = _ensure_bgr_safe(arr, photometric=str(getattr(pg, "photometric","") or ""))
-
+                    bgr = _ensure_bgr_safe(arr, photometric=str(getattr(pg, "photometric","") or ""))
+                    # DPI
                     dpi_xy = None
                     try:
                         xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
@@ -247,105 +232,92 @@ def doc_to_images_autorotate_deskew(
                             dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
                     except Exception:
                         dpi_xy = None
-
-                    exif_orient = None
-                    try: exif_orient = (pg.tags.get("Orientation") or {}).value
+                    # Orientation tag
+                    orient = None
+                    try: orient = (pg.tags.get("Orientation") or {}).value
                     except Exception: pass
-
-                    bgr1, exif_deg = ( _apply_exif_orientation(bgr0, exif_orient) if apply_orientation else (bgr0,0) )
-
-                    osd_deg_cw, osd_c = _osd_estimate_angle_cw(bgr1)
-                    if osd_deg_cw is not None and (osd_c or 0) >= osd_conf:
-                        nearest_cw = _snap_90k_cw(osd_deg_cw)
-                        ra_ccw = _cw_to_ccw_right_angle(nearest_cw)
-                    else:
-                        nearest_cw, ra_ccw = None, 0
-                    bgr2 = _apply_right_angle(bgr1, ra_ccw)
-
-                    skew_deg = _robust_skew_deg(bgr2, max_angle=skew_max_angle) if estimate_skew else None
-                    deskew_deg = float(skew_deg or 0.0)
-                    bgr3 = _rotate_keep_bounds(bgr2, deskew_deg) if abs(deskew_deg) > 0.01 else bgr2
-
-                    _imshow(bgr3, f"TIFF p{i} | EXIF={exif_deg}°, RA(CCW)={ra_ccw}°, deskew={deskew_deg:.2f}°")
-
-                    images.append(bgr3)
-                    metas.append({
-                        "page_index": i,
-                        "dpi": dpi_xy,
-                        "shape": tuple(bgr3.shape),
-                        "mode": "BGR",
-                        "source": "tifffile",
-                        "exif_orientation_applied_deg": int(exif_deg),
-                        "osd_raw_deg_cw": (None if osd_deg_cw is None else float(osd_deg_cw)),
-                        "osd_confidence": (None if osd_c is None else float(osd_c)),
-                        "right_angle_applied_deg": int(ra_ccw),
-                        "skew_deg": (None if skew_deg is None else float(skew_deg)),
-                        "deskew_applied_deg": float(deskew_deg),
-                        "total_rotation_applied_deg": float(exif_deg + ra_ccw + deskew_deg),
-                    })
-
-        def _proc_with_pillow(pth: Path):
-            with Image.open(pth.as_posix()) as im:
+                    pages_raw.append((i, bgr, dpi_xy, "tifffile", orient))
+        else:
+            with Image.open(p.as_posix()) as im:
                 n = getattr(im, "n_frames", 1)
                 for i in range(n):
                     im.seek(i)
                     frame = im.copy()
-                    exif_orient = None
-                    try: exif_orient = frame.getexif().get(274)
+                    orient = None
+                    try: orient = frame.getexif().get(274)
                     except Exception: pass
-
                     if frame.mode in ("RGB","RGBA","L"): safe = frame
                     elif frame.mode == "1":            safe = frame.convert("L")
                     else:                               safe = frame.convert("RGB")
                     arr = np.array(safe)
-                    bgr0 = _ensure_bgr_safe(arr, photometric=None)
-
-                    bgr1, exif_deg = ( _apply_exif_orientation(bgr0, exif_orient) if apply_orientation else (bgr0,0) )
-
-                    osd_deg_cw, osd_c = _osd_estimate_angle_cw(bgr1)
-                    if osd_deg_cw is not None and (osd_c or 0) >= osd_conf:
-                        nearest_cw = _snap_90k_cw(osd_deg_cw)
-                        ra_ccw = _cw_to_ccw_right_angle(nearest_cw)
-                    else:
-                        nearest_cw, ra_ccw = None, 0
-                    bgr2 = _apply_right_angle(bgr1, ra_ccw)
-
-                    skew_deg = _robust_skew_deg(bgr2, max_angle=skew_max_angle) if estimate_skew else None
-                    deskew_deg = float(skew_deg or 0.0)
-                    bgr3 = _rotate_keep_bounds(bgr2, deskew_deg) if abs(deskew_deg) > 0.01 else bgr2
-
-                    _imshow(bgr3, f"TIFF p{i} | EXIF={exif_deg}°, RA(CCW)={ra_ccw}°, deskew={deskew_deg:.2f}°")
-
+                    bgr = _ensure_bgr_safe(arr, photometric=None)
                     dpi_xy = _normalize_dpi_tuple(safe.info.get("dpi")) if isinstance(safe.info.get("dpi"), (tuple, list)) else None
-
-                    images.append(bgr3)
-                    metas.append({
-                        "page_index": i,
-                        "dpi": dpi_xy,
-                        "shape": tuple(bgr3.shape),
-                        "mode": "BGR",
-                        "source": "pillow",
-                        "exif_orientation_applied_deg": int(exif_deg),
-                        "osd_raw_deg_cw": (None if osd_deg_cw is None else float(osd_deg_cw)),
-                        "osd_confidence": (None if osd_c is None else float(osd_c)),
-                        "right_angle_applied_deg": int(ra_ccw),
-                        "skew_deg": (None if skew_deg is None else float(skew_deg)),
-                        "deskew_applied_deg": float(deskew_deg),
-                        "total_rotation_applied_deg": float(exif_deg + ra_ccw + deskew_deg),
-                    })
-
-        try:
-            if _HAS_TIFFFILE: _proc_with_tifffile(p)
-            else:             _proc_with_pillow(p)
-        except Exception:
-            _proc_with_pillow(p)
+                    pages_raw.append((i, bgr, dpi_xy, "pillow", orient))
     else:
         raise ValueError(f"Unsupported extension: {ext}")
 
+    # ---------- 2) Paralel: her sayfayı döndür+deskew ----------
+    def _process_one(rec) -> Tuple[np.ndarray, Dict[str, Any]]:
+        i, bgr_full, dpi_xy, source, orient = rec
+
+        # EXIF/TIFF orientation (kayıpsız)
+        exif_deg = 0
+        if apply_orientation and orient is not None:
+            bgr_full, exif_deg = _apply_exif_orientation(bgr_full, orient)
+
+        # Küçük kopya ile açı tahmini
+        small = _make_small(bgr_full)
+
+        # OSD (CW) -> RA (CCW) (kayıpsız)
+        osd_deg_cw, osd_c = _osd_estimate_angle_cw(small)
+        if osd_deg_cw is not None and (osd_c or 0) >= osd_conf:
+            nearest_cw = _snap_90k_cw(osd_deg_cw)
+            ra_ccw = _cw_to_ccw_right_angle(nearest_cw)
+        else:
+            nearest_cw, ra_ccw = None, 0
+        bgr_ra = _apply_right_angle(bgr_full, ra_ccw)
+
+        # Skew (küçük kopyadan ölç, tam çözünürlüğe uygula) – limit yok
+        skew_deg = _robust_skew_deg_small(_make_small(bgr_ra)) if estimate_skew else None
+        deskew_deg = float(skew_deg or 0.0)
+        bgr_final = _rotate_keep_bounds(bgr_ra, deskew_deg)
+
+        meta = {
+            "page_index": i,
+            "dpi": dpi_xy,
+            "shape": tuple(bgr_final.shape),
+            "mode": "BGR" if bgr_final.ndim==3 and bgr_final.shape[2]==3 else "RGB",
+            "source": source,
+            "exif_orientation_applied_deg": int(exif_deg),
+            "osd_raw_deg_cw": (None if osd_deg_cw is None else float(osd_deg_cw)),
+            "osd_confidence": (None if osd_c is None else float(osd_c)),
+            "right_angle_applied_deg": int(ra_ccw),   # CCW
+            "skew_deg": (None if skew_deg is None else float(skew_deg)),
+            "deskew_applied_deg": float(deskew_deg),
+            "total_rotation_applied_deg": float(exif_deg + ra_ccw + deskew_deg),
+        }
+        return bgr_final, meta
+
+    max_workers = (os.cpu_count() or 4) if n_jobs in (0, None) else max(1, n_jobs)
+    images: List[np.ndarray] = []
+    metas: List[Dict[str, Any]] = []
+
+    # Sıra korunacaksa futures’ı index’e göre yerleştiriyoruz
+    results: List[Tuple[int, np.ndarray, Dict[str, Any]]] = []
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_process_one, rec): rec[0] for rec in pages_raw}
+        for fut in cf.as_completed(futs):
+            idx = futs[fut]
+            bgr_final, meta = fut.result()
+            results.append((idx, bgr_final, meta))
+    results.sort(key=lambda x: x[0])
+    for _, img, m in results:
+        images.append(img); metas.append(m)
+
     return {
         "path": str(p),
-        "doc_str": doc_str,
+        "doc_str": "pdf_doc" if ext==".pdf" else "tiff_doc",
         "page_count": len(images),
-        "images": images,   # Sayfa sayfa BGR
+        "images": images,   # sayfa sayfa BGR
         "metas": metas
     }
