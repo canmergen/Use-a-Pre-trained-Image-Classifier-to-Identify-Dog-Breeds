@@ -1,268 +1,355 @@
-# doc_to_images.py
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
-import numpy as np
-import cv2
-import fitz  # PyMuPDF
-from PIL import Image, ImageOps
-Image.MAX_IMAGE_PIXELS = None
-
-try:
-    import tifffile as tiff
-    _HAS_TIFFFILE = True
-except Exception:
-    _HAS_TIFFFILE = False
-
-# ---- yardımcılar ----
-
-def _ensure_bgr(arr: np.ndarray) -> np.ndarray:
-    if arr.ndim == 2:
-        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-    if arr.ndim == 3 and arr.shape[2] == 3:
-        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    if arr.ndim == 3 and arr.shape[2] == 4:
-        rgb = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    g = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY) if arr.ndim == 3 else arr
-    return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-
-def _normalize_dpi_tuple(dpi_xy) -> Optional[Tuple[int, int]]:
-    if dpi_xy is None: return None
-    try:
-        x, y = int(dpi_xy[0]), int(dpi_xy[1])
-        if x <= 1 and y <= 1: return None
-        return (x, y)
-    except Exception:
-        return None
-
-def _border_mode_and_value(kind: str):
-    k = (kind or "white").lower()
-    if k == "replicate": return cv2.BORDER_REPLICATE, None
-    if k == "black":     return cv2.BORDER_CONSTANT, (0, 0, 0)
-    return cv2.BORDER_CONSTANT, (255, 255, 255)
-
-def _rotate_keep_bounds(bgr: np.ndarray, angle_deg: float, border_kind: str="white") -> np.ndarray:
-    if abs(angle_deg) < 1e-6: return bgr.copy()
-    h, w = bgr.shape[:2]
-    M = cv2.getRotationMatrix2D((w/2, h/2), angle_deg, 1.0)
-    cos, sin = abs(M[0,0]), abs(M[0,1])
-    new_w = int(h*sin + w*cos); new_h = int(h*cos + w*sin)
-    M[0,2] += (new_w/2) - (w/2)
-    M[1,2] += (new_h/2) - (h/2)
-    bmode, bval = _border_mode_and_value(border_kind)
-    if bmode == cv2.BORDER_CONSTANT:
-        return cv2.warpAffine(bgr, M, (new_w, new_h), flags=cv2.INTER_LINEAR,
-                              borderMode=bmode, borderValue=bval)
-    else:
-        return cv2.warpAffine(bgr, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=bmode)
-
-def _rotate_90k(bgr: np.ndarray, quad: int) -> np.ndarray:
-    if   quad == 0:   return bgr
-    elif quad == 90:  return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    elif quad == 180: return cv2.rotate(bgr, cv2.ROTATE_180)
-    elif quad == 270: return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
-    return bgr
-
-def _round_to_quadrant(deg: float) -> int:
-    q = int(np.round(deg / 90.0)) * 90
-    q = ((q % 360) + 360) % 360
-    return 0 if q == 360 else q  # {0,90,180,270}
-
-def _estimate_skew_deg(bgr: np.ndarray, max_angle: float = 8.0) -> Optional[float]:
-    try:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        g = cv2.GaussianBlur(gray, (3,3), 0)
-        v = cv2.Canny(g, 50, 150)
-        v = cv2.dilate(v, np.ones((3,3), np.uint8), 1)
-        lines = cv2.HoughLinesP(v, 1, np.pi/1800, 120,
-                                minLineLength=max(30, min(bgr.shape[:2])//15),
-                                maxLineGap=10)
-        angles = []
-        if lines is not None:
-            arr = lines.squeeze(axis=1) if lines.ndim == 3 else lines
-            for x1,y1,x2,y2,*_ in arr:
-                dx,dy = x2-x1, y2-y1
-                ang = 90.0 if dx==0 else float(np.degrees(np.arctan2(dy,dx)))
-                while ang <= -90: ang += 180
-                while ang >   90: ang -= 180
-                if abs(ang) <= max_angle: angles.append(ang)
-        if angles:
-            a = np.array(angles, dtype=np.float32)
-            med = float(np.median(a)); mad = float(np.median(np.abs(a-med))+1e-6)
-            keep = np.abs(a-med) <= 3.5*mad
-            a2 = a[keep] if keep.any() else a
-            return float(np.median(a2))
-        # fallback
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), 1)
-        cnts, _ = cv2.findContours(bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts: return None
-        areas = [cv2.contourArea(c) for c in cnts]
-        if not areas: return None
-        thr = max(50.0, np.percentile(areas, 60))
-        angles2 = []
-        for c in cnts:
-            if cv2.contourArea(c) < thr: continue
-            ang = cv2.minAreaRect(c)[-1]  # [-90,0)
-            if ang < -45: ang = 90 + ang
-            if abs(ang) <= max_angle: angles2.append(float(ang))
-        return float(np.median(np.array(angles2, dtype=np.float32))) if angles2 else None
-    except Exception:
-        return None
-
-def _text_orientation_score(bgr: np.ndarray) -> Tuple[float,float,float]:
-    """
-    Skorlayıcı: yatay satır baskınlığı ve başlık/boylam asimetrileri.
-    Döner: (textness, top_bias, left_bias)
-    """
-    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    # ikili hale getir (bilevel dokümanlarda daha güvenilir)
-    thr, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    if thr < 128: bw = 255 - bw  # metni siyah varsay
-    # projeksiyonlar
-    row = (255 - bw).mean(axis=1)  # siyah yoğunluk
-    col = (255 - bw).mean(axis=0)
-    textness = float(np.var(row) - np.var(col))  # yatay satır > dikey sütun
-    # üst-alt / sol-sağ asimetri (0 vs 180, 90 vs 270 ayrımı)
-    h, w = bw.shape
-    t = row[: max(4, h//10)].mean()
-    b = row[h - max(4, h//10):].mean()
-    l = col[: max(4, w//10)].mean()
-    r = col[w - max(4, w//10):].mean()
-    top_bias  = float(t - b)
-    left_bias = float(l - r)
-    return textness, top_bias, left_bias
-
-def _decide_quadrant_voted(
-    bgr: np.ndarray,
-    *,
-    pdf_page_rotation: Optional[int],
-    osd_deg: Optional[float],
-    osd_conf: Optional[float],
-    osd_conf_min: float = 0.0
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    0/90/180/270 seçimi: PDF meta + OSD + görsel skor.
-    """
-    # 1) görsel skor: dört yönü dene
-    cands = [0, 90, 180, 270]
-    scores = {}
-    for q in cands:
-        s_img = _rotate_90k(bgr, q)
-        textness, topb, leftb = _text_orientation_score(s_img)
-        # basit ağırlıklandırma
-        s = 1.0*textness + 0.15*topb + 0.05*leftb
-        scores[q] = float(s)
-    best_q = max(scores, key=scores.get)
-
-    # 2) OSD sinyali (güvenliyse)
-    osd_q = None
-    if (osd_deg is not None) and (osd_conf is None or osd_conf >= osd_conf_min):
-        osd_q = _round_to_quadrant(float(osd_deg))
-
-    # 3) PDF page.rotation
-    pdf_q = None
-    if pdf_page_rotation in (0, 90, 180, 270):
-        pdf_q = int(pdf_page_rotation)
-
-    # 4) oylama
-    votes = [q for q in (best_q, osd_q, pdf_q) if q is not None]
-    winner = best_q
-    if votes:
-        # en çok görülen yön
-        uniq, counts = np.unique(np.array(votes), return_counts=True)
-        if counts.max() >= 2:
-            winner = int(uniq[counts.argmax()])
-
-    details = {"scores": scores, "best_by_score": best_q, "osd_q": osd_q, "pdf_q": pdf_q, "votes": votes}
-    return winner, details
-
-
-def convert_document_to_images(
-    path: Union[str, Path],
+def convert_document_to_images_single(
+    path,
     *,
     pdf_dpi: int = 600,
     apply_orientation: bool = True,
-
-    # meta & debug
     return_bgr: bool = True,
     debug: bool = False,
-
     # OSD
-    osd_tc: Any = None,
+    osd_tc=None,
     osd_conf: float = 0.0,
-
-    # deskew
+    # Rotasyon/deskew
     estimate_skew: bool = True,
     do_deskew: bool = True,
     skew_max_angle: float = 8.0,
     deskew_abs_limit: float = 8.0,
     deskew_min_abs: float = 0.15,
     deskew_border: str = "white",
-) -> Dict[str, Any]:
+    # Yön kararı
+    axis_lock: str = "pdf",          # "pdf" | "auto" | "none"
+    prefer_pdf_meta: bool = True,
+    score_margin_abs: float = 12.0,  # yakınlık eşiği (mutlak)
+    score_margin_rel: float = 0.08,  # yakınlık eşiği (göreli)
+    axis_switch_abs: float = 40.0,   # eksen değiştirmek için gereken ek üstünlük (mutlak)
+    axis_switch_rel: float = 0.20    # eksen değiştirmek için gereken ek üstünlük (göreli)
+):
     """
-    Her sayfada: 0/90/180/270 yön kararını oylama ile verir, sonra küçük açı deskew uygular.
-    TIFF'te CCITT hatalarında per-page Pillow fallback var.
-    """
-    def _imshow(img: np.ndarray, title: str):
-        if not debug: return
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(8,8)); plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)); plt.title(title); plt.axis("off"); plt.show()
+    TEK FONKSİYON.
+    - PDF: alpha=False ile raster (beyaz zemin), sayfa.rotation meta okunur.
+    - TIFF: tifffile ile sayfa bazında dene; CCITT gibi durumlarda sadece o sayfayı Pillow ile oku (fallback).
+    - Her sayfada: güvenli oylama (PDF meta + OSD + görsel skor) ile 0/90/180/270, eksen kilidi uygulanır.
+    - Kuadrant + residual skew TEK WARP ile uygulanır (kırpmasız).
+    - Çıktı: { "pages": [ {"image": np.ndarray(BGR/RGB), ...meta...}, ...], "metas": [...] }
 
-    def _page_pipeline(arr_rgb_or_gray: np.ndarray, i: int, source: str, dpi_xy, pdf_rotation_meta: Optional[int] = None):
+    Parametreler:
+        axis_lock="pdf": PDF ekseninde kal (0/180 ya da 90/270); yanlış eksene dönmez.
+        single-warp mantığı içerir; interpolasyon tek sefer.
+    """
+    # --- importlar (tek fonksiyon içinde) ---
+    import numpy as _np
+    import cv2 as _cv2
+    import fitz as _fitz
+    from pathlib import Path as _Path
+    import numpy as _np
+    from PIL import Image as _Image, ImageOps as _ImageOps
+    try:
+        import tifffile as _tiff
+        _HAS_TIFFFILE = True
+    except Exception:
+        _HAS_TIFFFILE = False
+
+    # --- küçük yardımcılar (fonksiyon içi) ---
+    def _imshow(img, title: str):
+        if not debug: return
+        import matplotlib.pyplot as _plt
+        _plt.figure(figsize=(8,8))
+        if img.ndim == 2:
+            _plt.imshow(img, cmap="gray")
+        else:
+            _plt.imshow(_cv2.cvtColor(img, _cv2.COLOR_BGR2RGB))
+        _plt.title(title); _plt.axis("off"); _plt.show()
+
+    def _ensure_bgr(arr):
+        if arr.ndim == 2:
+            return _cv2.cvtColor(arr, _cv2.COLOR_GRAY2BGR)
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            return _cv2.cvtColor(arr, _cv2.COLOR_RGB2BGR)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            rgb = _cv2.cvtColor(arr, _cv2.COLOR_RGBA2RGB)
+            return _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR)
+        g = _cv2.cvtColor(arr, _cv2.COLOR_BGR2GRAY) if arr.ndim == 3 else arr
+        return _cv2.cvtColor(g, _cv2.COLOR_GRAY2BGR)
+
+    def _normalize_dpi_tuple(dpi_xy):
+        if dpi_xy is None: return None
+        try:
+            x, y = int(dpi_xy[0]), int(dpi_xy[1])
+            if x <= 1 and y <= 1: return None
+            return (x, y)
+        except Exception:
+            return None
+
+    def _border_mode_and_value(kind: str):
+        k = (kind or "white").lower()
+        if k == "replicate": return _cv2.BORDER_REPLICATE, None
+        if k == "black":     return _cv2.BORDER_CONSTANT, (0,0,0)
+        return _cv2.BORDER_CONSTANT, (255,255,255)
+
+    def _rotate_keep_bounds(bgr, angle_deg: float, border_kind: str="white"):
+        if abs(angle_deg) < 1e-6: return bgr.copy()
+        h, w = bgr.shape[:2]
+        M = _cv2.getRotationMatrix2D((w/2, h/2), angle_deg, 1.0)
+        cos, sin = abs(M[0,0]), abs(M[0,1])
+        new_w = int(h*sin + w*cos); new_h = int(h*cos + w*sin)
+        M[0,2] += (new_w/2) - (w/2); M[1,2] += (new_h/2) - (h/2)
+        bmode, bval = _border_mode_and_value(deskew_border)
+        if bmode == _cv2.BORDER_CONSTANT:
+            return _cv2.warpAffine(bgr, M, (new_w, new_h), flags=_cv2.INTER_LINEAR,
+                                   borderMode=bmode, borderValue=bval)
+        else:
+            return _cv2.warpAffine(bgr, M, (new_w, new_h), flags=_cv2.INTER_LINEAR, borderMode=bmode)
+
+    def _rotate_90k(bgr, quad: int):
+        if   quad == 0:   return bgr
+        elif quad == 90:  return _cv2.rotate(bgr, _cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif quad == 180: return _cv2.rotate(bgr, _cv2.ROTATE_180)
+        elif quad == 270: return _cv2.rotate(bgr, _cv2.ROTATE_90_CLOCKWISE)
+        return bgr
+
+    def _round_to_quadrant(deg: float) -> int:
+        q = int(_np.round(deg/90.0))*90
+        q = ((q % 360) + 360) % 360
+        return 0 if q == 360 else q
+
+    def _estimate_skew_deg(bgr, max_angle: float = 8.0):
+        try:
+            gray = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY)
+            g = _cv2.GaussianBlur(gray, (3,3), 0)
+            v = _cv2.Canny(g, 50, 150)
+            v = _cv2.dilate(v, _np.ones((3,3), _np.uint8), 1)
+            lines = _cv2.HoughLinesP(v, 1, _np.pi/1800, 120,
+                                     minLineLength=max(30, min(bgr.shape[:2])//15),
+                                     maxLineGap=10)
+            angles = []
+            if lines is not None:
+                arr = lines.squeeze(axis=1) if lines.ndim == 3 else lines
+                for x1,y1,x2,y2,*_ in arr:
+                    dx,dy = x2-x1, y2-y1
+                    ang = 90.0 if dx==0 else float(_np.degrees(_np.arctan2(dy,dx)))
+                    while ang <= -90: ang += 180
+                    while ang >   90: ang -= 180
+                    if abs(ang) <= max_angle: angles.append(ang)
+            if angles:
+                a = _np.array(angles, dtype=_np.float32)
+                med = float(_np.median(a)); mad = float(_np.median(_np.abs(a-med))+1e-6)
+                keep = _np.abs(a-med) <= 3.5*mad
+                a2 = a[keep] if keep.any() else a
+                return float(_np.median(a2))
+            # fallback
+            _, bw = _cv2.threshold(gray, 0, 255, _cv2.THRESH_BINARY_INV+_cv2.THRESH_OTSU)
+            bw = _cv2.morphologyEx(bw, _cv2.MORPH_OPEN, _np.ones((3,3), _np.uint8), 1)
+            cnts, _ = _cv2.findContours(bw, _cv2.RETR_LIST, _cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts: return None
+            areas = [_cv2.contourArea(c) for c in cnts]
+            if not areas: return None
+            thr = max(50.0, _np.percentile(areas, 60))
+            angles2 = []
+            for c in cnts:
+                if _cv2.contourArea(c) < thr: continue
+                ang = _cv2.minAreaRect(c)[-1]  # [-90,0)
+                if ang < -45: ang = 90 + ang
+                if abs(ang) <= max_angle: angles2.append(float(ang))
+            return float(_np.median(_np.array(angles2, dtype=_np.float32))) if angles2 else None
+        except Exception:
+            return None
+
+    def _text_orientation_score(bgr):
+        g = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2GRAY)
+        thr, bw = _cv2.threshold(g, 0, 255, _cv2.THRESH_BINARY+_cv2.THRESH_OTSU)
+        if thr < 128: bw = 255 - bw  # metni siyah varsay
+        row = (255 - bw).mean(axis=1)
+        col = (255 - bw).mean(axis=0)
+        textness = float(_np.var(row) - _np.var(col))
+        h, w = bw.shape
+        t = row[: max(4, h//10)].mean()
+        b = row[h - max(4, h//10):].mean()
+        l = col[: max(4, w//10)].mean()
+        r = col[w - max(4, w//10):].mean()
+        top_bias  = float(t - b)
+        left_bias = float(l - r)
+        # Ağırlıklı toplam (küçük bias katkıları)
+        score = 1.0*textness + 0.15*top_bias + 0.05*left_bias
+        return score, {"textness": textness, "top_bias": top_bias, "left_bias": left_bias}
+
+    def _decide_quadrant_voted(
+        bgr,
+        *,
+        pdf_page_rotation,
+        osd_deg,
+        osd_conf,
+        osd_conf_min: float = 0.0
+    ):
+        # 1) Dört yön skoru
+        cands = [0,90,180,270]
+        scores, extras = {}, {}
+        for q in cands:
+            s_img = _rotate_90k(bgr, q)
+            s, ex = _text_orientation_score(s_img)
+            scores[q] = float(s); extras[q] = ex
+        best_q = max(scores, key=scores.get)
+        s_min, s_max = min(scores.values()), max(scores.values())
+        s_range = max(1.0, (s_max - s_min))
+
+        # 2) OSD → kuadranta yuvarla
+        osd_q = None
+        if (osd_deg is not None) and (osd_conf is None or osd_conf >= osd_conf_min):
+            osd_q = _round_to_quadrant(float(osd_deg))
+
+        # 3) PDF meta
+        pdf_q = int(pdf_page_rotation) if (pdf_page_rotation in (0,90,180,270)) else None
+
+        def axis_of(q: int) -> int:
+            return 0 if q in (0,180) else 1
+
+        # 4) allowed set (axis lock)
+        allowed = cands[:]
+        if axis_lock == "pdf" and (pdf_q is not None):
+            allowed = [0,180] if axis_of(pdf_q) == 0 else [90,270]
+        elif axis_lock == "auto":
+            h, w = bgr.shape[:2]
+            primary = [0,180] if h >= w else [90,270]
+            best_primary = max(primary, key=lambda q: scores[q])
+            best_other   = max([q for q in cands if q not in primary], key=lambda q: scores[q])
+            gap_abs = scores[best_other] - scores[best_primary]
+            gap_rel = gap_abs / s_range
+            allowed = primary if not (gap_abs >= axis_switch_abs or gap_rel >= axis_switch_rel) else cands[:]
+
+        # 5) oylama (allowed filtresiyle)
+        votes = []
+        if best_q in allowed: votes.append(best_q)
+        if osd_q  in allowed: votes.append(osd_q)
+        if pdf_q  in allowed: votes.append(pdf_q)
+
+        winner = max(allowed, key=lambda q: scores[q])
+        if votes:
+            uniq, counts = _np.unique(_np.array(votes), return_counts=True)
+            # allowed içinden çoğunluk
+            best_idx, best_cnt, best_val = None, -1, None
+            for u, c in zip(uniq, counts):
+                if u in allowed and c > best_cnt:
+                    best_cnt, best_val = int(c), int(u)
+            if best_cnt >= 2:
+                winner = int(best_val)
+
+        # PDF önceliği (yakınsa PDF)
+        if prefer_pdf_meta and (pdf_q is not None) and (pdf_q in allowed):
+            s_w = scores[winner]; s_p = scores[pdf_q]
+            small_margin = (abs(s_w - s_p) <= score_margin_abs) or (abs(s_w - s_p) / s_range <= score_margin_rel)
+            if (winner != pdf_q) and small_margin:
+                winner = pdf_q
+
+        # 0↔180 yakında 0'a kilit
+        if set(allowed) == {0,180}:
+            s0, s180 = scores[0], scores[180]
+            close = (abs(s0 - s180) <= score_margin_abs) or (abs(s0 - s180) / s_range <= score_margin_rel)
+            if close:
+                winner = 0
+
+        details = {
+            "scores": scores,
+            "extras": extras,
+            "best_by_score": best_q,
+            "osd_q": osd_q,
+            "pdf_q": pdf_q,
+            "votes": votes,
+            "allowed": allowed,
+            "chosen": int(winner)
+        }
+        return int(winner), details
+
+    def _read_tiff_page_with_pillow(pth: _Path, index: int):
+        with _Image.open(pth.as_posix()) as im:
+            n = getattr(im, "n_frames", 1)
+            if index >= n: raise IndexError("TIFF page index out of range")
+            im.seek(index)
+            frame = im.copy()
+            # 1-bit → L + autocontrast
+            if frame.mode == "1":
+                frame = frame.convert("L")
+                frame = _ImageOps.autocontrast(frame)
+            arr = _np.array(frame)
+            # EXIF orientation
+            orient = None
+            if apply_orientation:
+                try:
+                    exif = frame.getexif()
+                    orient = int(exif.get(274) or 1) if exif else 1
+                except Exception:
+                    orient = 1
+            if apply_orientation and orient in (3,6,8):
+                if orient == 3: arr = _np.rot90(arr, 2)
+                if orient == 6: arr = _np.rot90(arr, 3)
+                if orient == 8: arr = _np.rot90(arr, 1)
+            dpi_xy = frame.info.get("dpi")
+            dpi_xy = _normalize_dpi_tuple(dpi_xy if isinstance(dpi_xy, (tuple,list)) else None)
+            return arr, dpi_xy
+
+    def _page_pipeline(arr_rgb_or_gray, i: int, source: str, dpi_xy, pdf_rotation_meta=None):
+        # BGR'e al
         bgr0 = _ensure_bgr(arr_rgb_or_gray) if return_bgr else arr_rgb_or_gray
 
-        # OSD (dereceyi al)
+        # OSD açısı (görüntüye dokunmadan)
         raw_osd_deg, raw_osd_conf = None, None
         if osd_tc is not None:
             try:
-                from rotate_utils import rotate_img_using_osd
-                # Görüntüyü döndürmeyelim; sadece dereceyi öğrenmek için kopya üzerinde çalıştırabiliriz
-                _tmp, d, c = rotate_img_using_osd(bgr0, osd_tc=osd_tc, osd_conf=osd_conf)
+                # Kullanıcı ortamında rotate_img_using_osd varsa:
+                from rotate_utils import rotate_img_using_osd as _rot_osd
+                _tmp, d, c = _rot_osd(bgr0, osd_tc=osd_tc, osd_conf=osd_conf)
                 raw_osd_deg, raw_osd_conf = float(d or 0.0), (None if c is None else float(c))
             except Exception:
-                pass
+                try:
+                    # global isim alanında olabilir
+                    _rot_osd  # type: ignore
+                except Exception:
+                    pass
 
-        # 0/90/180/270 yönünü belirle (oylama)
+        # 0/90/180/270 kararı
         quad, q_details = _decide_quadrant_voted(
-            bgr0, pdf_page_rotation=pdf_rotation_meta,
-            osd_deg=raw_osd_deg, osd_conf=raw_osd_conf, osd_conf_min=osd_conf
+            bgr0,
+            pdf_page_rotation=pdf_rotation_meta,
+            osd_deg=raw_osd_deg,
+            osd_conf=raw_osd_conf,
+            osd_conf_min=osd_conf
         )
-        bgr1 = _rotate_90k(bgr0, quad)
 
-        # deskew
-        skew_deg = _estimate_skew_deg(bgr1, max_angle=skew_max_angle) if estimate_skew else None
-        shape_before = tuple(bgr1.shape)
+        # Skew ölçümü için geçici upright (yalnız ölçüm)
+        bgr_upright = _rotate_90k(bgr0, quad)
+        skew_deg = _estimate_skew_deg(bgr_upright, max_angle=skew_max_angle) if estimate_skew else None
+
+        # Uygulanacak toplam açı (tek warp)
         deskew_applied = 0.0
         if do_deskew and (skew_deg is not None) and (abs(skew_deg) >= deskew_min_abs) and (abs(skew_deg) <= deskew_abs_limit):
-            bgr1 = _rotate_keep_bounds(bgr1, -skew_deg, border_kind=deskew_border)
+            total_deg = float(quad - skew_deg)   # CCW pozitif, residual'ı sıfırla
             deskew_applied = float(-skew_deg)
-        shape_after = tuple(bgr1.shape)
+        else:
+            total_deg = float(quad)
+
+        # Tek warp: orijinal bgr0 → total_deg
+        out_img = _rotate_keep_bounds(bgr0, total_deg, border_kind=deskew_border)
+
+        shape_before = tuple(bgr_upright.shape)
+        shape_after  = tuple(out_img.shape)
 
         meta = {
             "index": i,
             "dpi": dpi_xy,
             "shape": shape_after,
-            "dtype": str(bgr1.dtype),
+            "dtype": str(out_img.dtype),
             "mode": "BGR" if return_bgr else "RGB",
             "colorspace": "BGR" if return_bgr else "RGB",
             "source": source,
             "osd_raw_deg": raw_osd_deg,
             "osd_confidence": raw_osd_conf,
-            "rotation_quadrant_deg": quad,            # uygulanan 0/90/180/270
-            "rotation_deg": quad,                     # geriye dönük alan
-            "rotation_vote_detail": q_details,        # skorlar + oylar
+            "rotation_quadrant_deg": quad,
+            "rotation_deg": total_deg,
+            "rotation_vote_detail": q_details,
             "skew_deg": (None if skew_deg is None else float(skew_deg)),
             "deskew_applied_deg": deskew_applied,
-            "rotation_total_deg": float(quad + deskew_applied),
+            "rotation_total_deg": total_deg,
             "shape_before_deskew": shape_before,
             "shape_after_deskew": shape_after,
         }
-        pages.append({**meta, "image": bgr1})
+        pages.append({**meta, "image": out_img})
         metas.append({
             "page_index": i,
             "dpi": dpi_xy,
@@ -271,35 +358,36 @@ def convert_document_to_images(
             "osd_confidence": raw_osd_conf,
             "skew_deg": meta["skew_deg"],
             "deskew_applied_deg": deskew_applied,
-            "rotation_total_deg": meta["rotation_total_deg"],
+            "rotation_total_deg": total_deg,
             "vote": q_details,
             "shape_before_deskew": shape_before,
             "shape_after_deskew": shape_after,
         })
-        if debug:
-            _imshow(bgr1, f"p{i} | quad={quad}°, skew={skew_deg if skew_deg is not None else 'NA'}°, deskew={deskew_applied:.2f}° | {shape_after}")
 
-    p = Path(path).expanduser().resolve()
+        if debug:
+            _imshow(out_img, f"p{i} | quad={quad}°, skew={skew_deg if skew_deg is not None else 'NA'}°, "
+                             f"applied={total_deg:.2f}° (deskew={deskew_applied:+.2f}°) | {shape_after}")
+
+    # --- ana akış ---
+    p = _Path(str(path)).expanduser().resolve()
     ext = p.suffix.lower()
-    pages: List[Dict[str, Any]] = []
-    metas: List[Dict[str, Any]] = []
-    out: Dict[str, Any] = {"doc_str": None, "path": str(p), "page_count": 0, "pages": pages, "metas": metas}
+    pages, metas = [], []
+    out = {"doc_str": None, "path": str(p), "page_count": 0, "pages": pages, "metas": metas}
 
     if ext == ".pdf":
         out["doc_str"] = "pdf_doc"
-        doc = fitz.open(p.as_posix())
+        doc = _fitz.open(p.as_posix())
         try:
             for i in range(doc.page_count):
                 page = doc.load_page(i)
                 pdf_rotation_meta = int(page.rotation or 0)  # 0/90/180/270
-
-                # BEYAZ ZEMİN -> alpha=False
                 scale = pdf_dpi / 72.0
-                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-                buf = np.frombuffer(pix.samples, dtype=np.uint8)
+                # alpha=False => beyaz zemin, siyah debug sorunu yok
+                pix = page.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False, colorspace=_fitz.csRGB)
+                buf = _np.frombuffer(pix.samples, dtype=_np.uint8)
                 if pix.n == 1:
                     arr = buf.reshape(pix.h, pix.w).copy()
-                    arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+                    arr = _cv2.cvtColor(arr, _cv2.COLOR_GRAY2RGB)
                 else:
                     arr = buf.reshape(pix.h, pix.w, 3).copy()  # RGB
                 _page_pipeline(arr, i, "pdf_raster", (pdf_dpi, pdf_dpi), pdf_rotation_meta=pdf_rotation_meta)
@@ -309,55 +397,26 @@ def convert_document_to_images(
 
     elif ext in (".tif", ".tiff"):
         out["doc_str"] = "tiff_doc"
-
-        def _read_tiff_page_with_pillow(pth: Path, index: int) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
-            with Image.open(pth.as_posix()) as im:
-                n = getattr(im, "n_frames", 1)
-                if index >= n: raise IndexError("TIFF page index out of range")
-                im.seek(index)
-                frame = im.copy()
-                # 1-bit mod ise 0/255'e çevir
-                if frame.mode == "1":
-                    frame = frame.convert("L")
-                    frame = ImageOps.autocontrast(frame)
-                arr = np.array(frame)
-                # EXIF orientation
-                orient = None
-                if apply_orientation:
-                    try:
-                        exif = frame.getexif()
-                        orient = int(exif.get(274) or 1) if exif else 1
-                    except Exception:
-                        orient = 1
-                if apply_orientation and orient in (3,6,8):
-                    if orient == 3: arr = np.rot90(arr, 2)
-                    if orient == 6: arr = np.rot90(arr, 3)
-                    if orient == 8: arr = np.rot90(arr, 1)
-                dpi_xy = frame.info.get("dpi")
-                dpi_xy = _normalize_dpi_tuple(dpi_xy if isinstance(dpi_xy, (tuple, list)) else None)
-                return arr, dpi_xy
-
         if _HAS_TIFFFILE:
             try:
-                with tiff.TiffFile(p.as_posix()) as tf:
+                with _tiff.TiffFile(p.as_posix()) as tf:
                     for i, pg in enumerate(tf.pages):
-                        # per-page try: CCITT gibi durumlarda sadece bu sayfayı Pillow ile oku
                         try:
                             arr = pg.asarray()
-                            # boolean → 0/255
-                            if arr.dtype == np.bool_:
-                                arr = (arr.astype(np.uint8) * 255)
-                            # EXIF orientation tag
+                            if arr.dtype == _np.bool_:
+                                arr = (arr.astype(_np.uint8) * 255)
+                            # Orientation
+                            orient = None
                             if apply_orientation:
                                 try:
                                     ori = pg.tags.get("Orientation")
                                     orient = int(ori.value) if ori is not None else None
                                 except Exception:
                                     orient = None
-                                if orient in (3,6,8):
-                                    if orient == 3: arr = np.rot90(arr, 2)
-                                    if orient == 6: arr = np.rot90(arr, 3)
-                                    if orient == 8: arr = np.rot90(arr, 1)
+                            if apply_orientation and orient in (3,6,8):
+                                if orient == 3: arr = _np.rot90(arr, 2)
+                                if orient == 6: arr = _np.rot90(arr, 3)
+                                if orient == 8: arr = _np.rot90(arr, 1)
                             # DPI
                             dpi_xy = None
                             xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
@@ -368,26 +427,26 @@ def convert_document_to_images(
                                     x *= 2.54; y *= 2.54
                                 dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
                         except Exception:
-                            # sadece bu sayfa için Pillow fallback
+                            # yalnız bu sayfayı Pillow ile oku (CCITT vb.)
                             arr, dpi_xy = _read_tiff_page_with_pillow(p, i)
 
                         _page_pipeline(arr, i, "tifffile", dpi_xy)
             except Exception:
-                # tüm dosyada sorun -> tüm sayfaları Pillow ile
-                with Image.open(p.as_posix()) as im:
+                # tüm dosya tifffile'da sorunlu → baştan sona Pillow
+                with _Image.open(p.as_posix()) as im:
                     n = getattr(im, "n_frames", 1)
                     for i in range(n):
                         arr, dpi_xy = _read_tiff_page_with_pillow(p, i)
                         _page_pipeline(arr, i, "pillow", dpi_xy)
         else:
-            # doğrudan Pillow
-            with Image.open(p.as_posix()) as im:
+            with _Image.open(p.as_posix()) as im:
                 n = getattr(im, "n_frames", 1)
                 for i in range(n):
                     arr, dpi_xy = _read_tiff_page_with_pillow(p, i)
                     _page_pipeline(arr, i, "pillow", dpi_xy)
 
         out["page_count"] = len(pages)
+
     else:
         raise ValueError(f"Unsupported extension: {ext}")
 
