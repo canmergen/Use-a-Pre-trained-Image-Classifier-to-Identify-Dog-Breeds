@@ -1,6 +1,4 @@
-# doc_to_images.py
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,67 +17,60 @@ except Exception:
     _HAS_TIFFFILE = False
 
 
-def convert_document_to_images(
+def doc_to_images_autorotate_deskew(
     path: Union[str, Path],
     *,
     pdf_dpi: int = 600,
     apply_orientation: bool = True,
-    osd_tc: Any = None,           # TesseractClient benzeri; yoksa OSD atlanır
-    osd_conf: float = 0.0,        # OSD güven eşiği
-    estimate_skew: bool = True,   # residual skew tahmini
-    skew_max_angle: float = 8.0,  # |açı| > bu değer outlier sayılır
-    return_bgr: bool = True,      # görüntüyü BGR döndür (OCR için önerilir)
+    osd_tc: Any = None,          # TesseractClient benzeri: .get_osd_ocr(PIL, ...) -> dict
+    osd_conf: float = 0.0,       # OSD güven eşiği
+    estimate_skew: bool = True,  # residual skew tahmini
+    skew_max_angle: float = 8.0, # |açı| > bu değer outlier sayılır
+    return_bgr: bool = True,     # BGR döndür (OCR için uygundur)
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    PDF/TIFF dosyasını sayfa sayfa imajlara çevirir (kırpma yok) ve meta döndürür.
+    Tek fonksiyonla:
+      1) PDF/TIFF lossless raster
+      2) EXIF/TIFF orientation uygula (varsa)
+      3) OSD ile en yakın 0/90/180/270° (kayıpsız)
+      4) Skew (küçük açı) tahmini ve kırpmasız deskew
+
     Dönüş:
     {
-      "doc_str": "pdf_doc"|"tiff_doc",
       "path": str,
+      "doc_str": "pdf_doc"|"tiff_doc",
       "page_count": int,
-      "pages": [
+      "images": List[np.ndarray],  # BGR veya RGB, sayfa sırasıyla
+      "metas": [
         {
-          "index": int,
+          "page_index": int,
           "dpi": (x_dpi, y_dpi) | (pdf_dpi, pdf_dpi) | None,
-          "shape": (H, W, 3),
-          "dtype": "uint8",
+          "shape": (H, W, C),
           "mode": "BGR"|"RGB",
-          "colorspace": "BGR"|"RGB",
           "source": "pdf_raster"|"tifffile"|"pillow",
-          "rotation_deg": float,         # OSD
-          "osd_confidence": float|None,  # OSD
-          "skew_deg": float|None,        # residual skew
-          "image": np.ndarray (BGR veya RGB)
+          "exif_orientation_applied_deg": int,   # 0/±90/180
+          "osd_raw_deg": float|None,
+          "osd_confidence": float|None,
+          "right_angle_applied_deg": int,        # 0/±90/180
+          "skew_deg": float|None,                # ölçülen
+          "deskew_applied_deg": float,           # uygulanan
+          "total_rotation_applied_deg": float
         }, ...
-      ],
-      "metas": [ {page_index, dpi, shape, rotation_deg, osd_confidence, skew_deg}, ... ]
+      ]
     }
     """
 
-    # ---------- yardımcılar ----------
-
+    # ---- yardımcılar ----
     def _imshow(bgr: np.ndarray, title: str):
         if not debug:
             return
         import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 10))
+        plt.figure(figsize=(8, 8))
         plt.imshow(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         plt.title(title)
         plt.axis("off")
         plt.show()
-
-    def _apply_exif_orientation(arr: np.ndarray, orient: Optional[int]) -> np.ndarray:
-        # 1: normal, 3: 180, 6: 270 CW, 8: 90 CW
-        if orient is None:
-            return arr
-        if orient == 3:
-            return np.rot90(arr, 2)
-        if orient == 6:
-            return np.rot90(arr, 3)
-        if orient == 8:
-            return np.rot90(arr, 1)
-        return arr
 
     def _normalize_dpi_tuple(dpi_xy) -> Optional[Tuple[int, int]]:
         if dpi_xy is None:
@@ -93,37 +84,27 @@ def convert_document_to_images(
             return None
 
     def _rgba_to_bgr_on_white(rgba: np.ndarray) -> np.ndarray:
-        # RGBA -> beyaz zemin üstüne kompozit -> BGR
         rgb = rgba[..., :3].astype(np.float32)
         alpha = rgba[..., 3:4].astype(np.float32) / 255.0
         out = rgb * alpha + 255.0 * (1.0 - alpha)
         out = np.clip(out, 0, 255).astype(np.uint8)
         return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-    def _to_uint8_gray_from_bool_or_u16(arr: np.ndarray, invert: bool = False) -> np.ndarray:
-        # bool/16-bit'i güvenle 8-bit griye indir
+    def _to_uint8_gray(arr: np.ndarray) -> np.ndarray:
         if arr.dtype == np.bool_:
-            g = arr.astype(np.uint8) * 255
-        elif arr.dtype == np.uint16:
-            g = cv2.convertScaleAbs(arr, alpha=255.0 / 65535.0)
-        else:
-            g = arr.astype(np.uint8, copy=False)
-        if invert:
-            g = 255 - g
-        return g
+            return (arr.astype(np.uint8) * 255)
+        if arr.dtype == np.uint16:
+            return cv2.convertScaleAbs(arr, alpha=255.0 / 65535.0)
+        return arr.astype(np.uint8, copy=False)
 
     def _ensure_bgr_safe(arr: np.ndarray, *, photometric: Optional[str] = None) -> np.ndarray:
-        # Her türlü girişten BGR üret (bool/L/RGB/RGBA/CMYK/YCbCr/Palet/16-bit)
-        if arr.dtype == np.bool_:
-            inv = (photometric or "").upper() == "MINISWHITE"
-            g = _to_uint8_gray_from_bool_or_u16(arr, invert=inv)
-            return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-
+        # L/1/bool/uint16/RGB/RGBA -> BGR
         if arr.ndim == 2:
-            inv = (photometric or "").upper() == "MINISWHITE"
-            g = _to_uint8_gray_from_bool_or_u16(arr, invert=inv)
+            g = _to_uint8_gray(arr)
+            # TIFF photometric MINISWHITE ise invert et
+            if (photometric or "").upper() == "MINISWHITE":
+                g = 255 - g
             return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-
         if arr.ndim == 3:
             c = arr.shape[2]
             if c == 3:
@@ -132,36 +113,67 @@ def convert_document_to_images(
                 return _rgba_to_bgr_on_white(arr.astype(np.uint8, copy=False))
             if c > 4:
                 return cv2.cvtColor(arr[..., :3].astype(np.uint8, copy=False), cv2.COLOR_RGB2BGR)
-
         arr = np.squeeze(arr)
         if arr.ndim == 2:
-            g = _to_uint8_gray_from_bool_or_u16(arr)
-            return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-        raise ValueError(f"Unsupported array shape for BGR: {arr.shape}, dtype={arr.dtype}")
+            return cv2.cvtColor(_to_uint8_gray(arr), cv2.COLOR_GRAY2BGR)
+        raise ValueError(f"Unsupported array shape: {arr.shape}, dtype={arr.dtype}")
 
-    def _osd_rotate_if_needed(bgr: np.ndarray) -> Tuple[np.ndarray, float, Optional[float]]:
-        # Proje içinde rotate_img_using_osd varsa kullan; yoksa pas geç
+    def _apply_exif_orientation(bgr: np.ndarray, orient: Optional[int]) -> Tuple[np.ndarray, int]:
+        # 1: normal, 3: 180, 6: 270 CW (== 90 CCW), 8: 90 CW (== -90 CCW)
+        deg = 0
+        if orient is None:
+            return bgr, 0
+        if orient == 3:
+            bgr = np.rot90(bgr, 2); deg = 180
+        elif orient == 6:
+            bgr = np.rot90(bgr, 1); deg = 90
+        elif orient == 8:
+            bgr = np.rot90(bgr, 3); deg = -90
+        return bgr.copy(), deg
+
+    def _osd_estimate_angle(bgr: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
         if osd_tc is None:
-            return bgr, 0.0, None
-        rotate_fn = None
+            return None, None
         try:
-            from rotate_utils import rotate_img_using_osd as _rot
-            rotate_fn = _rot
+            from PIL import Image as _PILImage
+            pil = _PILImage.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            raw = osd_tc.get_osd_ocr(pil, config='', model='best', output_type='dict')
         except Exception:
-            try:
-                rotate_fn = globals().get("rotate_img_using_osd", None)  # type: ignore
-            except Exception:
-                rotate_fn = None
-        if rotate_fn is None:
-            return bgr, 0.0, None
-        try:
-            after_bgr, deg, conf = rotate_fn(bgr, osd_tc=osd_tc, osd_conf=osd_conf)  # type: ignore
-            return after_bgr, float(deg or 0.0), (None if conf is None else float(conf))
-        except Exception:
-            return bgr, 0.0, None
+            return None, None
+        if not isinstance(raw, dict) or 'error' in raw:
+            return None, None
+        d = raw.get('dict', raw)
+        deg  = d.get('rotate', d.get('rotation', d.get('rot', None)))
+        conf = d.get('orientation_conf', d.get('conf', d.get('confidence', None)))
+        return (None if deg is None else float(deg)), (None if conf is None else float(conf))
+
+    def _round_to_right_angle(osd_deg: float) -> int:
+        # 0/±90/180'e en yakın
+        cands = np.array([0, 90, -90, 180], dtype=np.int32)
+        return int(cands[np.argmin(np.abs(cands - osd_deg))])
+
+    def _apply_right_angle(bgr: np.ndarray, ra_deg: int) -> np.ndarray:
+        if ra_deg == 0:   return bgr.copy()
+        if ra_deg == 90:  return np.rot90(bgr, 1).copy()
+        if ra_deg == 180: return np.rot90(bgr, 2).copy()
+        if ra_deg == -90: return np.rot90(bgr, 3).copy()
+        # beklenmeyen: küçük açı gibi davran
+        return _rotate_keep_bounds(bgr, float(ra_deg))
+
+    def _rotate_keep_bounds(bgr: np.ndarray, angle_deg: float) -> np.ndarray:
+        if abs(angle_deg) < 1e-3:
+            return bgr.copy()
+        (h, w) = bgr.shape[:2]
+        c = (w / 2.0, h / 2.0)
+        M = cv2.getRotationMatrix2D(c, angle_deg, 1.0)  # CCW+
+        cos = abs(M[0, 0]); sin = abs(M[0, 1])
+        nW = int((h * sin) + (w * cos))
+        nH = int((h * cos) + (w * sin))
+        M[0, 2] += (nW / 2) - c[0]
+        M[1, 2] += (nH / 2) - c[1]
+        return cv2.warpAffine(bgr, M, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
     def _robust_skew_deg(bgr: np.ndarray, max_angle: float = 8.0) -> Optional[float]:
-        # Canny+Hough ve minAreaRect fallback ile residual skew tahmini
         try:
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             g = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -170,7 +182,7 @@ def convert_document_to_images(
             lines = cv2.HoughLinesP(edges, 1, np.pi / 1800, threshold=120,
                                     minLineLength=max(30, min(bgr.shape[:2]) // 15),
                                     maxLineGap=10)
-            angles: List[float] = []
+            angs: List[float] = []
             if lines is not None:
                 L = lines.squeeze(axis=1) if lines.ndim == 3 else lines
                 for x1, y1, x2, y2 in L:
@@ -179,16 +191,16 @@ def convert_document_to_images(
                     while ang <= -90: ang += 180
                     while ang > 90:   ang -= 180
                     if abs(ang) <= max_angle:
-                        angles.append(float(ang))
-            if angles:
-                a = np.array(angles, dtype=np.float32)
+                        angs.append(float(ang))
+            if angs:
+                a = np.array(angs, dtype=np.float32)
                 med = float(np.median(a))
                 mad = float(np.median(np.abs(a - med)) + 1e-6)
                 keep = np.abs(a - med) <= (3.5 * mad)
                 a2 = a[keep] if keep.any() else a
                 return float(np.median(a2))
 
-            # fallback
+            # fallback: minAreaRect
             _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
             cnts, _ = cv2.findContours(bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -198,7 +210,7 @@ def convert_document_to_images(
             if not areas:
                 return None
             thr = max(50.0, np.percentile(areas, 60))
-            angs: List[float] = []
+            angs2: List[float] = []
             for c in cnts:
                 if cv2.contourArea(c) < thr:
                     continue
@@ -207,33 +219,29 @@ def convert_document_to_images(
                 if ang < -45:
                     ang = 90 + ang
                 if abs(ang) <= max_angle:
-                    angs.append(float(ang))
-            if angs:
-                return float(np.median(np.array(angs, dtype=np.float32)))
+                    angs2.append(float(ang))
+            if angs2:
+                return float(np.median(np.array(angs2, dtype=np.float32)))
             return None
         except Exception:
             return None
 
-    # ---------- ana akış ----------
-
+    # ---- ana akış ----
     p = Path(path).expanduser().resolve()
     ext = p.suffix.lower()
-    out: Dict[str, Any] = {"doc_str": None, "path": str(p), "page_count": 0, "pages": [], "metas": []}
+    out_images: List[np.ndarray] = []
+    metas: List[Dict[str, Any]] = []
+    doc_str = None
 
     # ---- PDF ----
     if ext == ".pdf":
-        out["doc_str"] = "pdf_doc"
+        doc_str = "pdf_doc"
         doc = fitz.open(p.as_posix())
         try:
             for i in range(doc.page_count):
                 page = doc.load_page(i)
                 scale = pdf_dpi / 72.0
-                # Alfa kapalı render -> siyah sayfa riski yok
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(scale, scale),
-                    alpha=False,
-                    colorspace=fitz.csRGB
-                )
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
                 buf = np.frombuffer(pix.samples, dtype=np.uint8)
                 if pix.n == 1:
                     arr = buf.reshape(pix.h, pix.w).copy()
@@ -241,140 +249,138 @@ def convert_document_to_images(
                 elif pix.n == 3:
                     arr = buf.reshape(pix.h, pix.w, 3).copy()  # RGB
                 else:
-                    # Nadiren gelebilir; beyaz zemin kompoziti
                     rgba = buf.reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
                     bgr0 = _rgba_to_bgr_on_white(rgba)
-                    bgr = bgr0
-                    mode = "BGR"
-                    source = "pdf_raster"
-                    _imshow(bgr, f"PDF p{i} | dpi={pdf_dpi} | {bgr.shape} | RGBA→BGR")
-                    # OSD
-                    bgr_rot, rot_deg, conf = _osd_rotate_if_needed(bgr)
-                    # Skew
-                    skew_deg = _robust_skew_deg(bgr_rot, max_angle=skew_max_angle) if estimate_skew else None
-                    page_meta = {
-                        "index": i,
-                        "dpi": (pdf_dpi, pdf_dpi),
-                        "shape": tuple(bgr_rot.shape),
-                        "dtype": str(bgr_rot.dtype),
-                        "mode": mode,
-                        "colorspace": mode,
-                        "source": source,
-                        "rotation_deg": rot_deg,
-                        "osd_confidence": conf,
-                        "skew_deg": skew_deg,
-                    }
-                    out["pages"].append({**page_meta, "image": bgr_rot})
-                    out["metas"].append({"page_index": i, **{k: page_meta[k] for k in ("dpi", "shape", "rotation_deg", "osd_confidence", "skew_deg")}})
-                    continue
+                # RGB->BGR
+                if pix.n in (1, 3):
+                    bgr0 = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if return_bgr else arr
 
-                # RGB geldi; BGR'e çevir
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if return_bgr else arr
-                _imshow(bgr if return_bgr else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR),
-                        f"PDF p{i} | dpi={pdf_dpi} | {bgr.shape if return_bgr else arr.shape}")
+                src = "pdf_raster"
+                dpi_xy = (pdf_dpi, pdf_dpi)
+                mode = "BGR" if return_bgr else "RGB"
 
-                # OSD
-                bgr_rot, rot_deg, conf = _osd_rotate_if_needed(bgr if return_bgr else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-                # Skew
-                skew_deg = _robust_skew_deg(bgr_rot, max_angle=skew_max_angle) if estimate_skew else None
+                # 1) EXIF (PDF yok) -> 0
+                exif_deg_applied = 0
 
-                page_meta = {
-                    "index": i,
-                    "dpi": (pdf_dpi, pdf_dpi),
-                    "shape": tuple(bgr_rot.shape),
-                    "dtype": str(bgr_rot.dtype),
-                    "mode": "BGR" if return_bgr else "RGB",
-                    "colorspace": "BGR" if return_bgr else "RGB",
-                    "source": "pdf_raster",
-                    "rotation_deg": rot_deg,
-                    "osd_confidence": conf,
-                    "skew_deg": skew_deg,
-                }
-                out["pages"].append({**page_meta, "image": bgr_rot})
-                out["metas"].append({"page_index": i, **{k: page_meta[k] for k in ("dpi", "shape", "rotation_deg", "osd_confidence", "skew_deg")}})
+                # 2) OSD
+                osd_deg, osd_c = _osd_estimate_angle(bgr0)
+                ra_deg = 0
+                if osd_deg is not None and (osd_c or 0) >= osd_conf:
+                    ra_deg = _round_to_right_angle(osd_deg)
+                bgr1 = _apply_right_angle(bgr0, ra_deg)
+
+                # 3) Skew
+                if estimate_skew:
+                    skew_deg = _robust_skew_deg(bgr1, max_angle=skew_max_angle)
+                else:
+                    skew_deg = None
+                deskew_deg = float(skew_deg or 0.0)
+                bgr2 = _rotate_keep_bounds(bgr1, deskew_deg) if abs(deskew_deg) > 0.01 else bgr1
+
+                _imshow(bgr2, f"PDF p{i} | after RA={ra_deg}°, deskew={deskew_deg:.2f}°")
+
+                out_images.append(bgr2)
+                metas.append({
+                    "page_index": i,
+                    "dpi": dpi_xy,
+                    "shape": tuple(bgr2.shape),
+                    "mode": mode,
+                    "source": src,
+                    "exif_orientation_applied_deg": int(exif_deg_applied),
+                    "osd_raw_deg": (None if osd_deg is None else float(osd_deg)),
+                    "osd_confidence": (None if osd_c is None else float(osd_c)),
+                    "right_angle_applied_deg": int(ra_deg),
+                    "skew_deg": (None if skew_deg is None else float(skew_deg)),
+                    "deskew_applied_deg": float(deskew_deg),
+                    "total_rotation_applied_deg": float(exif_deg_applied + ra_deg + deskew_deg),
+                })
         finally:
             doc.close()
-        out["page_count"] = len(out["pages"])
 
     # ---- TIFF ----
     elif ext in (".tif", ".tiff"):
-        out["doc_str"] = "tiff_doc"
+        doc_str = "tiff_doc"
 
-        def _tiff_with_tifffile(pth: Path) -> List[Dict[str, Any]]:
-            pages: List[Dict[str, Any]] = []
+        def _proc_tiff_pages_with_tifffile(pth: Path):
             with tiff.TiffFile(pth.as_posix()) as tf:
                 for i, pg in enumerate(tf.pages):
-                    # metadata
+                    # Görüntü
+                    arr = pg.asarray()
+                    photometric = str(getattr(pg, "photometric", "") or "")
+                    bgr0 = _ensure_bgr_safe(arr, photometric=photometric)
+
+                    # DPI
+                    dpi_xy = None
                     try:
-                        photometric = str(getattr(pg, "photometric", "") or "")
-                        compression = str(getattr(pg, "compression", "") or "")
-                        spp = int(getattr(pg, "samplesperpixel", 1))
+                        xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
+                        if xr and yr and ru:
+                            def _rat(tag): num, den = tag.value; return float(num) / float(den)
+                            x, y = _rat(xr), _rat(yr)
+                            ru_val = getattr(ru, "value", ru)
+                            if ru_val == 3:  # cm
+                                x *= 2.54; y *= 2.54
+                            dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
                     except Exception:
-                        photometric, compression, spp = "", "", 1
-
-                    # CCITT/garip renk uzayı/kanal sayısı: Pillow fallback
-                    need_pillow = (
-                        "CCITT" in compression.upper()
-                        or ("RGB" not in photometric.upper() and "MINIS" not in photometric.upper())
-                        or spp not in (1, 3, 4)
-                    )
-
-                    if need_pillow:
-                        pil_img = pg.aspilimage().convert("RGB")
-                        arr = np.array(pil_img)
-                        bgr = _ensure_bgr_safe(arr, photometric=None)
-                        src = "pillow"
-                        dpi_xy = None  # Pillow ile tekil sayfa DPI'ını güvenilir almak zor
-                    else:
-                        arr = pg.asarray()
-                        bgr = _ensure_bgr_safe(arr, photometric=photometric)
-                        src = "tifffile"
-                        # DPI bilgisi
                         dpi_xy = None
-                        try:
-                            xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
-                            if xr and yr and ru:
-                                def _rat(tag):
-                                    num, den = tag.value
-                                    return float(num) / float(den)
-                                x, y = _rat(xr), _rat(yr)
-                                ru_val = getattr(ru, "value", ru)
-                                if ru_val == 3:  # cm
-                                    x *= 2.54; y *= 2.54
-                                dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
-                        except Exception:
-                            dpi_xy = None
 
-                    _imshow(bgr, f"TIFF p{i} | {src} | {bgr.shape}")
+                    # EXIF Orientation
+                    exif_orient = None
+                    try:
+                        exif_orient = (pg.tags.get("Orientation") or {}).value
+                    except Exception:
+                        exif_orient = None
+
+                    exif_deg_applied = 0
+                    if apply_orientation:
+                        bgr0, exif_deg_applied = _apply_exif_orientation(bgr0, exif_orient)
 
                     # OSD
-                    bgr_rot, rot_deg, conf = _osd_rotate_if_needed(bgr)
+                    osd_deg, osd_c = _osd_estimate_angle(bgr0)
+                    ra_deg = 0
+                    if osd_deg is not None and (osd_c or 0) >= osd_conf:
+                        ra_deg = _round_to_right_angle(osd_deg)
+                    bgr1 = _apply_right_angle(bgr0, ra_deg)
+
                     # Skew
-                    skew_deg = _robust_skew_deg(bgr_rot, max_angle=skew_max_angle) if estimate_skew else None
+                    if estimate_skew:
+                        skew_deg = _robust_skew_deg(bgr1, max_angle=skew_max_angle)
+                    else:
+                        skew_deg = None
+                    deskew_deg = float(skew_deg or 0.0)
+                    bgr2 = _rotate_keep_bounds(bgr1, deskew_deg) if abs(deskew_deg) > 0.01 else bgr1
 
-                    page_meta = {
-                        "index": i,
+                    _imshow(bgr2, f"TIFF p{i} | after EXIF={exif_deg_applied}°, RA={ra_deg}°, deskew={deskew_deg:.2f}°")
+
+                    out_images.append(bgr2)
+                    metas.append({
+                        "page_index": i,
                         "dpi": dpi_xy,
-                        "shape": tuple(bgr_rot.shape),
-                        "dtype": str(bgr_rot.dtype),
+                        "shape": tuple(bgr2.shape),
                         "mode": "BGR",
-                        "colorspace": "BGR",
-                        "source": src,
-                        "rotation_deg": rot_deg,
-                        "osd_confidence": conf,
-                        "skew_deg": skew_deg,
-                    }
-                    pages.append({**page_meta, "image": bgr_rot})
-            return pages
+                        "source": "tifffile",
+                        "exif_orientation_applied_deg": int(exif_deg_applied),
+                        "osd_raw_deg": (None if osd_deg is None else float(osd_deg)),
+                        "osd_confidence": (None if osd_c is None else float(osd_c)),
+                        "right_angle_applied_deg": int(ra_deg),
+                        "skew_deg": (None if skew_deg is None else float(skew_deg)),
+                        "deskew_applied_deg": float(deskew_deg),
+                        "total_rotation_applied_deg": float(exif_deg_applied + ra_deg + deskew_deg),
+                    })
 
-        def _tiff_with_pillow(pth: Path) -> List[Dict[str, Any]]:
-            pages: List[Dict[str, Any]] = []
+        def _proc_tiff_pages_with_pillow(pth: Path):
             with Image.open(pth.as_posix()) as im:
                 n = getattr(im, "n_frames", 1)
                 for i in range(n):
                     im.seek(i)
                     frame = im.copy()
-                    # mod normalize
+                    # EXIF orientation
+                    exif_orient = None
+                    try:
+                        exif_orient = frame.getexif().get(274)
+                    except Exception:
+                        exif_orient = None
+
+                    # normalize mod
                     if frame.mode in ("RGB", "RGBA", "L"):
                         safe = frame
                     elif frame.mode == "1":
@@ -382,48 +388,62 @@ def convert_document_to_images(
                     else:
                         safe = frame.convert("RGB")
                     arr = np.array(safe)
-                    bgr = _ensure_bgr_safe(arr, photometric=None)
-                    _imshow(bgr, f"TIFF p{i} | pillow | {bgr.shape}")
+                    bgr0 = _ensure_bgr_safe(arr, photometric=None)
 
-                    bgr_rot, rot_deg, conf = _osd_rotate_if_needed(bgr)
-                    skew_deg = _robust_skew_deg(bgr_rot, max_angle=skew_max_angle) if estimate_skew else None
+                    exif_deg_applied = 0
+                    if apply_orientation:
+                        bgr0, exif_deg_applied = _apply_exif_orientation(bgr0, exif_orient)
 
-                    page_meta = {
-                        "index": i,
-                        "dpi": _normalize_dpi_tuple(safe.info.get("dpi")) if isinstance(safe.info.get("dpi"), (tuple, list)) else None,
-                        "shape": tuple(bgr_rot.shape),
-                        "dtype": str(bgr_rot.dtype),
+                    osd_deg, osd_c = _osd_estimate_angle(bgr0)
+                    ra_deg = 0
+                    if osd_deg is not None and (osd_c or 0) >= osd_conf:
+                        ra_deg = _round_to_right_angle(osd_deg)
+                    bgr1 = _apply_right_angle(bgr0, ra_deg)
+
+                    if estimate_skew:
+                        skew_deg = _robust_skew_deg(bgr1, max_angle=skew_max_angle)
+                    else:
+                        skew_deg = None
+                    deskew_deg = float(skew_deg or 0.0)
+                    bgr2 = _rotate_keep_bounds(bgr1, deskew_deg) if abs(deskew_deg) > 0.01 else bgr1
+
+                    _imshow(bgr2, f"TIFF p{i} | pillow | after EXIF={exif_deg_applied}°, RA={ra_deg}°, deskew={deskew_deg:.2f}°")
+
+                    dpi_xy = _normalize_dpi_tuple(safe.info.get("dpi")) if isinstance(safe.info.get("dpi"), (tuple, list)) else None
+
+                    out_images.append(bgr2)
+                    metas.append({
+                        "page_index": i,
+                        "dpi": dpi_xy,
+                        "shape": tuple(bgr2.shape),
                         "mode": "BGR",
-                        "colorspace": "BGR",
                         "source": "pillow",
-                        "rotation_deg": rot_deg,
-                        "osd_confidence": conf,
-                        "skew_deg": skew_deg,
-                    }
-                    pages.append({**page_meta, "image": bgr_rot})
-            return pages
+                        "exif_orientation_applied_deg": int(exif_deg_applied),
+                        "osd_raw_deg": (None if osd_deg is None else float(osd_deg)),
+                        "osd_confidence": (None if osd_c is None else float(osd_c)),
+                        "right_angle_applied_deg": int(ra_deg),
+                        "skew_deg": (None if skew_deg is None else float(skew_deg)),
+                        "deskew_applied_deg": float(deskew_deg),
+                        "total_rotation_applied_deg": float(exif_deg_applied + ra_deg + deskew_deg),
+                    })
 
         try:
             if _HAS_TIFFFILE:
-                out["pages"] = _tiff_with_tifffile(p)
+                _proc_tiff_pages_with_tifffile(p)
             else:
-                out["pages"] = _tiff_with_pillow(p)
+                _proc_tiff_pages_with_pillow(p)
         except Exception:
-            # tifffile hata verirse pillow'a düş
-            out["pages"] = _tiff_with_pillow(p)
-
-        out["page_count"] = len(out["pages"])
-        for pg in out["pages"]:
-            out["metas"].append({
-                "page_index": pg["index"],
-                "dpi": pg["dpi"],
-                "shape": pg["shape"],
-                "rotation_deg": pg["rotation_deg"],
-                "osd_confidence": pg["osd_confidence"],
-                "skew_deg": pg["skew_deg"],
-            })
+            # tifffile hata verirse pillow’a düş
+            _proc_tiff_pages_with_pillow(p)
 
     else:
         raise ValueError(f"Unsupported extension: {ext}")
 
-    return out
+    res = {
+        "path": str(p),
+        "doc_str": doc_str,
+        "page_count": len(out_images),
+        "images": out_images,   # <-- Sayfa sayfa imajlar (BGR)
+        "metas": metas
+    }
+    return res
