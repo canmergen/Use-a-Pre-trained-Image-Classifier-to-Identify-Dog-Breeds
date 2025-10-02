@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 import re, difflib
 import numpy as np
 import cv2, fitz
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
-
 try:
     import tifffile as tiff
     _HAS_TIFF = True
@@ -20,50 +18,57 @@ def convert_document_with_rotation_and_keywords(
     path: Union[str, Path],
     *,
     pdf_dpi: int = 600,
-    osd_tc: Any = None,                # get_osd_ocr(PIL, output_type='dict') beklenir
-    tc_new: Any = None,                # ocr / run_ocr / predict / infer / get_text / __call__
-    keywords: Optional[List[str]] = None,
-    enable_keyword_rotation: bool = True,
-    keyword_rotation_mode: str = "after_osd",   # 'after_osd' | 'raw'
+    # OSD client: get_osd_ocr(PIL, output_type='dict')
+    osd_tc: Any = None,
+    # OCR client (opsiyonel) – kullanılmazsa tc_new devreye girer
+    ocr_text_fn: Optional[Callable[[np.ndarray], str]] = None,
+    tc_new: Any = None,                  # yedek OCR istemcisi
     tc_new_lang: str = "tur",
     tc_new_psm: Optional[int] = None,
     tc_new_oem: Optional[int] = None,
     tc_new_config: Optional[str] = None,
-    keyword_exceptions_prefix: Optional[List[str]] = None,  # örn: ['paylaş']
+
+    # Keyword/self-check (opsiyonel)
+    keywords: Optional[List[str]] = None,
+    enable_keyword_rotation: bool = True,
     fuzzy_min_ratio: float = 0.86,
+    keyword_exceptions_prefix: Optional[List[str]] = None,
+
+    # OSD -> CCW mapping seçimi
+    osd_mapping_autoselect: bool = True,   # A ve B mapping'i mini OCR ile kıyasla
+    ocr_min_chars: int = 20,               # metin var saymak için min karakter
+    retry_when_empty: bool = True,         # açıda metin yoksa sıradaki açıya dene
+
+    # Deskew (küçük açı)
     deskew: bool = True,
-    deskew_method: str = "projection", # 'projection' | 'hough' | 'auto'
     deskew_max_abs: float = 15.0,
     deskew_step: float = 0.5,
     deskew_min_gain: float = 1.03,
     deskew_min_abs: float = 0.3,
+
+    # Performans/Debug
     angle_estimation_max_side: int = 1600,
     return_bgr: bool = True,
     debug: bool = False,
-    ocr_debug: bool = False,           # konsola print + metaya OCR önizleme
+    ocr_debug: bool = False
 ) -> Dict[str, Any]:
 
-    # ------------ image helpers ------------
+    # ----------------- image helpers -----------------
     def _ensure_bgr(arr: np.ndarray) -> np.ndarray:
-        if arr.ndim == 2:
-            return cv2.cvtColor(arr.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
-        if arr.ndim == 3 and arr.shape[2] >= 3:
-            return arr[:, :, :3].astype(np.uint8, copy=False)
+        if arr.ndim == 2:  return cv2.cvtColor(arr.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
+        if arr.ndim == 3 and arr.shape[2] >= 3: return arr[:, :, :3].astype(np.uint8, copy=False)
         s = np.squeeze(arr)
-        if s.ndim == 2:
-            return cv2.cvtColor(s.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
-        if s.ndim == 3 and s.shape[2] >= 3:
-            return s[:, :, :3].astype(np.uint8, copy=False)
-        raise ValueError(f"Unsupported array shape: {arr.shape}")
+        if s.ndim == 2:  return cv2.cvtColor(s.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
+        if s.ndim == 3 and s.shape[2] >= 3: return s[:, :, :3].astype(np.uint8, copy=False)
+        raise ValueError(f"Unsupported shape: {arr.shape}")
 
     def _rgba_to_bgr_on_white(rgba: np.ndarray) -> np.ndarray:
         rgb = rgba[..., :3].astype(np.float32)
-        alpha = rgba[..., 3:4].astype(np.float32)/255.0
-        out = rgb*alpha + 255.0*(1.0-alpha)
+        a = rgba[..., 3:4].astype(np.float32)/255.0
+        out = rgb*a + 255.0*(1.0-a)
         return cv2.cvtColor(np.clip(out,0,255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
     def _apply_exif_orientation(bgr: np.ndarray, orient: Optional[int]) -> Tuple[np.ndarray,int]:
-        # 1: normal, 3: 180, 6: 270 CW (= +90 CCW), 8: 90 CW (= -90 CCW)
         if orient == 3:  return np.rot90(bgr,2).copy(), 180
         if orient == 6:  return np.rot90(bgr,1).copy(),  90
         if orient == 8:  return np.rot90(bgr,3).copy(), -90
@@ -71,11 +76,11 @@ def convert_document_with_rotation_and_keywords(
 
     def _rotate_full_canvas(bgr: np.ndarray, angle_ccw: float) -> np.ndarray:
         if abs(angle_ccw) < 1e-6: return bgr
-        (h,w) = bgr.shape[:2]
+        h, w = bgr.shape[:2]
         c = (w/2.0, h/2.0)
-        M = cv2.getRotationMatrix2D(c, angle_ccw, 1.0)  # CCW +
+        M = cv2.getRotationMatrix2D(c, angle_ccw, 1.0)
         cos, sin = abs(M[0,0]), abs(M[0,1])
-        nW = int(h*sin + w*cos); nH = int(h*cos + w*sin)
+        nW, nH = int(h*sin + w*cos), int(h*cos + w*sin)
         M[0,2] += (nW/2.0) - c[0]; M[1,2] += (nH/2.0) - c[1]
         return cv2.warpAffine(bgr, M, (nW,nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
@@ -87,22 +92,21 @@ def convert_document_with_rotation_and_keywords(
         return _rotate_full_canvas(bgr, float(ra))
 
     def _make_small(bgr: np.ndarray) -> np.ndarray:
-        h,w = bgr.shape[:2]
-        m = max(h,w)
+        h, w = bgr.shape[:2]
+        m = max(h, w)
         if m <= angle_estimation_max_side: return bgr
         s = angle_estimation_max_side/float(m)
         return cv2.resize(bgr, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
-    # ------------ OCR helpers ------------
+    # ----------------- OCR helpers -----------------
     def _osd_detect_deg_cw(bgr_small: np.ndarray) -> Tuple[Optional[int], Optional[float]]:
         if osd_tc is None: return None, None
         try:
             pil = Image.fromarray(cv2.cvtColor(bgr_small, cv2.COLOR_BGR2RGB))
             raw = osd_tc.get_osd_ocr(pil, config='', model='best', output_type='dict')
-            if not isinstance(raw, dict): return None, None
-            d = raw.get('dict', raw)
-            deg = int(d.get('rotate', d.get('rotation', d.get('rot', 0)) ) or 0) % 360
-            conf = float(d.get('orientation_conf', d.get('conf', d.get('confidence', 0.0)) ) or 0.0)
+            d = raw.get('dict', raw) if isinstance(raw, dict) else {}
+            deg = int(d.get('rotate', d.get('rotation', d.get('rot', 0))) or 0) % 360
+            conf = float(d.get('orientation_conf', d.get('conf', d.get('confidence', 0.0))) or 0.0)
             return deg, conf
         except Exception:
             return None, None
@@ -110,7 +114,7 @@ def convert_document_with_rotation_and_keywords(
     def _tc_new_text(bgr_small: np.ndarray) -> str:
         if tc_new is None: return ""
         pil = Image.fromarray(cv2.cvtColor(bgr_small, cv2.COLOR_BGR2RGB))
-        kwargs: Dict[str,Any] = {}
+        kwargs: Dict[str, Any] = {}
         if tc_new_config:
             kwargs["config"] = tc_new_config
         else:
@@ -119,7 +123,6 @@ def convert_document_with_rotation_and_keywords(
             if tc_new_oem is not None: cfg.append(f"--oem {int(tc_new_oem)}")
             if cfg: kwargs["config"] = " ".join(cfg)
         if tc_new_lang: kwargs["lang"] = tc_new_lang
-
         for name in ("ocr","run_ocr","predict","infer","get_text","__call__"):
             fn = getattr(tc_new, name, None)
             if callable(fn):
@@ -138,12 +141,20 @@ def convert_document_with_rotation_and_keywords(
                     pass
         return ""
 
-    # ------------ fuzzy keyword match ------------
+    def _ocr_text(bgr_small: np.ndarray) -> str:
+        if callable(ocr_text_fn):
+            try:
+                return ocr_text_fn(bgr_small) or ""
+            except Exception:
+                pass
+        return _tc_new_text(bgr_small)
+
+    # ----------------- keyword (fuzzy) -----------------
     _TR_WORD = re.compile(r"[a-zçğıöşü]+", re.IGNORECASE)
     def _tr_lower(s: str) -> str:
         return (s.replace("I","ı").replace("İ","i")).lower()
     def _tokenize(s: str) -> List[str]:
-        return [ _tr_lower(m.group(0)) for m in _TR_WORD.finditer(s) ]
+        return [ _tr_lower(m.group(0)) for m in _TR_WORD.finditer(s or "") ]
     def _keyword_score_fuzzy(text: str, kws: List[str],
                              exceptions_prefix: Optional[List[str]]=None,
                              min_ratio: float = 0.86) -> int:
@@ -153,16 +164,14 @@ def convert_document_with_rotation_and_keywords(
         ex = set(_tr_lower(x) for x in (exceptions_prefix or []))
         score = 0
         for kw in kws:
-            kw0 = _tr_lower(kw.strip())
+            kw0 = _tr_lower((kw or "").strip())
             if not kw0: continue
             if kw0 in tset:
                 score += 1; continue
-            # kök+ek (başlangıç) – ama istisna köklerle başlamasın
             starts = [tok for tok in tks if tok.startswith(kw0)]
             if starts:
                 if not any(tok.startswith(tuple(ex)) for tok in starts) if ex else True:
                     score += 1; continue
-            # fuzzy
             best = 0.0
             for tok in tset:
                 r = difflib.SequenceMatcher(None, kw0, tok).ratio()
@@ -170,7 +179,7 @@ def convert_document_with_rotation_and_keywords(
             if best >= min_ratio: score += 1
         return score
 
-    # ------------ skew ------------
+    # ----------------- skew (projection) -----------------
     def _deskew_projection_angle(bgr_small: np.ndarray,
                                  max_abs: float, step: float) -> Tuple[float, float, float]:
         gray = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
@@ -185,58 +194,45 @@ def convert_document_with_rotation_and_keywords(
             return float(np.var(proj) + np.var(np.diff(proj)))
 
         base = _score(bw)
-        best, best_sc = 0.0, -1e18
-
-        h,w = bw.shape
-        c = (w/2.0, h/2.0)
+        best_a, best_sc = 0.0, -1e18
+        h,w = bw.shape; c=(w/2.0,h/2.0)
         for a in np.arange(-max_abs, max_abs+1e-6, step, dtype=np.float32):
             M = cv2.getRotationMatrix2D(c, float(a), 1.0)
             cos, sin = abs(M[0,0]), abs(M[0,1])
-            nW = int(h*sin + w*cos); nH = int(h*cos + w*sin)
+            nW, nH = int(h*sin + w*cos), int(h*cos + w*sin)
             Mt = M.copy(); Mt[0,2] += (nW/2.0)-c[0]; Mt[1,2] += (nH/2.0)-c[1]
             rot = cv2.warpAffine(bw, Mt, (nW,nH), flags=cv2.INTER_NEAREST, borderValue=0)
             sc = _score(rot)
-            if sc > best_sc: best_sc, best = sc, float(a)
-        return best, best_sc, base
+            if sc > best_sc: best_sc, best_a = sc, float(a)
+        return best_a, best_sc, base
 
-    def _deskew_hough_angle(bgr_small: np.ndarray, cap: float=10.0) -> Tuple[float,int]:
-        try:
-            gray = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
-            g = cv2.GaussianBlur(gray,(3,3),0)
-            edges = cv2.Canny(g,50,150)
-            edges = cv2.dilate(edges, np.ones((3,3),np.uint8), 1)
-            lines = cv2.HoughLinesP(edges,1,np.pi/1800,120,
-                                    minLineLength=max(30, min(bgr_small.shape[:2])//15),
-                                    maxLineGap=10)
-            if lines is None: return 0.0, 0
-            angs=[]
-            L = lines.squeeze(axis=1) if lines.ndim==3 else lines
-            for x1,y1,x2,y2 in L:
-                dx,dy = x2-x1, y2-y1
-                ang = 90.0 if dx==0 else np.degrees(np.arctan2(dy,dx))
-                while ang <= -90: ang += 180
-                while ang >   90: ang -= 180
-                if abs(ang) <= cap: angs.append(float(ang))
-            if not angs: return 0.0,0
-            a = np.array(angs, np.float32)
-            med = float(np.median(a)); mad = float(np.median(np.abs(a-med))+1e-6)
-            keep = np.abs(a-med) <= 3.5*mad
-            a2 = a[keep] if keep.any() else a
-            return float(np.median(a2)), int(len(a2))
-        except Exception:
-            return 0.0, 0
-
-    # ------------ angles ------------
-    def _osd_cw_to_ccw_deg(dcw: Optional[int]) -> int:
+    # ----------------- OSD mapping helpers -----------------
+    # A: tesseract klasik – 90->+90, 270->-90 (CCW)
+    def _osd_map_A(dcw: Optional[int]) -> int:
         if dcw is None: return 0
         d = int(dcw) % 360
-        # OSD rotate (CW) -> uygulanacak CCW:
-        if d == 0:   return 0
-        if d == 90:  return 90      # sağa yatık (CW)  -> +90 CCW
-        if d == 180: return 180
-        if d == 270: return -90     # sola yatık (CCW) -> -90 CCW
-        return 0
+        return {0:0, 90:90, 180:180, 270:-90}.get(d, 0)
+    # B: ters – 90->-90, 270->+90 (bazı kurulumlarda işaret farkı görülür)
+    def _osd_map_B(dcw: Optional[int]) -> int:
+        if dcw is None: return 0
+        d = int(dcw) % 360
+        return {0:0, 90:-90, 180:180, 270:90}.get(d, 0)
 
+    def _choose_osd_mapping_with_ocr(bgr: np.ndarray, dcw: Optional[int]) -> int:
+        # osd_mapping_autoselect=True ise A ve B'yi mini OCR ile kıyasla
+        if dcw is None: return 0
+        if not osd_mapping_autoselect or osd_tc is None:
+            return _osd_map_A(dcw)
+        raA = _osd_map_A(dcw); raB = _osd_map_B(dcw)
+        # kısa OCR ile hangisi daha çok metin veriyor?
+        txtA = _ocr_text(_make_small(_apply_right_angle_ccw(bgr, raA)))
+        txtB = _ocr_text(_make_small(_apply_right_angle_ccw(bgr, raB)))
+        nA, nB = len(txtA or ""), len(txtB or "")
+        if ocr_debug:
+            print(f"[OSD map check] A={raA:+} chars={nA} | B={raB:+} chars={nB}")
+        return raA if nA >= nB else raB
+
+    # ----------------- viz -----------------
     def _imshow_before_after(before: np.ndarray, after: np.ndarray, title: str):
         if not debug: return
         try:
@@ -246,7 +242,7 @@ def convert_document_with_rotation_and_keywords(
             ax2 = plt.subplot(1,2,2); ax2.imshow(cv2.cvtColor(after,  cv2.COLOR_BGR2RGB)); ax2.set_title("After");  ax2.axis("off")
             plt.suptitle(title); plt.tight_layout(); plt.show()
         except Exception:
-            pass  # headless ortamda sorun çıkmasın
+            pass
 
     def _normalize_dpi_tuple(dpi_xy) -> Optional[Tuple[int,int]]:
         if dpi_xy is None: return None
@@ -257,7 +253,7 @@ def convert_document_with_rotation_and_keywords(
         except Exception:
             return None
 
-    # ------------ raster: PDF / TIFF ------------
+    # ----------------- rasterize -----------------
     p = Path(path).expanduser().resolve()
     ext = p.suffix.lower()
     pages_raw: List[Tuple[int,np.ndarray,Optional[Tuple[int,int]],str,Optional[int]]] = []
@@ -285,7 +281,7 @@ def convert_document_with_rotation_and_keywords(
             doc.close()
         doc_str = "pdf_doc"
 
-    elif ext in (".tif", ".tiff"):
+    elif ext in (".tif",".tiff"):
         doc_str = "tiff_doc"
         if _HAS_TIFF:
             with tiff.TiffFile(p.as_posix()) as tf:
@@ -302,15 +298,14 @@ def convert_document_with_rotation_and_keywords(
                             if xr and yr and ru:
                                 def _rat(tag): num, den = tag.value; return float(num)/float(den)
                                 x,y = _rat(xr), _rat(yr)
-                                if getattr(ru,"value",ru) == 3: x*=2.54; y*=2.54
+                                if getattr(ru,"value",ru)==3: x*=2.54; y*=2.54
                                 dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
-                        except Exception: dpi_xy = None
-                        orient = None
+                        except Exception: dpi_xy=None
+                        orient=None
                         try: orient = (pg.tags.get("Orientation") or {}).value
                         except Exception: pass
                         pages_raw.append((i, bgr, dpi_xy, "tifffile", orient))
                     except Exception:
-                        # Pillow fallback (CCITT vb.)
                         with Image.open(p.as_posix()) as im:
                             im.seek(i)
                             pil = im.convert("RGB")
@@ -331,128 +326,103 @@ def convert_document_with_rotation_and_keywords(
     else:
         raise ValueError(f"Unsupported extension: {ext}")
 
-    # ------------ process: EXIF -> OSD -> (optional) keywords -> DESKEW ------------
+    # ----------------- process per page -----------------
     images: List[np.ndarray] = []
-    metas: List[Dict[str,Any]] = []
-
+    metas: List[Dict[str, Any]] = []
     kw_enabled = (
         enable_keyword_rotation and
-        tc_new is not None and
-        isinstance(keywords, list) and
-        any(isinstance(k,str) and k.strip() for k in keywords)
+        isinstance(keywords, list) and any((k or "").strip() for k in keywords)
     )
-    kw_list = [k for k in (keywords or []) if isinstance(k,str) and k.strip()]
+    kws = [k for k in (keywords or []) if (k or "").strip()]
     kw_ex = list(keyword_exceptions_prefix or [])
 
     for (i, bgr0, dpi_xy, source, orient_tag) in pages_raw:
-        # EXIF (TIFF)
         exif_deg = 0
         if orient_tag is not None:
             bgr1, exif_deg = _apply_exif_orientation(bgr0, orient_tag)
         else:
             bgr1 = bgr0
 
-        # OSD ve mapping
+        # --- OSD ---
         small1 = _make_small(bgr1)
         osd_deg_cw, osd_conf = _osd_detect_deg_cw(small1)
-        osd_to_ccw = _osd_cw_to_ccw_deg(osd_deg_cw)
+        osd_ra = _choose_osd_mapping_with_ocr(bgr1, osd_deg_cw)  # CCW RA (A/B auto)
+        bgr_osd = _apply_right_angle_ccw(bgr1, osd_ra)
 
-        # OSD right-angle uygula (kayıpsız)
-        bgr_osd = _apply_right_angle_ccw(bgr1, osd_to_ccw)
+        # --- Keyword/OCR döngüsü (opsiyonel) ---
+        ocr_dbg: Dict[str, Any] = {}
+        base = bgr_osd
+        best_img = base
+        best_ra_extra = 0
+        best_score = -1
+        best_chars = -1
 
-        # Keyword döngüsü
-        best_ra = 0
-        best_score = 0
-        best_img = bgr_osd
-        ocr_dbg: Dict[str,Any] = {}
-
-        if kw_enabled:
-            # hangi baz üzerinde döneceğiz?
-            base_img = bgr_osd if keyword_rotation_mode == "after_osd" else bgr1
-            base_ra_offset = osd_to_ccw if keyword_rotation_mode == "raw" else 0
-
-            candidate_ras = [0, 90, 180, -90]
-            best_score = -1
-            for ra in candidate_ras:
-                prev = _apply_right_angle_ccw(base_img, ra) if ra != 0 else base_img
-                prev_small = _make_small(prev)
-                txt = _tc_new_text(prev_small)
-                sc = _keyword_score_fuzzy(txt, kw_list, exceptions_prefix=kw_ex, min_ratio=fuzzy_min_ratio)
-                if sc > best_score:
-                    best_score = sc
-                    best_ra = ra
-                    best_img = prev
+        if kw_enabled or retry_when_empty:
+            for ra in [0, 90, 180, -90]:
+                cand = _apply_right_angle_ccw(base, ra) if ra!=0 else base
+                txt = _ocr_text(_make_small(cand))
+                score = _keyword_score_fuzzy(txt, kws, exceptions_prefix=kw_ex, min_ratio=fuzzy_min_ratio) if kw_enabled else 0
+                n_chars = len(txt or "")
                 if ocr_debug:
                     preview = (txt or "")[:400].replace("\n\n","\n")
                     lines = "\n".join(preview.splitlines()[:3])
-                    print(f"[OCR p{i:02d} RA={ra:+}] score={sc} | preview:\n{lines}\n{'-'*60}")
-                    ocr_dbg[str(ra)] = {"score": int(sc), "preview": lines}
-            # keyword_rotation_mode = 'raw' ise, toplam açıya OSD offsetini ekleyeceğiz:
-            if keyword_rotation_mode == "raw":
-                best_ra += base_ra_offset  # toplam CCW RA
+                    print(f"[p{i:02d} RA={ra:+}] chars={n_chars} score={score}\n{lines}\n{'-'*60}")
+                    ocr_dbg[str(ra)] = {"chars": int(n_chars), "score": int(score), "preview": lines}
+                # Seçim kuralı: önce metin uzunluğu, sonra skor
+                better = (n_chars > best_chars) or (n_chars == best_chars and score > best_score)
+                if better:
+                    best_chars, best_score = n_chars, score
+                    best_ra_extra = ra
+                    best_img = cand
+            # Metin tamamen yoksa (hepsinde kısa): OSD sonucu kalır (best_ra_extra olabilir)
+            if (best_chars < ocr_min_chars) and not kw_enabled and not retry_when_empty:
+                best_img, best_ra_extra = base, 0
+        else:
+            best_img, best_ra_extra = base, 0
 
-        # DESKEW (güvence ile)
+        # --- DESKEW (küçük açı; büyük açılar RA ile düzeltilir) ---
         small2 = _make_small(best_img)
-        deskew_deg = 0.0
-        proj_best = proj_base = 0.0
-        hough_deg, hough_n = 0.0, 0
-
+        deskew_deg = 0.0; proj_best = proj_base = 0.0
         if deskew:
-            if deskew_method == "projection":
-                a, s_best, s_base = _deskew_projection_angle(small2, deskew_max_abs, deskew_step)
-                gain = (s_best / max(s_base,1e-6)) if s_best>0 else 1.0
-                if abs(a) >= deskew_min_abs and gain >= deskew_min_gain:
-                    deskew_deg, proj_best, proj_base = float(a), float(s_best), float(s_base)
-            elif deskew_method == "hough":
-                a, n = _deskew_hough_angle(small2, cap=min(deskew_max_abs,15.0))
-                if abs(a) >= deskew_min_abs:
-                    deskew_deg, hough_deg, hough_n = float(a), float(a), int(n)
-            else:  # auto
-                a1,s1,b0 = _deskew_projection_angle(small2, deskew_max_abs, deskew_step)
-                a2,n2     = _deskew_hough_angle(small2, cap=min(deskew_max_abs,15.0))
-                gain1 = (s1/max(b0,1e-6)) if s1>0 else 1.0
-                if abs(a1)>=deskew_min_abs and gain1>=deskew_min_gain:
-                    deskew_deg, proj_best, proj_base = float(a1), float(s1), float(b0)
-                elif abs(a2)>=deskew_min_abs:
-                    deskew_deg, hough_deg, hough_n = float(a2), float(a2), int(n2)
+            a, s_best, s_base = _deskew_projection_angle(small2, deskew_max_abs, deskew_step)
+            gain = (s_best/max(s_base,1e-6)) if s_best>0 else 1.0
+            if abs(a) >= deskew_min_abs and gain >= deskew_min_gain:
+                deskew_deg, proj_best, proj_base = float(a), float(s_best), float(s_base)
 
-        bgr_final = _rotate_full_canvas(best_img, float(deskew_deg))
-        total_deg = float(exif_deg + osd_to_ccw + best_ra + deskew_deg)
+        final = _rotate_full_canvas(best_img, deskew_deg)
+        total = float(exif_deg + osd_ra + best_ra_extra + deskew_deg)
 
         if debug:
-            _imshow_before_after(bgr0, bgr_final, f"Page {i} | total={total_deg:.2f}°")
+            _imshow_before_after(bgr0, final, f"Page {i} | total={total:.2f}°")
 
-        meta: Dict[str,Any] = {
+        meta: Dict[str, Any] = {
             "page_index": i,
             "dpi": dpi_xy,
-            "shape": tuple(bgr_final.shape),
+            "shape": tuple(final.shape),
             "source": source,
             "exif_orientation_applied_deg": int(exif_deg),
             "osd_raw_deg_cw": (None if osd_deg_cw is None else int(osd_deg_cw)),
             "osd_confidence": (None if osd_conf is None else float(osd_conf)),
-            "osd_to_ccw_deg": int(osd_to_ccw),
+            "osd_right_angle_ccw_deg": int(osd_ra),      # auto-chosen A/B mapping
             "keyword_rotation_enabled": bool(kw_enabled),
-            "keyword_rotation_mode": keyword_rotation_mode,
-            "keyword_best_ccw_deg": int(best_ra if kw_enabled else 0),
+            "keyword_best_extra_ccw_deg": int(best_ra_extra),
             "keyword_match_score": int(best_score if kw_enabled else 0),
-            "deskew_method": deskew_method,
+            "keyword_chars": int(best_chars if (kw_enabled or retry_when_empty) else 0),
             "deskew_deg": float(deskew_deg),
             "deskew_projection_best": float(proj_best),
             "deskew_projection_base": float(proj_base),
-            "deskew_hough_deg": float(hough_deg),
-            "deskew_hough_votes": int(hough_n),
-            "total_rotation_applied_deg": total_deg
+            "total_rotation_applied_deg": total
         }
-        if ocr_debug and kw_enabled:
+        if ocr_debug and (kw_enabled or retry_when_empty):
             meta["ocr_debug"] = ocr_dbg
 
-        images.append(bgr_final)
+        images.append(final)
         metas.append(meta)
 
     return {
         "path": str(p),
         "doc_str": "pdf_doc" if ext == ".pdf" else "tiff_doc",
         "page_count": len(images),
-        "images": images,   # sayfa sayfa BGR
+        "images": images,
         "metas": metas
     }
