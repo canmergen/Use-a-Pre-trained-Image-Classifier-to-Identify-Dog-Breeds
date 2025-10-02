@@ -1,226 +1,158 @@
-def build_per_box_df_onecall(
-    lower_img,
-    final_boxes,
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+from typing import Any, Callable, Dict, List, Optional
+import re, difflib
+import numpy as np
+
+def classify_hazirun_single(
+    doc_res: Dict[str, Any],
     *,
-    sig_boxes,
-    role_blocks,
-    sermaye_boxes,
-    known_names,
-    ocr_url: str,
-    lang: str = "tur+eng+lat",
-    role_threshold: float = 0.80,
-    name_sim_threshold: float = 0.82,
-):
+    ocr_text_fn: Callable[[np.ndarray], str],   # BGR np.ndarray -> str
+    must_keywords: Optional[List[str]] = None,
+    aux_keywords: Optional[List[str]]  = None,
+    fuzzy_min_ratio: float = 0.85,    # 0..1
+    min_aux_required: int = 2,
+    debug: bool = False
+) -> Dict[str, Any]:
     """
-    Tek fonksiyon: OCR (remote) + kutu analizi + per_box_df üretimi.
-    Çıktı kolonları: i, bbox, loc, sig, role_best, role_score, name_in_box, text_preview
+    Tek fonksiyon: OCR ile sayfa sayfa kontrol eder.
+    Kural: En az bir sayfa 'hazirun' ise belge 'HAZIRUNDUR'. Değilse 'HAZIRUN DEĞİLDİR'.
+    Çıktı sadece 'hazirun' olan sayfaların image+meta'larını içerir; diğerleri gerekçeyle listelenir.
+
+    Return:
+    {
+      'flag': 'HAZIRUNDUR' | 'HAZIRUN DEĞİLDİR',
+      'first_match_index': int | None,
+      'hazirun_pages': [ {'index', 'image', 'meta', 'must_hits', 'aux_score', 'page_score'} ],
+      'non_hazirun_pages': [ {'index', 'reason', 'must_hits', 'aux_score', ('ocr_preview' if debug)} ],
+      'page_count': int
+    }
     """
-    # ---- imports (fonksiyon içinde tutuyoruz) ----
-    import re, json, base64, unicodedata
-    from typing import Any, Tuple, List, Dict, Optional
-    import numpy as np
-    import pandas as pd
-    import cv2, requests
-    from rapidfuzz import fuzz, process
-
-    # ---------- geometry ----------
-    def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
-        if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
-            x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
-        if isinstance(b, dict):
-            if all(k in b for k in ("x","y","w","h")):
-                return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-            if all(k in b for k in ("x0","y0","x1","y1")):
-                return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
-            if all(k in b for k in ("left","top","right","bottom")):
-                return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
-        return None
-
-    def _to_xyxy(b: Any) -> Tuple[int,int,int,int]:
-        x,y,w,h = _to_xywh(b); return (x, y, x+w, y+h)
-
-    def _iou(a, b) -> float:
-        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-        ix1,iy1 = max(ax1,bx1), max(ay1,by1)
-        ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-        iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
-        inter = iw * ih
-        if inter == 0: return 0.0
-        aarea = (ax2-ax1)*(ay2-ay1); barea = (bx2-bx1)*(by2-by1)
-        return inter / (aarea + barea - inter + 1e-9)
-
-    def _contains(outer, inner, pad=2) -> bool:
-        ox1,oy1,ox2,oy2 = outer; ix1,iy1,ix2,iy2 = inner
-        return (ix1 >= ox1-pad) and (iy1 >= oy1-pad) and (ix2 <= ox2+pad) and (iy2 <= oy2+pad)
-
-    def _any_overlap(a, group) -> bool:
-        for g in group:
-            if _iou(a, g) > 0 or _contains(a, g) or _contains(g, a): return True
-        return False
-
-    # ---------- text / roles / names ----------
-    def _strip_diac(s: str) -> str:
-        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def _U(s: str) -> str:
-        s = (s or "").upper(); return re.sub(r"\s+"," ",_strip_diac(s)).strip()
-
-    ROLE_ALIASES: Dict[str, List[str]] = {
-        "toplanti_baskani":    ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
-        "yk_baskani":          ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI"],
-        "yk_uyesi":            ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ"],
-        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
-        "katip":               ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-        "divan_baskani":       ["DİVAN BAŞKANI","DIVAN BASKANI"],
-        "tutanak_yazmani":     ["TUTANAK YAZMANI","YAZMAN"],
-    }
-    ROLE_PRIORITY = ["toplanti_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","divan_baskani","tutanak_yazmani"]
-    ROLE_TOKENS = set(sum([a.split() for v in ROLE_ALIASES.values() for a in v], [])) | {
-        "YÖNETİM","KURULU","ÜYE","ÜYELERİ","ÜYELER","ÜYESİ","BAŞKAN","BAŞKANI","KATİP","KÂTİP",
-        "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
-    }
-
-    def best_role_for_text(text: str):
-        tU = _U(text)
-        def _score(alias: str) -> float: return fuzz.token_set_ratio(tU, _U(alias)) / 100.0
-        best_role, best_score = None, 0.0
-        for rk, aliases in ROLE_ALIASES.items():
-            sc = max(_score(a) for a in aliases)
-            if (sc > best_score) or (abs(sc-best_score) < 1e-6 and (best_role is None or ROLE_PRIORITY.index(rk) < ROLE_PRIORITY.index(best_role))):
-                best_role, best_score = rk, sc
-        return best_role, best_score
-
-    def remove_role_words(text: str) -> str:
-        toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)
-        toks = [t for t in toks if _U(t) not in ROLE_TOKENS]
-        return " ".join(toks)
-
-    def raw_name_candidates(text: str) -> List[str]:
-        t = text.replace("\n"," ")
-        segs = [p.strip() for p in re.split(r"\s*(?:[,;/]| ve )\s*", t, flags=re.IGNORECASE) if p.strip()]
-        out: List[str] = []
-        for seg in segs:
-            toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", seg)
-            if not toks: continue
-            n = len(toks)
-            for L in (3,2):
-                for i in range(max(0, n-L+1)): out.append(" ".join(toks[i:i+L]))
-            if n == 1: out.append(toks[0])
-        return list(dict.fromkeys(out))
-
-    def map_to_known(name: str, pool: List[str]) -> Optional[str]:
-        if not pool: return None
-        best = process.extractOne(name, pool, scorer=fuzz.token_set_ratio)
-        if best and best[1] >= name_sim_threshold*100: return best[0]
-        toks = name.split()
-        if len(toks) == 1:
-            first = _U(toks[0]); by_first = {}
-            for kn in pool:
-                ts = kn.split()
-                if ts: by_first.setdefault(_U(ts[0]), []).append(kn)
-            vals = by_first.get(first, [])
-            if len(vals) == 1: return vals[0]
-        return None
-
-    def pick_name_from_text(text: str, pool: List[str]) -> Optional[str]:
-        cands = raw_name_candidates(remove_role_words(text))
-        chosen, seen = [], set()
-        for c in cands:
-            mapped = map_to_known(c, pool)
-            name = mapped or c
-            if name not in seen:
-                seen.add(name); chosen.append(name)
-        return "; ".join(chosen) if chosen else None
-
-    def find_tckn(text: str) -> Optional[str]:
-        m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", text.replace(" ", ""))
-        return "; ".join(list(dict.fromkeys(m))) if m else None
-
-    # ---------- OCR (endpoint payload SENİN formatınla) ----------
-    def _ocr_remote_png(img_gray, *, psm: int, oem: int) -> str:
-        ok, buf = cv2.imencode(".png", img_gray)
-        if not ok: return ""
-        # DİKKAT: endpoint 'image' ve 'config' bekliyor
-        payload = {
-            "image": base64.b64encode(buf.tobytes()).decode("ascii"),
-            "lang": lang,
-            "config": f"-psm {int(psm)} -oem {int(oem)}"
-        }
+    # --- local helpers (fonksiyon içine gömülü) ---
+    def _try_ratio():
         try:
-            r = requests.post(ocr_url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=30)
-            r.raise_for_status()
-            j = r.json()
-            return (j.get("text") or "").strip()
+            from rapidfuzz import fuzz
+            return lambda a,b: float(fuzz.partial_ratio(a, b)) / 100.0
         except Exception:
-            return ""
+            return lambda a,b: difflib.SequenceMatcher(None, a, b).ratio()
+    _ratio = _try_ratio()
 
-    def ocr_box(lower_img, xywh: Tuple[int,int,int,int], psm: int, oem: int) -> str:
-        x,y,w,h = xywh
-        crop = lower_img[max(0,y):y+h, max(0,x):x+w]
-        if crop is None or getattr(crop, "size", 0) == 0: return ""
-        # hafif hazırlık: grayscale + lokal kontrast
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        # küçük varyasyonlar için nazik temizleme
-        gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        # hafif ikili eşik (metni koyult, zemini beyazla) – aşırıya kaçmadan
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return _ocr_remote_png(bw, psm=psm, oem=oem)
+    def _tr_lower(s: str) -> str:
+        return (s or "").replace("I","ı").replace("İ","i").lower()
 
-    # ---------- hazırlık ----------
-    final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
-    final_xyxy = [_to_xyxy(b) for b in final_xywh]
-    sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
-    role_xyxy  = [_to_xyxy(b) for b in (role_blocks or [])]
-    serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
-    known_pool = list(dict.fromkeys(known_names or []))
+    def _normalize_text(s: str) -> str:
+        t = _tr_lower(s)
+        t = re.sub(r"[_–—\-•・·]+", " ", t)
+        t = re.sub(r"[^\w\s%./]", " ", t, flags=re.UNICODE)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
 
-    def decide_psm_oem(loc: str) -> Tuple[int,int]:
-        if loc == "sermaye": return 1, 1
-        if loc == "roles":   return 11, 1
-        return 11, 1
+    # --- defaults ---
+    if must_keywords is None:
+        must_keywords = ["hazır bulunan", "hazirun", "hazırun", "genel kurul", "toplantı"]
+    if aux_keywords is None:
+        aux_keywords  = ["pay", "sermaye", "imza", "gündem", "ortak", "liste", "vekil", "temsilci", "oran", "tutar"]
 
-    # ---------- ana döngü ----------
-    rows = []
-    for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
-        loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
-        sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
+    images: List[np.ndarray] = list(doc_res.get("images", []))
+    metas:  List[Dict[str, Any]] = list(doc_res.get("metas", []))
+    n = len(images)
 
-        psm0, oem0 = decide_psm_oem(loc)
-        text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
-        text_preview = re.sub(r"\s+"," ",text0)[:200]
+    hazirun_pages: List[Dict[str, Any]] = []
+    non_hazirun_pages: List[Dict[str, Any]] = []
+    first_match_index: Optional[int] = None
 
-        role_key, role_score = best_role_for_text(text0)
-        role_best = role_key if (role_score >= role_threshold or loc=="roles") else None
+    for i in range(n):
+        img = images[i]
 
-        name1 = pick_name_from_text(text0, known_pool)
-        tckn0 = find_tckn(text0)
+        # OCR
+        try:
+            text_raw = ocr_text_fn(img) or ""
+        except Exception as e:
+            text_raw = ""
+            if debug:
+                non_hazirun_pages.append({
+                    "index": i,
+                    "reason": f"OCR hata: {e}",
+                    "must_hits": 0,
+                    "aux_score": 0,
+                    "ocr_preview": ""
+                })
+            else:
+                non_hazirun_pages.append({
+                    "index": i,
+                    "reason": "OCR okunamadı",
+                    "must_hits": 0,
+                    "aux_score": 0
+                })
+            continue
 
-        # Fallback, isim zayıfsa/boşsa
-        need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
-        if need_fallback:
-            text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-            if text1 and (len(text1) > len(text0) or not name1):
-                role_key2, role_score2 = best_role_for_text(text1)
-                if role_score2 > role_score:
-                    role_key, role_score = role_key2, role_score2
-                    role_best = role_key if (role_score >= role_threshold or loc=="roles") else role_best
-                name2 = pick_name_from_text(text1, known_pool)
-                if name2: name1 = name2
-                tckn1 = find_tckn(text1)
-                if tckn1: tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
-                if len(text1) > len(text0):
-                    text_preview = re.sub(r"\s+"," ",text1)[:200]
+        text = _normalize_text(text_raw)
 
-        name_in_box = (name1 + " | " + tckn0) if (name1 and tckn0) else (tckn0 or name1)
+        # MUST: en az 1 şart
+        must_hits = 0
+        for kw in must_keywords:
+            kw0 = _tr_lower(kw.strip())
+            if not kw0:
+                continue
+            if kw0 in text:
+                must_hits += 1; continue
+            toks = text.split()
+            if any(tok.startswith(kw0) for tok in toks):
+                must_hits += 1; continue
+            if _ratio(kw0, text) >= fuzzy_min_ratio:
+                must_hits += 1; continue
 
-        rows.append({
-            "i": i,
-            "bbox": b_wh,
-            "loc": loc,
-            "sig": bool(sig),
-            "role_best": role_best,
-            "role_score": float(role_score),
-            "name_in_box": name_in_box,
-            "text_preview": text_preview
-        })
+        # AUX: bağlam güçlendirme
+        aux_score = 0
+        for kw in aux_keywords:
+            kw0 = _tr_lower(kw.strip())
+            if not kw0:
+                continue
+            hit = False
+            if kw0 in text:
+                hit = True
+            else:
+                toks = text.split()
+                if any(tok.startswith(kw0) for tok in toks):
+                    hit = True
+                elif _ratio(kw0, text) >= fuzzy_min_ratio:
+                    hit = True
+            if hit:
+                aux_score += 1
 
-    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
+        # Sayfa kararı
+        is_hazirun = (must_hits >= 1) and (aux_score >= min_aux_required)
+        page_score = 2*must_hits + 1*aux_score  # raporlama için basit kompozit
+
+        if is_hazirun:
+            if first_match_index is None:
+                first_match_index = i
+            hazirun_pages.append({
+                "index": i,
+                "image": images[i],
+                "meta": metas[i] if i < len(metas) else {},
+                "must_hits": int(must_hits),
+                "aux_score": int(aux_score),
+                "page_score": int(page_score)
+            })
+        else:
+            row = {
+                "index": i,
+                "reason": "Zayıf kanıt (must<1 veya aux<min)",
+                "must_hits": int(must_hits),
+                "aux_score": int(aux_score)
+            }
+            if debug:
+                row["ocr_preview"] = text[:300]
+            non_hazirun_pages.append(row)
+
+    # Belge bayrağı (en az 1 sayfa hazirunsa toplam HAZIRUNDUR)
+    flag = "HAZIRUNDUR" if len(hazirun_pages) > 0 else "HAZIRUN DEĞİLDİR"
+
+    return {
+        "flag": flag,
+        "first_match_index": first_match_index,
+        "hazirun_pages": hazirun_pages,          # sadece hazirun olan sayfalar (image+meta)
+        "non_hazirun_pages": non_hazirun_pages,  # hazirun olmayanların indeks+gerekçeleri
+        "page_count": n
+    }
