@@ -37,17 +37,22 @@ def classify_hazirun_single(
     # OCR hatasını negatif sayma kontrolü
     assume_nonhazirun_on_ocr_fail: bool = False,  # False: unknown_pages'a at
 
+    # TABLO zorunluluğu
+    require_table: bool = True,
+    table_min_intersections: int = 12,            # min. çizgi kesişimi
+    table_min_cells: int = 6,                     # min. hücre tahmini (yaklaşık)
+    table_min_area_ratio: float = 0.10,           # tablo alanı / sayfa alanı min oran
+    table_debug_crop_ratio: float = 0.85,         # en büyük tablo maskesini kırpma için
+
     # Çıktı
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    PDF/TIFF'ten üretilmiş doc_res ({'images': [...], 'metas': [...]}) üzerinde:
-      - Sayfa başlığının bulunduğu üst bandı OCR eder (downscale + JPEG/PNG).
-      - NEW_URL (HTTP) -> başarısızsa tc_new fallback.
-      - Tek 'keywords' listesiyle fuzzy + token-coverage + prefix bazlı skorlar.
-      - En az 1 sayfa eşikleri geçerse belge 'HAZIRUNDUR', aksi halde 'HAZIRUN DEĞİLDİR'.
-      - Sadece 'hazirun' sayfalarının image+meta'larını döndürür.
-      - OCR hataları 'unknown_pages' listesine gider (opsiyonel olarak negatif sayılabilir).
+    - Önce tablolu sayfa zorunluluğu (morfolojik çizgi çıkarımı): tablo yoksa sayfa 'non_hazirun' (no_table).
+    - Varsa: üst bant OCR (downscale + JPEG/PNG) -> HTTP (NEW_URL) -> tc_new fallback.
+    - Tek 'keywords' listesiyle fuzzy + token-coverage + prefix bazlı skorlar.
+    - En az 1 sayfa eşikleri geçerse belge 'HAZIRUNDUR', aksi halde 'HAZIRUN DEĞİLDİR'.
+    - Sadece 'hazirun' sayfalarının image+meta'larını döndürür.
     """
 
     # ---------------- local helpers ----------------
@@ -94,6 +99,47 @@ def classify_hazirun_single(
             return ""
         return base64.b64encode(buf).decode("utf-8")
 
+    # ---- tablo tespiti (morfolojik) ----
+    def _has_table(bgr: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+        import cv2
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        # adaptif binarizasyon -> çizgileri öne çıkar
+        g = cv2.GaussianBlur(gray, (3,3), 0)
+        bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 35, 10)
+        h, w = bw.shape
+        # yatay/dikey çizgi ekstraksiyonu
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w//80), 1))
+        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h//50)))
+        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+        vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vert_kernel,  iterations=1)
+        # çizgileri kalınlaştır
+        horiz = cv2.dilate(horiz, np.ones((1,3), np.uint8), iterations=1)
+        vert  = cv2.dilate(vert,  np.ones((3,1), np.uint8), iterations=1)
+        # kesişimler
+        inter = cv2.bitwise_and(horiz, vert)
+        intersections = int(np.count_nonzero(inter > 0))
+        # büyük tablo bölgesini bul
+        lines = cv2.bitwise_or(horiz, vert)
+        # bağlı bileşenler
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(lines, connectivity=8)
+        areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.array([])
+        max_area = int(areas.max()) if areas.size else 0
+        area_ratio = max_area / float(h*w) if (h*w) else 0.0
+        # hücre tahmini: kesişimlerin yoğunluğuna göre kaba yaklaşım
+        approx_cells = int(max(intersections // 8, (areas.size > 0) * (max_area // max(1,(w//40)*(h//60)))))
+        ok = (
+            intersections >= table_min_intersections and
+            approx_cells   >= table_min_cells and
+            area_ratio     >= table_min_area_ratio
+        )
+        dbg = {
+            "intersections": intersections,
+            "approx_cells": approx_cells,
+            "max_table_area_ratio": round(area_ratio, 4)
+        }
+        return bool(ok), dbg
+
     def _ocr_via_tc_new(img: np.ndarray) -> str:
         if tc_new is None: return ""
         from PIL import Image
@@ -102,7 +148,6 @@ def classify_hazirun_single(
         cfg = [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}"]
         if ocr_extra_config: cfg.append(ocr_extra_config)
         kwargs: Dict[str, Any] = {"lang": ocr_lang, "config": " ".join(cfg)}
-
         for name in ("ocr","run_ocr","predict","infer","get_text","__call__"):
             fn = getattr(tc_new, name, None)
             if callable(fn):
@@ -149,9 +194,7 @@ def classify_hazirun_single(
 
     def _ocr_text(img_full: np.ndarray) -> Tuple[str, Dict[str, Any]]:
         roi = _img_top_band_and_downscale(img_full)
-        # HTTP -> fallback tc_new
-        txt = ""
-        err = None
+        txt = ""; err = None
         if NEW_URL:
             try:
                 txt = _ocr_via_http(roi)
@@ -167,10 +210,8 @@ def classify_hazirun_single(
     def _phrase_best_score(phrase: str, text: str, toks: List[str]) -> Tuple[float, Dict[str, Any]]:
         ph = _tr_lower((phrase or "").strip())
         if not ph: return 0.0, {"why":"empty"}
-        # 1) fuzzy
         s_fz = _ratio(ph, text)
-        # 2) coverage in window
-        ph_toks = [t for t in _tokens(ph) if t]
+        ph_toks = [t for t in WORD_RE.findall(ph) if t]
         cover_best = 0.0
         if ph_toks and toks:
             need = set(ph_toks)
@@ -179,7 +220,6 @@ def classify_hazirun_single(
                 window = toks[s:e]
                 cov = sum(1 for t in need if t in window) / max(1, len(need))
                 cover_best = max(cover_best, cov)
-        # 3) prefix
         prefix_hits = 0.0
         if ph_toks and toks:
             pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
@@ -220,10 +260,19 @@ def classify_hazirun_single(
     for i in range(n):
         img = images[i]
 
-        # OCR (üst band + downscale, HTTP->fallback)
+        # 1) TABLO zorunluluğu
+        if require_table:
+            has_tbl, tbl_dbg = _has_table(img)
+            if not has_tbl:
+                non_hazirun_pages.append({
+                    "index": i,
+                    "reason": "no_table",
+                    **({"table_debug": tbl_dbg} if debug else {})
+                })
+                continue  # OCR aşamasına geçmeden reddet
+        # 2) OCR (üst bant + downscale, HTTP->fallback)
         text_raw, err_info = _ocr_text(img)
 
-        # OCR boş veya hata
         if not text_raw:
             if assume_nonhazirun_on_ocr_fail:
                 non_hazirun_pages.append({"index": i, "reason": "OCR boş/hata", "hits": 0, "total_score": 0.0, **err_info})
@@ -234,7 +283,7 @@ def classify_hazirun_single(
         text = _normalize_text(text_raw)
         toks = _tokens(text)
 
-        # Her ifade için skor
+        # 3) Tek-liste fuzzy/coverage skoru
         hit_cnt, score_sum = 0, 0.0
         ev: List[Dict[str, Any]] = []
         for ph in keywords:
@@ -270,8 +319,8 @@ def classify_hazirun_single(
     return {
         "flag": flag,
         "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,           # sadece eşleşen sayfalar (image+meta)
-        "non_hazirun_pages": non_hazirun_pages,   # eşik altı sayfalar (gerekçeyle)
+        "hazirun_pages": hazirun_pages,           # sadece eşleşen (image+meta)
+        "non_hazirun_pages": non_hazirun_pages,   # tablo yok / eşik altı vb. gerekçeler
         "unknown_pages": unknown_pages,           # OCR başarısız/boş sayfalar
         "page_count": n
     }
