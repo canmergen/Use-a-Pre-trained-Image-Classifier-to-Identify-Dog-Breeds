@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import re, difflib, time, json
 import numpy as np
 
@@ -14,25 +14,27 @@ def classify_hazirun_single(
     ocr_lang: str = "tur+eng+lat",
     ocr_psm: Optional[int] = 1,
     ocr_oem: Optional[int] = 1,
-    ocr_extra_config: Optional[str] = None, # ör: "--dpi 300"
+    ocr_extra_config: Optional[str] = None,
     http_timeout_s: float = 8.0,
     http_retries: int = 2,
     http_backoff_s: float = 0.75,
-    # sınıflandırma kelimeleri
-    must_keywords: Optional[List[str]] = None,
-    aux_keywords: Optional[List[str]]  = None,
-    fuzzy_min_ratio: float = 0.85,    # 0..1
-    min_aux_required: int = 2,
-    # çıktı
+    # Anahtar ifadeler (tek liste, fuzzy + dağıtık eşleşme)
+    keywords: Optional[List[str]] = None,
+    fuzzy_min_ratio: float = 0.86,        # 0..1 (RapidFuzz varsa partial_ratio/100)
+    phrase_window: int = 12,              # çok kelimeli ifadelerde pencere boyu
+    # Karar eşikleri
+    min_hit_phrases: int = 3,             # eşleşen ifade sayısı eşiği
+    min_total_score: float = 4.5,         # toplam skor eşiği (hit + ortalama fuzzy katkı)
+    # Çıktı
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    Tek fonksiyon: OCR (tc_new veya NEW_URL) ile sayfa sayfa kontrol eder.
-    Kural: En az 1 sayfa 'hazirun' ise belge HAZIRUNDUR. Değilse HAZIRUN DEĞİLDİR.
-    Dönen img/meta yalnız hazirun sayfalarındandır; diğer sayfalar 'non_hazirun_pages' listesine gerekçeyle eklenir.
+    Tek fonksiyon: OCR (NEW_URL ve/veya tc_new) ile sayfa sayfa kontrol eder.
+    Kural: En az bir sayfa (min_hit_phrases VEYA min_total_score) eşiklerini geçerse belge HAZIRUNDUR.
+    Yakalanan sayfaların image/meta'ları döner; diğerleri 'non_hazirun_pages' listesinde gerekçeyle raporlanır.
     """
 
-    # ---------------- local helpers (fonksiyon içine gömülü) ----------------
+    # ---------------- helpers ----------------
     def _ratio_init():
         try:
             from rapidfuzz import fuzz
@@ -76,12 +78,12 @@ def classify_hazirun_single(
                 try:
                     txt = fn(pil, **kwargs)
                     if isinstance(txt, dict): txt = txt.get("text","")
-                    return txt if isinstance(txt,str) else str(txt)
+                    return txt if isinstance(txt, str) else str(txt)
                 except TypeError:
                     try:
                         txt = fn(pil, output_type="text", **kwargs)
                         if isinstance(txt, dict): txt = txt.get("text","")
-                        return txt if isinstance(txt,str) else str(txt)
+                        return txt if isinstance(txt, str) else str(txt)
                     except Exception:
                         pass
                 except Exception:
@@ -95,13 +97,13 @@ def classify_hazirun_single(
             "image": _img_to_png_b64(img),
             "lang": ocr_lang or "tur",
             "config": " ".join(
-                [f"--psm {int(ocr_psm)}"] if ocr_psm is not None else []
-            +   [f"--oem {int(ocr_oem)}"] if ocr_oem is not None else []
-            +   ([ocr_extra_config] if ocr_extra_config else [])
+                ([f"--psm {int(ocr_psm)}"] if ocr_psm is not None else []) +
+                ([f"--oem {int(ocr_oem)}"] if ocr_oem is not None else []) +
+                ([ocr_extra_config] if ocr_extra_config else [])
             )
         }
         last_err = None
-        for k in range(http_retries+1):
+        for k in range(http_retries + 1):
             try:
                 r = requests.post(NEW_URL, json=payload, timeout=http_timeout_s)
                 r.raise_for_status()
@@ -119,8 +121,7 @@ def classify_hazirun_single(
         return ""
 
     def _ocr_text(img: np.ndarray) -> str:
-        # Önce HTTP dene (NEW_URL verildiyse), timeout/hata olursa tc_new'e fallback;
-        # NEW_URL yoksa doğrudan tc_new; tc_new de yoksa boş döner.
+        # Önce HTTP (varsa), sonra tc_new fallback
         if NEW_URL:
             try:
                 t = _ocr_via_http(img)
@@ -132,11 +133,82 @@ def classify_hazirun_single(
             if t: return t
         return ""
 
+    # ---- tek-list fuzzy eşleştirme: phrase score ----
+    WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
+    def _tokens(s: str) -> List[str]:
+        return WORD_RE.findall(s)
+
+    def _phrase_best_score(phrase: str, text: str, toks: List[str]) -> Tuple[float, Dict[str, Any]]:
+        """Bir ifadeyi metne göre puanla; en iyi yöntemi ve delilleri döndür."""
+        ph = _tr_lower(phrase.strip())
+        if not ph:
+            return 0.0, {"why":"empty"}
+        # 1) Direct fuzzy
+        s_fz = _ratio(ph, text)
+
+        # 2) Token coverage in window (order-insensitive)
+        ph_toks = [t for t in _tokens(ph) if t]
+        cover_best = 0.0; cover_detail = {}
+        if ph_toks and toks:
+            need = set(ph_toks)
+            # hızlı indeksleme
+            pos: Dict[str, List[int]] = {}
+            for idx, tk in enumerate(toks):
+                pos.setdefault(tk, []).append(idx)
+            # Greedy window search
+            for tk in need:
+                if tk not in pos:
+                    continue
+            # brute force: başlangıç konumlarının küçük bir altkümeyle kaydırılması
+            starts = []
+            for tk in ph_toks[: min(len(ph_toks), 3) ]:
+                if tk in pos: starts.extend(pos[tk][:20])
+            starts = sorted(set(starts))[:60] if starts else list(range(0, max(1, len(toks)-phrase_window+1), max(1, phrase_window//2)))
+            for s in starts:
+                e = min(len(toks), s + phrase_window)
+                window = toks[s:e]
+                got = sum(1 for t in need if t in window)
+                cov = got / max(1, len(need))
+                cover_best = max(cover_best, cov)
+                if cover_best == cov:
+                    cover_detail = {"window_start": s, "window_end": e, "covered": got, "need": len(need)}
+        # 3) Prefix hits
+        prefix_hits = 0.0
+        if ph_toks and toks:
+            pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
+            prefix_hits = pref / max(1, len(ph_toks))
+
+        # En iyi skor (0..1). Küçük bir bonus ile birleştirme
+        best = max(s_fz, cover_best, prefix_hits)
+        detail = {
+            "fuzzy": round(s_fz, 3),
+            "coverage": round(cover_best, 3),
+            "prefix": round(prefix_hits, 3),
+            "best": round(best, 3),
+            **({"coverage_detail": cover_detail} if cover_detail else {})
+        }
+        return best, detail
+
     # ---------------- defaults ----------------
-    if must_keywords is None:
-        must_keywords = ["hazır bulunan", "hazirun", "hazırun", "genel kurul", "toplantı"]
-    if aux_keywords is None:
-        aux_keywords  = ["pay", "sermaye", "imza", "gündem", "ortak", "liste", "vekil", "temsilci", "oran", "tutar"]
+    if keywords is None:
+        keywords = [
+            # başlık ve varyantlar
+            "hazır bulunanlar listesi", "hazir bulunanlar listesi", "hazirun cetveli",
+            "genel kurul", "olağan genel kurul", "liste örneği",
+            # tablo başlıkları / alanlar
+            "pay sahibinin ad soyad unvanı", "ad soyad", "ad/soyad/unvanı", "kimlik numarası",
+            "vergi kimlik", "mersis numarası", "uyruğu", "adresi",
+            "payların itibari değeri", "ediniliş şekli", "ediniliş tarihi",
+            "katılım şekli", "temsilci türü", "temsilcinin ad soyad unvanı",
+            "temsilcinin kimlik numarası", "imza",
+            # alt metin
+            "şirketin sermayesi", "payların toplam itibari değeri",
+            "asgari toplantı nisabı", "mevcut toplantı nisabı",
+            # imza blokları
+            "divan başkanı", "oy toplama memuru", "yönetim kurulu üyeleri",
+            # şirket tipleri
+            "anonim şirketi", "a.ş", "aş", "limited şirketi", "ltd şti", "ltd. şti."
+        ]
 
     images: List[np.ndarray] = list(doc_res.get("images", []))
     metas:  List[Dict[str, Any]] = list(doc_res.get("metas", []))
@@ -151,45 +223,39 @@ def classify_hazirun_single(
 
         # OCR (retry+fallback içeride)
         try:
-            text_raw = _ocr_text(img) or ""
+            raw = _ocr_text(img) or ""
         except Exception as e:
-            # OCR tamamen düşerse sayfayı non-hazirun listesine, sebep ile ekle
             non_hazirun_pages.append({
                 "index": i,
                 "reason": f"OCR hata: {e}",
-                "must_hits": 0,
-                "aux_score": 0,
+                "hits": 0,
+                "total_score": 0.0,
                 **({"ocr_preview": ""} if debug else {})
             })
             continue
 
-        text = _normalize_text(text_raw)
+        text = _normalize_text(raw)
+        toks = _tokens(text)
 
-        # MUST: en az 1
-        must_hits = 0
-        if text:
-            toks = text.split()
-            for kw in must_keywords:
-                kw0 = _tr_lower((kw or "").strip())
-                if not kw0: 
-                    continue
-                if (kw0 in text) or any(tok.startswith(kw0) for tok in toks) or (_ratio(kw0, text) >= fuzzy_min_ratio):
-                    must_hits += 1
+        # Her ifade için en iyi skor
+        per_phrase = []
+        hit_cnt = 0
+        score_sum = 0.0
+        dbg_details = []
+        for ph in keywords:
+            sc, det = _phrase_best_score(ph, text, toks)
+            per_phrase.append((ph, sc, det))
+            # hit say: güçlü kabul için sc >= fuzzy_min_ratio
+            if sc >= fuzzy_min_ratio:
+                hit_cnt += 1
+            score_sum += sc
+            if debug:
+                if sc >= 0.5:  # gereksiz gürültüyü azalt
+                    dbg_details.append({"phrase": ph, **det})
 
-        # AUX: bağlam güçlendirme
-        aux_score = 0
-        if text:
-            toks = text.split()
-            for kw in aux_keywords:
-                kw0 = _tr_lower((kw or "").strip())
-                if not kw0: 
-                    continue
-                hit = (kw0 in text) or any(tok.startswith(kw0) for tok in toks) or (_ratio(kw0, text) >= fuzzy_min_ratio)
-                if hit: aux_score += 1
-
-        # Sayfa kararı
-        is_hazirun = (must_hits >= 1) and (aux_score >= min_aux_required)
-        page_score = 2*must_hits + aux_score
+        # Karar: ifade sayısı eşiği veya toplam skor eşiği
+        total_score = hit_cnt + (score_sum / max(1, len(keywords))) * 2.0  # küçük bir kalite katkısı
+        is_hazirun = (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
 
         if is_hazirun:
             if first_match_index is None:
@@ -198,28 +264,31 @@ def classify_hazirun_single(
                 "index": i,
                 "image": images[i],
                 "meta": metas[i] if i < len(metas) else {},
-                "must_hits": int(must_hits),
-                "aux_score": int(aux_score),
-                "page_score": int(page_score)
+                "hits": int(hit_cnt),
+                "total_score": float(round(total_score, 3)),
+                **({"evidence": dbg_details[:20]} if debug else {})
             })
         else:
             row = {
                 "index": i,
-                "reason": "Zayıf kanıt (must<1 veya aux<min)",
-                "must_hits": int(must_hits),
-                "aux_score": int(aux_score)
+                "reason": "Eşik altı",
+                "hits": int(hit_cnt),
+                "total_score": float(round(total_score, 3))
             }
             if debug:
                 row["ocr_preview"] = text[:300]
+                row["top_matches"] = sorted(
+                    [{"phrase": ph, "best": round(det["best"],3)} for ph, sc, det in per_phrase],
+                    key=lambda x: x["best"], reverse=True
+                )[:10]
             non_hazirun_pages.append(row)
 
-    # Belge bayrağı (en az 1 sayfa hazirun ise)
     flag = "HAZIRUNDUR" if len(hazirun_pages) > 0 else "HAZIRUN DEĞİLDİR"
 
     return {
         "flag": flag,
         "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,          # sadece hazirun sayfalar (image+meta)
-        "non_hazirun_pages": non_hazirun_pages,  # diğer sayfalar gerekçesiyle
+        "hazirun_pages": hazirun_pages,          # yalnız yakalanan sayfalar (image+meta + kanıt/opsiyonel)
+        "non_hazirun_pages": non_hazirun_pages,  # yakalanmayanların nedeni ve özet kanıtı
         "page_count": n
     }
