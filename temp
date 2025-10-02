@@ -30,6 +30,10 @@ def classify_hazirun_single(
     fuzzy_min_ratio: float = 0.86,                # 0..1
     phrase_window: int = 12,                      # kelime penceresi
 
+    # Güçlü başlıklar (yakalanırsa tablo şartını baypas edebilir)
+    strong_phrases: Optional[List[str]] = None,
+    strong_phrase_ratio: float = 0.90,            # ≥ bu oranda yakalanırsa "hemen hazirun"
+
     # Karar eşikleri
     min_hit_phrases: int = 3,                     # ≥ bu kadar ifade yakalanırsa kabul
     min_total_score: float = 4.5,                 # veya toplam skor ≥ eşik
@@ -39,20 +43,19 @@ def classify_hazirun_single(
 
     # TABLO zorunluluğu
     require_table: bool = True,
-    table_min_intersections: int = 12,            # min. çizgi kesişimi
-    table_min_cells: int = 6,                     # min. hücre tahmini (yaklaşık)
-    table_min_area_ratio: float = 0.10,           # tablo alanı / sayfa alanı min oran
-    table_debug_crop_ratio: float = 0.85,         # en büyük tablo maskesini kırpma için
+    table_require_mode: str = "soft",             # "soft" | "hard"
+    table_min_intersections: int = 10,            # min. çizgi kesişimi (biraz gevşek)
+    table_min_cells: int = 4,                     # min. hücre tahmini
+    table_min_area_ratio: float = 0.06,           # tablo alanı / sayfa alanı min oranı
 
     # Çıktı
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    - Önce tablolu sayfa zorunluluğu (morfolojik çizgi çıkarımı): tablo yoksa sayfa 'non_hazirun' (no_table).
-    - Varsa: üst bant OCR (downscale + JPEG/PNG) -> HTTP (NEW_URL) -> tc_new fallback.
-    - Tek 'keywords' listesiyle fuzzy + token-coverage + prefix bazlı skorlar.
-    - En az 1 sayfa eşikleri geçerse belge 'HAZIRUNDUR', aksi halde 'HAZIRUN DEĞİLDİR'.
-    - Sadece 'hazirun' sayfalarının image+meta'larını döndürür.
+    - 'soft' modda: güçlü başlık varsa tablo şartını baypas eder, yoksa tablo aranır.
+    - 'hard' modda: tablo yoksa sayfa direkt 'non_hazirun'.
+    - OCR boş/timeout negatif sayılmaz (unknown_pages); istersen assume_nonhazirun_on_ocr_fail=True yap.
+    - En az 1 sayfa kabul edilirse belge 'HAZIRUNDUR'; sadece o sayfalar image+meta ile döner.
     """
 
     # ---------------- local helpers ----------------
@@ -103,30 +106,23 @@ def classify_hazirun_single(
     def _has_table(bgr: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
         import cv2
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        # adaptif binarizasyon -> çizgileri öne çıkar
         g = cv2.GaussianBlur(gray, (3,3), 0)
         bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                    cv2.THRESH_BINARY_INV, 35, 10)
         h, w = bw.shape
-        # yatay/dikey çizgi ekstraksiyonu
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w//80), 1))
-        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h//50)))
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w//90), 1))
+        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h//60)))
         horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
         vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vert_kernel,  iterations=1)
-        # çizgileri kalınlaştır
         horiz = cv2.dilate(horiz, np.ones((1,3), np.uint8), iterations=1)
         vert  = cv2.dilate(vert,  np.ones((3,1), np.uint8), iterations=1)
-        # kesişimler
         inter = cv2.bitwise_and(horiz, vert)
         intersections = int(np.count_nonzero(inter > 0))
-        # büyük tablo bölgesini bul
         lines = cv2.bitwise_or(horiz, vert)
-        # bağlı bileşenler
         num, labels, stats, _ = cv2.connectedComponentsWithStats(lines, connectivity=8)
         areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.array([])
         max_area = int(areas.max()) if areas.size else 0
         area_ratio = max_area / float(h*w) if (h*w) else 0.0
-        # hücre tahmini: kesişimlerin yoğunluğuna göre kaba yaklaşım
         approx_cells = int(max(intersections // 8, (areas.size > 0) * (max_area // max(1,(w//40)*(h//60)))))
         ok = (
             intersections >= table_min_intersections and
@@ -230,22 +226,22 @@ def classify_hazirun_single(
     # ---------------- defaults ----------------
     if keywords is None:
         keywords = [
-            # başlık ve varyantlar
             "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
             "genel kurul","olağan genel kurul","liste örneği",
-            # tablo başlıkları / alanlar
             "pay sahibinin ad soyad unvanı","ad soyad","ad/soyad/unvanı","kimlik numarası",
             "vergi kimlik","mersis numarası","uyruğu","adresi",
             "payların itibari değeri","ediniliş şekli","ediniliş tarihi",
             "katılım şekli","temsilci türü","temsilcinin ad soyad unvanı",
             "temsilcinin kimlik numarası","imza",
-            # alt metin
             "şirketin sermayesi","payların toplam itibari değeri",
             "asgari toplantı nisabı","mevcut toplantı nisabı",
-            # imza blokları
             "divan başkanı","oy toplama memuru","yönetim kurulu üyeleri",
-            # şirket tipleri
             "anonim şirketi","a.ş","aş","limited şirketi","ltd şti","ltd. şti."
+        ]
+    if strong_phrases is None:
+        strong_phrases = [
+            "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
+            "genel kurulda hazır bulunanlar listesi"
         ]
 
     images: List[np.ndarray] = list(doc_res.get("images", []))
@@ -260,19 +256,8 @@ def classify_hazirun_single(
     for i in range(n):
         img = images[i]
 
-        # 1) TABLO zorunluluğu
-        if require_table:
-            has_tbl, tbl_dbg = _has_table(img)
-            if not has_tbl:
-                non_hazirun_pages.append({
-                    "index": i,
-                    "reason": "no_table",
-                    **({"table_debug": tbl_dbg} if debug else {})
-                })
-                continue  # OCR aşamasına geçmeden reddet
-        # 2) OCR (üst bant + downscale, HTTP->fallback)
+        # 1) OCR (üst band + downscale, HTTP->fallback)
         text_raw, err_info = _ocr_text(img)
-
         if not text_raw:
             if assume_nonhazirun_on_ocr_fail:
                 non_hazirun_pages.append({"index": i, "reason": "OCR boş/hata", "hits": 0, "total_score": 0.0, **err_info})
@@ -283,7 +268,29 @@ def classify_hazirun_single(
         text = _normalize_text(text_raw)
         toks = _tokens(text)
 
-        # 3) Tek-liste fuzzy/coverage skoru
+        # 2) Güçlü başlık kontrolü
+        strong_hit = False
+        strong_best = 0.0
+        for ph in strong_phrases:
+            sc, _ = _phrase_best_score(ph, text, toks)
+            strong_best = max(strong_best, sc)
+            if sc >= strong_phrase_ratio:
+                strong_hit = True
+                break
+
+        # 3) TABLO zorunluluğu (moda göre)
+        skip_table_check = (require_table is False) or (table_require_mode == "soft" and strong_hit)
+        if require_table and not skip_table_check:
+            has_tbl, tbl_dbg = _has_table(img)
+            if not has_tbl:
+                non_hazirun_pages.append({
+                    "index": i,
+                    "reason": "no_table",
+                    **({"table_debug": tbl_dbg, "strong_best": round(strong_best,3)} if debug else {})
+                })
+                continue
+
+        # 4) Tek-liste fuzzy/coverage skoru
         hit_cnt, score_sum = 0, 0.0
         ev: List[Dict[str, Any]] = []
         for ph in keywords:
@@ -295,7 +302,9 @@ def classify_hazirun_single(
                 ev.append({"phrase": ph, **det})
 
         total_score = hit_cnt + (score_sum / max(1, len(keywords))) * 2.0
-        is_hazirun = (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
+
+        # 5) Karar: güçlü başlık veya skor eşikleri
+        is_hazirun = strong_hit or (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
 
         if is_hazirun:
             if first_match_index is None:
@@ -306,10 +315,17 @@ def classify_hazirun_single(
                 "meta": metas[i] if i < len(metas) else {},
                 "hits": int(hit_cnt),
                 "total_score": float(round(total_score,3)),
+                "strong_best": float(round(strong_best,3)),
                 **({"evidence": ev[:20]} if debug else {})
             })
         else:
-            row = {"index": i, "reason": "Eşik altı", "hits": int(hit_cnt), "total_score": float(round(total_score,3))}
+            row = {
+                "index": i,
+                "reason": "Eşik altı",
+                "hits": int(hit_cnt),
+                "total_score": float(round(total_score,3)),
+                "strong_best": float(round(strong_best,3))
+            }
             if debug:
                 row["ocr_preview"] = text[:300]
             non_hazirun_pages.append(row)
