@@ -1,32 +1,45 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
-import re, difflib
+import re, difflib, time, json
 import numpy as np
 
 def classify_hazirun_single(
     doc_res: Dict[str, Any],
     *,
-    ocr_text_fn: Callable[[np.ndarray], str],   # BGR np.ndarray -> str
+    # OCR kaynakları (en az biri)
+    tc_new: Optional[Any] = None,           # callable client: ocr/run_ocr/predict/infer/get_text/__call__
+    NEW_URL: Optional[str] = None,          # REST endpoint (image base64 JSON)
+    # OCR ayarları
+    ocr_lang: str = "tur+eng+lat",
+    ocr_psm: Optional[int] = 1,
+    ocr_oem: Optional[int] = 1,
+    ocr_extra_config: Optional[str] = None, # ör: "--dpi 300"
+    http_timeout_s: float = 8.0,
+    http_retries: int = 2,
+    http_backoff_s: float = 0.75,
+    # sınıflandırma kelimeleri
     must_keywords: Optional[List[str]] = None,
     aux_keywords: Optional[List[str]]  = None,
-    fuzzy_min_ratio: float = 0.85,
+    fuzzy_min_ratio: float = 0.85,    # 0..1
     min_aux_required: int = 2,
+    # çıktı
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    Tek fonksiyon: OCR ile sayfa sayfa kontrol eder.
-    En az 1 sayfa hazirun ise belge HAZIRUNDUR. Değilse HAZIRUN DEĞİLDİR.
+    Tek fonksiyon: OCR (tc_new veya NEW_URL) ile sayfa sayfa kontrol eder.
+    Kural: En az 1 sayfa 'hazirun' ise belge HAZIRUNDUR. Değilse HAZIRUN DEĞİLDİR.
+    Dönen img/meta yalnız hazirun sayfalarındandır; diğer sayfalar 'non_hazirun_pages' listesine gerekçeyle eklenir.
     """
 
-    # --- helpers ---
-    def _try_ratio():
+    # ---------------- local helpers (fonksiyon içine gömülü) ----------------
+    def _ratio_init():
         try:
             from rapidfuzz import fuzz
             return lambda a,b: float(fuzz.partial_ratio(a, b)) / 100.0
         except Exception:
             return lambda a,b: difflib.SequenceMatcher(None, a, b).ratio()
-    _ratio = _try_ratio()
+    _ratio = _ratio_init()
 
     def _tr_lower(s: str) -> str:
         return (s or "").replace("I","ı").replace("İ","i").lower()
@@ -38,7 +51,88 @@ def classify_hazirun_single(
         t = re.sub(r"\s+", " ", t).strip()
         return t
 
-    # --- defaults ---
+    def _img_to_png_b64(img: np.ndarray) -> str:
+        import cv2, base64
+        ok, buf = cv2.imencode(".png", img)
+        if not ok: return ""
+        return base64.b64encode(buf).decode("utf-8")
+
+    def _ocr_via_tc_new(img: np.ndarray) -> str:
+        if tc_new is None: return ""
+        from PIL import Image
+        import cv2
+        pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        kwargs: Dict[str, Any] = {}
+        cfg = []
+        if ocr_psm is not None: cfg.append(f"--psm {int(ocr_psm)}")
+        if ocr_oem is not None: cfg.append(f"--oem {int(ocr_oem)}")
+        if ocr_extra_config:    cfg.append(ocr_extra_config)
+        if cfg: kwargs["config"] = " ".join(cfg)
+        if ocr_lang: kwargs["lang"] = ocr_lang
+
+        for name in ("ocr","run_ocr","predict","infer","get_text","__call__"):
+            fn = getattr(tc_new, name, None)
+            if callable(fn):
+                try:
+                    txt = fn(pil, **kwargs)
+                    if isinstance(txt, dict): txt = txt.get("text","")
+                    return txt if isinstance(txt,str) else str(txt)
+                except TypeError:
+                    try:
+                        txt = fn(pil, output_type="text", **kwargs)
+                        if isinstance(txt, dict): txt = txt.get("text","")
+                        return txt if isinstance(txt,str) else str(txt)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        return ""
+
+    def _ocr_via_http(img: np.ndarray) -> str:
+        if not NEW_URL: return ""
+        import requests
+        payload = {
+            "image": _img_to_png_b64(img),
+            "lang": ocr_lang or "tur",
+            "config": " ".join(
+                [f"--psm {int(ocr_psm)}"] if ocr_psm is not None else []
+            +   [f"--oem {int(ocr_oem)}"] if ocr_oem is not None else []
+            +   ([ocr_extra_config] if ocr_extra_config else [])
+            )
+        }
+        last_err = None
+        for k in range(http_retries+1):
+            try:
+                r = requests.post(NEW_URL, json=payload, timeout=http_timeout_s)
+                r.raise_for_status()
+                try:
+                    j = r.json()
+                except Exception:
+                    j = json.loads(r.text)
+                return j.get("text","") or ""
+            except Exception as e:
+                last_err = e
+                if k < http_retries:
+                    time.sleep(http_backoff_s * (1.5**k))
+                else:
+                    raise last_err
+        return ""
+
+    def _ocr_text(img: np.ndarray) -> str:
+        # Önce HTTP dene (NEW_URL verildiyse), timeout/hata olursa tc_new'e fallback;
+        # NEW_URL yoksa doğrudan tc_new; tc_new de yoksa boş döner.
+        if NEW_URL:
+            try:
+                t = _ocr_via_http(img)
+                if t: return t
+            except Exception as e:
+                if debug: print(f"[OCR HTTP] hata: {e}")
+        if tc_new:
+            t = _ocr_via_tc_new(img)
+            if t: return t
+        return ""
+
+    # ---------------- defaults ----------------
     if must_keywords is None:
         must_keywords = ["hazır bulunan", "hazirun", "hazırun", "genel kurul", "toplantı"]
     if aux_keywords is None:
@@ -55,43 +149,45 @@ def classify_hazirun_single(
     for i in range(n):
         img = images[i]
 
-        # OCR
+        # OCR (retry+fallback içeride)
         try:
-            text_raw = ocr_text_fn(img) or ""
+            text_raw = _ocr_text(img) or ""
         except Exception as e:
-            text_raw = ""
+            # OCR tamamen düşerse sayfayı non-hazirun listesine, sebep ile ekle
             non_hazirun_pages.append({
                 "index": i,
                 "reason": f"OCR hata: {e}",
                 "must_hits": 0,
                 "aux_score": 0,
-                "ocr_preview": "" if not debug else ""
+                **({"ocr_preview": ""} if debug else {})
             })
             continue
 
         text = _normalize_text(text_raw)
 
-        # MUST kontrolü
-        must_hits = sum(
-            1 for kw in must_keywords
-            if kw and (
-                _tr_lower(kw) in text or
-                any(tok.startswith(_tr_lower(kw)) for tok in text.split()) or
-                _ratio(_tr_lower(kw), text) >= fuzzy_min_ratio
-            )
-        )
+        # MUST: en az 1
+        must_hits = 0
+        if text:
+            toks = text.split()
+            for kw in must_keywords:
+                kw0 = _tr_lower((kw or "").strip())
+                if not kw0: 
+                    continue
+                if (kw0 in text) or any(tok.startswith(kw0) for tok in toks) or (_ratio(kw0, text) >= fuzzy_min_ratio):
+                    must_hits += 1
 
-        # AUX kontrolü
-        aux_score = sum(
-            1 for kw in aux_keywords
-            if kw and (
-                _tr_lower(kw) in text or
-                any(tok.startswith(_tr_lower(kw)) for tok in text.split()) or
-                _ratio(_tr_lower(kw), text) >= fuzzy_min_ratio
-            )
-        )
+        # AUX: bağlam güçlendirme
+        aux_score = 0
+        if text:
+            toks = text.split()
+            for kw in aux_keywords:
+                kw0 = _tr_lower((kw or "").strip())
+                if not kw0: 
+                    continue
+                hit = (kw0 in text) or any(tok.startswith(kw0) for tok in toks) or (_ratio(kw0, text) >= fuzzy_min_ratio)
+                if hit: aux_score += 1
 
-        # Karar
+        # Sayfa kararı
         is_hazirun = (must_hits >= 1) and (aux_score >= min_aux_required)
         page_score = 2*must_hits + aux_score
 
@@ -102,28 +198,28 @@ def classify_hazirun_single(
                 "index": i,
                 "image": images[i],
                 "meta": metas[i] if i < len(metas) else {},
-                "must_hits": must_hits,
-                "aux_score": aux_score,
-                "page_score": page_score
+                "must_hits": int(must_hits),
+                "aux_score": int(aux_score),
+                "page_score": int(page_score)
             })
         else:
             row = {
                 "index": i,
                 "reason": "Zayıf kanıt (must<1 veya aux<min)",
-                "must_hits": must_hits,
-                "aux_score": aux_score
+                "must_hits": int(must_hits),
+                "aux_score": int(aux_score)
             }
             if debug:
                 row["ocr_preview"] = text[:300]
             non_hazirun_pages.append(row)
 
-    # Flag
-    flag = "HAZIRUNDUR" if hazirun_pages else "HAZIRUN DEĞİLDİR"
+    # Belge bayrağı (en az 1 sayfa hazirun ise)
+    flag = "HAZIRUNDUR" if len(hazirun_pages) > 0 else "HAZIRUN DEĞİLDİR"
 
     return {
         "flag": flag,
         "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,
-        "non_hazirun_pages": non_hazirun_pages,
+        "hazirun_pages": hazirun_pages,          # sadece hazirun sayfalar (image+meta)
+        "non_hazirun_pages": non_hazirun_pages,  # diğer sayfalar gerekçesiyle
         "page_count": n
     }
