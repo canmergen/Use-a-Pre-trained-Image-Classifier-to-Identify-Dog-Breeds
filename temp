@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re, difflib, time, json
 import numpy as np
 
@@ -8,44 +8,49 @@ def classify_hazirun_single(
     doc_res: Dict[str, Any],
     *,
     # OCR kaynakları (en az biri)
-    tc_new: Optional[Any] = None,           # callable client: ocr/run_ocr/predict/infer/get_text/__call__
-    NEW_URL: Optional[str] = None,          # REST endpoint (image base64 JSON)
+    tc_new: Optional[Any] = None,                  # callable client: ocr/run_ocr/predict/infer/get_text/__call__
+    NEW_URL: Optional[str] = None,                 # REST endpoint (image base64 JSON)
 
     # OCR ayarları
     ocr_lang: str = "tur+eng+lat",
-    ocr_psm: Optional[int] = 6,
-    ocr_oem: Optional[int] = 1,
+    ocr_psm: int = 6,
+    ocr_oem: int = 1,
     ocr_extra_config: Optional[str] = None,
     http_timeout_s: float = 12.0,
     http_retries: int = 3,
     http_backoff_s: float = 0.9,
 
-    # OCR hız/kararlılık için: sadece üst bandı oku
-    ocr_on_top_ratio: float = 0.33,         # [0.2, 0.5] tipik
-    ocr_downscale_max_w: int = 2200,        # HTTP için downscale (OCR için yeterli)
+    # Performans: başlık bandı + downscale ile OCR
+    ocr_on_top_ratio: float = 0.33,               # [0.2, 0.5] önerilir
+    ocr_downscale_max_w: int = 2200,              # OCR için yeterli genişlik
+    ocr_use_jpeg: bool = True,                    # PNG büyükse JPEG(92) tercih et
 
-    # Anahtar ifadeler (tek liste, fuzzy + dağıtık eşleşme)
+    # Tek liste anahtar ifadeler (fuzzy + coverage)
     keywords: Optional[List[str]] = None,
-    fuzzy_min_ratio: float = 0.86,          # 0..1
-    phrase_window: int = 12,
+    fuzzy_min_ratio: float = 0.86,                # 0..1
+    phrase_window: int = 12,                      # kelime penceresi
 
     # Karar eşikleri
-    min_hit_phrases: int = 3,               # ≥ bu kadar ifade tutarsa
-    min_total_score: float = 4.5,           # veya toplam skor ≥ bu eşikse
+    min_hit_phrases: int = 3,                     # ≥ bu kadar ifade yakalanırsa kabul
+    min_total_score: float = 4.5,                 # veya toplam skor ≥ eşik
 
-    # OCR başarısızlığını negatif sayma
-    assume_nonhazirun_on_ocr_fail: bool = False,
+    # OCR hatasını negatif sayma kontrolü
+    assume_nonhazirun_on_ocr_fail: bool = False,  # False: unknown_pages'a at
 
     # Çıktı
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    En az bir sayfa eşikleri geçerse belge HAZIRUNDUR.
-    OCR hatası alan sayfalar negatif sayılmaz (unknown_pages'a atılır) — istersen
-    assume_nonhazirun_on_ocr_fail=True yapabilirsin.
+    PDF/TIFF'ten üretilmiş doc_res ({'images': [...], 'metas': [...]}) üzerinde:
+      - Sayfa başlığının bulunduğu üst bandı OCR eder (downscale + JPEG/PNG).
+      - NEW_URL (HTTP) -> başarısızsa tc_new fallback.
+      - Tek 'keywords' listesiyle fuzzy + token-coverage + prefix bazlı skorlar.
+      - En az 1 sayfa eşikleri geçerse belge 'HAZIRUNDUR', aksi halde 'HAZIRUN DEĞİLDİR'.
+      - Sadece 'hazirun' sayfalarının image+meta'larını döndürür.
+      - OCR hataları 'unknown_pages' listesine gider (opsiyonel olarak negatif sayılabilir).
     """
 
-    # ---------------- helpers ----------------
+    # ---------------- local helpers ----------------
     def _ratio_init():
         try:
             from rapidfuzz import fuzz
@@ -59,7 +64,7 @@ def classify_hazirun_single(
 
     def _normalize_text(s: str) -> str:
         t = _tr_lower(s)
-        t = re.sub(r"[_–—\\-•・·]+", " ", t)
+        t = re.sub(r"[_–—\-•・·]+", " ", t)
         t = re.sub(r"[^\w\s%./]", " ", t, flags=re.UNICODE)
         t = re.sub(r"\s+", " ", t).strip()
         return t
@@ -79,10 +84,14 @@ def classify_hazirun_single(
             roi = cv2.resize(roi, (ocr_downscale_max_w, nh), interpolation=cv2.INTER_AREA)
         return roi
 
-    def _img_to_png_b64(img: np.ndarray) -> str:
+    def _img_to_b64(img: np.ndarray) -> str:
         import cv2, base64
-        ok, buf = cv2.imencode(".png", img)
-        if not ok: return ""
+        if ocr_use_jpeg:
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        else:
+            ok, buf = cv2.imencode(".png", img)
+        if not ok:
+            return ""
         return base64.b64encode(buf).decode("utf-8")
 
     def _ocr_via_tc_new(img: np.ndarray) -> str:
@@ -90,13 +99,9 @@ def classify_hazirun_single(
         from PIL import Image
         import cv2
         pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        kwargs: Dict[str, Any] = {}
-        cfg = []
-        if ocr_psm is not None: cfg.append(f"--psm {int(ocr_psm)}")
-        if ocr_oem is not None: cfg.append(f"--oem {int(ocr_oem)}")
-        if ocr_extra_config:    cfg.append(ocr_extra_config)
-        if cfg: kwargs["config"] = " ".join(cfg)
-        if ocr_lang: kwargs["lang"] = ocr_lang
+        cfg = [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}"]
+        if ocr_extra_config: cfg.append(ocr_extra_config)
+        kwargs: Dict[str, Any] = {"lang": ocr_lang, "config": " ".join(cfg)}
 
         for name in ("ocr","run_ocr","predict","infer","get_text","__call__"):
             fn = getattr(tc_new, name, None)
@@ -120,13 +125,9 @@ def classify_hazirun_single(
         if not NEW_URL: return ""
         import requests
         payload = {
-            "image": _img_to_png_b64(img),
+            "image": _img_to_b64(img),
             "lang": ocr_lang or "tur",
-            "config": " ".join(
-                ([f"--psm {int(ocr_psm)}"] if ocr_psm is not None else []) +
-                ([f"--oem {int(ocr_oem)}"] if ocr_oem is not None else []) +
-                ([ocr_extra_config] if ocr_extra_config else [])
-            )
+            "config": " ".join(filter(None, [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}", ocr_extra_config]))
         }
         last_err = None
         for k in range(http_retries + 1):
@@ -143,43 +144,42 @@ def classify_hazirun_single(
                 if k < http_retries:
                     time.sleep(http_backoff_s * (1.5**k))
                 else:
-                    raise last_err
+                    if debug: print(f"[OCR HTTP] hata: {last_err}")
         return ""
 
-    def _ocr_text(img_full: np.ndarray) -> str:
+    def _ocr_text(img_full: np.ndarray) -> Tuple[str, Dict[str, Any]]:
         roi = _img_top_band_and_downscale(img_full)
-        # Önce HTTP (varsa), sonra tc_new fallback
+        # HTTP -> fallback tc_new
+        txt = ""
+        err = None
         if NEW_URL:
             try:
-                t = _ocr_via_http(roi)
-                if t: return t
+                txt = _ocr_via_http(roi)
             except Exception as e:
-                if debug: print(f"[OCR HTTP] hata: {e}")
-        if tc_new:
-            t = _ocr_via_tc_new(roi)
-            if t: return t
-        return ""
+                err = e
+        if not txt and tc_new is not None:
+            try:
+                txt = _ocr_via_tc_new(roi)
+            except Exception as e:
+                err = e
+        return txt, ({} if err is None else {"error": str(err)})
 
     def _phrase_best_score(phrase: str, text: str, toks: List[str]) -> Tuple[float, Dict[str, Any]]:
         ph = _tr_lower((phrase or "").strip())
-        if not ph:
-            return 0.0, {"why": "empty"}
-        # 1) Direct fuzzy
+        if not ph: return 0.0, {"why":"empty"}
+        # 1) fuzzy
         s_fz = _ratio(ph, text)
-        # 2) Coverage in window
+        # 2) coverage in window
         ph_toks = [t for t in _tokens(ph) if t]
-        cover_best = 0.0; cover_detail = {}
+        cover_best = 0.0
         if ph_toks and toks:
             need = set(ph_toks)
-            # hızlı tarama
-            starts = list(range(0, max(1, len(toks)-phrase_window+1), max(1, phrase_window//2)))
-            for s in starts:
+            for s in range(0, max(1, len(toks)-phrase_window+1), max(1, phrase_window//2)):
                 e = min(len(toks), s + phrase_window)
                 window = toks[s:e]
                 cov = sum(1 for t in need if t in window) / max(1, len(need))
-                if cov > cover_best:
-                    cover_best = cov; cover_detail = {"window_start": s, "window_end": e, "need": len(need)}
-        # 3) Prefix
+                cover_best = max(cover_best, cov)
+        # 3) prefix
         prefix_hits = 0.0
         if ph_toks and toks:
             pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
@@ -190,16 +190,21 @@ def classify_hazirun_single(
     # ---------------- defaults ----------------
     if keywords is None:
         keywords = [
+            # başlık ve varyantlar
             "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
             "genel kurul","olağan genel kurul","liste örneği",
+            # tablo başlıkları / alanlar
             "pay sahibinin ad soyad unvanı","ad soyad","ad/soyad/unvanı","kimlik numarası",
             "vergi kimlik","mersis numarası","uyruğu","adresi",
             "payların itibari değeri","ediniliş şekli","ediniliş tarihi",
             "katılım şekli","temsilci türü","temsilcinin ad soyad unvanı",
             "temsilcinin kimlik numarası","imza",
+            # alt metin
             "şirketin sermayesi","payların toplam itibari değeri",
             "asgari toplantı nisabı","mevcut toplantı nisabı",
+            # imza blokları
             "divan başkanı","oy toplama memuru","yönetim kurulu üyeleri",
+            # şirket tipleri
             "anonim şirketi","a.ş","aş","limited şirketi","ltd şti","ltd. şti."
         ]
 
@@ -214,36 +219,31 @@ def classify_hazirun_single(
 
     for i in range(n):
         img = images[i]
-        # OCR (retry+fallback içeride; üst band + downscale)
-        try:
-            raw = _ocr_text(img) or ""
-        except Exception as e:
+
+        # OCR (üst band + downscale, HTTP->fallback)
+        text_raw, err_info = _ocr_text(img)
+
+        # OCR boş veya hata
+        if not text_raw:
             if assume_nonhazirun_on_ocr_fail:
-                non_hazirun_pages.append({"index": i, "reason": f"OCR hata: {e}", "hits": 0, "total_score": 0.0})
+                non_hazirun_pages.append({"index": i, "reason": "OCR boş/hata", "hits": 0, "total_score": 0.0, **err_info})
             else:
-                unknown_pages.append({"index": i, "reason": f"OCR hata: {e}"})
+                unknown_pages.append({"index": i, "reason": "OCR boş/hata", **err_info})
             continue
 
-        text = _normalize_text(raw)
+        text = _normalize_text(text_raw)
         toks = _tokens(text)
 
-        # Boş metin: unknown olarak işaretle (negatif sayma)
-        if not text:
-            if assume_nonhazirun_on_ocr_fail:
-                non_hazirun_pages.append({"index": i, "reason": "OCR boş metin", "hits": 0, "total_score": 0.0})
-            else:
-                unknown_pages.append({"index": i, "reason": "OCR boş metin"})
-            continue
-
-        # Her ifade için en iyi skor
-        hit_cnt = 0; score_sum = 0.0; dbg_details = []
+        # Her ifade için skor
+        hit_cnt, score_sum = 0, 0.0
+        ev: List[Dict[str, Any]] = []
         for ph in keywords:
             sc, det = _phrase_best_score(ph, text, toks)
             if sc >= fuzzy_min_ratio:
                 hit_cnt += 1
             score_sum += sc
             if debug and sc >= 0.5:
-                dbg_details.append({"phrase": ph, **det})
+                ev.append({"phrase": ph, **det})
 
         total_score = hit_cnt + (score_sum / max(1, len(keywords))) * 2.0
         is_hazirun = (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
@@ -257,7 +257,7 @@ def classify_hazirun_single(
                 "meta": metas[i] if i < len(metas) else {},
                 "hits": int(hit_cnt),
                 "total_score": float(round(total_score,3)),
-                **({"evidence": dbg_details[:20]} if debug else {})
+                **({"evidence": ev[:20]} if debug else {})
             })
         else:
             row = {"index": i, "reason": "Eşik altı", "hits": int(hit_cnt), "total_score": float(round(total_score,3))}
@@ -270,8 +270,8 @@ def classify_hazirun_single(
     return {
         "flag": flag,
         "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,           # sadece eşleşen sayfalar
-        "non_hazirun_pages": non_hazirun_pages,   # negatifler (gerekçeli)
-        "unknown_pages": unknown_pages,           # OCR fail/boş metin
+        "hazirun_pages": hazirun_pages,           # sadece eşleşen sayfalar (image+meta)
+        "non_hazirun_pages": non_hazirun_pages,   # eşik altı sayfalar (gerekçeyle)
+        "unknown_pages": unknown_pages,           # OCR başarısız/boş sayfalar
         "page_count": n
     }
