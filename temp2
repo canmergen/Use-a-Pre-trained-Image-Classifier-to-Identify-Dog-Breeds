@@ -1,379 +1,234 @@
-def build_per_box_df_onecall(
-    lower_img,
-    final_boxes,
-    *,
-    sig_boxes,
-    role_blocks,
-    sermaye_boxes,
-    known_names,
-    ocr_url: str,
-    lang: str = "tur+eng+lat",
-    role_threshold: float = 0.80,      # sadece loc!="roles" için kullanılır
-    name_sim_threshold: float = 0.82,
-):
-    import re, json, base64, unicodedata
-    from typing import Any, Tuple, List, Dict, Optional
-    import numpy as np
-    import pandas as pd
-    import cv2, requests
+# -*- coding: utf-8 -*-
+import cv2, re, unicodedata
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --- Fuzzy helper (RapidFuzz varsa onu kullan, yoksa difflib) ---
+try:
     from rapidfuzz import fuzz, process
+    def _fuzzy_ratio(a, b): return float(fuzz.partial_ratio(a, b)) / 100.0
+except Exception:
+    import difflib
+    def _fuzzy_ratio(a, b): return difflib.SequenceMatcher(None, a, b).ratio()
 
-    # ---------- geometry ----------
-    def _to_xywh(b: Any) -> Optional[Tuple[int,int,int,int]]:
-        if isinstance(b, (tuple, list, np.ndarray)) and len(b)==4:
-            x,y,w,h = [int(round(float(v))) for v in b]; return (x,y,w,h)
-        if isinstance(b, dict):
-            if all(k in b for k in ("x","y","w","h")):  return int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
-            if all(k in b for k in ("x0","y0","x1","y1")):  return int(b["x0"]), int(b["y0"]), int(b["x1"]-b["x0"]), int(b["y1"]-b["y0"])
-            if all(k in b for k in ("left","top","right","bottom")):  return int(b["left"]), int(b["top"]), int(b["right"]-b["left"]), int(b["bottom"]-b["top"])
-        return None
-    def _to_xyxy(b: Any) -> Tuple[int,int,int,int]:
-        x,y,w,h = _to_xywh(b); return (x, y, x+w, y+h)
-    def _iou(a, b) -> float:
-        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-        ix1,iy1 = max(ax1,bx1), max(ay1,by1); ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-        iw, ih = max(0, ix2-ix1), max(0, iy2-iy1); inter = iw*ih
-        if inter == 0: return 0.0
-        aarea = (ax2-ax1)*(ay2-ay1); barea = (bx2-bx1)*(by2-by1)
-        return inter / (aarea + barea - inter + 1e-9)
-    def _contains(outer, inner, pad=2) -> bool:
-        ox1,oy1,ox2,oy2 = outer; ix1,iy1,ix2,iy2 = inner
-        return (ix1 >= ox1-pad) and (iy1 >= oy1-pad) and (ix2 <= ox2+pad) and (iy2 <= oy2+pad)
-    def _any_overlap(a, group) -> bool:
-        for g in group:
-            if _iou(a, g) > 0 or _contains(a, g) or _contains(g, a): return True
-        return False
+def extract_top_info_from_doc_images_fuzzy(
+    doc_images,
+    *,
+    ocr_fn,                          # <- SENİN fonksiyonun: img_bgr -> str
+    debug: bool = False,
+    show_fig: bool = False,          # debug görsellerini göstermek için
+    table_top_shift_ratio: float = 0.02,
+    fuzzy_type_thresh: float = 0.82, # şirket türü fuzzy eşiği
+    fuzzy_join_lines: bool = True,   # satır birleştirip ek fuzzy denemesi
+) -> pd.DataFrame:
+    """
+    doc_images: List[np.ndarray (BGR)]
+    ocr_fn: callable(img_bgr) -> str  (örn. pytesseract_ocr_text)
+    """
 
-    # ---------- normalize ----------
-    def _strip_diac(s: str) -> str:
-        return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    def _U(s: str) -> str:
-        s = (s or "").upper(); return re.sub(r"\s+"," ",_strip_diac(s)).strip()
-
-    _OCR_SUBS = {"!":"I","|":"I","ı":"i","İ":"I","1":"I","l":"I","0":"O","€":"E"}
-    def _norm_ocr(s: str) -> str:
-        if not s: return ""
-        s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-        s = "".join(_OCR_SUBS.get(c, c) for c in s)
-        s = s.upper()
-        s = re.sub(r"[^A-Z0-9\s]", " ", s)
+    # ---- yardımcılar ----
+    def _normalize_line(s: str) -> str:
+        s = unicodedata.normalize("NFKC", s or "")
+        s = s.replace("\u00A0"," ").replace("\u200B"," ")
+        s = s.replace("’","'").replace("“","\"").replace("”","\"")
+        tr = str.maketrans({"İ":"i","I":"ı","Ç":"ç","Ğ":"ğ","Ö":"ö","Ş":"ş","Ü":"ü"})
+        s = s.translate(tr).lower()
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    # ---------- roles ----------
-    ROLE_ALIASES: Dict[str, List[str]] = {
-        "toplanti_baskani": ["TOPLANTI BAŞKANI","TOPLANTI BASKANI"],
-        "divan_baskani":    ["DİVAN BAŞKANI","DIVAN BASKANI"],
-        "yk_baskani":       ["YÖNETİM KURULU BAŞKANI","YONETIM KURULU BASKANI","YK BAŞKANI","YK BASKANI","YÖNETİM KURULU BAŞI"],
-        "yk_uyesi":         ["YÖNETİM KURULU ÜYESİ","YONETIM KURULU UYESI","YK ÜYESİ","YK UYESI","YÖNETİM KURULU ÜYELERİ","YONETIM KURULU UYELERI"],
-        "bakanlik_temsilcisi": ["BAKANLIK TEMSİLCİSİ","BAKANLIK TEMSILCISI","TİCARET BAKANLIĞI TEMSİLCİSİ","TICARET BAKANLIGI TEMSILCISI"],
-        "katip": ["KÂTİP","KATİP","OY TOPLAMA MEMURU","OY TOPLAYICI"],
-        "tutanak_yazmani": ["TUTANAK YAZMANI","YAZMAN"],
-    }
-    ROLE_ANCHORS = {
-        "toplanti_baskani": {"TOPLANTI","BASKAN","BASKANI"},
-        "divan_baskani":    {"DIVAN","BASKANI"},
-        "yk_baskani":       {"YONETIM","KURULU","BASKANI","YK","BAŞKANI"},
-        "yk_uyesi":         {"YONETIM","KURULU","UYESI","UYE","UYELERI","YK"},
-        "bakanlik_temsilcisi": {"BAKANLIK","TEMSILCISI","TICARET"},
-        "katip": {"KATIP","KÂTIP","OY","TOPLAMA","MEMURU"},
-        "tutanak_yazmani": {"TUTANAK","YAZMANI","YAZMAN"},
-    }
-    ROLE_PRIORITY = ["toplanti_baskani","divan_baskani","yk_baskani","yk_uyesi","bakanlik_temsilcisi","katip","tutanak_yazmani"]
-    ROLE_TOKENS = set(sum([a.split() for v in ROLE_ALIASES.values() for a in v], [])) | {
-        "YÖNETİM","KURULU","ÜYE","ÜYELERİ","ÜYELER","ÜYESİ","BAŞKAN","BAŞKANI","KATİP","KÂTİP",
-        "DİVAN","OY","TOPLAMA","MEMURU","TEMSİLCİSİ","BAKANLIK","YAZMAN","İMZA","IMZA","KAŞE","MÜHÜR","STAMP"
-    }
+    def _upper_tr(s: str) -> str:
+        rep={"i":"İ","ı":"I","ğ":"Ğ","ü":"Ü","ş":"Ş","ö":"Ö","ç":"Ç"}
+        return "".join(rep.get(c,c.upper()) for c in (s or "").lower())
 
-    def _alias_score(T: str, alias: str) -> float:
-        A = _norm_ocr(alias)
-        s1 = fuzz.token_set_ratio(T, A) / 100.0
-        s2 = fuzz.partial_ratio(T, A) / 100.0
-        s3 = fuzz.ratio(T, A) / 100.0
-        return 0.5*s1 + 0.35*s2 + 0.15*s3
+    def _detect_table_top(gray: np.ndarray):
+        if gray.ndim == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        H, W = gray.shape[:2]
+        blur = cv2.GaussianBlur(gray, (3,3), 0)
+        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        if np.mean(bw) > 127: bw = cv2.bitwise_not(bw)
+        kx = max(10, W//80); ky = max(10, H//80)
+        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)), iterations=2)
+        vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)), iterations=2)
+        mask = cv2.add(horiz, vert)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts: return None
+        x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        y_top = int(y + max(1, round(table_top_shift_ratio*h)))
+        return max(0, min(H-1, y_top)), (x,y,w,h), gray
 
-    def _anchor_bonus(T: str, role: str) -> float:
-        toks = set(T.split()); ach = ROLE_ANCHORS.get(role, set())
-        if not ach: return 0.0
-        cov = len(toks & ach) / len(ach)
-        return 0.15 * cov
+    def _extract_upper(img, y_top): 
+        return img[:y_top,:] if y_top is not None else None
 
-    def best_role_for_text(text: str):
-        T = _norm_ocr(text)
-        if not T:
-            return (None, 0.0)
-        # Kesin desenler
-        if re.search(r"\bYONETIM\s+KURULU\s+UYE(LERI|SI)\b", T): return ("yk_uyesi", 0.99)
-        if re.search(r"\bDIVAN\s+BASKAN[I]?\b", T):              return ("divan_baskani", 0.99)
-        meeting_hit = 1 if re.search(r"\bTOPLANTI\s+\S{0,6}\s+BASKAN[I]?\b", T) else 0
-
-        scores = {}
-        for role, aliases in ROLE_ALIASES.items():
-            s_alias = max(_alias_score(T, a) for a in aliases)
-            s = s_alias + _anchor_bonus(T, role)
-            if role == "toplanti_baskani" and meeting_hit: s += 0.08
-            scores[role] = s
-        ranked = sorted(scores.items(), key=lambda kv: (-kv[1], ROLE_PRIORITY.index(kv[0])))
-        return ranked[0]  # (role, score)
-
-    # ---------- names (extraction) ----------
-    def remove_role_words(text: str) -> str:
-        toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", text)
-        toks = [t for t in toks if _U(t) not in ROLE_TOKENS]
-        return " ".join(toks)
-
-    def raw_name_candidates(text: str) -> List[str]:
-        t = text.replace("\n"," ")
-        segs = [p.strip() for p in re.split(r"\s*(?:[,;/]| ve )\s*", t, flags=re.IGNORECASE) if p.strip()]
-        out: List[str] = []
-        for seg in segs:
-            toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", seg)
-            if not toks: continue
-            n = len(toks)
-            for L in (3,2):
-                for i in range(max(0, n-L+1)): out.append(" ".join(toks[i:i+L]))
-            if n == 1: out.append(toks[0])
-        return list(dict.fromkeys(out))
-
-    def match_known_names_in_text(text: str, pool: List[str], thr: float) -> List[str]:
-        T = _norm_ocr(remove_role_words(text))
-        if not T or not pool: return []
-        hits = []
-        for kn in pool:
-            K = _norm_ocr(kn)
-            s1 = fuzz.partial_ratio(T, K) / 100.0
-            s2 = fuzz.token_set_ratio(T, K) / 100.0
-            score = 0.6*s1 + 0.4*s2
-            if score >= thr: hits.append((kn, score))
-        hits.sort(key=lambda x: -x[1])
-        out, seen = [], set()
-        for name, _ in hits:
-            if name not in seen:
-                seen.add(name); out.append(name)
-        return out
-
-    def map_by_first_and_partial_last(text: str, pool: List[str]) -> Optional[str]:
-        if not pool: return None
-        toks = [t for t in re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+", remove_role_words(text)) if len(t) >= 2]
-        if not toks: return None
-        first_tokens = toks[:3]
-        best_name, best_combo = None, 0.0
-        for kn in pool:
-            parts = [p for p in kn.split() if p]
-            if not parts: continue
-            k_first, k_last = parts[0], parts[-1]
-            ad_scores = [fuzz.token_set_ratio(_U(ft), _U(k_first))/100.0 for ft in first_tokens]
-            ad_score = max(ad_scores) if ad_scores else 0.0
-            last_score = fuzz.partial_ratio(_U(" ".join(toks)), _U(k_last))/100.0
-            combo = 0.7*ad_score + 0.3*last_score
-            if ad_score >= 0.85 and last_score >= 0.60 and combo > best_combo:
-                best_combo, best_name = combo, kn
-        return best_name
-
-    def pick_name_from_text(text: str, pool: List[str]) -> Optional[str]:
-        multi = match_known_names_in_text(text, pool, name_sim_threshold)
-        if multi: return "; ".join(multi)
-        direct = map_by_first_and_partial_last(text, pool)
-        if direct: return direct
-        cands = raw_name_candidates(remove_role_words(text))
-        chosen, seen = [], set()
-        for c in cands:
-            mapped = process.extractOne(c, pool, scorer=fuzz.token_set_ratio)
-            name = mapped[0] if (mapped and mapped[1] >= name_sim_threshold*100) else c
-            if name not in seen:
-                seen.add(name); chosen.append(name)
-        return "; ".join(chosen) if chosen else None
-
-    # ---------- names (sanitization & merge) ----------
-    _NAME_TOKEN_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü’']+")
-    _BAD_TOKEN = {"VE","VEYA","ILE","İLE"}
-
-    def _normalize_name(s: str) -> str:
-        return re.sub(r"\s+"," ", s.strip())
-
-    def _split_candidates(name_str: str) -> List[str]:
-        if not name_str: return []
-        parts = re.split(r"[;|,/]+", name_str)
-        return [_normalize_name(p) for p in parts if _normalize_name(p)]
-
-    def _clean_tokens(s: str) -> str:
-        toks = _NAME_TOKEN_RE.findall(s)
-        toks = [t for t in toks if len(t) >= 2]
-        toks = [t for t in toks if t.upper() not in _BAD_TOKEN]
-        # en fazla 3 kelime kuralı
-        toks = toks[:3]
-        return " ".join(toks)
-
-    def _dedup_similar(names: List[str], thr: float = 0.92) -> List[str]:
-        out: List[str] = []
-        for n in names:
-            if not out:
-                out.append(n); continue
-            simmax = max(fuzz.token_set_ratio(n, m)/100.0 for m in out)
-            if simmax < thr:
-                out.append(n)
-        return out
-
-    def _prefer_known(names: List[str], known_pool: List[str], hit_thr: float = 0.84) -> List[str]:
-        if not known_pool: return names
-        mapped = []
-        for n in names:
-            best = process.extractOne(n, known_pool, scorer=fuzz.token_set_ratio)
-            mapped.append(best[0] if (best and best[1] >= hit_thr*100) else n)
-        return mapped
-
-    def sanitize_names(raw_names: Optional[str], raw_text: str, known_pool: List[str]) -> Optional[str]:
-        # parçala ve temizle
-        cands = _split_candidates(raw_names) if raw_names else []
-        if not cands:
-            # metinden fallback
-            cands = _split_candidates(_clean_tokens(raw_text))
-        cands = [_clean_tokens(c) for c in cands]
-        cands = [c for c in cands if c]  # boşları at
-        # bilinen isimlere hizala
-        cands = _prefer_known(cands, known_pool)
-        # tek harf/çöp zaten atıldı; aynı kişinin varyantlarını birleştir
-        cands = _dedup_similar(cands, thr=0.92)
-        # aynı ad-soyad tekrarları → teke indir; farklı isimler korunur (tamamını yaz)
-        return "; ".join(cands) if cands else None
-
-    def merge_name_tckn(name: Optional[str], tckn: Optional[str]) -> Optional[str]:
-        if name and tckn:
-            uniq = list(dict.fromkeys([p.strip() for p in re.split(r"[;,\s]+", tckn) if p.strip()]))
-            return f"{name} | {'; '.join(uniq)}"
-        if tckn:
-            uniq = list(dict.fromkeys([p.strip() for p in re.split(r'[;,\s]+', tckn) if p.strip()]))
-            return "; ".join(uniq)
-        return name
-
-    def find_tckn(text: str) -> Optional[str]:
-        m = re.findall(r"(?<!\d)(\d{10,11})(?!\d)", text.replace(" ", ""))
-        return "; ".join(list(dict.fromkeys(m))) if m else None
-
-    # ---------- sermaye (float) ----------
-    _SEP = r"[.\,\s\u00A0\u202F\u2009]"
-    _CURR_WORDS = ("TL","TRY","EUR","EURO","₺","€")
-    _NUM_RE = re.compile(rf"(?<!\d)(\d{{1,3}}(?:{_SEP}\d{{3}})+|\d+)(?:{_SEP}?\d{{2}})?(?!\d)")
-    def _clean_amount_context(text: str) -> str:
-        if not text: return ""
-        t = text
-        for w in _CURR_WORDS: t = re.sub(rf"\b{w}\b", " ", t, flags=re.IGNORECASE)
-        t = t.replace("₺"," ").replace("€"," ").replace("\u00A0"," ").replace("\u202F"," ").replace("\u2009"," ")
-        return t
-    def _to_float_from_token(token: str) -> float | None:
-        s = token.replace("\u00A0"," ").replace("\u202F"," ").replace("\u2009"," ").strip().replace(" ","")
-        has_dot, has_com = "." in s, "," in s
-        if has_dot and has_com:
-            last = max(s.rfind("."), s.rfind(","))
-            if (len(s) - last - 1) == 2:
-                dec = s[last]; other = "," if dec=="." else "."
-                s = s.replace(other, "").replace(dec, ".")
+    def _extract_date(text: str):
+        t = unicodedata.normalize("NFKC", text or "")
+        t = t.replace("⁄","/").replace("–","/").replace("-","/")
+        t = re.sub(r"\s+"," ",t)
+        pat = re.compile(r"(?<!\d)(\d{1,2})[/.](\d{1,2})[/.](\d{2,4})(?!\d)")
+        for m in pat.finditer(t):
+            d, mo, yy = m.group(1), m.group(2), m.group(3)
+            try: d_i, m_i = int(d), int(mo)
+            except: continue
+            yy = re.sub(r"^\D+","",yy)
+            if len(yy) == 2: y_i = int("20"+yy)
+            elif len(yy) > 4: y_i = int(yy[-4:])
             else:
-                s = s.replace(".","").replace(",","")
-        else:
-            if s.count(",")==1 and len(s.split(",")[-1])==2: s = s.replace(",", ".")
-            else: s = s.replace(",", "")
-            if not (s.count(".")==1 and len(s.split(".")[-1])==2): s = s.replace(".","")
-        try: return float(s)
-        except Exception: return None
-    def extract_amount_float(text: str) -> float | None:
-        t = _clean_amount_context(text)
-        toks = _NUM_RE.findall(t)
+                try: y_i = int(yy)
+                except: continue
+            if 1<=d_i<=31 and 1<=m_i<=12 and 1900<=y_i<=2100:
+                return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
+        # brute-force
+        digits = re.sub(r"\D","",t)
+        if len(digits) >= 8:
+            best=None
+            for i in range(len(digits)-7):
+                try:
+                    d_i=int(digits[i:i+2]); m_i=int(digits[i+2:i+4]); y_i=int(digits[i+4:i+8])
+                except: continue
+                if 1<=d_i<=31 and 1<=m_i<=12 and 1900<=y_i<=2100:
+                    tup=(y_i,i,d_i,m_i)
+                    if best is None or tup>best: best=tup
+            if best:
+                y_i,_,d_i,m_i=best
+                return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
+        return None
+
+    # --- şirket türü sözlüğü + regex + fuzzy varyantlar ---
+    CANON_TYPES = {
+        "anonim şirketi": [
+            "a.ş", "as", "aş", "anonim şirket", "anonim sirket", "an0nım s1rket", "anonım sirkett"
+        ],
+        "limited şirketi": [
+            "ltd. şti", "ltd şti", "ltd sti", "limited şirket", "limited sirket", "ltd. sti.", "ltd. şti."
+        ],
+        "holding": ["holding"],
+        "kooperatif": ["kooperatif"],
+        "kolektif şirket": ["kolektif şirket", "kolektif sirket"],
+        "adi komandit şirket": ["adi komandit şirket", "adi komandit sirket"],
+        "sermayesi paylara bölünmüş komandit şirket": [
+            "sermayesi paylara bölünmüş komandit şirket",
+            "sermayesi paylara bolunmus komandit sirket"
+        ],
+        "komandit şirket": ["komandit şirket", "komandit sirket"],
+        "vakıf": ["vakıf", "vakif"],
+        "dernek": ["dernek"]
+    }
+
+    # tür regex’leri (yüksek kesinlik)
+    TYPE_PATTERNS = [
+        (r"\ba\s*\.?\s*ş\b", "anonim şirketi"),
+        (r"\bas\b", "anonim şirketi"),
+        (r"\banonim\s+şirket[iı]?\b", "anonim şirketi"),
+        (r"\bltd\s*\.?\s*şt[iı]\b", "limited şirketi"),
+        (r"\bltd\s*\.?\s*st[iı]\b", "limited şirketi"),
+        (r"\blimited\s+şirket[iı]?\b", "limited şirketi"),
+        (r"\bholding\b", "holding"),
+        (r"\bkooperatif\b", "kooperatif"),
+        (r"\bkolektif\s+şirket[iı]?\b", "kolektif şirket"),
+        (r"\badi\s+komandit\s+şirket[iı]?\b", "adi komandit şirket"),
+        (r"\bsermayesi\s+paylara\s+bölünmüş\s+komandit\s+şirket[iı]?\b", "sermayesi paylara bölünmüş komandit şirket"),
+        (r"\bkomandit\s+şirket[iı]?\b", "komandit şirket"),
+        (r"\bvakf[ıi]\b|\bvakif\b", "vakıf"),
+        (r"\bdernek\b", "dernek"),
+    ]
+    TYPE_REGEX = [(re.compile(pat, re.IGNORECASE), label) for pat, label in TYPE_PATTERNS]
+
+    def _find_company(lines: list[str]):
+        # 1) regex ile tür bul (yüksek kesinlik)
         best = None
-        for tok in toks:
-            v = _to_float_from_token(tok)
-            if v is None: continue
-            if (best is None) or (v > best): best = v
-        return best
+        for raw in lines:
+            norm = _normalize_line(raw)
+            for creg, label in TYPE_REGEX:
+                m = creg.search(norm)
+                if m:
+                    name_left = raw[:m.start()].strip()
+                    name_clean = re.sub(r"[,\.\-_'’\"\s]+$","", name_left)
+                    name_up = _upper_tr(re.sub(r"\s+"," ", name_clean))
+                    score = (len(name_up), sum(c.isupper() for c in name_up))
+                    cand = (score, name_up, label)
+                    if best is None or cand > best: best = cand
+        if best:
+            _, cname, ctype = best
+            return cname if cname else None, ctype
 
-    # ---------- OCR ----------
-    def _ocr_remote_png(img_gray, *, psm: int, oem: int) -> str:
-        ok, buf = cv2.imencode(".png", img_gray)
-        if not ok: return ""
-        payload = {"image": base64.b64encode(buf.tobytes()).decode("ascii"), "lang": lang, "config": f"--psm {int(psm)} --oem {int(oem)}"}
-        try:
-            r = requests.post(ocr_url, data=json.dumps(payload), headers={"Content-Type":"application/json"}, timeout=60)
-            r.raise_for_status(); j = r.json()
-            return (j.get("text") or "").strip()
-        except Exception:
-            return ""
-    def ocr_box(lower_img, xywh: Tuple[int,int,int,int], psm: int, oem: int) -> str:
-        x,y,w,h = xywh
-        crop = lower_img[max(0,y):y+h, max(0,x):x+w]
-        if crop is None or getattr(crop, "size", 0) == 0: return ""
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim==3 else crop
-        gray = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        return _ocr_remote_png(bw, psm=psm, oem=oem)
+        # 2) fuzzy: her satırda canonical tür varyantlarına en iyi eşleşme
+        for raw in lines:
+            norm = _normalize_line(raw)
+            for canonical, variants in CANON_TYPES.items():
+                local_best = 0.0; hit_span = None
+                for v in variants:
+                    sc = _fuzzy_ratio(v, norm)
+                    if sc > local_best:
+                        local_best = sc
+                if local_best >= fuzzy_type_thresh:
+                    # ad: satırın tür kısmından önceki bölümü (yaklaşık)
+                    # heuristik: tür anahtar kelimesinin ilk kelimesini ara
+                    key = variants[0].split()[0]
+                    pos = norm.find(key.split('.')[0])  # kaba arama
+                    name_left = raw[:max(0,pos)].strip() if pos>0 else raw
+                    name_clean = re.sub(r"[,\.\-_'’\"\s]+$","", name_left)
+                    cname = _upper_tr(re.sub(r"\s+"," ", name_clean))
+                    return (cname if cname else None), canonical
 
-    # ---------- boxes ----------
-    final_xywh = [b for b in (_to_xywh(b) for b in final_boxes) if b is not None and b[2]>0 and b[3]>0]
-    final_xyxy = [_to_xyxy(b) for b in final_xywh]
-    sig_xyxy   = [_to_xyxy(b) for b in (sig_boxes or [])]
-    role_xyxy  = [_to_xyxy(b) for b in (role_blocks or [])]
-    serm_xyxy  = [_to_xyxy(b) for b in (sermaye_boxes or [])]
-    known_pool = list(dict.fromkeys(known_names or []))
+        # 3) satırları birleştirip fuzzy dene (başlık/satır kırılması durumları)
+        if fuzzy_join_lines and lines:
+            joined_raw = " ".join(lines)
+            joined_norm = _normalize_line(joined_raw)
+            for canonical, variants in CANON_TYPES.items():
+                if max(_fuzzy_ratio(v, joined_norm) for v in variants) >= fuzzy_type_thresh:
+                    # adı ilk satırdan al (fallback)
+                    cname = _upper_tr(re.sub(r"\s+"," ", lines[0]))
+                    return (cname if cname else None), canonical
 
-    def decide_psm_oem(loc: str) -> Tuple[int,int]:
-        if loc == "sermaye": return 1, 1
-        if loc == "roles":   return 11, 1
-        return 11, 1
+        return None, None
 
-    # ---------- loop ----------
+    # ---- ana akış ----
     rows = []
-    for i, (b_wh, b_xyxy) in enumerate(zip(final_xywh, final_xyxy)):
-        loc = "roles" if _any_overlap(b_xyxy, role_xyxy) else ("sermaye" if _any_overlap(b_xyxy, serm_xyxy) else "other")
-        sig = any(_contains(b_xyxy, s, pad=2) or _iou(b_xyxy, s) >= 0.02 for s in sig_xyxy)
 
-        psm0, oem0 = decide_psm_oem(loc)
-        text0 = ocr_box(lower_img, b_wh, psm=psm0, oem=oem0)
-        text_preview = re.sub(r"\s+"," ",text0)[:200]
+    for idx, img in enumerate(doc_images):
+        y_top_bbox = _detect_table_top(img)
+        if not y_top_bbox:
+            if debug: print(f"[p{idx}] No table found.")
+            continue
+        y_top, (x,y,w,h), gray = y_top_bbox
 
-        # ROL: sadece roles kutularında
-        if loc == "roles":
-            role_key, role_score = best_role_for_text(text0)  # en iyi etiket
-            role_best = role_key
-        else:
-            role_key, role_score, role_best = None, 0.0, None
+        upper = _extract_upper(img, y_top)
+        if upper is None or upper.size == 0:
+            if debug: print(f"[p{idx}] Empty upper region.")
+            continue
 
-        if loc == "sermaye":
-            amount_val = extract_amount_float(text0)
-            if amount_val is None:
-                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-                if len(text1) > len(text0): text_preview = re.sub(r"\s+"," ",text1)[:200]
-                amount_val = extract_amount_float(text1) or extract_amount_float(text_preview)
-            if amount_val is not None and float(amount_val).is_integer():
-                amount_val = int(amount_val)
-            name_in_box = amount_val
-        else:
-            # İSİM + TCKN
-            name1 = pick_name_from_text(text0, known_pool)
-            tckn0 = find_tckn(text0)
+        if debug and show_fig:
+            vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            cv2.rectangle(vis,(x,y),(x+w,y+h),(0,255,0),2)
+            cv2.line(vis,(0,y_top),(gray.shape[1]-1,y_top),(255,0,0),2)
+            plt.figure(figsize=(9,4))
+            plt.imshow(cv2.cvtColor(upper, cv2.COLOR_BGR2RGB))
+            plt.title(f"[p{idx}] Upper section")
+            plt.axis("off"); plt.show()
 
-            # Fallback OCR sadece isim/TCKN için; ROL sadece roles kutusunda güncellenir
-            need_fallback = (not name1) or (name1 and known_pool and max((fuzz.token_set_ratio(name1, k) for k in known_pool), default=0) < name_sim_threshold*100)
-            if need_fallback:
-                text1 = ocr_box(lower_img, b_wh, psm=1, oem=1)
-                if text1 and (len(text1) > len(text0) or not name1):
-                    if loc == "roles":
-                        role_key2, role_score2 = best_role_for_text(text1)
-                        role_key, role_score = role_key2, role_score2
-                        role_best = role_key
-                    name2 = pick_name_from_text(text1, known_pool)
-                    if name2: name1 = name2
-                    tckn1 = find_tckn(text1)
-                    if tckn1:
-                        tckn0 = tckn0 + ("; "+tckn1 if tckn0 else tckn1)
-                    if len(text1) > len(text0): text_preview = re.sub(r"\s+"," ",text1)[:200]
+        # OCR (senin fonksiyonun)
+        text = ocr_fn(upper) or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if debug:
+            print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
 
-            # SON TEMİZLİK: tek harfleri at, 3 kelimeyi aşma, varyantları birleştir
-            name1 = sanitize_names(name1, text_preview, known_pool)
-            name_in_box = merge_name_tckn(name1, tckn0)
+        # Tarih
+        date = None
+        for ln in lines:
+            date = _extract_date(ln)
+            if date: break
 
-        rows.append({
-            "i": i, "bbox": b_wh, "loc": loc, "sig": bool(sig),
-            "role_best": role_best, "role_score": float(role_score),
-            "name_in_box": name_in_box, "text_preview": text_preview
-        })
+        # Şirket adı + türü (regex + fuzzy)
+        cname, ctype = _find_company(lines)
 
-    return pd.DataFrame(rows, columns=["i","bbox","loc","sig","role_best","role_score","name_in_box","text_preview"])
+        row = {
+            "page_index": idx,
+            "tarih": date,
+            "şirket_adı": cname,
+            "şirket_türü": ctype
+        }
+        if debug: row["debug_text"] = text[:400]
+        rows.append(row)
+
+    return pd.DataFrame(rows)
