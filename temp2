@@ -1,504 +1,429 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-import re, unicodedata
-from typing import List, Tuple, Dict, Optional, Callable
-
+import re, time, json, difflib
+from typing import Any, List, Tuple, Dict, Optional
 import numpy as np
-import pandas as pd
-import cv2
 
-# ---- Fuzzy yardımcı ----
-try:
-    from rapidfuzz import fuzz
-    def _fuzzy_ratio(a: str, b: str) -> float:
-        return max(fuzz.partial_ratio(a, b), fuzz.ratio(a, b)) / 100.0
-except Exception:
-    import difflib
-    def _fuzzy_ratio(a: str, b: str) -> float:
-        return difflib.SequenceMatcher(None, a, b).ratio()
+def classify_hazirun_single(
+    doc_res: Dict[str, Any], *,
+    # OCR kaynakları
+    tc_new: Optional[Any] = None,
+    NEW_URL: Optional[str] = None,
 
-def extract_top_info_from_doc_images_fuzzy(
-    doc_images: List[np.ndarray],
-    ocr_fn: Callable[[np.ndarray], str],  # img_bgr -> text
-    *,
-    table_top_shift_ratio: float = 0.02,
-    fuzzy_type_thresh: float = 0.82,
-    fuzzy_join_lines: bool = True,
-    fallback_top_ratio: float = 0.25,     # tablo yoksa üst %25
-    min_upper_px: int = 120,
-    debug: bool = False,
-    show_fig: bool = False,
-    show_table_fig: bool = False,
-) -> pd.DataFrame:
+    # OCR ayarları
+    ocr_lang: str = "tur+eng+lat",
+    ocr_psm: int = 6,
+    ocr_oem: int = 1,
+    ocr_extra_config: Optional[str] = None,
+    http_timeout_s: float = 12.0,
+    http_retries: int = 3,
+    http_backoff_s: float = 0.9,
+
+    # Performans: başlık bandı + downscale ile OCR
+    ocr_on_top_ratio: float = 0.33,
+    ocr_downscale_max_w: int = 2200,
+    ocr_use_jpeg: bool = True,
+
+    # Tek liste anahtar ifadeler (fuzzy + coverage)
+    keywords: Optional[List[str]] = None,
+    fuzzy_min_ratio: float = 0.86,
+    phrase_window: int = 12,
+
+    # Güçlü başlıklar
+    strong_phrases: Optional[List[str]] = None,
+    strong_phrase_ratio: float = 0.90,
+
+    # Karar eşikleri
+    min_hit_phrases: int = 3,
+    min_total_score: float = 4.5,
+
+    # OCR hatasını negatif sayma
+    assume_nonhazirun_on_ocr_fail: bool = False,
+
+    # TABLO zorunluluğu
+    require_table: bool = True,
+    table_require_mode: str = "soft",   # "soft" | "hard"
+    table_min_intersections: int = 10,
+    table_min_cells: int = 4,
+    table_min_area_ratio: float = 0.06,
+
+    # Yeni: belge kararı ve toleranslar
+    doc_decision: str = "any",          # "any" | "majority" | "all"
+    treat_first_no_table_as_unknown: bool = True,
+    stop_on_first_match: bool = False,
+    fullpage_fallback_when_weak: bool = True,    # üst bant zayıfsa tam sayfa OCR dene
+    weak_hit_cnt: int = 1,                        # “zayıf” tanımı için
+    weak_total_score: float = 2.0,
+
+    debug: bool = False
+) -> Dict[str, Any]:
     """
-    Dönüş: DataFrame[page_index, tarih, şirket_adı, şirket_türü, şirket_adı_upper, (debug_text)]
+    - Varsayılan davranış korunur: 'any' modunda en az 1 sayfa pozitifse belge HAZIRUNDUR.
+    - İlk sayfa kapak gibi tablo yok ve güçlü başlık yoksa 'unknown' sayılması için
+      treat_first_no_table_as_unknown=True eklenmiştir.
+    - Üst bant OCR zayıfsa (hit_cnt<=weak_hit_cnt ve total_score<=weak_total_score),
+      fullpage_fallback_when_weak=True ise tam sayfa OCR ile ikinci deneme yapılır.
+    - doc_decision: 'any' (≥1 pozitif), 'majority' (pozitif > negatif), 'all' (tüm pozitif).
+    - stop_on_first_match=True ise ilk pozitifte belge 'HAZIRUNDUR' ve döner.
     """
 
-    # --------- Ortak yardımcılar ---------
-    def _normalize_line(s: str) -> str:
-        s = unicodedata.normalize("NFKC", s or "")
-        s = s.replace("\u00A0"," ").replace("\u200B"," ")
-        s = s.replace("’","'").replace("“","\"").replace("”","\"")
-        tr = str.maketrans({"İ":"i","I":"ı","Ç":"ç","Ğ":"ğ","Ö":"ö","Ş":"ş","Ü":"ü"})
-        s = s.translate(tr).lower()
-        return re.sub(r"\s+"," ", s).strip()
+    # ---------------- local helpers ----------------
+    def _ratio_init():
+        try:
+            from rapidfuzz import fuzz
+            return lambda a,b: float(fuzz.partial_ratio(a, b)) / 100.0
+        except Exception:
+            return lambda a,b: difflib.SequenceMatcher(None, a, b).ratio()
+    _ratio = _ratio_init()
 
-    def upper_tr(text: str) -> str:
-        if not text: return ""
-        mapping = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
-        return "".join(mapping.get(ch, ch.upper()) for ch in text)
+    def _tr_lower(s: str) -> str:
+        return (s or "").replace("I","ı").replace("İ","i").lower()
 
-    # --------- Tablo tespiti / üst kırpma ---------
-    def _detect_table_top(img: np.ndarray) -> Optional[int]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        H, W = gray.shape[:2]
-        blur = cv2.GaussianBlur(gray, (3,3), 0)
-        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        if np.mean(bw) > 127:
-            bw = cv2.bitwise_not(bw)
-        kx = max(10, W//80); ky = max(10, H//80)
-        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)), iterations=2)
-        vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)), iterations=2)
-        mask = cv2.add(horiz, vert)
+    def _normalize_text(s: str) -> str:
+        t = _tr_lower(s)
+        t = re.sub(r"[_–—\-•・·]+", " ", t)
+        t = re.sub(r"[^\w\s%./]", " ", t, flags=re.UNICODE)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
 
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            if debug and show_table_fig:
-                try:
-                    import matplotlib.pyplot as plt
-                    plt.figure(figsize=(9,4)); plt.imshow(gray, cmap="gray")
-                    plt.title("No table found"); plt.axis("off"); plt.show()
-                except Exception: pass
-            return None
+    WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
+    def _tokens(s: str) -> List[str]:
+        return WORD_RE.findall(s)
 
-        x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
-        y_top = int(y + max(1, round(table_top_shift_ratio * h)))
+    def _img_top_band_and_downscale(bgr: np.ndarray) -> np.ndarray:
+        import cv2
+        h, w = bgr.shape[:2]
+        top_h = max(1, int(h * max(0.18, min(0.6, ocr_on_top_ratio))))
+        roi = bgr[:top_h, :]
+        if w > ocr_downscale_max_w:
+            scale = ocr_downscale_max_w / float(w)
+            nh = max(1, int(round(roi.shape[0] * scale)))
+            roi = cv2.resize(roi, (ocr_downscale_max_w, nh), interpolation=cv2.INTER_AREA)
+        return roi
 
-        if debug and show_table_fig:
-            try:
-                import matplotlib.pyplot as plt
-                vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                cv2.rectangle(vis,(x,y),(x+w,y+h),(0,255,0),2)
-                cv2.line(vis,(0,y_top),(W-1,y_top),(255,0,0),2)
-                plt.figure(figsize=(9,6)); plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-                plt.title(f"Table box & top line (y={y_top})"); plt.axis("off"); plt.show()
-            except Exception: pass
+    def _img_full_downscale(bgr: np.ndarray) -> np.ndarray:
+        import cv2
+        h, w = bgr.shape[:2]
+        if w > ocr_downscale_max_w:
+            scale = ocr_downscale_max_w / float(w)
+            nh = max(1, int(round(h * scale)))
+            return cv2.resize(bgr, (ocr_downscale_max_w, nh), interpolation=cv2.INTER_AREA)
+        return bgr
 
-        return y_top if 0 < y_top < H else None
+    def _img_to_b64(img: np.ndarray) -> str:
+        import cv2, base64
+        if ocr_use_jpeg:
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        else:
+            ok, buf = cv2.imencode(".png", img)
+        if not ok:
+            return ""
+        return base64.b64encode(buf).decode("utf-8")
 
-    def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
-        H, W = img.shape[:2]
-        y_fb = max(1, int(round(H * fallback_top_ratio)))  # üst %25
-        y_use = y_fb if (y_top is None or y_top < y_fb) else y_top
-        up = img[:y_use, :]
-        if debug and show_fig:
-            try:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-                plt.title(f"Upper crop (0:{y_use}) | mode={'fallback%25' if y_use==y_fb else 'table-top'}")
-                plt.axis("off"); plt.show()
-            except Exception: pass
-        return up if (up is not None and up.size and up.shape[0] >= min_upper_px) else None
-
-    # --------- Tarih yakalama ---------
-    MONTHS: Dict = {
-        1:["ocak","oca"], 2:["şubat","subat","şub","sub"], 3:["mart","mar"], 4:["nisan","nis"],
-        5:["mayıs","mayis","may"], 6:["haziran","haz"], 7:["temmuz","tem"],
-        8:["ağustos","agustos","ağu","agu"], 9:["eylül","eylul","eyl"],
-        10:["ekim","eki"], 11:["kasım","kasim","kas"], 12:["aralık","aralik","ara"],
-        "en":{1:["january","jan"],2:["february","feb"],3:["march","mar"],4:["april","apr"],5:["may"],
-              6:["june","jun"],7:["july","jul"],8:["august","aug"],9:["september","sep","sept"],
-              10:["october","oct"],11:["november","nov"],12:["december","dec"]}
-    }
-    MONTH_WORDS: List[str] = []
-    for k,v in MONTHS.items():
-        if k=="en": continue
-        MONTH_WORDS += v
-    MONTH_WORDS += sum(MONTHS["en"].values(), [])
-    MONTH_WORDS_RGX = "|".join(sorted(set([
-        re.escape(x).replace(r"\ ", r"\s*").replace(r"\.", r".?")
-        for x in MONTH_WORDS
-    ]), key=len, reverse=True))
-    ROMAN_MAP = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
-
-    def _norm_year(y: str) -> Optional[int]:
-        y = re.sub(r"^\D+","", y or "")
-        if not y: return None
-        if len(y)==2: y="20"+y
-        if len(y)>4: y=y[-4:]
-        try: return int(y)
-        except: return None
-
-    def _valid(d: int, m: int, y: int) -> bool:
-        return 1 <= d <= 31 and 1 <= m <= 12 and 1900 <= y <= 2100
-
-    def _month_from_word(tok: str) -> Optional[int]:
-        t = unicodedata.normalize("NFKC", tok or "").lower()
-        t = (t.replace("ı","i").replace("ş","s").replace("ğ","g")
-               .replace("ü","u").replace("ö","o").replace("ç","c"))
-        for num, variants in MONTHS.items():
-            if num=="en": continue
-            vs = [x.replace("ı","i").replace("ş","s").replace("ğ","g")
-                    .replace("ü","u").replace("ö","o").replace("ç","c") for x in variants]
-            if t in vs: return int(num)
-        for num, variants in MONTHS["en"].items():
-            if t in variants: return int(num)
-        best = (0.0, None)
-        for num, variants in MONTHS.items():
-            if num=="en": continue
-            for v in variants:
-                sc = _fuzzy_ratio(t, v)
-                if sc>best[0]: best=(sc, int(num))
-        if best[0] >= 0.85: return best[1]
-        best = (0.0, None)
-        for num, variants in MONTHS["en"].items():
-            for v in variants:
-                sc = _fuzzy_ratio(t, v)
-                if sc>best[0]: best=(sc, int(num))
-        return best[1] if best[0] >= 0.85 else None
-
-    def _extract_date(text: str) -> Optional[str]:
-        if not text: return None
-        T = unicodedata.normalize("NFKC", text)
-        T = re.sub(r"\s+"," ", T)
-
-        m1 = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)", T)
-        if m1:
-            d, mo, yy = m1.group(1), m1.group(2), _norm_year(m1.group(3))
-            try: d_i, m_i = int(d), int(mo)
-            except: d_i = m_i = 0
-            if yy and _valid(d_i, m_i, yy): return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
-
-        pat_words = re.compile(
-            rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)",
-            re.IGNORECASE
+    # ---- tablo tespiti (morfolojik) ----
+    def _has_table(bgr: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
+        import cv2
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        g = cv2.GaussianBlur(gray, (3,3), 0)
+        bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 35, 10)
+        h, w = bw.shape
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w//90), 1))
+        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h//60)))
+        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+        vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vert_kernel,  iterations=1)
+        horiz = cv2.dilate(horiz, np.ones((1,3), np.uint8), iterations=1)
+        vert  = cv2.dilate(vert,  np.ones((3,1), np.uint8), iterations=1)
+        inter = cv2.bitwise_and(horiz, vert)
+        intersections = int(np.count_nonzero(inter > 0))
+        lines = cv2.bitwise_or(horiz, vert)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(lines, connectivity=8)
+        areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.array([])
+        max_area = int(areas.max()) if areas.size else 0
+        area_ratio = max_area / float(h*w) if (h*w) else 0.0
+        approx_cells = int(max(intersections // 8, (areas.size > 0) * (max_area // max(1,(w//40)*(h//60)))))
+        ok = (
+            intersections >= table_min_intersections and
+            approx_cells   >= table_min_cells and
+            area_ratio     >= table_min_area_ratio
         )
-        m2 = pat_words.search(T)
-        if m2:
-            d, mon_word, yy = m2.group(1), m2.group(2), _norm_year(m2.group(3))
-            m_i = _month_from_word(mon_word)
-            try: d_i = int(d)
-            except: d_i = 0
-            if yy and m_i and _valid(d_i, m_i, yy): return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
-
-        m3 = re.search(r"(?<!\d)(\d{1,2})\s*(?:[.-/])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[.-/])?\s*(\d{2,4})(?!\d)",
-                       T, re.IGNORECASE)
-        if m3:
-            d, roman, yy = m3.group(1), m3.group(2).upper(), _norm_year(m3.group(3))
-            m_i = ROMAN_MAP.get(roman)
-            try: d_i = int(d)
-            except: d_i = 0
-            if yy and m_i and _valid(d_i, m_i, yy): return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
-
-        digits = re.sub(r"\D","", T)
-        if len(digits) >= 8:
-            best=None
-            for i in range(len(digits)-7):
-                try:
-                    d_i=int(digits[i:i+2]); m_i=int(digits[i+2:i+4]); y_i=int(digits[i+4:i+8])
-                except: continue
-                if _valid(d_i, m_i, y_i):
-                    cand=(y_i,i,d_i,m_i)
-                    if (best is None) or (cand>best): best=cand
-            if best:
-                y_i,_,d_i,m_i = best
-                return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
-
-        toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]+|\d+", T)
-        for i in range(len(toks)-2):
-            if toks[i].isdigit() and toks[i+2].isdigit():
-                d_i = int(toks[i]); yy = _norm_year(toks[i+2])
-                m_i = _month_from_word(toks[i+1])
-                if yy and m_i and _valid(d_i, m_i, yy):
-                    return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
-        return None
-
-    # --------- Tür tanımları ---------
-    CANON_TYPES = {
-        "ANONİM ŞİRKETİ": ["a.ş","aş","as","anonim şirket","anonim sirket","anonım s1rket"],
-        "LİMİTED ŞİRKETİ": ["ltd. şti","ltd şti","ltd sti","limited şirket","limited sirket","ltd. sti.","ltd. şti."],
-        "HOLDİNG": ["holding","holdıng"],
-        "KOOPERATİF": ["kooperatif","kooperatıf"],
-        "KOLEKTİF ŞİRKET": ["kolektif şirket","kolektif sirket"],
-        "ADİ KOMANDİT ŞİRKET": ["adi komandit şirket","adi komandit sirket"],
-        "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET": [
-            "sermayesi paylara bölünmüş komandit şirket","sermayesi paylara bolunmus komandit sirket"
-        ],
-        "KOMANDİT ŞİRKET": ["komandit şirket","komandit sirket"],
-        "VAKIF": ["vakıf","vakif"],
-        "DERNEK": ["dernek"],
-    }
-    TYPE_PATTERNS = [
-        (r"\ba\s*.?\sş\b", "ANONİM ŞİRKETİ"),
-        (r"\bas\b", "ANONİM ŞİRKETİ"),
-        (r"\banonim\s+şirket[iı]?\b", "ANONİM ŞİRKETİ"),
-        (r"\bltd\s.?\sşt[iı]\b", "LİMİTED ŞİRKETİ"),
-        (r"\bltd\s.?\s*st[iı]\b", "LİMİTED ŞİRKETİ"),
-        (r"\blimited\s+şirket[iı]?\b", "LİMİTED ŞİRKETİ"),
-        (r"\bholding\b", "HOLDİNG"),
-        (r"\bkooperatif\b", "KOOPERATİF"),
-        (r"\bkolektif\s+şirket[iı]?\b", "KOLEKTİF ŞİRKET"),
-        (r"\badi\s+komandit\s+şirket[iı]?\b", "ADİ KOMANDİT ŞİRKET"),
-        (r"\bsermayesi\s+paylara\s+bölünmüş\s+komandit\s+şirket[iı]?\b", "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"),
-        (r"\bkomandit\s+şirket[iı]?\b", "KOMANDİT ŞİRKET"),
-        (r"\bvakf[ıi]\b|\bvakif\b", "VAKIF"),
-        (r"\bdernek\b", "DERNEK"),
-    ]
-    TYPE_REGEX = [(re.compile(pat, re.IGNORECASE), label) for pat, label in TYPE_PATTERNS]
-
-    # --------- Base cut (sağlam kesim) ---------
-    _TR2ASCII_UP = str.maketrans({
-        "ç":"c","Ç":"C","ğ":"g","Ğ":"G","ı":"i","I":"I","İ":"I","i":"I",
-        "ş":"s","Ş":"S","ö":"o","Ö":"O","ü":"u","Ü":"U"
-    })
-    def _to_base_and_map(s: str) -> tuple[str, list[int]]:
-        s = unicodedata.normalize("NFKC", s or "")
-        base_chars, idx_map = [], []
-        for i, ch in enumerate(s):
-            if ch.isspace():
-                base_chars.append(" ")
-            else:
-                base_chars.append(ch.translate(_TR2ASCII_UP).upper())
-            idx_map.append(i)
-        return "".join(base_chars), idx_map
-
-    _GEN_ASC = r"(?:I(?:NIN|NUN|IN|UN)?)"
-    _BASE_TYPE_RE = re.compile(
-        rf"\b(?:ANONIM\s+SIRKET{_GEN_ASC}|LIMITED\s+SIRKET{_GEN_ASC}|SIRKET{_GEN_ASC}|LTD\.?\s*STI|A\.?\s*S|AS)\b"
-    )
-
-    def _robust_cut_at_type(original: str) -> tuple[str, bool, bool]:
-        base, idx_map = _to_base_and_map(original)
-        m = _BASE_TYPE_RE.search(base)
-        if not m:
-            return original.strip(), False, False
-        if m.start() == 0:
-            rest = original[idx_map[m.end()]:].lstrip(" :;,-—–")
-            base2, map2 = _to_base_and_map(rest)
-            m2 = _BASE_TYPE_RE.search(base2)
-            if m2 and m2.start() > 0:
-                cut_at = map2[m2.start()]
-                return rest[:cut_at].rstrip(" ,.-:;’'\"“”").strip(), True, True
-            return rest.strip(), True, False
-        cut_at = idx_map[m.start()]
-        return original[:cut_at].rstrip(" ,.-:;’'\"“”").strip(), False, True
-
-    # --------- Ek temizleyiciler + diakritik düzeltme ---------
-    _TYPE_ANCHORS = [
-        r"A\.?\s*Ş\.?", r"AŞ",
-        r"ANON[İI]M\s+Ş[İI]RKET[İI]?",
-        r"LTD\.?\s*ŞT[İI]", r"LTD\.?\s*ST[İI]",
-        r"L[İI]M[İI]TED\s+Ş[İI]RKET[İI]?",
-        r"Ş[İI]RKET[İI]?", r"KOOPERAT[İI]F", r"HOLD[İI]NG",
-        r"KOMAND[İI]T", r"KOLEKT[İI]F"
-    ]
-    _GEN_SUFFIX = r"(?:\s*[’'\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-    _HARD_CUT_RE = re.compile(rf"\b(?:{'|'.join(_TYPE_ANCHORS)})\b{_GEN_SUFFIX}.*", re.IGNORECASE)
-    _LEADING_TYPE_RE = re.compile(rf"^\s*(?:{'|'.join(_TYPE_ANCHORS)})\b{_GEN_SUFFIX}\s*[:,-]?\s*", re.IGNORECASE)
-
-    def _strip_by_type(name: str, company_type: Optional[str]) -> str:
-        if not name or not company_type: return (name or "").strip()
-        CORE = {
-            "ANONİM ŞİRKETİ": r"(?:a\s*.?\sş|aş|as|anonim\s+şirket[İIıi]?)",
-            "LİMİTED ŞİRKETİ": r"(?:ltd\s.?\sşt[İIıi]|ltd\s.?\sst[İIıi]|limited\s+şirket[İIıi]?)",
-            "HOLDİNG": r"(?:holding)",
-            "KOOPERATİF": r"(?:kooperatif)",
-            "KOLEKTİF ŞİRKET": r"(?:kolektif\s+şirket[İIıi]?)",
-            "ADİ KOMANDİT ŞİRKET": r"(?:adi\s+komandit\s+şirket[İIıi]?)",
-            "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET": r"(?:sermayesi\s+paylara\s+bölünmüş\s+komandit\s+şirket[İIıi]?)",
-            "KOMANDİT ŞİRKET": r"(?:komandit\s+şirket[İIıi]?)",
-            "VAKIF": r"(?:vakf[ıi]|vakif)",
-            "DERNEK": r"(?:dernek)",
+        dbg = {
+            "intersections": intersections,
+            "approx_cells": approx_cells,
+            "max_table_area_ratio": round(area_ratio, 4)
         }
-        core = CORE.get((company_type or "").strip().upper())
-        if not core: return name.strip()
-        up = unicodedata.normalize("NFKC", name)
-        pat = re.compile(
-            rf"\b{core}\b(?:\s[.’'\"“”]?\s*(?:nin|nın|nun|nün|in|ın|un|ün|e|ye|de|te|den|ten))?.*$",
-            flags=re.IGNORECASE
-        )
-        m = pat.search(up.lower())
-        if not m: return name.strip()
-        cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
-        return re.sub(r"\s+"," ", cleaned).strip()
+        return bool(ok), dbg
 
-    def _strip_any_known_type(name: str) -> str:
-        if not name: return ""
-        up = unicodedata.normalize("NFKC", name).upper()
-        pats = [
-            r"\bA\s*.?\sŞ\b", r"\bAŞ\b", r"\bAS\b", r"\bANON[İI]M\s+Ş[İI]RKET[İI]?\b",
-            r"\bLTD\s.?\sŞT[İI]\b", r"\bLTD\s.?\s*ST[İI]\b", r"\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]?\b",
-            r"\bHOLD[İI]NG\b", r"\bKOOPERAT[İI]F\b", r"\bKOLEKT[İI]F\s+Ş[İI]RKET[İI]?\b",
-            r"\bAD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b",
-            r"\bSERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b",
-            r"\bKOMAND[İI]T\s+Ş[İI]RKET[İI]?\b", r"\bVAK(I|İ)F\b", r"\bDERNEK\b"
+    # ---- OCR ----
+    def _ocr_via_tc_new(img: np.ndarray) -> str:
+        if tc_new is None:
+            return ""
+        from PIL import Image
+        import cv2
+        pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        cfg = [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}"]
+        if ocr_extra_config:
+            cfg.append(ocr_extra_config)
+        kwargs: Dict[str, Any] = {"lang": ocr_lang, "config": " ".join(cfg)}
+        for name in ("ocr","run_ocr","predict","infer","get_text","call"):
+            fn = getattr(tc_new, name, None)
+            if callable(fn):
+                try:
+                    txt = fn(pil, **kwargs)
+                    if isinstance(txt, dict): txt = txt.get("text","")
+                    return txt if isinstance(txt, str) else str(txt)
+                except TypeError:
+                    try:
+                        txt = fn(pil, output_type="text", **kwargs)
+                        if isinstance(txt, dict): txt = txt.get("text","")
+                        return txt if isinstance(txt, str) else str(txt)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        return ""
+
+    def _ocr_via_http(img: np.ndarray) -> str:
+        if not NEW_URL: return ""
+        import requests
+        payload = {
+            "image": _img_to_b64(img),
+            "lang": ocr_lang or "tur",
+            "config": " ".join(filter(None, [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}", ocr_extra_config]))
+        }
+        last_err = None
+        for k in range(http_retries + 1):
+            try:
+                r = requests.post(NEW_URL, json=payload, timeout=http_timeout_s)
+                r.raise_for_status()
+                try:
+                    j = r.json()
+                except Exception:
+                    j = json.loads(r.text)
+                return j.get("text","") or ""
+            except Exception as e:
+                last_err = e
+                if k < http_retries:
+                    time.sleep(http_backoff_s * (1.5**k))
+                else:
+                    if debug: print(f"[OCR HTTP] hata: {last_err}")
+        return ""
+
+    def _ocr_text(img_full: np.ndarray, mode: str = "top") -> Tuple[str, Dict[str, Any]]:
+        # mode: "top" | "full"
+        roi = _img_top_band_and_downscale(img_full) if mode == "top" else _img_full_downscale(img_full)
+        txt = ""; err = None
+        if NEW_URL:
+            try:
+                txt = _ocr_via_http(roi)
+            except Exception as e:
+                err = e
+        if not txt and tc_new is not None:
+            try:
+                txt = _ocr_via_tc_new(roi)
+            except Exception as e:
+                err = e
+        return txt, ({} if err is None else {"error": str(err), "mode": mode})
+
+    def _phrase_best_score(phrase: str, text: str, toks: List[str]) -> Tuple[float, Dict[str, Any]]:
+        ph = _tr_lower((phrase or "").strip())
+        if not ph: return 0.0, {"why":"empty"}
+        s_fz = _ratio(ph, text)
+        ph_toks = [t for t in WORD_RE.findall(ph) if t]
+        cover_best = 0.0
+        if ph_toks and toks:
+            need = set(ph_toks)
+            for s in range(0, max(1, len(toks)-phrase_window+1), max(1, phrase_window//2)):
+                e = min(len(toks), s + phrase_window)
+                window = toks[s:e]
+                cov = sum(1 for t in need if t in window) / max(1, len(need))
+                cover_best = max(cover_best, cov)
+        prefix_hits = 0.0
+        if ph_toks and toks:
+            pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
+            prefix_hits = pref / max(1, len(ph_toks))
+        best = max(s_fz, cover_best, prefix_hits)
+        return best, {"fuzzy": round(s_fz,3), "coverage": round(cover_best,3), "prefix": round(prefix_hits,3), "best": round(best,3)}
+
+    # ---------------- defaults ----------------
+    if keywords is None:
+        keywords = [
+            "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
+            "genel kurul","olağan genel kurul","liste örneği",
+            "pay sahibinin ad soyad unvanı","ad soyad","ad/soyad/unvanı","kimlik numarası",
+            "vergi kimlik","mersis numarası","uyruğu","adresi",
+            "payların itibari değeri","ediniliş şekli","ediniliş tarihi",
+            "katılım şekli","temsilci türü","temsilcinin ad soyad unvanı",
+            "temsilcinin kimlik numarası","imza",
+            "şirketin sermayesi","payların toplam itibari değeri",
+            "asgari toplantı nisabı","mevcut toplantı nisabı",
+            "divan başkanı","oy toplama memuru","yönetim kurulu üyeleri",
+            "anonim şirketi","a.ş","aş","limited şirketi","ltd şti","ltd. şti."
         ]
-        big = re.compile("|".join(pats))
-        m = big.search(up)
-        if not m: return name.strip()
-        cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
-        return re.sub(r"\s+"," ", cleaned).strip()
-
-    def _strip_after_generic_company_word(name: str) -> str:
-        if not name: return ""
-        tr_map = str.maketrans({"ş":"s","Ş":"S","ı":"i","İ":"I","ö":"o","Ö":"O","ğ":"g","Ğ":"G","ü":"u","Ü":"U","ç":"c","Ç":"C"})
-        norm = unicodedata.normalize("NFKC", name).translate(tr_map)
-        pat = re.compile(r"\bS\sI\sR\sK\sE\s*T(?:[İI])?(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN)?\b", re.IGNORECASE)
-        m = pat.search(norm.upper())
-        if not m: return name.strip()
-        cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
-        return re.sub(r"\s+"," ", cleaned).strip()
-
-    def _strip_trailing_type_words(name: str) -> str:
-        if not name: return ""
-        up = unicodedata.normalize("NFKC", name).upper()
-        pats = [
-            r"\bANON[İI]M\b.$", r"\bL[İI]M[İI]TED\b.$", r"\bHOLD[İI]NG\b.$",
-            r"\bKOOPERAT[İI]F\b.$", r"\bKOMAND[İI]T\b.$", r"\bKOLEKT[İI]F\b.$",
-            r"\bA\s*.?\sŞ\b.$", r"\bLTD\s*.?\sŞT[İI]\b.$", r"\bLTD\s*.?\sST[İI]\b.$"
+    if strong_phrases is None:
+        strong_phrases = [
+            "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
+            "genel kurulda hazır bulunanlar listesi"
         ]
-        first = None
-        for p in pats:
-            m = re.search(p, up)
-            if m: first = m if (first is None or m.start() < first.start()) else first
-        if not first: return name.strip()
-        cut = first.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
-        return re.sub(r"\s+"," ", cleaned).strip()
 
-    # OCR metninden TR diakritik düzeltme
-    _TR_FOLD = str.maketrans({"ç":"c","Ç":"c","ğ":"g","Ğ":"g","ı":"i","I":"i","İ":"i","ş":"s","Ş":"s","ö":"o","Ö":"o","ü":"u","Ü":"u"})
-    _WORD_RE = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşü]+")
+    images: List[np.ndarray] = list(doc_res.get("images", []))
+    metas:  List[Dict[str, Any]] = list(doc_res.get("metas", []))
+    n = len(images)
 
-    def _base_tr(s: str) -> str:
-        return unicodedata.normalize("NFKC", s).translate(_TR_FOLD).lower()
+    hazirun_pages: List[Dict[str, Any]] = []
+    non_hazirun_pages: List[Dict[str, Any]] = []
+    unknown_pages: List[Dict[str, Any]] = []
+    first_match_index: Optional[int] = None
 
-    def _autocorrect_from_text(clean_name: str, ocr_text: str) -> str:
-        if not clean_name or not ocr_text: return clean_name
-        text_tokens = _WORD_RE.findall(ocr_text)
-        best_for_base: Dict[str,str] = {}
-        for tok in text_tokens:
-            b = _base_tr(tok)
-            if (b not in best_for_base) or (len(tok) > len(best_for_base[b])):
-                best_for_base[b] = tok
-        parts = _WORD_RE.split(clean_name)
-        words  = _WORD_RE.findall(clean_name)
-        fixed_words = []
-        for w in words:
-            fixed_words.append(best_for_base.get(_base_tr(w), w))
-        out, wi = [], 0
-        for p in parts:
-            out.append(p)
-            if wi < len(fixed_words):
-                out.append(fixed_words[wi]); wi += 1
-        return "".join(out)
+    # ---- Sayfa döngüsü ----
+    for i in range(n):
+        img = images[i]
 
-    def clean_company_name(company_name: str, company_type: Optional[str], text_ctx: str) -> str:
-        out = (company_name or "").strip()
-        if not out: return ""
-
-        # 0) Base cut: tür kelimesi + ekleri ile güvenli kesim
-        out, _, _ = _robust_cut_at_type(out)
-
-        # 1) Tür temelli kesim (varsa)
-        out1 = _strip_by_type(out, company_type)
-        if out1: out = out1
-
-        # 2) Yumuşak temizleyiciler
-        out2 = _strip_any_known_type(out);   out = out2 or out
-        out3 = _strip_after_generic_company_word(out); out = out3 or out
-        out4 = _strip_trailing_type_words(out); out = out4 or out
-
-        # 3) OCR metninden diakritik düzeltme
-        out = _autocorrect_from_text(out, text_ctx)
-
-        return re.sub(r"\s+"," ", out).strip()
-
-    # --------- Şirket bulucu ---------
-    def _find_company(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
-        # Regex
-        for raw in lines:
-            norm = _normalize_line(raw)
-            for creg, label in TYPE_REGEX:
-                m = creg.search(norm)
-                if m:
-                    if m.start() == 0:
-                        return raw.strip(), label  # başta tür var; temizlik aşaması alır
-                    name_part = raw[:m.start()].strip()
-                    cname = re.sub(r"\s+"," ", name_part).strip() or None
-                    return cname, label
-
-        # Fuzzy (satır)
-        best_label, best_score, best_raw = None, 0.0, None
-        for raw in lines:
-            norm = _normalize_line(raw)
-            for canonical, variants in CANON_TYPES.items():
-                sc = max(_fuzzy_ratio(v, norm) for v in variants)
-                if sc > best_score:
-                    best_score, best_label, best_raw = sc, canonical, raw
-        if best_label and best_score >= fuzzy_type_thresh:
-            return (best_raw.strip() if best_raw else None), best_label
-
-        # Fuzzy (join)
-        if fuzzy_join_lines and lines:
-            joined_raw = " ".join(lines)
-            joined_norm = _normalize_line(joined_raw)
-            best_label, best_score = None, 0.0
-            for canonical, variants in CANON_TYPES.items():
-                sc = max(_fuzzy_ratio(v, joined_norm) for v in variants)
-                if sc > best_score:
-                    best_score, best_label = sc, canonical
-            if best_label and best_score >= fuzzy_type_thresh:
-                return joined_raw.strip(), best_label
-
-        return None, None
-
-    # --------- Akış ---------
-    rows = []
-    for idx, img in enumerate(doc_images):
-        y_top = _detect_table_top(img)
-        if debug:
-            print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback upper ratio used)")
-
-        upper = _extract_upper(img, y_top)
-        if upper is None:
-            if debug: print(f"[p{idx}] Upper region empty -> skipped.")
+        # 1) OCR (üst bant)
+        text_raw, err_info_top = _ocr_text(img, mode="top")
+        if not text_raw:
+            if assume_nonhazirun_on_ocr_fail:
+                non_hazirun_pages.append({"index": i, "reason": "OCR boş/hata", "hits": 0, "total_score": 0.0, **err_info_top})
+            else:
+                unknown_pages.append({"index": i, "reason": "OCR boş/hata", **err_info_top})
             continue
 
-        text = ocr_fn(upper) or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if debug:
-            print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
+        text = _normalize_text(text_raw)
+        toks = _tokens(text)
 
-        # Tarih
-        date = None
-        for ln in lines:
-            date = _extract_date(ln)
-            if date: break
+        # 2) Güçlü başlık
+        strong_hit = False
+        strong_best = 0.0
+        for ph in strong_phrases:
+            sc, _ = _phrase_best_score(ph, text, toks)
+            strong_best = max(strong_best, sc)
+            if sc >= strong_phrase_ratio:
+                strong_hit = True
+                break
 
-        # Şirket
-        cname_raw, ctype = _find_company(lines)
-        cname = None
-        if cname_raw:
-            cname = clean_company_name(cname_raw, ctype, text)
+        # 3) TABLO (moda göre) + kapak toleransı
+        skip_table_check = (require_table is False) or (table_require_mode == "soft" and strong_hit)
 
-        # Temizlik sonrası boşaldıysa küçük fallback
-        if (not cname) and lines:
-            trial = " ".join(lines[:3])
-            cname = clean_company_name(trial, ctype, text)
+        page_has_table, tbl_dbg = (True, {})  # default
+        if require_table and not skip_table_check:
+            page_has_table, tbl_dbg = _has_table(img)
+            if not page_has_table:
+                # Kapak toleransı (yalnızca ilk sayfa ve güçlü başlık yoksa)
+                if i == 0 and treat_first_no_table_as_unknown and not strong_hit:
+                    unknown_pages.append({
+                        "index": i,
+                        "reason": "no_table_cover_like",
+                        **({"table_debug": tbl_dbg, "strong_best": round(strong_best,3)} if debug else {})
+                    })
+                    continue
+                else:
+                    non_hazirun_pages.append({
+                        "index": i,
+                        "reason": "no_table",
+                        **({"table_debug": tbl_dbg, "strong_best": round(strong_best,3)} if debug else {})
+                    })
+                    continue
 
-        row = {
-            "page_index": idx,
-            "tarih": date,
-            "şirket_adı": (upper_tr(cname) if cname else None),
-            "şirket_türü": (upper_tr(ctype) if ctype else None),
-            "şirket_adı_upper": (upper_tr(cname) if cname else None),
-        }
-        if debug:
-            row["debug_text"] = text[:1400]
-        rows.append(row)
+        # 4) Tek-liste fuzzy/coverage skoru (üst bant sonucuna göre)
+        def _score_from_text(_text: str) -> Tuple[int, float, List[Dict[str, Any]]]:
+            _toks = _tokens(_normalize_text(_text))
+            hit_cnt, score_sum = 0, 0.0
+            ev: List[Dict[str, Any]] = []
+            for ph in keywords:
+                sc, det = _phrase_best_score(ph, _normalize_text(_text), _toks)
+                if sc >= fuzzy_min_ratio: hit_cnt += 1
+                score_sum += sc
+                if debug and sc >= 0.5: ev.append({"phrase": ph, **det})
+            total_score = hit_cnt + (score_sum / max(1, len(keywords))) * 2.0
+            return hit_cnt, float(round(total_score,3)), ev
 
-    return pd.DataFrame(rows)
+        hit_cnt, total_score, ev = _score_from_text(text)
+
+        # 5) Üst bant zayıfsa tam sayfa OCR fallback
+        used_fullpage = False
+        if fullpage_fallback_when_weak and (hit_cnt <= weak_hit_cnt and total_score <= weak_total_score) and not strong_hit:
+            fp_txt, err_info_fp = _ocr_text(img, mode="full")
+            if fp_txt:
+                hit_cnt_fp, total_score_fp, ev_fp = _score_from_text(fp_txt)
+                if (hit_cnt_fp > hit_cnt) or (total_score_fp > total_score):
+                    hit_cnt, total_score, ev = hit_cnt_fp, total_score_fp, ev_fp
+                    used_fullpage = True
+                    if debug:
+                        ev.insert(0, {"fallback": "fullpage_used", "prev_hits": hit_cnt, "prev_score": total_score})
+            else:
+                # fullpage OCR da boşsa err'i debug'a koy
+                if debug and err_info_fp:
+                    ev.insert(0, {"fallback": "fullpage_failed", **err_info_fp})
+
+        # 6) Karar: güçlü başlık veya skor eşikleri
+        is_hazirun = strong_hit or (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
+
+        if is_hazirun:
+            if first_match_index is None:
+                first_match_index = i
+            rec = {
+                "index": i,
+                "image": images[i],
+                "meta": metas[i] if i < len(metas) else {},
+                "hits": int(hit_cnt),
+                "total_score": float(round(total_score,3)),
+                "strong_best": float(round(strong_best,3)),
+                "table_check": {"required": require_table and not skip_table_check, "has_table": page_has_table, **(tbl_dbg if debug else {})},
+            }
+            if debug:
+                rec["evidence"] = ev[:25]
+                rec["ocr_mode"] = "full" if used_fullpage else "top"
+            hazirun_pages.append(rec)
+
+            if stop_on_first_match and doc_decision == "any":
+                # Hemen döndür
+                return {
+                    "flag": "HAZIRUNDUR",
+                    "first_match_index": first_match_index,
+                    "hazirun_pages": hazirun_pages,
+                    "non_hazirun_pages": non_hazirun_pages,
+                    "unknown_pages": unknown_pages,
+                    "page_count": n
+                }
+        else:
+            row = {
+                "index": i,
+                "reason": "Eşik altı",
+                "hits": int(hit_cnt),
+                "total_score": float(round(total_score,3)),
+                "strong_best": float(round(strong_best,3)),
+                "table_check": {"required": require_table and not skip_table_check, "has_table": page_has_table, **(tbl_dbg if debug else {})},
+            }
+            if debug:
+                row["ocr_mode"] = "full" if used_fullpage else "top"
+            non_hazirun_pages.append(row)
+
+    # ---- Belge düzeyinde karar ----
+    pos = len(hazirun_pages)
+    neg = len(non_hazirun_pages)
+    unk = len(unknown_pages)
+
+    if doc_decision == "any":
+        flag = "HAZIRUNDUR" if pos > 0 else "HAZIRUN DEĞİLDİR"
+    elif doc_decision == "majority":
+        # Pozitif > negatif ise hazirun; eşitlik halinde pozitif varsa hazirun (bağlı belge mantığı)
+        if pos > neg or (pos == neg and pos > 0):
+            flag = "HAZIRUNDUR"
+        else:
+            flag = "HAZIRUN DEĞİLDİR"
+    elif doc_decision == "all":
+        # Tüm sayfalar hazirun olmalı; unknown varsa 'DEĞİLDİR' dememek için toleranslı davranmak istiyorsanız
+        # burayı ihtiyaca göre yumuşatabilirsiniz.
+        flag = "HAZIRUNDUR" if (pos > 0 and neg == 0 and unk == 0) else "HAZIRUN DEĞİLDİR"
+    else:
+        # bilinmeyen mod -> varsayılan
+        flag = "HAZIRUNDUR" if pos > 0 else "HAZIRUN DEĞİLDİR"
+
+    return {
+        "flag": flag,
+        "first_match_index": first_match_index,
+        "hazirun_pages": hazirun_pages,           # sadece eşleşen (image+meta)
+        "non_hazirun_pages": non_hazirun_pages,   # tablo yok / eşik altı vb.
+        "unknown_pages": unknown_pages,           # OCR başarısız/boş/kapak toleransı
+        "page_count": n,
+        "doc_decision": doc_decision,
+        "summary": {"pos": pos, "neg": neg, "unk": unk}
+    }
