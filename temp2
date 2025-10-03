@@ -1,117 +1,116 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import re, unicodedata
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Callable
+
 import numpy as np
-import cv2
 import pandas as pd
+import cv2
 
-# Opsiyonel görselleştirme (debug=True ise kullanılır)
-import matplotlib.pyplot as plt
-
-# Fuzzy için rapidfuzz önerilir; yoksa basit oran fallback
 try:
     from rapidfuzz import fuzz
     def _fuzzy_ratio(a: str, b: str) -> float:
-        return fuzz.partial_ratio(a, b) / 100.0
+        # 0-1 ölçeğine indirger; kısmi eşleşmeler için daha toleranslı
+        return max(fuzz.partial_ratio(a, b), fuzz.ratio(a, b)) / 100.0
 except Exception:
+    # rapidfuzz yoksa basit yedek (daha zayıf ama kırılmaz)
+    import difflib
     def _fuzzy_ratio(a: str, b: str) -> float:
-        a = (a or "").lower(); b = (b or "").lower()
-        if not a or not b:
-            return 0.0
-        # Çok kaba fallback: ortak alt dize uzunluğu / uzun olanın uzunluğu
-        import difflib
-        m = difflib.SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
-        return (m.size / max(len(a), len(b))) if max(len(a), len(b)) else 0.0
-
+        return difflib.SequenceMatcher(None, a, b).ratio()
 
 def extract_top_info_from_doc_images_fuzzy(
-    doc_images: List[np.ndarray],            # List[BGR image]
-    ocr_fn,                                   # Callable(img_bgr) -> str (HTTP OCR wrapper)
+    doc_images: List[np.ndarray],
+    ocr_fn: Callable[[np.ndarray], str],  # img_bgr -> text
     *,
-    table_top_shift_ratio: float = 0.02,      # tablo üstünden küçük bir aşağı kaydırma
-    fuzzy_type_thresh: float = 0.82,          # şirket türü fuzzy eşiği
+    table_top_shift_ratio: float = 0.02,
+    fuzzy_type_thresh: float = 0.82,
     fuzzy_join_lines: bool = True,
-    fallback_top_ratio: float = 0.25,         # TABLO YOKSA: sayfa üst oranı
+    fallback_top_ratio: float = 0.25,     # tablo bulunamazsa üst 1/4
+    min_upper_px: int = 120,              # çok küçük alanları ele
     debug: bool = False,
     show_fig: bool = False,
     show_table_fig: bool = False
 ) -> pd.DataFrame:
     """
-    Giriş:
-        doc_images : List[np.ndarray (BGR)]
-        ocr_fn     : callable(img_bgr) -> str
-    Çıkış:
-        DataFrame[page_index, tarih, şirket_adı, şirket_türü, şirket_adı_upper, (debug_text)]
+    doc_images: List[np.ndarray (BGR)]
+    Dönüş: DataFrame[page_index, tarih, şirket_adı, şirket_türü, şirket_adı_upper, (debug_text)]
     """
 
     # ---------------- ortak yardımcılar ----------------
     def _normalize_line(s: str) -> str:
         s = unicodedata.normalize("NFKC", s or "")
-        s = s.replace("\u00A0", " ").replace("\u200B", " ")
-        s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+        s = s.replace("\u00A0"," ").replace("\u200B"," ")
+        s = s.replace("’","'").replace("“","\"").replace("”","\"")
         tr = str.maketrans({"İ":"i","I":"ı","Ç":"ç","Ğ":"ğ","Ö":"ö","Ş":"ş","Ü":"ü"})
         s = s.translate(tr).lower()
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
     def _upper_tr(s: str) -> str:
-        rep = {"i":"İ","ı":"I","ğ":"Ğ","ü":"Ü","ş":"Ş","ö":"Ö","ç":"Ç"}
-        return "".join(rep.get(c, c.upper()) for c in (s or "").lower())
+        rep={"i":"İ","ı":"I","ğ":"Ğ","ü":"Ü","ş":"Ş","ö":"Ö","ç":"Ç"}
+        return "".join(rep.get(c,c.upper()) for c in (s or "").lower())
 
     def _detect_table_top(img: np.ndarray) -> Optional[int]:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         H, W = gray.shape[:2]
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Siyah çizgiler beyaz zeminde olsun
+        blur = cv2.GaussianBlur(gray, (3,3), 0)
+        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        # Yazı beyaz zeminde siyah olsun
         if np.mean(bw) > 127:
             bw = cv2.bitwise_not(bw)
 
-        kx = max(10, W // 80)
-        ky = max(10, H // 80)
-        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)),
-                                 iterations=2)
-        vert = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
-                                cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)),
-                                iterations=2)
+        kx = max(10, W//80); ky = max(10, H//80)
+        horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)), iterations=2)
+        vert  = cv2.morphologyEx(bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)), iterations=2)
         mask = cv2.add(horiz, vert)
+
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
             return None
 
-        x, y, w, h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        x,y,w,h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
         y_top = int(y + max(1, round(table_top_shift_ratio * h)))
 
         if debug and show_table_fig:
             vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.line(vis, (0, y_top), (W - 1, y_top), (255, 0, 0), 2)
-            plt.figure(figsize=(9, 6))
-            plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-            plt.title(f"Table top y={y_top}")
-            plt.axis("off")
-            plt.show()
+            cv2.rectangle(vis,(x,y),(x+w,y+h),(0,255,0),2)
+            cv2.line(vis,(0,y_top),(W-1,y_top),(255,0,0),2)
+            try:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(9,6)); plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+                plt.title(f"Table top y={y_top}"); plt.axis("off"); plt.show()
+            except Exception:
+                pass
 
+        # Güvenlik: sayfanın çok altında/üstünde anlamsızsa None
+        if y_top < 0 or y_top > H - min_upper_px:
+            return None
         return y_top
 
     def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
-        if y_top is None:
+        H, W = img.shape[:2]
+        if y_top is not None and 0 < y_top <= H:
+            up = img[:y_top, :]
+        else:
+            # Fallback: üst 1/4
+            y_fb = max(min(int(round(H * fallback_top_ratio)), H), min_upper_px)
+            up = img[:y_fb, :]
+
+        if up is None or up.size == 0 or up.shape[0] < min_upper_px:
             return None
-        up = img[:max(1, y_top), :]
-        if up.size == 0:
-            return None
+
         if debug and show_fig:
-            plt.figure(figsize=(9, 4))
-            plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-            plt.title("Upper section")
-            plt.axis("off")
-            plt.show()
+            try:
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(9,4)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
+                plt.title("Upper section"); plt.axis("off"); plt.show()
+            except Exception:
+                pass
         return up
 
     # ---------------- tarih yakalayıcı ----------------
-    MONTHS: Dict[Any, Any] = {
+    MONTHS: Dict = {
         1:  ["ocak","oca"],
         2:  ["şubat","subat","şub","sub"],
         3:  ["mart","mar"],
@@ -125,14 +124,14 @@ def extract_top_info_from_doc_images_fuzzy(
         11: ["kasım","kasim","kas"],
         12: ["aralık","aralik","ara"],
         "en": {
-            1:["january","jan"], 2:["february","feb"], 3:["march","mar"],
-            4:["april","apr"], 5:["may"], 6:["june","jun"],
-            7:["july","jul"], 8:["august","aug"], 9:["september","sep","sept"],
-            10:["october","oct"], 11:["november","nov"], 12:["december","dec"]
+            1:["january","jan"], 2:["february","feb"], 3:["march","mar"], 4:["april","apr"],
+            5:["may"], 6:["june","jun"], 7:["july","jul"], 8:["august","aug"],
+            9:["september","sep","sept"], 10:["october","oct"], 11:["november","nov"], 12:["december","dec"]
         }
     }
+
     MONTH_WORDS: List[str] = []
-    for k, v in MONTHS.items():
+    for k,v in MONTHS.items():
         if k == "en": continue
         MONTH_WORDS += v
     MONTH_WORDS += sum(MONTHS["en"].values(), [])
@@ -140,18 +139,16 @@ def extract_top_info_from_doc_images_fuzzy(
         re.escape(x).replace(r"\ ", r"\s*").replace(r"\.", r".?")
         for x in MONTH_WORDS
     ]), key=len, reverse=True))
+
     ROMAN_MAP = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
 
     def _norm_year(y: str) -> Optional[int]:
-        y = re.sub(r"^\D+", "", y or "")
+        y = re.sub(r"^\D+","", y or "")
         if not y: return None
-        if len(y) == 2: y = "20" + y
+        if len(y) == 2: y = "20"+y
         if len(y) > 4: y = y[-4:]
-        try:
-            yi = int(y)
-        except Exception:
-            return None
-        return yi
+        try: return int(y)
+        except: return None
 
     def _valid(d: int, m: int, y: int) -> bool:
         return 1 <= d <= 31 and 1 <= m <= 12 and 1900 <= y <= 2100
@@ -160,34 +157,29 @@ def extract_top_info_from_doc_images_fuzzy(
         t = unicodedata.normalize("NFKC", tok or "").lower()
         t = (t.replace("ı","i").replace("ş","s").replace("ğ","g")
                .replace("ü","u").replace("ö","o").replace("ç","c"))
-        # Kesin TR
+        # kesin TR
         for num, variants in MONTHS.items():
             if num == "en": continue
             vs = [x.replace("ı","i").replace("ş","s").replace("ğ","g")
                     .replace("ü","u").replace("ö","o").replace("ç","c") for x in variants]
-            if t in vs:
-                return int(num)
-        # Kesin EN
+            if t in vs: return int(num)
+        # kesin EN
         for num, variants in MONTHS["en"].items():
-            if t in variants:
-                return int(num)
-        # Fuzzy TR
+            if t in variants: return int(num)
+        # fuzzy TR
         best = (0.0, None)
         for num, variants in MONTHS.items():
             if num == "en": continue
             for v in variants:
                 sc = _fuzzy_ratio(t, v)
-                if sc > best[0]:
-                    best = (sc, int(num))
-        if best[0] >= 0.85:
-            return best[1]
-        # Fuzzy EN
+                if sc > best[0]: best = (sc, int(num))
+        if best[0] >= 0.85: return best[1]
+        # fuzzy EN
         best = (0.0, None)
         for num, variants in MONTHS["en"].items():
             for v in variants:
                 sc = _fuzzy_ratio(t, v)
-                if sc > best[0]:
-                    best = (sc, int(num))
+                if sc > best[0]: best = (sc, int(num))
         return best[1] if best[0] >= 0.85 else None
 
     def _extract_date(text: str) -> Optional[str]:
@@ -199,14 +191,12 @@ def extract_top_info_from_doc_images_fuzzy(
         m1 = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)", T)
         if m1:
             d, mo, yy = m1.group(1), m1.group(2), _norm_year(m1.group(3))
-            try:
-                d_i, m_i = int(d), int(mo)
-            except Exception:
-                d_i = m_i = 0
+            try: d_i, m_i = int(d), int(mo)
+            except: d_i = m_i = 0
             if yy and _valid(d_i, m_i, yy):
                 return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
 
-        # 2) 3 Eylül 2024 / 7 Aug 2023
+        # 2) 3 Eylül 2024 vb.
         pat_words = re.compile(
             rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)",
             re.IGNORECASE
@@ -215,36 +205,30 @@ def extract_top_info_from_doc_images_fuzzy(
         if m2:
             d, mon_word, yy = m2.group(1), m2.group(2), _norm_year(m2.group(3))
             m_i = _month_from_word(mon_word)
-            try:
-                d_i = int(d)
-            except Exception:
-                d_i = 0
+            try: d_i = int(d)
+            except: d_i = 0
             if yy and m_i and _valid(d_i, m_i, yy):
                 return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
 
-        # 3) 03 III 2024
+        # 3) Romen ay
         m3 = re.search(r"(?<!\d)(\d{1,2})\s*(?:[.-/])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[.-/])?\s*(\d{2,4})(?!\d)",
                        T, re.IGNORECASE)
         if m3:
             d, roman, yy = m3.group(1), m3.group(2).upper(), _norm_year(m3.group(3))
             m_i = ROMAN_MAP.get(roman)
-            try:
-                d_i = int(d)
-            except Exception:
-                d_i = 0
+            try: d_i = int(d)
+            except: d_i = 0
             if yy and m_i and _valid(d_i, m_i, yy):
                 return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
 
-        # 4) Brute-force rakam akışı
-        digits = re.sub(r"\D", "", T)
+        # 4) Brute-force rakam arama (en makul YYYY en büyük)
+        digits = re.sub(r"\D","", T)
         if len(digits) >= 8:
             best = None
-            for i in range(len(digits) - 7):
+            for i in range(len(digits)-7):
                 try:
-                    d_i = int(digits[i:i+2])
-                    m_i = int(digits[i+2:i+4])
-                    y_i = int(digits[i+4:i+8])
-                except Exception:
+                    d_i = int(digits[i:i+2]); m_i = int(digits[i+2:i+4]); y_i = int(digits[i+4:i+8])
+                except:
                     continue
                 if _valid(d_i, m_i, y_i):
                     cand = (y_i, i, d_i, m_i)
@@ -254,39 +238,38 @@ def extract_top_info_from_doc_images_fuzzy(
                 y_i, _, d_i, m_i = best
                 return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
 
-        # 5) Fuzzy üçlü: 3 Eylu1 2024
+        # 5) Fuzzy üçlü: d, month-word, yyyy
         toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü]+|\d+", T)
-        for i in range(len(toks) - 2):
+        for i in range(len(toks)-2):
             if toks[i].isdigit() and toks[i+2].isdigit():
-                d_i = int(toks[i])
-                yy = _norm_year(toks[i+2])
+                d_i = int(toks[i]); yy = _norm_year(toks[i+2])
                 m_i = _month_from_word(toks[i+1])
                 if yy and m_i and _valid(d_i, m_i, yy):
                     return f"{d_i:02d}/{m_i:02d}/{yy:04d}"
-
         return None
 
     # ---------------- şirket türü/adı ----------------
     CANON_TYPES: Dict[str, List[str]] = {
-        "anonim şirketi": ["a.ş", "aş", "as", "anonim şirket", "anonim sirket", "anonım s1rket"],
-        "limited şirketi": ["ltd. şti", "ltd şti", "ltd sti", "limited şirket", "limited sirket", "ltd. sti.", "ltd. şti."],
-        "holding": ["holding", "holdıng"],
-        "kooperatif": ["kooperatif", "kooperatıf"],
-        "kolektif şirket": ["kolektif şirket", "kolektif sirket"],
-        "adi komandit şirket": ["adi komandit şirket", "adi komandit sirket"],
+        "anonim şirketi": ["a.ş","aş","as","anonim şirket","anonim sirket","anonım s1rket"],
+        "limited şirketi": ["ltd. şti","ltd şti","ltd sti","limited şirket","limited sirket","ltd. sti.","ltd. şti."],
+        "holding": ["holding","holdıng"],
+        "kooperatif": ["kooperatif","kooperatıf"],
+        "kolektif şirket": ["kolektif şirket","kolektif sirket"],
+        "adi komandit şirket": ["adi komandit şirket","adi komandit sirket"],
         "sermayesi paylara bölünmüş komandit şirket": [
-            "sermayesi paylara bölünmüş komandit şirket", "sermayesi paylara bolunmus komandit sirket"
+            "sermayesi paylara bölünmüş komandit şirket","sermayesi paylara bolunmus komandit sirket"
         ],
-        "komandit şirket": ["komandit şirket", "komandit sirket"],
-        "vakıf": ["vakıf", "vakif"],
-        "dernek": ["dernek"]
+        "komandit şirket": ["komandit şirket","komandit sirket"],
+        "vakıf": ["vakıf","vakif"],
+        "dernek": ["dernek"],
     }
-    TYPE_PATTERNS = [
-        (r"\ba\s*\.?\sş\b", "anonim şirketi"),
+
+    TYPE_PATTERNS: List[Tuple[str, str]] = [
+        (r"\ba\s*.?\sş\b", "anonim şirketi"),
         (r"\bas\b", "anonim şirketi"),
         (r"\banonim\s+şirket[iı]?\b", "anonim şirketi"),
-        (r"\bltd\s*\.?\s*şt[iı]\b", "limited şirketi"),
-        (r"\bltd\s*\.?\s*st[iı]\b", "limited şirketi"),
+        (r"\bltd\s.?\sşt[iı]\b", "limited şirketi"),
+        (r"\bltd\s.?\s*st[iı]\b", "limited şirketi"),
         (r"\blimited\s+şirket[iı]?\b", "limited şirketi"),
         (r"\bholding\b", "holding"),
         (r"\bkooperatif\b", "kooperatif"),
@@ -300,11 +283,10 @@ def extract_top_info_from_doc_images_fuzzy(
     TYPE_REGEX = [(re.compile(pat, re.IGNORECASE), label) for pat, label in TYPE_PATTERNS]
 
     def _strip_by_type(name: str, company_type: Optional[str]) -> str:
-        if not name or not company_type:
-            return (name or "").strip()
+        if not name or not company_type: return (name or "").strip()
         CORE = {
-            "anonim şirketi": r"(?:a\s*\.?\sş|aş|as|anonim\s+şirket[İIıi]?)",
-            "limited şirketi": r"(?:ltd\s*\.?\sşt[İIıi]|ltd\s*\.?\sst[İIıi]|limited\s+şirket[İIıi]?)",
+            "anonim şirketi": r"(?:a\s*.?\sş|aş|as|anonim\s+şirket[İIıi]?)",
+            "limited şirketi": r"(?:ltd\s.?\sşt[İIıi]|ltd\s.?\sst[İIıi]|limited\s+şirket[İIıi]?)",
             "holding": r"(?:holding)",
             "kooperatif": r"(?:kooperatif)",
             "kolektif şirket": r"(?:kolektif\s+şirket[İIıi]?)",
@@ -315,26 +297,24 @@ def extract_top_info_from_doc_images_fuzzy(
             "dernek": r"(?:dernek)",
         }
         core = CORE.get((company_type or "").strip().lower())
-        if not core:
-            return name.strip()
+        if not core: return name.strip()
         up = unicodedata.normalize("NFKC", name)
         pat = re.compile(
-            rf"\b{core}\b(?:\s[.’'\"”\"]?\s*(?:nin|nın|nun|nün|in|ın|un|ün|e|ye|de|te|den|ten))?.*$",
+            rf"\b{core}\b(?:\s[.’'\"“”]?\s*(?:nin|nın|nun|nün|in|ın|un|ün|e|ye|de|te|den|ten))?.*$",
             flags=re.IGNORECASE
         )
         m = pat.search(up.lower())
-        if not m:
-            return name.strip()
+        if not m: return name.strip()
         cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"")
-        return re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
+        return re.sub(r"\s+"," ", cleaned).strip()
 
     def _strip_any_known_type(name: str) -> str:
         if not name: return ""
         up = unicodedata.normalize("NFKC", name).upper()
         pats = [
-            r"\bA\s*\.?\sŞ\b", r"\bAŞ\b", r"\bAS\b", r"\bANON[İI]M\s+Ş[İI]RKET[İI]?\b",
-            r"\bLTD\s*\.?\sŞT[İI]\b", r"\bLTD\s*\.?\s*ST[İI]\b", r"\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]?\b",
+            r"\bA\s*.?\sŞ\b", r"\bAŞ\b", r"\bAS\b", r"\bANON[İI]M\s+Ş[İI]RKET[İI]?\b",
+            r"\bLTD\s.?\sŞT[İI]\b", r"\bLTD\s.?\s*ST[İI]\b", r"\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]?\b",
             r"\bHOLD[İI]NG\b", r"\bKOOPERAT[İI]F\b", r"\bKOLEKT[İI]F\s+Ş[İI]RKET[İI]?\b",
             r"\bAD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b",
             r"\bSERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b",
@@ -344,39 +324,37 @@ def extract_top_info_from_doc_images_fuzzy(
         m = big.search(up)
         if not m: return name.strip()
         cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"")
-        return re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
+        return re.sub(r"\s+"," ", cleaned).strip()
 
     def _strip_after_generic_company_word(name: str) -> str:
         if not name: return ""
         tr_map = str.maketrans({"ş":"s","Ş":"S","ı":"i","İ":"I","ö":"o","Ö":"O","ğ":"g","Ğ":"G","ü":"u","Ü":"U","ç":"c","Ç":"C"})
         norm = unicodedata.normalize("NFKC", name).translate(tr_map)
-        # "ŞİRKET" farklı OCR varyantlarına dayanıklı
-        pat = re.compile(r"\bS\s*I\s*R\s*K\s*E\s*T(?:[İI])?(?:NIN|NIN|NUN|NUN|IN|IN|UN|UN)?\b", re.IGNORECASE)
+        pat = re.compile(r"\bS\sI\sR\sK\sE\s*T(?:[İI])?(?:NIN|NIN|NUN|NUN|IN|IN|UN|UN)?\b", re.IGNORECASE)
         m = pat.search(norm.upper())
         if not m: return name.strip()
         cut = m.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"")
-        return re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
+        return re.sub(r"\s+"," ", cleaned).strip()
 
     def _strip_trailing_type_words(name: str) -> str:
         if not name: return ""
         up = unicodedata.normalize("NFKC", name).upper()
         pats = [
-            r"\bANON[İI]M\b.$", r"\bL[İI]M[İI]TED\b.$", r"\bHOLD[İI]NG\b.$", r"\bKOOPERAT[İI]F\b.$",
-            r"\bKOMAND[İI]T\b.$", r"\bKOLEKT[İI]F\b.$", r"\bA\s*\.?\sŞ\b.$",
-            r"\bLTD\s*\.?\sŞT[İI]\b.$", r"\bLTD\s*\.?\sST[İI]\b.$"
+            r"\bANON[İI]M\b.$", r"\bL[İI]M[İI]TED\b.$", r"\bHOLD[İI]NG\b.$",
+            r"\bKOOPERAT[İI]F\b.$", r"\bKOMAND[İI]T\b.$", r"\bKOLEKT[İI]F\b.$",
+            r"\bA\s*.?\sŞ\b.$", r"\bLTD\s*.?\sŞT[İI]\b.$", r"\bLTD\s*.?\sST[İI]\b.$"
         ]
         first = None
         for p in pats:
             m = re.search(p, up)
             if m:
                 first = m if (first is None or m.start() < first.start()) else first
-        if not first:
-            return name.strip()
+        if not first: return name.strip()
         cut = first.start()
-        cleaned = name[:cut].rstrip(" ,.-’'\"")
-        return re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = name[:cut].rstrip(" ,.-’'\"“”")
+        return re.sub(r"\s+"," ", cleaned).strip()
 
     def clean_company_name(company_name: str, company_type: Optional[str]) -> str:
         out = (company_name or "").strip()
@@ -389,7 +367,7 @@ def extract_top_info_from_doc_images_fuzzy(
         return out3
 
     def _find_company(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
-        # 1) Regex doğrudan satır bazlı
+        # 1) Regex
         for raw in lines:
             norm = _normalize_line(raw)
             for creg, label in TYPE_REGEX:
@@ -398,7 +376,7 @@ def extract_top_info_from_doc_images_fuzzy(
                     name_part = raw[:m.start()].strip()
                     cname = re.sub(r"\s+", " ", name_part).strip()
                     return (cname if cname else None), label
-        # 2) Fuzzy satır bazlı
+        # 2) Fuzzy (satır)
         for raw in lines:
             norm = _normalize_line(raw)
             for canonical, variants in CANON_TYPES.items():
@@ -406,7 +384,7 @@ def extract_top_info_from_doc_images_fuzzy(
                 if best >= fuzzy_type_thresh:
                     cname = re.sub(r"\s+", " ", raw.strip())
                     return (cname if cname else None), canonical
-        # 3) Fuzzy join
+        # 3) Fuzzy (join)
         if fuzzy_join_lines and lines:
             joined_raw = " ".join(lines)
             joined_norm = _normalize_line(joined_raw)
@@ -417,63 +395,40 @@ def extract_top_info_from_doc_images_fuzzy(
         return None, None
 
     # ---------------- ana akış ----------------
-    rows: List[Dict[str, Any]] = []
-
+    rows = []
     for idx, img in enumerate(doc_images):
-        H, W = img.shape[:2]
-
-        # 1) Tablo tespiti
         y_top = _detect_table_top(img)
-
-        if y_top is None:
-            # Fallback: sayfa üst 1/4 (parametre: fallback_top_ratio)
-            y_top = int(max(1, round(H * fallback_top_ratio)))
-            if debug:
-                print(f"[p{idx}] No table found. Fallback to top {fallback_top_ratio:.2f} (y_top={y_top}).")
-                if show_table_fig:
-                    vis = img.copy()
-                    cv2.line(vis, (0, y_top), (W - 1, y_top), (0, 0, 255), 2)
-                    plt.figure(figsize=(9, 6))
-                    plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-                    plt.title(f"Fallback top crop y={y_top}")
-                    plt.axis("off")
-                    plt.show()
-        else:
-            if debug:
-                print(f"[p{idx}] Table top detected at y={y_top}.")
+        if debug:
+            print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback upper ratio used)")
 
         upper = _extract_upper(img, y_top)
         if upper is None or upper.size == 0:
-            if debug:
-                print(f"[p{idx}] Empty upper region after detection/fallback.")
+            if debug: print(f"[p{idx}] Upper region empty -> skipped.")
             continue
 
-        # 2) OCR
+        # OCR
         text = ocr_fn(upper) or ""
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if debug:
             print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
 
-        # 3) Tarih (satır satır; ilk bulunan)
+        # Tarih (satır satır; ilk bulunan)
         date = None
         for ln in lines:
             date = _extract_date(ln)
-            if date:
-                break
+            if date: break
 
-        # 4) Şirket adı + türü
-        cname_raw, ctype = _find_company(lines)
+        # Şirket adı + türü
+        cname, ctype = _find_company(lines)
+        if cname:
+            cname = clean_company_name(cname, ctype)
 
-        # 5) Şirket adını temizle
-        cname_clean = clean_company_name(cname_raw, ctype) if cname_raw else None
-
-        # 6) Satır
         row = {
             "page_index": idx,
             "tarih": date,
-            "şirket_adı": cname_clean if cname_clean else None,
-            "şirket_türü": _upper_tr(ctype) if ctype else None,
-            "şirket_adı_upper": _upper_tr(cname_clean) if cname_clean else None,
+            "şirket_adı": (_upper_tr(cname) if cname else None),
+            "şirket_türü": (_upper_tr(ctype) if ctype else None),
+            "şirket_adı_upper": (_upper_tr(cname) if cname else None)
         }
         if debug:
             row["debug_text"] = text[:1200]
