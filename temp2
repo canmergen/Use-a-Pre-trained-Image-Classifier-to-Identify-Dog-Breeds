@@ -4,37 +4,28 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# --- Fuzzy helper (RapidFuzz varsa onu kullan, yoksa difflib) ---
-try:
-    from rapidfuzz import fuzz, process
-    def _fuzzy_ratio(a, b): return float(fuzz.partial_ratio(a, b)) / 100.0
-except Exception:
-    import difflib
-    def _fuzzy_ratio(a, b): return difflib.SequenceMatcher(None, a, b).ratio()
-
-def extract_top_info_from_doc_images_fuzzy(
+def extract_top_info_from_doc_images_fuzzy_strict(
     doc_images,
     *,
-    ocr_fn,                          # <- SENİN fonksiyonun: img_bgr -> str
+    ocr_fn,                          # img_bgr -> str  (senin HTTP/PyTesseract wrapper'ın)
     debug: bool = False,
-    show_fig: bool = False,          # debug görsellerini göstermek için
+    show_fig: bool = False,
     table_top_shift_ratio: float = 0.02,
-    fuzzy_type_thresh: float = 0.82, # şirket türü fuzzy eşiği
-    fuzzy_join_lines: bool = True,   # satır birleştirip ek fuzzy denemesi
 ) -> pd.DataFrame:
     """
-    doc_images: List[np.ndarray (BGR)]
-    ocr_fn: callable(img_bgr) -> str  (örn. pytesseract_ocr_text)
+    - Tablo üstünü bulur, üst bandı OCR eder.
+    - Tarih (dd/mm/yyyy) çıkarır.
+    - Şirket adı + tür: SADECE tür bulunursa adı çıkarır; tür yoksa şirket_adı=None bırakır.
+    - Tür bulunduğunda, türün BAŞLANGICINA kadar olan ham metin şirket adıdır (kırpma limiti yok).
     """
 
-    # ---- yardımcılar ----
+    # ---------- yardımcılar ----------
     def _normalize_line(s: str) -> str:
         s = unicodedata.normalize("NFKC", s or "")
         s = s.replace("\u00A0"," ").replace("\u200B"," ")
-        s = s.replace("’","'").replace("“","\"").replace("”","\"")
-        tr = str.maketrans({"İ":"i","I":"ı","Ç":"ç","Ğ":"ğ","Ö":"ö","Ş":"ş","Ü":"ü"})
-        s = s.translate(tr).lower()
-        s = re.sub(r"\s+", " ", s).strip()
+        trans = str.maketrans({"İ":"i","I":"ı","Ç":"ç","Ğ":"ğ","Ö":"ö","Ş":"ş","Ü":"ü"})
+        s = s.translate(trans).lower()
+        s = re.sub(r"\s+"," ", s).strip()
         return s
 
     def _upper_tr(s: str) -> str:
@@ -58,27 +49,27 @@ def extract_top_info_from_doc_images_fuzzy(
         y_top = int(y + max(1, round(table_top_shift_ratio*h)))
         return max(0, min(H-1, y_top)), (x,y,w,h), gray
 
-    def _extract_upper(img, y_top): 
+    def _extract_upper(img, y_top):
         return img[:y_top,:] if y_top is not None else None
 
     def _extract_date(text: str):
         t = unicodedata.normalize("NFKC", text or "")
         t = t.replace("⁄","/").replace("–","/").replace("-","/")
-        t = re.sub(r"\s+"," ",t)
+        t = re.sub(r"\s+"," ", t)
         pat = re.compile(r"(?<!\d)(\d{1,2})[/.](\d{1,2})[/.](\d{2,4})(?!\d)")
         for m in pat.finditer(t):
             d, mo, yy = m.group(1), m.group(2), m.group(3)
             try: d_i, m_i = int(d), int(mo)
             except: continue
             yy = re.sub(r"^\D+","",yy)
-            if len(yy) == 2: y_i = int("20"+yy)
-            elif len(yy) > 4: y_i = int(yy[-4:])
+            if len(yy)==2: y_i = int("20"+yy)
+            elif len(yy)>4: y_i = int(yy[-4:])
             else:
                 try: y_i = int(yy)
                 except: continue
             if 1<=d_i<=31 and 1<=m_i<=12 and 1900<=y_i<=2100:
                 return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
-        # brute-force
+        # brute force
         digits = re.sub(r"\D","",t)
         if len(digits) >= 8:
             best=None
@@ -94,105 +85,71 @@ def extract_top_info_from_doc_images_fuzzy(
                 return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
         return None
 
-    # --- şirket türü sözlüğü + regex + fuzzy varyantlar ---
-    CANON_TYPES = {
-        "anonim şirketi": [
-            "a.ş", "as", "aş", "anonim şirket", "anonim sirket", "an0nım s1rket", "anonım sirkett"
-        ],
-        "limited şirketi": [
-            "ltd. şti", "ltd şti", "ltd sti", "limited şirket", "limited sirket", "ltd. sti.", "ltd. şti."
-        ],
-        "holding": ["holding"],
-        "kooperatif": ["kooperatif"],
-        "kolektif şirket": ["kolektif şirket", "kolektif sirket"],
-        "adi komandit şirket": ["adi komandit şirket", "adi komandit sirket"],
-        "sermayesi paylara bölünmüş komandit şirket": [
-            "sermayesi paylara bölünmüş komandit şirket",
-            "sermayesi paylara bolunmus komandit sirket"
-        ],
-        "komandit şirket": ["komandit şirket", "komandit sirket"],
-        "vakıf": ["vakıf", "vakif"],
-        "dernek": ["dernek"]
-    }
-
-    # tür regex’leri (yüksek kesinlik)
-    TYPE_PATTERNS = [
-        (r"\ba\s*\.?\s*ş\b", "anonim şirketi"),
-        (r"\bas\b", "anonim şirketi"),
-        (r"\banonim\s+şirket[iı]?\b", "anonim şirketi"),
-        (r"\bltd\s*\.?\s*şt[iı]\b", "limited şirketi"),
-        (r"\bltd\s*\.?\s*st[iı]\b", "limited şirketi"),
-        (r"\blimited\s+şirket[iı]?\b", "limited şirketi"),
-        (r"\bholding\b", "holding"),
-        (r"\bkooperatif\b", "kooperatif"),
-        (r"\bkolektif\s+şirket[iı]?\b", "kolektif şirket"),
-        (r"\badi\s+komandit\s+şirket[iı]?\b", "adi komandit şirket"),
-        (r"\bsermayesi\s+paylara\s+bölünmüş\s+komandit\s+şirket[iı]?\b", "sermayesi paylara bölünmüş komandit şirket"),
-        (r"\bkomandit\s+şirket[iı]?\b", "komandit şirket"),
-        (r"\bvakf[ıi]\b|\bvakif\b", "vakıf"),
-        (r"\bdernek\b", "dernek"),
+    # ---------- TÜRLER: ham satır üzerinde sağlam yakalama ----------
+    # A.Ş. / AŞ / AS (OCR varyantları) + Limited/LTD. ŞTİ. + diğerleri
+    RAW_TYPE_PATTERNS = [
+        # Anonim Şirket
+        (r"(?i)\bA\s*\.?\s*Ş\b\.?",                      "anonim şirketi"),
+        (r"(?i)\bAŞ\b\.?",                               "anonim şirketi"),
+        (r"(?i)\bAS\b\.?",                               "anonim şirketi"),
+        (r"(?i)\bANON[İI]M\s+Ş[İI]RKET[İI]?\b\.?",       "anonim şirketi"),
+        # Limited Şirket
+        (r"(?i)\bLTD\s*\.?\s*ŞT[İI]\b\.?",               "limited şirketi"),
+        (r"(?i)\bLTD\s*\.?\s*ST[İI]\b\.?",               "limited şirketi"),
+        (r"(?i)\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]?\b\.?",   "limited şirketi"),
+        # Holding / Kooperatif
+        (r"(?i)\bHOLD[İI]NG\b\.?",                       "holding"),
+        (r"(?i)\bKOOPERAT[İI]F\b\.?",                    "kooperatif"),
+        # Kolektif / Komandit
+        (r"(?i)\bKOLEKT[İI]F\s+Ş[İI]RKET[İI]?\b\.?",     "kolektif şirket"),
+        (r"(?i)\bAD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b\.?", "adi komandit şirket"),
+        (r"(?i)\bSERMAYES[İI]\s+PAYLARA\s+B[ÖO]L[ÜU]NM[ÜU]Ş\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?\b\.?",
+                                                         "sermayesi paylara bölünmüş komandit şirket"),
+        (r"(?i)\bKOMAND[İI]T\s+Ş[İI]RKET[İI]?\b\.?",     "komandit şirket"),
+        # İsteğe bağlı: Vakıf/Dernek
+        (r"(?i)\bVAK(F[İI]|[İI]F)\b",                    "vakıf"),
+        (r"(?i)\bDERNEK\b",                              "dernek"),
     ]
-    TYPE_REGEX = [(re.compile(pat, re.IGNORECASE), label) for pat, label in TYPE_PATTERNS]
+    RAW_TYPE_REGEX = [(re.compile(pat), label) for pat, label in RAW_TYPE_PATTERNS]
 
-    def _find_company(lines: list[str]):
-        # 1) regex ile tür bul (yüksek kesinlik)
+    def _extract_company_strict(lines: list[str]) -> tuple[str|None, str|None]:
+        """
+        Tür bulunursa: şirket adını türün BAŞLANGICINA kadar ham metinden alır.
+        Tür bulunmazsa: (None, None) döner (ismi tahmin etmeye kalkmaz).
+        """
         best = None
         for raw in lines:
-            norm = _normalize_line(raw)
-            for creg, label in TYPE_REGEX:
-                m = creg.search(norm)
+            if not raw or not raw.strip():
+                continue
+            for creg, label in RAW_TYPE_REGEX:
+                m = creg.search(raw)   # <- HAM SATIRDA arıyoruz
                 if m:
-                    name_left = raw[:m.start()].strip()
-                    name_clean = re.sub(r"[,\.\-_'’\"\s]+$","", name_left)
-                    name_up = _upper_tr(re.sub(r"\s+"," ", name_clean))
-                    score = (len(name_up), sum(c.isupper() for c in name_up))
-                    cand = (score, name_up, label)
-                    if best is None or cand > best: best = cand
+                    name_part = raw[:m.start()].strip()
+                    # Sonda tırnak/noktalama/çizgi artıkları varsa hafif temizle (metni kesmeden)
+                    name_part = re.sub(r"[\"'’\-–—\s]+$", "", name_part)
+                    # Çok kısa/boş ise atla
+                    if len(name_part) < 2:
+                        continue
+                    # TR büyük harfe çevir + fazla boşlukları sadeleştir
+                    cname = _upper_tr(re.sub(r"\s+", " ", name_part))
+                    score = (len(cname), sum(ch.isupper() for ch in cname))
+                    cand = (score, cname, label)
+                    if (best is None) or (cand > best):
+                        best = cand
         if best:
             _, cname, ctype = best
-            return cname if cname else None, ctype
-
-        # 2) fuzzy: her satırda canonical tür varyantlarına en iyi eşleşme
-        for raw in lines:
-            norm = _normalize_line(raw)
-            for canonical, variants in CANON_TYPES.items():
-                local_best = 0.0; hit_span = None
-                for v in variants:
-                    sc = _fuzzy_ratio(v, norm)
-                    if sc > local_best:
-                        local_best = sc
-                if local_best >= fuzzy_type_thresh:
-                    # ad: satırın tür kısmından önceki bölümü (yaklaşık)
-                    # heuristik: tür anahtar kelimesinin ilk kelimesini ara
-                    key = variants[0].split()[0]
-                    pos = norm.find(key.split('.')[0])  # kaba arama
-                    name_left = raw[:max(0,pos)].strip() if pos>0 else raw
-                    name_clean = re.sub(r"[,\.\-_'’\"\s]+$","", name_left)
-                    cname = _upper_tr(re.sub(r"\s+"," ", name_clean))
-                    return (cname if cname else None), canonical
-
-        # 3) satırları birleştirip fuzzy dene (başlık/satır kırılması durumları)
-        if fuzzy_join_lines and lines:
-            joined_raw = " ".join(lines)
-            joined_norm = _normalize_line(joined_raw)
-            for canonical, variants in CANON_TYPES.items():
-                if max(_fuzzy_ratio(v, joined_norm) for v in variants) >= fuzzy_type_thresh:
-                    # adı ilk satırdan al (fallback)
-                    cname = _upper_tr(re.sub(r"\s+"," ", lines[0]))
-                    return (cname if cname else None), canonical
-
+            return cname, ctype
         return None, None
 
-    # ---- ana akış ----
-    rows = []
+    # ---------- ana akış ----------
+    out_rows = []
 
     for idx, img in enumerate(doc_images):
-        y_top_bbox = _detect_table_top(img)
-        if not y_top_bbox:
+        probe = _detect_table_top(img)
+        if not probe:
             if debug: print(f"[p{idx}] No table found.")
             continue
-        y_top, (x,y,w,h), gray = y_top_bbox
-
+        y_top, (x,y,w,h), gray = probe
         upper = _extract_upper(img, y_top)
         if upper is None or upper.size == 0:
             if debug: print(f"[p{idx}] Empty upper region.")
@@ -209,7 +166,7 @@ def extract_top_info_from_doc_images_fuzzy(
 
         # OCR (senin fonksiyonun)
         text = ocr_fn(upper) or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = [ln for ln in (text.splitlines() if text else []) if ln and ln.strip()]
         if debug:
             print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
 
@@ -219,16 +176,14 @@ def extract_top_info_from_doc_images_fuzzy(
             date = _extract_date(ln)
             if date: break
 
-        # Şirket adı + türü (regex + fuzzy)
-        cname, ctype = _find_company(lines)
+        # Şirket adı + tür (STRICT: tür bulunmazsa şirket_adı=None)
+        company_name, company_type = _extract_company_strict(lines)
 
-        row = {
+        out_rows.append({
             "page_index": idx,
             "tarih": date,
-            "şirket_adı": cname,
-            "şirket_türü": ctype
-        }
-        if debug: row["debug_text"] = text[:400]
-        rows.append(row)
+            "şirket_adı": company_name,   # tür yoksa None
+            "şirket_türü": company_type
+        })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(out_rows)
