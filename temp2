@@ -46,22 +46,22 @@ def classify_hazirun_single(
     table_min_cells: int = 4,
     table_min_area_ratio: float = 0.06,
 
-    # Yeni: belge kararı ve toleranslar
+    # Belge kararı ve toleranslar
     doc_decision: str = "any",          # "any" | "majority" | "all"
     treat_first_no_table_as_unknown: bool = True,
     stop_on_first_match: bool = False,
-    fullpage_fallback_when_weak: bool = True,    # üst bant zayıfsa tam sayfa OCR dene
-    weak_hit_cnt: int = 1,                        # “zayıf” tanımı için
+    fullpage_fallback_when_weak: bool = True,
+    weak_hit_cnt: int = 1,
     weak_total_score: float = 2.0,
 
     # Paragraf yoğunluğu (erken veto)
     reject_if_long_text: bool = True,
-    top_words_soft_cap: int = 250,          # üst bantta >250 kelimeyse full OCR ile kontrol et
-    full_max_chars: int = 6000,             # tam sayfada >6000 karakterse eler
-    full_max_words: int = 900,              # veya >900 kelimeyse eler
-    full_para_lines_minlen: int = 60,       # en az 60 karakterlik satırlar...
-    full_para_lines_count: int = 6,         # ...en az 6 adet ise eler
-    full_alpha_ratio_min: float = 0.75,     # alfabetik oran (sayı/ID dokümanlarından ayırır)
+    top_words_soft_cap: int = 250,
+    full_max_chars: int = 6000,
+    full_max_words: int = 900,
+    full_para_lines_minlen: int = 60,
+    full_para_lines_count: int = 6,
+    full_alpha_ratio_min: float = 0.75,
 
     # Tablo sonrası zorunlu kontrol
     force_full_text_check_after_table: bool = True,
@@ -69,24 +69,26 @@ def classify_hazirun_single(
     full_max_words_table: int = 750,
     full_para_lines_count_table: int = 5,
 
-    # --- Uzun metin + yasaklı ifadeler vetosu (sayfa SONU) ---
+    # Uzun metin + yasaklı ifadeler (sayfa sonu vetosu)
     reject_if_long_with_phrases: bool = True,
-    long_text_min_chars: int = 4500,       # full OCR metni >= 4500 karakter
-    long_text_min_words: int = 700,        # veya >= 700 kelime
+    long_text_min_chars: int = 4500,
+    long_text_min_words: int = 700,
     banned_phrases: Optional[List[str]] = None,
-    banned_fuzzy_ratio: float = 0.83,      # rapidfuzz.partial_ratio eşiği
-    banned_min_hits: int = 2,              # en az 2 yasaklı ifade
+    banned_fuzzy_ratio: float = 0.83,
+    banned_min_hits: int = 2,
+
+    # --- YENİ: Meta tabanlı hızlı veto ---
+    use_meta_char_filter: bool = True,
+    meta_char_mode: str = "soft_phrases",   # "hard" | "soft_phrases"
+    meta_char_max: int = 6000,              # meta['keyword_chars'] veya ocr_debug['0']['chars'] eşiği
 
     debug: bool = False
 ) -> Dict[str, Any]:
     """
-    - Varsayılan: 'any' modunda ≥1 sayfa pozitifse belge HAZIRUNDUR.
-    - İlk sayfa kapak gibi tablo yok ve güçlü başlık yoksa 'unknown' sayılması için
-      treat_first_no_table_as_unknown=True kullanılır.
-    - Üst bant OCR zayıfsa (hit_cnt<=weak_hit_cnt ve total_score<=weak_total_score),
-      fullpage_fallback_when_weak=True ise tam sayfa OCR ile ikinci deneme yapılır.
-    - doc_decision: 'any' (≥1 pozitif), 'majority' (pozitif > negatif), 'all' (tüm pozitif).
-    - stop_on_first_match=True ise ilk pozitifte belge 'HAZIRUNDUR' ve döner.
+    'any' modunda ≥1 sayfa pozitifse belge HAZIRUNDUR. Uzun "roman" sayfaları
+    - önce meta char filtresiyle,
+    - sonra paragraf yoğunluğu ve/veya yasaklı ifadelerle
+    eler.
     """
 
     # ---------- defaults ----------
@@ -121,7 +123,6 @@ def classify_hazirun_single(
         return t
 
     WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
-
     def _tokens(s: str) -> List[str]:
         return WORD_RE.findall(s)
 
@@ -161,10 +162,8 @@ def classify_hazirun_single(
         alpha = sum(ch.isalpha() for ch in txt)
         return alpha / max(1, len(txt))
 
-    def _should_reject_by_text_density(
-        top_txt: str, get_full_txt_fn: Callable[[], str], debug: bool = False
-    ) -> Tuple[bool, Dict[str, Any]]:
-        """Üst bant → (gerekirse) full sayfa OCR ile paragraf yoğunluğu filtresi."""
+    def _should_reject_by_text_density(top_txt: str, get_full_txt_fn: Callable[[], str],
+                                       debug: bool = False) -> Tuple[bool, Dict[str, Any]]:
         m_top = _count_words_chars_lines(top_txt)
         if m_top["n_words"] <= top_words_soft_cap:
             return False, {"phase": "top_only", **m_top}
@@ -191,10 +190,22 @@ def classify_hazirun_single(
             return ""
         return base64.b64encode(buf).decode("utf-8")
 
+    # --- YENİ: meta chars çekici ---
+    def _get_meta_chars(meta: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not meta:
+            return None
+        if isinstance(meta.get("keyword_chars"), (int, float)):
+            return int(meta["keyword_chars"])
+        try:
+            od = meta.get("ocr_debug") or {}
+            cand = (od.get("0") or {}).get("chars")
+            return int(cand) if cand is not None else None
+        except Exception:
+            return None
+
     # –– tablo tespiti (morfolojik) ––
     def _has_table(bgr: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
         import cv2
-        # Parametreler
         min_columns_required = 3
         min_rows_required = 2
         min_col_separators = min_columns_required + 1
@@ -210,23 +221,22 @@ def classify_hazirun_single(
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # Binarizasyon
-        tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+        tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT,
+                                  cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
         block = max(31, (min(h, w) // 25) | 1)
         bw_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
                                          cv2.THRESH_BINARY_INV, block, 10)
-        _, bw_otsu = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        _, bw_otsu = cv2.threshold(tophat, 0, 255,
+                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         bw = cv2.bitwise_or(bw_adapt, bw_otsu)
 
-        # Çizgi çıkarımı
         hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w // 100), 1))
         vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h // 100)))
         horiz = cv2.dilate(cv2.erode(bw, hk, 1), hk, 1)
         vert = cv2.dilate(cv2.erode(bw, vk, 1), vk, 1)
         horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), 1)
-        vert = cv2.dilate(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)), 1)
+        vert = cv2.dilate(vert,  cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)), 1)
 
-        # Ayraç merkezleri
         def _separator_positions(binary, axis='v'):
             num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
             sep_pos = []
@@ -288,15 +298,10 @@ def classify_hazirun_single(
             if _cv(gaps_h) > min_spacing_cv:
                 spacing_ok = spacing_ok and True
 
-        ok = bool(
-            has_min_grid and
-            inter_cc >= min_intersections_cc and
-            approx_cells >= min_cell_count and
-            spacing_ok
-        )
+        ok = bool(has_min_grid and inter_cc >= min_intersections_cc and
+                  approx_cells >= min_cell_count and spacing_ok)
         dbg = {
-            "n_vsep": int(n_vsep),
-            "n_hsep": int(n_hsep),
+            "n_vsep": int(n_vsep), "n_hsep": int(n_hsep),
             "min_col_separators": int(min_col_separators),
             "min_row_separators": int(min_row_separators),
             "intersections_cc": int(inter_cc),
@@ -346,7 +351,8 @@ def classify_hazirun_single(
         payload = {
             "image": _img_to_b64(img),
             "lang": ocr_lang or "tur",
-            "config": " ".join(filter(None, [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}", ocr_extra_config]))
+            "config": " ".join(filter(None, [f"--psm {int(ocr_psm)}",
+                                             f"--oem {int(ocr_oem)}", ocr_extra_config]))
         }
         last_err = None
         for k in range(http_retries + 1):
@@ -368,10 +374,8 @@ def classify_hazirun_single(
         return ""
 
     def _ocr_text(img_full: np.ndarray, mode: str = "top") -> Tuple[str, Dict[str, Any]]:
-        # mode: "top" | "full"
         roi = _img_top_band_and_downscale(img_full) if mode == "top" else _img_full_downscale(img_full)
-        txt = ""
-        err = None
+        txt, err = "", None
         if NEW_URL:
             try:
                 txt = _ocr_via_http(roi)
@@ -404,7 +408,8 @@ def classify_hazirun_single(
             pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
             prefix_hits = pref / max(1, len(ph_toks))
         best = max(s_fz, cover_best, prefix_hits)
-        return best, {"fuzzy": round(s_fz, 3), "coverage": round(cover_best, 3), "prefix": round(prefix_hits, 3), "best": round(best, 3)}
+        return best, {"fuzzy": round(s_fz, 3), "coverage": round(cover_best, 3),
+                      "prefix": round(prefix_hits, 3), "best": round(best, 3)}
 
     # ---------------- defaults ----------------
     if keywords is None:
@@ -444,12 +449,44 @@ def classify_hazirun_single(
     # ---- Sayfa döngüsü ----
     for i in range(n):
         img = images[i]
+        meta_i = metas[i] if i < len(metas) else {}
+        meta_chars = _get_meta_chars(meta_i)
+
+        # (0) YENİ: Meta tabanlı hızlı veto
+        if use_meta_char_filter and meta_chars is not None and meta_chars >= meta_char_max:
+            if meta_char_mode == "hard":
+                non_hazirun_pages.append({
+                    "index": i, "reason": "meta_char_exceeded",
+                    "meta_chars": int(meta_chars), "meta_char_max": int(meta_char_max)
+                })
+                continue
+            elif meta_char_mode == "soft_phrases":
+                # az OCR ile yasaklıları kontrol et
+                t_raw, _ = _ocr_text(img, mode="top")
+                t_norm = _normalize_text(t_raw or "")
+                if len(t_norm) < 200:
+                    fp_txt, _ = _ocr_text(img, mode="full")
+                    t_norm = _normalize_text(fp_txt or "")
+                hits = 0
+                for ph in (banned_phrases or []):
+                    if _ratio(_tr_lower(ph), t_norm) >= banned_fuzzy_ratio:
+                        hits += 1
+                        if hits >= banned_min_hits:
+                            break
+                if hits >= banned_min_hits:
+                    non_hazirun_pages.append({
+                        "index": i, "reason": "meta_char_exceeded_with_banned_phrases",
+                        "meta_chars": int(meta_chars), "banned_hits": int(hits)
+                    })
+                    continue
+                # aksi halde normal akışa devam
 
         # 1) OCR (üst bant)
         text_raw, err_info_top = _ocr_text(img, mode="top")
         if not text_raw:
             if assume_nonhazirun_on_ocr_fail:
-                non_hazirun_pages.append({"index": i, "reason": "ocr_empty_or_error", "hits": 0, "total_score": 0.0, **err_info_top})
+                non_hazirun_pages.append({"index": i, "reason": "ocr_empty_or_error",
+                                          "hits": 0, "total_score": 0.0, **err_info_top})
             else:
                 unknown_pages.append({"index": i, "reason": "ocr_empty_or_error", **err_info_top})
             continue
@@ -462,8 +499,7 @@ def classify_hazirun_single(
             rej, rej_dbg = _should_reject_by_text_density(text_raw, _get_full_text_once, debug=debug)
             if rej:
                 non_hazirun_pages.append({
-                    "index": i,
-                    "reason": "text_density_exceeded",
+                    "index": i, "reason": "text_density_exceeded",
                     **({"text_density_debug": rej_dbg} if debug else {})
                 })
                 continue
@@ -490,20 +526,18 @@ def classify_hazirun_single(
             if not page_has_table:
                 if i == 0 and treat_first_no_table_as_unknown and not strong_hit:
                     unknown_pages.append({
-                        "index": i,
-                        "reason": "no_table_cover_like",
+                        "index": i, "reason": "no_table_cover_like",
                         **({"table_debug": tbl_dbg, "strong_best": round(strong_best, 3)} if debug else {})
                     })
                     continue
                 else:
                     non_hazirun_pages.append({
-                        "index": i,
-                        "reason": "no_table",
+                        "index": i, "reason": "no_table",
                         **({"table_debug": tbl_dbg, "strong_best": round(strong_best, 3)} if debug else {})
                     })
                     continue
 
-            # 3.1) Tablo VARSA da roman-vetosu (zorunlu tam sayfa kontrol)
+            # 3.1) Tablo VARSA da roman-vetosu
             if reject_if_long_text and force_full_text_check_after_table:
                 fp_txt, _err_fp = _ocr_text(img, mode="full")
                 m_full = _count_words_chars_lines(fp_txt or "")
@@ -515,13 +549,14 @@ def classify_hazirun_single(
                 )
                 if reject_tbl and alpha_r >= full_alpha_ratio_min:
                     non_hazirun_pages.append({
-                        "index": i,
-                        "reason": "text_density_exceeded_table",
-                        **({"text_density_debug": {"phase": "full_forced", "alpha_ratio": round(alpha_r, 3), **m_full, **tbl_dbg}} if debug else {})
+                        "index": i, "reason": "text_density_exceeded_table",
+                        **({"text_density_debug": {"phase": "full_forced",
+                                                   "alpha_ratio": round(alpha_r, 3),
+                                                   **m_full, **tbl_dbg}} if debug else {})
                     })
                     continue
 
-        # 4) Tek-liste fuzzy/coverage skoru (üst bant sonucuna göre)
+        # 4) Skor
         def _score_from_text(_text: str) -> Tuple[int, float, List[Dict[str, Any]]]:
             _toks = _tokens(_normalize_text(_text))
             hit_cnt, score_sum = 0, 0.0
@@ -538,7 +573,7 @@ def classify_hazirun_single(
 
         hit_cnt, total_score, ev = _score_from_text(text)
 
-        # 5) Üst bant zayıfsa tam sayfa OCR fallback
+        # 5) Üst bant zayıfsa full fallback
         used_fullpage = False
         if fullpage_fallback_when_weak and (hit_cnt <= weak_hit_cnt and total_score <= weak_total_score) and not strong_hit:
             fp_txt, err_info_fp = _ocr_text(img, mode="full")
@@ -560,6 +595,7 @@ def classify_hazirun_single(
             m_full = _count_words_chars_lines(fp_txt)
             if (m_full["n_chars"] >= long_text_min_chars) or (m_full["n_words"] >= long_text_min_words):
                 norm_full = _normalize_text(fp_txt)
+
                 def _fuzzy_hits(text_norm: str, phrases: List[str], thr: float) -> Tuple[int, List[Tuple[str, float]]]:
                     hits = []
                     for ph in phrases:
@@ -567,35 +603,32 @@ def classify_hazirun_single(
                         if sc >= thr:
                             hits.append((ph, round(sc, 3)))
                     return len(hits), sorted(hits, key=lambda x: x[1], reverse=True)[:8]
+
                 bh, top_hits = _fuzzy_hits(norm_full, banned_phrases, banned_fuzzy_ratio)
                 if bh >= banned_min_hits:
                     non_hazirun_pages.append({
-                        "index": i,
-                        "reason": "long_text_banned_phrases",
+                        "index": i, "reason": "long_text_banned_phrases",
                         **({"text_density_debug": {
-                            "n_chars": m_full["n_chars"],
-                            "n_words": m_full["n_words"],
-                            "n_long_lines": m_full["n_long_lines"],
-                            "banned_hits": bh,
+                            "n_chars": m_full["n_chars"], "n_words": m_full["n_words"],
+                            "n_long_lines": m_full["n_long_lines"], "banned_hits": bh,
                             "top_hits": top_hits
                         }} if debug else {})
                     })
                     continue
 
-        # 6) Karar: güçlü başlık veya skor eşikleri
+        # 6) Karar
         is_hazirun = strong_hit or (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
-
         if is_hazirun:
             if first_match_index is None:
                 first_match_index = i
             rec = {
-                "index": i,
-                "image": images[i],
+                "index": i, "image": images[i],
                 "meta": metas[i] if i < len(metas) else {},
                 "hits": int(hit_cnt),
                 "total_score": float(round(total_score, 3)),
                 "strong_best": float(round(strong_best, 3)),
-                "table_check": {"required": require_table and not skip_table_check, "has_table": page_has_table, **(tbl_dbg if debug else {})},
+                "table_check": {"required": require_table and not skip_table_check,
+                                "has_table": page_has_table, **(tbl_dbg if debug else {})},
             }
             if debug:
                 rec["evidence"] = ev[:25]
@@ -613,22 +646,18 @@ def classify_hazirun_single(
                 }
         else:
             row = {
-                "index": i,
-                "reason": "threshold_not_met",
-                "hits": int(hit_cnt),
-                "total_score": float(round(total_score, 3)),
+                "index": i, "reason": "threshold_not_met",
+                "hits": int(hit_cnt), "total_score": float(round(total_score, 3)),
                 "strong_best": float(round(strong_best, 3)),
-                "table_check": {"required": require_table and not skip_table_check, "has_table": page_has_table, **(tbl_dbg if debug else {})},
+                "table_check": {"required": require_table and not skip_table_check,
+                                "has_table": page_has_table, **(tbl_dbg if debug else {})},
             }
             if debug:
                 row["ocr_mode"] = "full" if used_fullpage else "top"
             non_hazirun_pages.append(row)
 
-    # ---- Belge düzeyinde karar ----
-    pos = len(hazirun_pages)
-    neg = len(non_hazirun_pages)
-    unk = len(unknown_pages)
-
+    # ---- Belge düzeyi ----
+    pos, neg, unk = len(hazirun_pages), len(non_hazirun_pages), len(unknown_pages)
     if doc_decision == "any":
         flag = "HAZIRUNDUR" if pos > 0 else "HAZIRUN DEĞİLDİR"
     elif doc_decision == "majority":
@@ -641,9 +670,9 @@ def classify_hazirun_single(
     return {
         "flag": flag,
         "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,           # sadece eşleşen (image+meta)
-        "non_hazirun_pages": non_hazirun_pages,   # tablo yok / eşik altı vb.
-        "unknown_pages": unknown_pages,           # OCR başarısız/boş/kapak toleransı
+        "hazirun_pages": hazirun_pages,
+        "non_hazirun_pages": non_hazirun_pages,
+        "unknown_pages": unknown_pages,
         "page_count": n,
         "doc_decision": doc_decision,
         "summary": {"pos": pos, "neg": neg, "unk": unk}
