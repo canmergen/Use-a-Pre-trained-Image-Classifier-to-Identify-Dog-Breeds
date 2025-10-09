@@ -1,11 +1,3 @@
-# --- yardımcı: satır kırığı ile ayrılan '... GIDA s\nAN., VE TİC ...' örneklerini birleştir ---
-def _merge_split_san(name: str) -> str:
-    # 's AN.' / 's AN,' / 's AN' varyasyonları
-    name = re.sub(r"\bs\s+an(\.|,)", r"SAN\1", name, flags=re.IGNORECASE)
-    name = re.sub(r"\bs\s+an\b", "SAN", name, flags=re.IGNORECASE)
-    return name
-
-
 def _find_company(
     lines: List[str],
     *,
@@ -15,20 +7,28 @@ def _find_company(
     """
     Üst bölüm OCR satırlarından şirket adını ve türünü yakala.
     Dönüş: (cname_raw, ctype)
+    Yaklaşım:
+      1) İlk ~12 satırı birleştir (flat).
+      2) Tip (A.Ş., LTD. ŞTİ., ANONİM ŞİRKETİ, …) için boşluk/dağınık-harf toleranslı regex ile YER tespit et.
+      3) Tip başlangıcından sola doğru token bazlı genişletme yap (header kelimelerinde dur).
+      4) 's AN' → 'SAN' birleştirmesi ve basit normalizasyon.
     """
-
-    # ---- kalite metriği (kısa/rakam ağırlıklı adayları ele) ----
+    # ---------------- helpers ----------------
     def _quality_score(name: str) -> float:
         if not name: return 0.0
         s = unicodedata.normalize("NFKC", name)
         letters = sum(ch.isalpha() for ch in s)
         digits  = sum(ch.isdigit() for ch in s)
-        if letters < 3 or letters <= digits:  # aşırı zayıf
+        if letters < 3 or letters <= digits:
             return 0.0
         toks = [t for t in re.split(r"\s+", s.strip()) if t]
         return 0.6*min(len(s)/80.0, 1.0) + 0.3*min(len(toks)/8.0, 1.0) + 0.1*(letters/(letters+digits+1e-6))
 
-    # ---- boşluk/dağınık harfe toleranslı tip kalıpları ----
+    def _merge_split_san(name: str) -> str:
+        name = re.sub(r"\bs\s+an(\.|,)", r"SAN\1", name, flags=re.IGNORECASE)
+        name = re.sub(r"\bs\s+an\b", "SAN", name, flags=re.IGNORECASE)
+        return name
+
     def _spaced(word: str) -> str:
         m = (word.replace("İ","I").replace("ı","i")
                  .replace("Ş","S").replace("ş","s")
@@ -39,6 +39,41 @@ def _find_company(
         letters = [re.escape(ch) for ch in m if ch.strip()]
         return r"\s*".join(letters)
 
+    def _map_type_to_label(type_text: str) -> Optional[str]:
+        up = _normalize_line(type_text)
+        for creg, label in TYPE_REGEX:
+            if creg.search(up):
+                return label
+        return None
+
+    # header/gürültü bariyeri
+    HEADER_WORDS = {
+        "GENEL","KURUL","KURULDA","HAZIR","BULUNANLAR","LİSTESİ","LISTESI","TOPLANTI",
+        "TUTANAĞI","TUTANAGI","PAY","SAHİBİNİN","SAHIBININ","TC","TCKN","VKN","VKNO",
+        "AD","SOYAD","ADRES","ÜNVAN","UNVAN","KATILIM","TEMSİLCİ","IMZA","İMZA",
+        "TOPLAM","İTİBARİ","ITIBARI","GÜNDEM"
+    }
+
+    # ---------------- inputs ----------------
+    src = [ln for ln in (lines or []) if isinstance(ln, str)]
+    if not src:
+        return None, None
+
+    # ilk 12 satır yeterli; tek karakter/simge satırlarını at
+    filt = []
+    for ln in src[:12]:
+        s = (ln or "").strip()
+        if not s:
+            continue
+        if re.fullmatch(r"[^\wçğıöşüÇĞİÖŞÜ]+|[A-Za-zÇĞİÖŞÜçğıöşü]", s):
+            continue
+        filt.append(s)
+
+    flat = re.sub(r"\s+", " ", " ".join(filt if filt else src[:12])).strip()
+    if not flat:
+        return None, None
+
+    # ---------------- type detection ----------------
     spaced_anchors = [
         _spaced("ANONIM")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
         _spaced("LIMITED")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
@@ -52,79 +87,68 @@ def _find_company(
         _spaced("VAKIF"),
         _spaced("DERNEK"),
     ]
-    SPACED_TYPE = r"(?:\b" + r"\b|\b".join(spaced_anchors) + r"\b)"
+    TYPE_ANY = re.compile(r"(?:\b" + r"\b|\b".join(spaced_anchors) + r"\b)", re.IGNORECASE)
 
-    # Greedy (non-greedy değil): tipten önceki tüm sol bağlamı al
-    RE_COMP_BEFORE = re.compile(
-        rf"(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜ0-9\s&\.\-']{{6,}})\s+(?P<type>{SPACED_TYPE})",
-        re.IGNORECASE
-    )
-    RE_COMP_AFTER = re.compile(
-        rf"(?P<type>{SPACED_TYPE})\s*[:,-]?\s*(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜ0-9\s&\.\-']{{6,}})",
-        re.IGNORECASE
-    )
+    mtype = TYPE_ANY.search(flat)
+    if not mtype:
+        # geri dönüş: mevcut eski mantığa bırak
+        # (senin önceki REGEX/FUZZY blokların aşağıda tekrar çalışacak)
+        pass
+    else:
+        # ---------------- smart left-extend around type ----------------
+        ts = mtype.start()  # tipin başladığı index
+        left = flat[:ts].rstrip()
 
-    HEADER_WORDS = {
-        "GENEL","KURUL","KURULDA","HAZIR","BULUNANLAR","LİSTESİ","LISTESI","TOPLANTI",
-        "TUTANAĞI","TUTANAGI","PAY","SAHİBİNİN","SAHIBININ","TC","TCKN","VKN","VKNO",
-        "AD","SOYAD","ADRES","ÜNVAN","UNVAN","KATILIM","TEMSİLCİ","IMZA","İMZA",
-        "TOPLAM","İTİBARİ","ITIBARI","GÜNDEM"
-    }
+        # soldan bir pencere al (yeterince geniş)
+        window = left[-160:] if len(left) > 160 else left
 
-    def _map_type_to_label(type_span: str) -> Optional[str]:
-        up = _normalize_line(type_span)
-        for creg, label in TYPE_REGEX:
-            if creg.search(up):
-                return label
-        return None
+        # header bariyerine kadar en sağdaki aday segmenti seç
+        # sağdan sola ilk header kelimesi geçişinde kır
+        upw = unicodedata.normalize("NFKC", window).upper()
+        cut = 0
+        for hw in HEADER_WORDS:
+            k = upw.rfind(hw)
+            if k != -1:
+                cut = max(cut, k + len(hw))
+        candidate_zone = window[cut:].strip()
 
-    # ---- 0) satırları hazırla ----
-    src = [ln for ln in (lines or []) if isinstance(ln, str)]
-    if not src:
-        return None, None
+        # token bazlı geri genişletme: en az 2 anlamlı (>=3 harf) token yakala
+        toks = candidate_zone.split()
+        keep = []
+        for t in reversed(toks):
+            keep.append(t)
+            if sum(1 for z in keep if len(re.sub(r"[^A-Za-zÇĞİÖŞÜçğıöşü0-9]", "", z)) >= 3) >= 2:
+                # yeterli bağlam toplandı
+                pass
+        name_guess = " ".join(reversed(keep)).strip()
 
-    # Gürültü/tek karakter/başlık kelimeleri ayıkla; ilk 12 satır makul
-    filt = []
-    for ln in src[:12]:
-        s = (ln or "").strip()
-        if not s:
-            continue
-        # tek işaret / tek harf satırı
-        if re.fullmatch(r"[^\wçğıöşüÇĞİÖŞÜ]+|[A-Za-zÇĞİÖŞÜçğıöşü]", s):
-            continue
-        up = unicodedata.normalize("NFKC", s).upper()
-        if any(w in up for w in HEADER_WORDS):
-            continue
-        filt.append(s)
+        # 's AN' → 'SAN' düzeltmesi + sadeleştirme
+        name_guess = _merge_split_san(name_guess)
+        name_guess = re.sub(r"\s+", " ", name_guess).strip()
 
-    # ---- 1) FLAT: satırları birleştir ve ara (satır kırıkları çözülür) ----
-    flat = re.sub(r"\s+", " ", " ".join(filt if filt else src[:12])).strip()
-    for pat in (RE_COMP_BEFORE, RE_COMP_AFTER):
-        m = pat.search(flat)
-        if m:
-            cname_raw = _merge_split_san(m.group("name").strip())
-            ctype = _map_type_to_label(m.group("type"))
-            return cname_raw, ctype
+        # kalite kontrolü; zayıfsa aşağıdaki klasik yaklaşımlara düş
+        if _quality_score(name_guess) > 0:
+            ctype = _map_type_to_label(mtype.group(0))
+            return name_guess, ctype
 
-    # ---- 2) PAIR JOIN: ardışık satır çiftlerini birleştirip ara ----
+    # ---------------- fallback 1: satır çiftlerini birleştirerek ara ----------------
     best = None  # (score, cname_raw, ctype)
     for i in range(len(src)-1):
         pair = re.sub(r"\s+", " ", (src[i] + " " + src[i+1])).strip()
-        for pat in (RE_COMP_BEFORE, RE_COMP_AFTER):
-            m = pat.search(pair)
-            if not m:
-                continue
-            cname_raw = _merge_split_san(m.group("name").strip())
-            q = _quality_score(cname_raw)
-            if q <= 0:
-                continue
-            ctype = _map_type_to_label(m.group("type"))
-            if (best is None) or (q > best[0]):
-                best = (q, cname_raw, ctype)
+        mm = TYPE_ANY.search(pair)
+        if not mm:
+            continue
+        left = pair[:mm.start()].strip()
+        left = _merge_split_san(left)
+        if _quality_score(left) <= 0:
+            continue
+        ctype = _map_type_to_label(mm.group(0))
+        if (best is None) or (_quality_score(left) > best[0]):
+            best = (_quality_score(left), left, ctype)
     if best:
         return best[1], best[2]
 
-    # ---- 3) Geriye uyumluluk: eski REGEX/FUZZY mantığı ----
+    # ---------------- fallback 2: eski REGEX/FUZZY mantığı ----------------
     best_regex = None  # (score, line_idx, cname_raw, ctype)
     for i, raw in enumerate(src):
         norm = _normalize_line(raw)
@@ -133,9 +157,8 @@ def _find_company(
             if not mm:
                 continue
             cand = raw.strip() if mm.start() == 0 else raw[:mm.start()].strip()
-            q = _quality_score(cand)
-            if q > 0 and ((best_regex is None) or (q > best_regex[0]) or (q == best_regex[0] and i < best_regex[1])):
-                best_regex = (q, i, str(cand), label)
+            if _quality_score(cand) > 0 and ((best_regex is None) or (_quality_score(cand) > best_regex[0]) or (_quality_score(cand) == best_regex[0] and i < best_regex[1])):
+                best_regex = (_quality_score(cand), i, str(cand), label)
     if best_regex:
         return best_regex[2], best_regex[3]
 
