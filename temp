@@ -1,59 +1,123 @@
-import cv2, numpy as np, matplotlib.pyplot as plt
-from typing import Union, Sequence
+import cv2, numpy as np
+import matplotlib.pyplot as plt
+from typing import Union, Sequence, Tuple
 
 def clean_doc_images_locationwise(
     doc_images: Union[np.ndarray, Sequence[np.ndarray]],
     *,
     return_gray: bool = True,
-    debug: bool = False
+    debug: bool = False,
+    process_only_above_table: bool = True,
+    line_scale: int = 30,
+    min_table_area_ratio: float = 0.12,
+    low_hi_split: int = 180,
+    local_mean_ksize: int = 25,
+    smooth_ksize: int = 3,
+    fallback_ratio: float = 0.15     # tablo bulunamazsa üst %15'e uygula
 ):
     """
-    Local contrast cleaner for OCR.
-    Converts near-black pixels to black and near-white to white
-    based on neighborhood intensity, preserving edges and readability.
+    Applies local contrast cleaning (0/255 push) only above the detected table.
+    If no table is found, applies it to the top <fallback_ratio> of the image.
     """
 
     def _ensure_list(x):
         if isinstance(x, np.ndarray): return [x], True
         return list(x), False
 
-    def _to_gray(img):
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    def _to_gray(img: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
-    def _local_contrast_clean(gray):
-        # 1. Smooth slightly to reduce noise
-        blur = cv2.GaussianBlur(gray, (3,3), 0)
+    def _contrast_push(gray_roi: np.ndarray) -> np.ndarray:
+        sk = smooth_ksize if smooth_ksize % 2 == 1 else smooth_ksize + 1
+        blur = cv2.GaussianBlur(gray_roi, (sk, sk), 0)
 
-        # 2. Compute local mean using a larger window
-        mean = cv2.blur(blur, (25,25))
-
-        # 3. Difference from local mean
+        k = local_mean_ksize if local_mean_ksize % 2 == 1 else local_mean_ksize + 1
+        mean = cv2.blur(blur, (k, k))
         diff = cv2.subtract(blur, mean)
-        enhanced = cv2.addWeighted(blur, 1.5, diff, 1.5, 0)
+        enh = cv2.addWeighted(blur, 1.5, diff, 1.5, 0)
 
-        # 4. Push near-black / near-white extremes
-        result = enhanced.copy()
-        low_mask = (enhanced < 100)
-        high_mask = (enhanced > 180)
-        result[low_mask] = 0
-        result[high_mask] = 255
+        out = enh.copy()
+        low_mask  = (enh <= low_hi_split)
+        high_mask = (enh >  low_hi_split)
+        out[low_mask]  = 0
+        out[high_mask] = 255
+        out = cv2.medianBlur(out, sk)
+        return out
 
-        # 5. Final smoothing for readability
-        result = cv2.medianBlur(result, 3)
-        return result
+    def _detect_main_table(gray: np.ndarray) -> Tuple[int,int,int,int]:
+        H, W = gray.shape
+        thr = cv2.adaptiveThreshold(gray, 255,
+                                    cv2.ADAPTIVE_THRESH_MEAN_C,
+                                    cv2.THRESH_BINARY_INV, 31, 10)
+        h_len = max(10, W // line_scale)
+        v_len = max(10, H // line_scale)
+
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+        h_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, h_kernel)
+        v_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, v_kernel)
+        grid = cv2.bitwise_or(h_lines, v_lines)
+        grid = cv2.dilate(grid, np.ones((3,3), np.uint8), iterations=1)
+        grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=1)
+        contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return 0, 0, 0, 0
+
+        best, best_area = None, 0
+        for c in contours:
+            x,y,w,h = cv2.boundingRect(c)
+            area = w*h
+            if area < min_table_area_ratio * W * H: 
+                continue
+            score = area * (w / (h + 1e-3))
+            if score > best_area:
+                best_area = score
+                best = (x,y,w,h)
+
+        if best is None: return 0,0,0,0
+        x,y,w,h = best
+        return y, y+h, x, x+w
 
     imgs, was_single = _ensure_list(doc_images)
     outs = []
+
     for i, im in enumerate(imgs):
         gray = _to_gray(im)
-        cleaned = _local_contrast_clean(gray)
+        H, W = gray.shape
+
+        y_top, y_bot, x_l, x_r = (0,0,0,0)
+        if process_only_above_table:
+            y_top, y_bot, x_l, x_r = _detect_main_table(gray)
+
+        # If no table detected -> use top fallback ratio
+        if (y_bot - y_top) < 0.05 * H:
+            roi_y0, roi_y1 = 0, int(H * fallback_ratio)
+        else:
+            roi_y0, roi_y1 = 0, max(0, y_top)
+
+        roi = gray[roi_y0:roi_y1, :]
+        if roi.size > 0:
+            cleaned_roi = _contrast_push(roi)
+            out_page = gray.copy()
+            out_page[roi_y0:roi_y1, :] = cleaned_roi
+        else:
+            out_page = gray
 
         if debug:
-            plt.figure(figsize=(12,5))
-            plt.subplot(1,2,1); plt.imshow(gray, cmap='gray'); plt.title(f'Before (page {i})'); plt.axis('off')
-            plt.subplot(1,2,2); plt.imshow(cleaned, cmap='gray'); plt.title(f'After (page {i})'); plt.axis('off')
+            plt.figure(figsize=(14,5))
+            plt.subplot(1,2,1); plt.imshow(gray, cmap='gray'); plt.title(f"Before (page {i})"); plt.axis('off')
+            vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            if y_bot>y_top:
+                cv2.rectangle(vis, (x_l, y_top), (x_r, y_bot), (0,255,0), 2)
+            plt.subplot(1,2,2); plt.imshow(out_page, cmap='gray')
+            t = f"After (page {i})"
+            if y_bot>y_top:
+                t += " [table boxed]"
+            else:
+                t += f" [fallback top {int(fallback_ratio*100)}%]"
+            plt.title(t); plt.axis('off')
             plt.show()
 
-        outs.append(cleaned if return_gray else cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR))
+        outs.append(out_page if return_gray else cv2.cvtColor(out_page, cv2.COLOR_GRAY2BGR))
 
     return outs[0] if was_single else outs
