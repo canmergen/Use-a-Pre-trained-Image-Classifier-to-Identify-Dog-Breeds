@@ -1,123 +1,174 @@
-import cv2, numpy as np
-import matplotlib.pyplot as plt
-from typing import Union, Sequence, Tuple
+# --- yardımcı: satır kırığı ile ayrılan '... GIDA s\nAN., VE TİC ...' örneklerini birleştir ---
+def _merge_split_san(name: str) -> str:
+    # 's AN.' / 's AN,' / 's AN' varyasyonları
+    name = re.sub(r"\bs\s+an(\.|,)", r"SAN\1", name, flags=re.IGNORECASE)
+    name = re.sub(r"\bs\s+an\b", "SAN", name, flags=re.IGNORECASE)
+    return name
 
-def clean_doc_images_locationwise(
-    doc_images: Union[np.ndarray, Sequence[np.ndarray]],
+
+def _find_company(
+    lines: List[str],
     *,
-    return_gray: bool = True,
-    debug: bool = False,
-    process_only_above_table: bool = True,
-    line_scale: int = 30,
-    min_table_area_ratio: float = 0.12,
-    low_hi_split: int = 180,
-    local_mean_ksize: int = 25,
-    smooth_ksize: int = 3,
-    fallback_ratio: float = 0.15     # tablo bulunamazsa üst %15'e uygula
-):
+    fuzzy_type_thresh: float = 0.82,
+    fuzzy_join_lines: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Applies local contrast cleaning (0/255 push) only above the detected table.
-    If no table is found, applies it to the top <fallback_ratio> of the image.
+    Üst bölüm OCR satırlarından şirket adını ve türünü yakala.
+    Dönüş: (cname_raw, ctype)
     """
 
-    def _ensure_list(x):
-        if isinstance(x, np.ndarray): return [x], True
-        return list(x), False
+    # ---- kalite metriği (kısa/rakam ağırlıklı adayları ele) ----
+    def _quality_score(name: str) -> float:
+        if not name: return 0.0
+        s = unicodedata.normalize("NFKC", name)
+        letters = sum(ch.isalpha() for ch in s)
+        digits  = sum(ch.isdigit() for ch in s)
+        if letters < 3 or letters <= digits:  # aşırı zayıf
+            return 0.0
+        toks = [t for t in re.split(r"\s+", s.strip()) if t]
+        return 0.6*min(len(s)/80.0, 1.0) + 0.3*min(len(toks)/8.0, 1.0) + 0.1*(letters/(letters+digits+1e-6))
 
-    def _to_gray(img: np.ndarray) -> np.ndarray:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    # ---- boşluk/dağınık harfe toleranslı tip kalıpları ----
+    def _spaced(word: str) -> str:
+        m = (word.replace("İ","I").replace("ı","i")
+                 .replace("Ş","S").replace("ş","s")
+                 .replace("Ğ","G").replace("ğ","g")
+                 .replace("Ü","U").replace("ü","u")
+                 .replace("Ö","O").replace("ö","o")
+                 .replace("Ç","C").replace("ç","c"))
+        letters = [re.escape(ch) for ch in m if ch.strip()]
+        return r"\s*".join(letters)
 
-    def _contrast_push(gray_roi: np.ndarray) -> np.ndarray:
-        sk = smooth_ksize if smooth_ksize % 2 == 1 else smooth_ksize + 1
-        blur = cv2.GaussianBlur(gray_roi, (sk, sk), 0)
+    spaced_anchors = [
+        _spaced("ANONIM")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
+        _spaced("LIMITED")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
+        r"L\s*TD\.?\s*"+_spaced("STI"),
+        _spaced("A")+r"\.?\s*"+_spaced("S")+r"\.?",  # A.Ş.
+        _spaced("AS"),
+        _spaced("HOLDING"),
+        _spaced("KOOPERATIF"),
+        _spaced("KOLEKTIF")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
+        _spaced("KOMANDIT")+r"\s+"+_spaced("SIRKET")+r"[Iİ]?",
+        _spaced("VAKIF"),
+        _spaced("DERNEK"),
+    ]
+    SPACED_TYPE = r"(?:\b" + r"\b|\b".join(spaced_anchors) + r"\b)"
 
-        k = local_mean_ksize if local_mean_ksize % 2 == 1 else local_mean_ksize + 1
-        mean = cv2.blur(blur, (k, k))
-        diff = cv2.subtract(blur, mean)
-        enh = cv2.addWeighted(blur, 1.5, diff, 1.5, 0)
+    # Greedy (non-greedy değil): tipten önceki tüm sol bağlamı al
+    RE_COMP_BEFORE = re.compile(
+        rf"(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜ0-9\s&\.\-']{{6,}})\s+(?P<type>{SPACED_TYPE})",
+        re.IGNORECASE
+    )
+    RE_COMP_AFTER = re.compile(
+        rf"(?P<type>{SPACED_TYPE})\s*[:,-]?\s*(?P<name>[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜ0-9\s&\.\-']{{6,}})",
+        re.IGNORECASE
+    )
 
-        out = enh.copy()
-        low_mask  = (enh <= low_hi_split)
-        high_mask = (enh >  low_hi_split)
-        out[low_mask]  = 0
-        out[high_mask] = 255
-        out = cv2.medianBlur(out, sk)
-        return out
+    HEADER_WORDS = {
+        "GENEL","KURUL","KURULDA","HAZIR","BULUNANLAR","LİSTESİ","LISTESI","TOPLANTI",
+        "TUTANAĞI","TUTANAGI","PAY","SAHİBİNİN","SAHIBININ","TC","TCKN","VKN","VKNO",
+        "AD","SOYAD","ADRES","ÜNVAN","UNVAN","KATILIM","TEMSİLCİ","IMZA","İMZA",
+        "TOPLAM","İTİBARİ","ITIBARI","GÜNDEM"
+    }
 
-    def _detect_main_table(gray: np.ndarray) -> Tuple[int,int,int,int]:
-        H, W = gray.shape
-        thr = cv2.adaptiveThreshold(gray, 255,
-                                    cv2.ADAPTIVE_THRESH_MEAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 10)
-        h_len = max(10, W // line_scale)
-        v_len = max(10, H // line_scale)
+    def _map_type_to_label(type_span: str) -> Optional[str]:
+        up = _normalize_line(type_span)
+        for creg, label in TYPE_REGEX:
+            if creg.search(up):
+                return label
+        return None
 
-        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-        h_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, h_kernel)
-        v_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, v_kernel)
-        grid = cv2.bitwise_or(h_lines, v_lines)
-        grid = cv2.dilate(grid, np.ones((3,3), np.uint8), iterations=1)
-        grid = cv2.morphologyEx(grid, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=1)
-        contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return 0, 0, 0, 0
+    # ---- 0) satırları hazırla ----
+    src = [ln for ln in (lines or []) if isinstance(ln, str)]
+    if not src:
+        return None, None
 
-        best, best_area = None, 0
-        for c in contours:
-            x,y,w,h = cv2.boundingRect(c)
-            area = w*h
-            if area < min_table_area_ratio * W * H: 
+    # Gürültü/tek karakter/başlık kelimeleri ayıkla; ilk 12 satır makul
+    filt = []
+    for ln in src[:12]:
+        s = (ln or "").strip()
+        if not s:
+            continue
+        # tek işaret / tek harf satırı
+        if re.fullmatch(r"[^\wçğıöşüÇĞİÖŞÜ]+|[A-Za-zÇĞİÖŞÜçğıöşü]", s):
+            continue
+        up = unicodedata.normalize("NFKC", s).upper()
+        if any(w in up for w in HEADER_WORDS):
+            continue
+        filt.append(s)
+
+    # ---- 1) FLAT: satırları birleştir ve ara (satır kırıkları çözülür) ----
+    flat = re.sub(r"\s+", " ", " ".join(filt if filt else src[:12])).strip()
+    for pat in (RE_COMP_BEFORE, RE_COMP_AFTER):
+        m = pat.search(flat)
+        if m:
+            cname_raw = _merge_split_san(m.group("name").strip())
+            ctype = _map_type_to_label(m.group("type"))
+            return cname_raw, ctype
+
+    # ---- 2) PAIR JOIN: ardışık satır çiftlerini birleştirip ara ----
+    best = None  # (score, cname_raw, ctype)
+    for i in range(len(src)-1):
+        pair = re.sub(r"\s+", " ", (src[i] + " " + src[i+1])).strip()
+        for pat in (RE_COMP_BEFORE, RE_COMP_AFTER):
+            m = pat.search(pair)
+            if not m:
                 continue
-            score = area * (w / (h + 1e-3))
-            if score > best_area:
-                best_area = score
-                best = (x,y,w,h)
+            cname_raw = _merge_split_san(m.group("name").strip())
+            q = _quality_score(cname_raw)
+            if q <= 0:
+                continue
+            ctype = _map_type_to_label(m.group("type"))
+            if (best is None) or (q > best[0]):
+                best = (q, cname_raw, ctype)
+    if best:
+        return best[1], best[2]
 
-        if best is None: return 0,0,0,0
-        x,y,w,h = best
-        return y, y+h, x, x+w
+    # ---- 3) Geriye uyumluluk: eski REGEX/FUZZY mantığı ----
+    best_regex = None  # (score, line_idx, cname_raw, ctype)
+    for i, raw in enumerate(src):
+        norm = _normalize_line(raw)
+        for creg, label in TYPE_REGEX:
+            mm = creg.search(norm)
+            if not mm:
+                continue
+            cand = raw.strip() if mm.start() == 0 else raw[:mm.start()].strip()
+            q = _quality_score(cand)
+            if q > 0 and ((best_regex is None) or (q > best_regex[0]) or (q == best_regex[0] and i < best_regex[1])):
+                best_regex = (q, i, str(cand), label)
+    if best_regex:
+        return best_regex[2], best_regex[3]
 
-    imgs, was_single = _ensure_list(doc_images)
-    outs = []
+    best_fuzzy = None  # (rank, line_idx, cname_raw, ctype)
+    for i, raw in enumerate(src):
+        norm = _normalize_line(raw)
+        best_label, best_score = None, 0.0
+        for canonical, variants in CANON_TYPES.items():
+            sc = max(_fuzzy_ratio(v, norm) for v in variants)
+            if sc > best_score:
+                best_score, best_label = sc, canonical
+        if best_label and best_score >= fuzzy_type_thresh:
+            cand = raw.strip()
+            q = _quality_score(cand)
+            if q > 0:
+                rank = 0.7*best_score + 0.3*min(q, 1.0)
+                if (best_fuzzy is None) or (rank > best_fuzzy[0]) or (rank == best_fuzzy[0] and i < best_fuzzy[1]):
+                    best_fuzzy = (rank, i, str(cand), best_label)
+    if best_fuzzy:
+        return best_fuzzy[2], best_fuzzy[3]
 
-    for i, im in enumerate(imgs):
-        gray = _to_gray(im)
-        H, W = gray.shape
+    if fuzzy_join_lines and src:
+        joined_raw = " ".join(src).strip()
+        joined_norm = _normalize_line(joined_raw)
+        best_label, best_score = None, 0.0
+        for canonical, variants in CANON_TYPES.items():
+            sc = max(_fuzzy_ratio(v, joined_norm) for v in variants)
+            if sc > best_score:
+                best_score, best_label = sc, canonical
+        if best_label and best_score >= fuzzy_type_thresh:
+            head = " ".join([ln.strip() for ln in src[:3]]).strip()
+            cand = head if _quality_score(head) >= _quality_score(joined_raw) else joined_raw
+            if _quality_score(cand) > 0:
+                return str(cand), best_label
 
-        y_top, y_bot, x_l, x_r = (0,0,0,0)
-        if process_only_above_table:
-            y_top, y_bot, x_l, x_r = _detect_main_table(gray)
-
-        # If no table detected -> use top fallback ratio
-        if (y_bot - y_top) < 0.05 * H:
-            roi_y0, roi_y1 = 0, int(H * fallback_ratio)
-        else:
-            roi_y0, roi_y1 = 0, max(0, y_top)
-
-        roi = gray[roi_y0:roi_y1, :]
-        if roi.size > 0:
-            cleaned_roi = _contrast_push(roi)
-            out_page = gray.copy()
-            out_page[roi_y0:roi_y1, :] = cleaned_roi
-        else:
-            out_page = gray
-
-        if debug:
-            plt.figure(figsize=(14,5))
-            plt.subplot(1,2,1); plt.imshow(gray, cmap='gray'); plt.title(f"Before (page {i})"); plt.axis('off')
-            vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            if y_bot>y_top:
-                cv2.rectangle(vis, (x_l, y_top), (x_r, y_bot), (0,255,0), 2)
-            plt.subplot(1,2,2); plt.imshow(out_page, cmap='gray')
-            t = f"After (page {i})"
-            if y_bot>y_top:
-                t += " [table boxed]"
-            else:
-                t += f" [fallback top {int(fallback_ratio*100)}%]"
-            plt.title(t); plt.axis('off')
-            plt.show()
-
-        outs.append(out_page if return_gray else cv2.cvtColor(out_page, cv2.COLOR_GRAY2BGR))
-
-    return outs[0] if was_single else outs
+    return None, None
