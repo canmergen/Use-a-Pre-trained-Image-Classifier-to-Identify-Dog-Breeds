@@ -1,142 +1,63 @@
 import cv2, numpy as np
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import matplotlib.pyplot as plt
+from typing import Union, Sequence
 
 def clean_doc_images_locationwise(
     doc_images: Union[np.ndarray, Sequence[np.ndarray]],
     *,
-    rois: Optional[
-        Union[
-            List[Tuple[Tuple[float,float,float,float], bool]],      # [(roi, is_ratio)]
-            List[List[Tuple[Tuple[float,float,float,float], bool]]] # per-page
-        ]
-    ] = None,
-    apply_full_if_no_roi: bool = True,
-    default_params: Optional[Dict[str, int]] = None,     # kernel_open, block_size, C, small_open
-    per_page_params: Optional[List[Dict[str, int]]] = None,
     return_gray: bool = True,
     debug: bool = False
 ):
     """
-    Single-call background cleaning for OCR.
-    - Accepts one image or a list of images (np.ndarray).
-    - Optionally apply on ROIs (pixel or ratio). Each ROI is ((x,y,w,h), is_ratio).
-    - Returns same container structure as input: single image -> single; list -> list.
-    - If debug=True, shows side-by-side Before/After for each page.
-
-    Notes:
-    - Output is grayscale uint8 by default (return_gray=True). Set False to return BGR.
+    Softer background cleaner for OCR.
+    - Removes gray noise & scanner shadows without destroying text.
+    - Accepts one image or list of images.
+    - Returns same type (single img or list).
     """
 
-    # -------- helpers (scoped) --------
+    # ---- helpers ----
     def _ensure_list(x):
         if isinstance(x, np.ndarray):
             return [x], True
         return list(x), False
 
-    def _to_bgr(img: np.ndarray) -> np.ndarray:
-        if img.ndim == 2:  # gray
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        if img.ndim == 3 and img.shape[2] == 3:
-            return img
-        raise ValueError("Each image must be HxW or HxWx3 uint8 ndarray.")
+    def _to_gray(img):
+        if img.ndim == 3:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return img.copy()
 
-    def _roi_to_px(roi: Tuple[float,float,float,float], W: int, H: int, is_ratio: bool):
-        if is_ratio:
-            x = int(np.clip(roi[0], 0, 1) * W)
-            y = int(np.clip(roi[1], 0, 1) * H)
-            w = int(np.clip(roi[2], 0, 1) * W)
-            h = int(np.clip(roi[3], 0, 1) * H)
-        else:
-            x, y, w, h = map(int, roi)
-        x = max(0, min(x, W-1)); y = max(0, min(y, H-1))
-        w = max(1, min(w, W-x)); h = max(1, min(h, H-y))
-        return x, y, w, h
-
-    def _clean_single(bgr: np.ndarray, p: Dict[str,int]) -> np.ndarray:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    def _soft_clean(gray):
+        # Normalize lighting
         norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        blur = cv2.GaussianBlur(norm, (3, 3), 0)
-
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (p["kernel_open"], p["kernel_open"]))
-        background = cv2.morphologyEx(blur, cv2.MORPH_OPEN, k)
-
-        diff = cv2.subtract(blur, background)
+        # Slight blur to smooth small dots
+        blur = cv2.GaussianBlur(norm, (3,3), 0)
+        # Estimate background by heavy blur (no morphology)
+        bg = cv2.GaussianBlur(blur, (55,55), 0)
+        diff = cv2.subtract(bg, blur)
         diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        # Blend with original to preserve text
+        combined = cv2.addWeighted(gray, 0.75, diff, 0.25, 0)
+        # Gentle threshold — preserves thin strokes
+        _, th = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        return th
 
-        bs = p["block_size"] if p["block_size"] % 2 == 1 else p["block_size"] + 1
-        bin_img = cv2.adaptiveThreshold(
-            diff, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-            bs, p["C"]
-        )
-
-        k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (p["small_open"], p["small_open"]))
-        final = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, k2)
-        return final  # gray
-
-    def _apply_on_roi(base_bgr: np.ndarray, roi_px: Tuple[int,int,int,int], p: Dict[str,int]) -> np.ndarray:
-        x, y, w, h = roi_px
-        cleaned = _clean_single(base_bgr[y:y+h, x:x+w], p)
-        out = base_bgr.copy()
-        out[y:y+h, x:x+w] = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
-        return out
-
-    # -------- run --------
+    # ---- main ----
     imgs, was_single = _ensure_list(doc_images)
-    out: List[np.ndarray] = []
+    outs = []
 
-    base_params = dict(kernel_open=35, block_size=41, C=8, small_open=2)
-    if default_params: base_params.update(default_params)
-
-    same_rois_all = None; page_rois = None
-    if rois is not None:
-        if len(rois) > 0 and isinstance(rois[0], tuple):  # same for all pages
-            same_rois_all = rois
-        else:
-            page_rois = rois
-
-    for i, im in enumerate(imgs):
-        bgr = _to_bgr(im)
-        H, W = bgr.shape[:2]
-
-        p = base_params.copy()
-        if per_page_params and i < len(per_page_params) and per_page_params[i]:
-            p.update(per_page_params[i])
-
-        # prepare ROIs
-        rois_this = []
-        if page_rois is not None and i < len(page_rois) and page_rois[i]:
-            rois_this = page_rois[i]
-        elif same_rois_all is not None:
-            rois_this = same_rois_all
-
-        before_view = bgr
-
-        if rois_this:
-            canvas = bgr.copy()
-            for (roi, is_ratio) in rois_this:
-                canvas = _apply_on_roi(canvas, _roi_to_px(roi, W, H, is_ratio), p)
-            result_bgr = canvas
-        else:
-            if not apply_full_if_no_roi:
-                result_bgr = bgr
-            else:
-                cleaned = _clean_single(bgr, p)  # gray
-                result_bgr = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+    for i, img in enumerate(imgs):
+        gray = _to_gray(img)
+        cleaned = _soft_clean(gray)
 
         if debug:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(12, 5))
-            plt.subplot(1,2,1); plt.imshow(cv2.cvtColor(before_view, cv2.COLOR_BGR2RGB)); plt.title(f"Before (page {i})"); plt.axis("off")
-            plt.subplot(1,2,2); 
-            show_img = result_bgr if not return_gray else cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-            plt.imshow(show_img if show_img.ndim==3 else show_img, cmap=None if show_img.ndim==3 else "gray")
-            plt.title(f"After (page {i})"); plt.axis("off")
+            plt.figure(figsize=(12,5))
+            plt.subplot(1,2,1); plt.imshow(gray, cmap='gray'); plt.title(f'Before (page {i})'); plt.axis('off')
+            plt.subplot(1,2,2); plt.imshow(cleaned, cmap='gray'); plt.title(f'After (page {i})'); plt.axis('off')
             plt.show()
 
         if return_gray:
-            out.append(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY))
+            outs.append(cleaned)
         else:
-            out.append(result_bgr)
+            outs.append(cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR))
 
-    return out[0] if was_single else out
+    return outs[0] if was_single else outs
