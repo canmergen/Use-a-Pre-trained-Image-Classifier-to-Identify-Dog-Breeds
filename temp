@@ -6,7 +6,7 @@ def extract_top_info_from_doc_images_fuzzy(
     ocr_fn: Callable[[np.ndarray], str],  # img_bgr -> text
     *,
     table_top_shift_ratio: float = 0.02,
-    fallback_top_ratio: float = 0.25,     # tablo yoksa üst %25
+    fallback_top_ratio: float = 0.30,     # bir tık artırdım (üst bantı kesin yakalayalım)
     min_upper_px: int = 120,
     debug: bool = False,
     show_fig: bool = False,
@@ -14,7 +14,7 @@ def extract_top_info_from_doc_images_fuzzy(
 ) -> pd.DataFrame:
     """Dönüş: DataFrame[page_index, tarih, şirket_adı, şirket_türü, (debug_text)]"""
 
-    # ---------------------- Inline utils (TR/dil/normalize) -------------------
+    # ---------------------- Inline utils --------------------------------------
     def _upper_tr(s: str) -> str:
         mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
         return "".join(mp.get(ch, ch.upper()) for ch in s or "")
@@ -31,6 +31,16 @@ def extract_top_info_from_doc_images_fuzzy(
     def _spaced_token(tok: str) -> str:
         return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
 
+    def _score_name(name: str) -> float:
+        if not name: return 0.0
+        s = _nfkc(name)
+        letters = sum(ch.isalpha() for ch in s)
+        digits  = sum(ch.isdigit() for ch in s)
+        if letters < 3 or letters <= digits: return 0.0
+        toks = [t for t in re.split(r"\s+", s.strip()) if t]
+        # şirket adının çok uzun paragraf olmaması için yumuşak tavanlar
+        return 0.55*min(len(s)/90,1.0) + 0.35*min(len(toks)/9,1.0) + 0.10*(letters/(letters+digits+1e-6))
+
     # ---------------------- Table top & upper crop ----------------------------
     def _detect_table_top(img: np.ndarray) -> Optional[int]:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
@@ -38,8 +48,7 @@ def extract_top_info_from_doc_images_fuzzy(
         blur = cv2.GaussianBlur(gray, (3,3), 0)
         thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                     cv2.THRESH_BINARY_INV, 35, 5)
-        kx = max(12, W // 60)
-        ky = max(12, H // 60)
+        kx = max(12, W // 60); ky = max(12, H // 60)
         horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
                                  cv2.getStructuringElement(cv2.MORPH_RECT, (kx,1)), 1)
         vert  = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
@@ -54,8 +63,7 @@ def extract_top_info_from_doc_images_fuzzy(
         cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in cnts:
             x,y,w,h = cv2.boundingRect(c)
-            if w >= int(W*0.5) and h >= max(8, H//120):
-                cand.append(y)
+            if w >= int(W*0.5) and h >= max(8, H//120): cand.append(y)
         if not cand:
             if debug and show_table_fig:
                 try:
@@ -86,7 +94,7 @@ def extract_top_info_from_doc_images_fuzzy(
             try:
                 import matplotlib.pyplot as plt
                 plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-                plt.title(f"Upper crop (0:{y_use}) | mode={'fallback%25' if y_use==y_fb else 'table-top'}")
+                plt.title(f"Upper crop (0:{y_use}) | mode={'fallback%'+str(int(fallback_top_ratio*100)) if y_use==y_fb else 'table-top'}")
                 plt.axis("off"); plt.show()
             except Exception: pass
         return up if (up is not None and up.size and up.shape[0] >= min_upper_px) else None
@@ -168,7 +176,7 @@ def extract_top_info_from_doc_images_fuzzy(
                 return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
         return None
 
-    # ---------------------- Company type canonicalization ---------------------
+    # ---------------------- Type canonicalization -----------------------------
     def _map_type_to_canonical(type_text: str) -> Optional[str]:
         if not type_text: return None
         u = _upper_tr(_norm_spaces(type_text))
@@ -207,11 +215,18 @@ def extract_top_info_from_doc_images_fuzzy(
         if "DERNEK" in flat: return "DERNEK"
         return None
 
-    # ---------------------- Company finder (back-scan) ------------------------
-    def _extract_company_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Tek string üzerinde: tip demirini bul, SOL'daki 220→400 pencereden adı çıkar."""
-        if not isinstance(text, str) or not text.strip(): return None, None
+    # ---------------------- Company extraction (robust, multi-strategy) -------
+    def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
+        """
+        1) Tüm tip eşleşmeleri üzerinde back-scan (çoklu pencere)
+        2) Satır tabanlı: tip geçen satırın önceki 1–3 satırını birleştir
+        3) Acil durum: tipten önce 80 char içindeki en uzun büyük-harf bloğu
+        """
+        dbg = {}
+        T = _norm_spaces(text)
+        L = [_norm_spaces(ln) for ln in lines if isinstance(ln,str) and ln.strip()]
 
+        # Tip desenleri (ek toleranslı)
         GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
         AS   = r"(?:A\.?\s*Ş|A\.?\s*S|AŞ|AS)"+GEN
         ANON = r"ANON[İI]M\s+"+_spaced_token("ŞİRKET")+GEN
@@ -219,56 +234,71 @@ def extract_top_info_from_doc_images_fuzzy(
         SIRK = _spaced_token("ŞİRKET")+GEN
         CORE = rf"(?:{AS}|{ANON}|{LTD}|KOLEKT[İI]F\s+{SIRK}|AD[İI]\s+KOMAND[İI]T\s+{SIRK}|SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+{SIRK}|KOMAND[İI]T\s+{SIRK}|HOLD[İI]NG|KOOPERAT[İI]F|VAKF[Iİ]|VAKIF|DERNEK)"
         TYPE_RE = re.compile(CORE, re.IGNORECASE)
-
-        T = _norm_spaces(text)
         matches = list(TYPE_RE.finditer(T))
-        if not matches: return None, None
-        m = matches[-1]  # son tip
-        ctype = _map_type_to_canonical(m.group(0))
+        if not matches:
+            dbg["reason"] = "no_type_match"
+            return None, None, dbg
 
         STOPTAIL = {"AN","VE","TIC","TİC","SAN","VE.","TIC.","TİC.","SAN."}
-        STOPWORDS = {"GENEL","KURUL","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","GÜNDEM",
-                     "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","YILLIK","TUTANAK","SAYIN","ŞAHİBİNİN","SAHİBİNİN"}
+        STOPWORDS = {"GENEL","KURUL","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ",
+                     "GÜNDEM","TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","YILLIK","TUTANAK",
+                     "SAYIN","ŞAHİBİNİN","SAHİBİNİN"}
 
-        def backscan(window:int) -> Optional[str]:
-            left = T[max(0, m.start()-window):m.start()]
-            left = re.sub(r"[^\w\s\.\-\/&’'ÇĞİÖŞÜçğıöşü]", " ", left)
-            left = re.sub(r"\s+", " ", left).strip(" ,.-:;’'")
+        def _clean_name(s: str) -> str:
+            s = re.sub(r"[^\w\s\.\-\/&’'ÇĞİÖŞÜçğıöşü]", " ", s)
+            s = re.sub(r"\s+", " ", s).strip(" ,.-:;’'")
+            # stop-tail at
+            tail = re.sub(r".*\s", "", s).upper()
+            if tail in STOPTAIL: s = re.sub(r"\s+\S+$", "", s).strip(" ,.-:;’'")
+            return s
+
+        def backscan_at(T: str, at: int, window: int) -> Optional[str]:
+            left = T[max(0, at-window):at]
+            left = _clean_name(left)
             if not left: return None
-            toks = left.split()
-            while toks and toks[-1].upper() in STOPTAIL: toks.pop()
-            out = [t for t in toks if t.upper() not in STOPWORDS]
-            name = " ".join(out).strip(" ,.-:;’'")
-            return name if sum(ch.isalpha() for ch in name) >= 3 else None
+            toks = [t for t in left.split() if t.upper() not in STOPWORDS]
+            name = " ".join(toks).strip(" ,.-:;’'")
+            return name if _score_name(name) > 0 else None
 
-        name = backscan(220) or backscan(400)
-        if not name: return None, ctype
-        return _upper_tr(name), ctype
+        candidates: List[Tuple[float,str,str]] = []  # (score, name, type)
 
-    # ---------------------- Company name cleaner (final touch) ----------------
-    def _clean_company_name(name: str, ctype: Optional[str], ctx_text: str) -> str:
-        if not name: return ""
-        # tür ve ekleri kes (A.Ş.’nin vs.)
-        if ctype:
-            CORE = {
-                "ANONİM ŞİRKETİ": r"(?:a\.?\s*ş|a\.?\s*s|aş|as|anonim\s+şirket[İIıi]?)",
-                "LİMİTED ŞİRKETİ": r"(?:ltd\s*\.?\s*şt[İIıi]|ltd\s*\.?\s*st[İIıi]|limited\s+şirket[İIıi]?)",
-                "HOLDİNG": r"(?:holding)",
-                "KOOPERATİF": r"(?:kooperatif)",
-                "KOLEKTİF ŞİRKET": r"(?:kolektif\s+şirket[İIıi]?)",
-                "ADİ KOMANDİT ŞİRKET": r"(?:adi\s+komandit\s+şirket[İIıi]?)",
-                "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET": r"(?:sermayesi\s+paylara\s+bölünmüş\s+komandit\s+şirket[İIıi]?)",
-                "KOMANDİT ŞİRKET": r"(?:komandit\s+şirket[İIıi]?)",
-                "VAKIF": r"(?:vakf[ıi]|vakif)",
-                "DERNEK": r"(?:dernek)",
-            }
-            gen = r"(?:\s*[’'\"“”]?\s*(?:nin|nın|nun|nün|in|ın|un|ün))?"
-            pat = re.compile(rf"\b{CORE.get(ctype, '___')}\b{gen}.*$", re.IGNORECASE)
-            name = re.sub(pat, "", name).strip(" ,.-:;’'")
-        # güvenli karakter seti
-        name = re.sub(r"[^\w\s\.\-\/&’'ÇĞİÖŞÜçğıöşü]", " ", name)
-        name = re.sub(r"\s+", " ", name).strip(" ,.-:;’'")
-        return name
+        # 1) Tüm eşleşmeleri dene (sondan değil HEPSİ)
+        for m in matches:
+            ctype = _map_type_to_canonical(m.group(0))
+            for w in (180, 280, 420, 600):
+                nm = backscan_at(T, m.start(), w)
+                if nm:
+                    candidates.append((_score_name(nm), nm, ctype or ""))
+
+        # 2) Satır tabanlı: tip geçen satırın önceki 1-3 satırı
+        type_line_idx = []
+        for i, ln in enumerate(L):
+            if TYPE_RE.search(ln):
+                type_line_idx.append(i)
+        for i in type_line_idx:
+            for span in (1,2,3):
+                j = max(0, i-span)
+                nm = _clean_name(" ".join(L[j:i]))
+                nm = " ".join([t for t in nm.split() if t.upper() not in STOPWORDS]).strip(" ,.-:;’'")
+                if nm: candidates.append((_score_name(nm), nm, ""))
+
+        # 3) Acil durum: tipten önceki 80 karakterde büyük-harf bloğu
+        for m in matches:
+            left80 = T[max(0, m.start()-80):m.start()]
+            blocks = re.findall(r"[A-ZÇĞİÖŞÜ0-9][A-ZÇĞİÖŞÜ0-9\.\-\/&’']{3,}(?:\s+[A-ZÇĞİÖŞÜ0-9\.\-\/&’']{2,})*", left80)
+            if blocks:
+                nm = _clean_name(blocks[-1])
+                if nm: candidates.append((_score_name(nm), nm, _map_type_to_canonical(m.group(0)) or ""))
+
+        # Seçim
+        if not candidates:
+            dbg["reason"] = "no_candidates"
+            return None, _map_type_to_canonical(matches[-1].group(0)), dbg
+        best = max(candidates, key=lambda x: x[0])
+        cname = best[1]
+        ctype = best[2] or _map_type_to_canonical(matches[-1].group(0))
+        dbg["best_score"] = best[0]; dbg["best_name"] = cname; dbg["type"] = ctype
+        return _upper_tr(cname), ctype, dbg
 
     # =========================== MAIN LOOP ====================================
     rows = []
@@ -286,30 +316,25 @@ def extract_top_info_from_doc_images_fuzzy(
         if debug:
             print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
 
-        # Tarih (satır satır dene)
+        # Tarih
         date = None
         for ln in lines:
             date = _extract_date(ln)
             if date: break
 
-        # Şirket (tam metin üzerinden sağlam çıkarım)
-        cname, ctype = _extract_company_from_text(text)
-        if cname:
-            cname = _clean_company_name(cname, ctype, text)
+        # Şirket: çoklu strateji
+        cname, ctype, dbg = _extract_company(text, lines)
+        if debug:
+            print(f"[p{idx}] company_debug:", dbg)
 
         row = {
             "page_index": idx,
             "tarih": date,
             "şirket_adı": (cname if (isinstance(cname, str) and cname.strip()) else None),
-            "şirket_türü": _map_type_to_canonical(ctype) if ctype else None,
+            "şirket_türü": (_upper_tr(ctype) if ctype else None),
         }
         if debug:
-            row["debug_text"] = text[:1400]
+            row["debug_text"] = text[:1600]
         rows.append(row)
-
-    # Son rötuş: TR upper
-    for r in rows:
-        if r.get("şirket_adı"): r["şirket_adı"] = _upper_tr(r["şirket_adı"])
-        if r.get("şirket_türü"): r["şirket_türü"] = _upper_tr(r["şirket_türü"])
 
     return pd.DataFrame(rows)
