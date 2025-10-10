@@ -1,127 +1,42 @@
-def _extract_company(lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
-    """
-    Yalnızca 'tür' demirinin SOL tarafını kullanarak şirket adını çıkar.
-    Sağdaki metin (başlıklar, "...TOPLANTISINDA...") hiçbir koşulda dahil edilmez.
-    En fazla 2 üst satır SOL'a eklenerek isim tamamlanır.
-    """
-    import re, unicodedata
-    dbg: Dict = {}
+def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
+    H, W = img.shape[:2]
+    # fallback: üst %20 ya da parametrede ne verdiysen
+    y_fb = max(1, int(round(H * fallback_top_ratio)))
 
-    # --- normalize lines ---
-    L = [unicodedata.normalize("NFKC", (ln or "")).strip() for ln in (lines or [])]
-    L = [ln for ln in L if ln]
-    if not L:
-        return None, None, {"reason": "empty_lines"}
+    # tablo tespit edildiyse onu kullan; değilse fallback
+    y_use = y_fb if (y_top is None or y_top < 60) else y_top
+    y_use = max(y_use, min_upper_px)                 # en az şu kadar olsun
 
-    # --- helpers ---
-    def upper_tr(s: str) -> str:
-        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
-        return "".join(mp.get(ch, ch.upper()) for ch in s or "")
+    up = img[:y_use, :]
 
-    def spaced_tok(tok: str) -> str:
-        # "ŞİRKET" -> Ş\s*İ\s*R\s*K\s*E\s*T
-        return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
+    # Güvenlik: kırpılan alanın ALT %10'unda ızgara (siyah piksel) yoğunluğu yüksekse,
+    # kademeli olarak 10px geri çek.
+    try:
+        roi_h = max(4, int(0.10 * up.shape[0]))
+        tail = up[-roi_h:, :]
+        g = cv2.cvtColor(tail, cv2.COLOR_BGR2GRAY) if tail.ndim==3 else tail
+        _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+        density = float(np.count_nonzero(bw)) / (bw.size + 1e-6)
+        retreat = 0
+        while density > grid_density_limit and (y_use - retreat) > min_upper_px+10:
+            retreat += 10
+            tail = up[-(roi_h+retreat):-retreat if retreat>0 else None, :]
+            g = cv2.cvtColor(tail, cv2.COLOR_BGR2GRAY) if tail.ndim==3 else tail
+            _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+            density = float(np.count_nonzero(bw)) / (bw.size + 1e-6)
+        if retreat > 0:
+            y_use = max(min_upper_px, y_use - retreat)
+            up = img[:y_use, :]
+    except Exception:
+        pass
 
-    GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-    TYPE_PAT = (
-        rf"(?:ANON[İI]M\s+{spaced_tok('ŞİRKET')}|A\.?\s*Ş|AŞ|A\.?\s*S|"
-        rf"LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+{spaced_tok('ŞİRKET')}){GEN}"
-        r"|HOLD[İI]NG|KOOPERAT[İI]F|KOMAND[İI]T\s+" + spaced_tok("ŞİRKET") +
-        r"|KOLEKT[İI]F\s+" + spaced_tok("ŞİRKET") +
-        r"|SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+" + spaced_tok("ŞİRKET") +
-        r"|DERNEK|VAKF[İI]|VAKIF"
-    )
-    TYPE_RE = re.compile(TYPE_PAT, re.IGNORECASE)
+    if debug and show_fig and up is not None and up.size:
+        try:
+            import matplotlib.pyplot as plt
+            mode = "fallback%{}".format(int(fallback_top_ratio*100)) if (y_top is None or y_top < 60) else "table-top"
+            plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
+            plt.title(f"Upper crop (0:{y_use}) | mode={mode}")
+            plt.axis("off"); plt.show()
+        except: pass
 
-    # tür -> kanonik
-    def _map_type_to_canonical(type_text: str) -> Optional[str]:
-        if not type_text: return None
-        u = (type_text.upper()
-             .replace("İ","I").replace("Ş","S").replace("Ğ","G")
-             .replace("Ü","U").replace("Ö","O").replace("Ç","C"))
-        flat = re.sub(r"[\s\.\-_/’'`´]+","",u)
-        if re.search(r"(AS|AŞ|ANONIMSIRKET)", flat): return "ANONİM ŞİRKETİ"
-        if re.search(r"(LTDSTI|LIMITEDSIRKET)", flat): return "LİMİTED ŞİRKETİ"
-        if "HOLDING" in flat: return "HOLDİNG"
-        if "KOOPERATIF" in flat: return "KOOPERATİF"
-        if re.search(r"KOLEKTIF.*SIRKET", flat): return "KOLEKTİF ŞİRKET"
-        if re.search(r"ADIKOMANDIT.*SIRKET", flat): return "ADİ KOMANDİT ŞİRKET"
-        if re.search(r"SERMAYESIPAYLARABOLUNMUSKOMANDIT.*SIRKET", flat): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
-        if re.search(r"KOMANDIT.*SIRKET", flat): return "KOMANDİT ŞİRKET"
-        if "VAKIF" in flat: return "VAKIF"
-        if "DERNEK" in flat: return "DERNEK"
-        return None
-
-    # gürültü sözcükleri (baş/son kırpma için — içteki kelimelere dokunmuyoruz)
-    NOISE_EDGE = {
-        "GENEL","KURUL","KURULDA","KURULUN","TOPLANTISI","TOPLANTISINDA","HAZIR",
-        "BULUNANLAR","LİSTESİ","LISTESI","ÖRNEĞİ","ORNEGI","GÜNDEM","GUNDEM","TUTANAK"
-    }
-    FILLERS_EDGE = {"VE","DE","DA","İLE","ILE","VEYA","-","—","–","•"}
-
-    def edge_trim_soft(s: str) -> str:
-        toks = re.split(r"\s+", s.strip())
-        i = 0
-        while i < len(toks) and (toks[i].upper() in NOISE_EDGE or toks[i].upper() in FILLERS_EDGE):
-            i += 1
-        j = len(toks)
-        while j > i and (toks[j-1].upper() in NOISE_EDGE or toks[j-1].upper() in FILLERS_EDGE):
-            j -= 1
-        return re.sub(r"\s{2,}"," "," ".join(toks[i:j]).strip())
-
-    # --- 1) Anchor (tür) konumunu bul: önce aynı satır, yoksa i+i+1 birleşik ---
-    anchors = []  # (i, start_in_concat, raw_type, inline_is_single_line, split_point_in_i1)
-    n = len(L)
-    for i in range(n):
-        s = L[i]
-        m = TYPE_RE.search(s)
-        if m:
-            anchors.append((i, m.start(), m.group(0), True, None))
-            continue
-        if i+1 < n:
-            concat = s + " " + L[i+1]
-            m2 = TYPE_RE.search(concat)
-            if m2:
-                # split point: m2.start() her iki satır toplamında; sol parça yalnızca bu start'a kadar
-                anchors.append((i, m2.start(), m2.group(0), False, len(s)))
-
-    if not anchors:
-        return None, None, {"reason":"no_type_in_lines"}
-
-    # En son (başlıklardan kaçınmak için)
-    i, start_in_concat, raw_type, single_line, split_pt = anchors[-1]
-    ctype = _map_type_to_canonical(raw_type)
-
-    # --- 2) Sadece SOL tarafı al ---
-    if single_line:
-        left_main = L[i][:start_in_concat]
-    else:
-        # i + i+1 birleşiminde: yalnızca sol parça
-        # (i'nin tamamı + i+1'in 'start_in_concat - split_pt' kadarı)
-        take_from_next = max(0, start_in_concat - (split_pt + 1))  # +1: araya koyduğumuz boşluk
-        left_main = (L[i] + " " + L[i+1][:take_from_next]).rstrip()
-
-    # Üst satırlar: isim başı yukarıdaysa (max 2 satır) ekle
-    left_prev1 = L[i-1] if i-1 >= 0 else ""
-    left_prev2 = L[i-2] if i-2 >= 0 else ""
-
-    # Adaylar — SADECE SOL/ÜST, sağ yok!
-    cand_list = []
-    def push(label, txt):
-        txt = edge_trim_soft(txt)
-        if txt and sum(ch.isalpha() for ch in txt) >= 3:
-            # basit skor: daha uzun ve tokenlı olanı tercih et
-            score = min(len(txt)/120.0, 1.0) + min(len(txt.split())/10.0, 1.0)
-            cand_list.append((score, txt, label))
-
-    push("inline_left", left_main)
-    if left_prev1: push("prev1+inline_left", left_prev1 + " " + left_main)
-    if left_prev2: push("prev2+prev1+inline_left", left_prev2 + " " + left_prev1 + " " + left_main)
-    if left_prev1: push("prev1_only", left_prev1)         # bazen tür bir sonraki satırda, ad tamamen i-1'de
-    if left_prev2: push("prev2_prev1", left_prev2 + " " + left_prev1)
-
-    if not cand_list:
-        return None, ctype, {"reason":"no_left_candidate", "type":ctype}
-
-    best = max(cand_list, key=lambda x: x[0])
-    return upper_tr(best[1]), ctype, {"reason":"ok", "picked":best[2], "score":best[0], "type":ctype}
+    return up if (up is not None and up.size and up.shape[0] >= min_upper_px) else None
