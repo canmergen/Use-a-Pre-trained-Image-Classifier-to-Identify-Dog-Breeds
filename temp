@@ -1,315 +1,147 @@
-def extract_top_info_from_doc_images_fuzzy(
-    doc_images: List[np.ndarray],
-    ocr_fn: Callable[[np.ndarray], str],   # img_bgr -> text
-    table_top_shift_ratio: float = 0.02,
-    fallback_top_ratio: float = 0.20,
-    min_upper_px: int = 120,
+def clean_header_phrase_substrings(
+    top_df: pd.DataFrame,
+    *,
+    text_col: str = "şirket_adı",
+    fuzzy_threshold: int = 82,      # istersen 78-85 aralığında oynat
+    min_window_tokens: int = 3,
+    max_window_tokens: int = 10,
+    max_passes: int = 3,
     debug: bool = False,
-    show_fig: bool = False,
-    show_table_fig: bool = False,
+    # ---- yeni korumalar ----
+    max_header_search_chars: int = 350,   # sadece metnin ilk kısmında başlık arıyoruz
 ) -> pd.DataFrame:
     """
-    Dönüş: DataFrame[page_index, tarih, şirket_adı, şirket_türü, (debug_text)]
+    Satırları silmez. text_col içindeki 'başlık/şablon' cümlesini (örn. GENEL KURULDA HAZIR BULUNANLAR LİSTESİ)
+    yalnızca o blok olarak kaldırır; şirket adı/türüne dokunmaz. OCR gürültüsüne dayanıklı fuzzy alt-dizgi kullanır.
     """
 
-    # ==================== helpers ====================
-    def _upper_tr(s: str) -> str:
-        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
-        return "".join(mp.get(ch, ch.upper()) for ch in s or "")
+    if text_col not in top_df.columns:
+        raise ValueError(f"'{text_col}' column not found")
 
-    def _nfkc(s: str) -> str:
-        return unicodedata.normalize("NFKC", s or "")
+    # --- 1) sabit şablonlar ---
+    exact_patterns = [
+        r"GENEL\s+KURULDA\s+HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
+        r"HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
+        r"TOPLANTIYA\s+KATILANLAR",
+        r"TOPLANTI\s+TUTANA[ĞG][Iİ]",
+        r"G[UÜ]NDEM\s+MADDELER[İI]",
+        r"KARARLAR",
+    ]
+    exact_re = re.compile("|".join(exact_patterns), flags=re.IGNORECASE)
 
-    def _norm_spaces(s: str) -> str:
-        s = (_nfkc(s)
-             .replace("\u00A0"," ").replace("\u200B"," ")
-             .replace("’","'").replace("“","\"").replace("”","\""))
-        return re.sub(r"\s+", " ", s).strip()
+    templates = [
+        "GENEL KURULDA HAZIR BULUNANLAR LISTESI",
+        "HAZIR BULUNANLAR LISTESI",
+        "TOPLANTIYA KATILANLAR",
+        "TOPLANTI TUTANAGI",
+        "GUNDEM MADDELERI",
+        "KARARLAR",
+    ]
+    # başlık olma olasılığını güçlendiren anahtar kelimeler (en az birini içermeli)
+    header_keywords = {"GENEL","KURUL","HAZIR","BULUNANLAR","LİSTE","LISTE","TOPLANTI","TUTANAK","GÜNDEM","GUNDEM","ÖRNEĞİ","ORNEGI"}
 
-    def _spaced_token(tok: str) -> str:
-        # "ŞİRKET" -> Ş\s*İ\s*R\s*K\s*E\s*T
-        return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
+    # --- 2) normalizasyon yardımcıları ---
+    tr_map  = str.maketrans({"İ":"I","I":"I","ı":"I","Ş":"S","ş":"S","Ğ":"G","ğ":"G","Ü":"U","ü":"U","Ö":"O","ö":"O","Ç":"C","ç":"C"})
+    ocr_map = str.maketrans({"0":"O","1":"I","5":"S","8":"B","2":"Z","!":"I","|":"I"})
+    def norm(s: str) -> str:
+        s = unicodedata.normalize("NFKD", s or "")
+        s = s.translate(tr_map).translate(ocr_map)
+        s = re.sub(r"\s+", " ", s)
+        return s.strip().upper()
 
-    # ---------------------- table/upper crop ----------------------
-    def _detect_table_top(img: np.ndarray) -> Optional[int]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        H, W = gray.shape[:2]
-        blur = cv2.GaussianBlur(gray, (3,3), 0)
-        thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY_INV, 35, 5)
-        kx = max(12, W // 60); ky = max(12, H // 60)
-        horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_RECT, (kx,1)), 1)
-        vert  = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_RECT, (1,ky)), 1)
-        mask = cv2.bitwise_or(horiz, vert)
-        lines = cv2.HoughLinesP(horiz, 1, np.pi/180, threshold=80,
-                                minLineLength=int(W*0.55), maxLineGap=10)
-        cand = []
-        if lines is not None:
-            for x1,y1,x2,y2 in lines[:,0,:]:
-                if abs(y1-y2) <= 2: cand.append(int((y1+y2)//2))
-        cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            x,y,w,h = cv2.boundingRect(c)
-            if w >= int(W*0.5) and h >= max(8, H//120): cand.append(y)
-        if not cand:
-            if debug and show_table_fig:
-                try:
-                    import matplotlib.pyplot as plt
-                    plt.figure(figsize=(9,4)); plt.imshow(gray, cmap="gray")
-                    plt.title("No table line found"); plt.axis("off"); plt.show()
-                except Exception: pass
-            return None
-        y_top = max(0, min(cand))
-        y_top = int(y_top + max(2, round(table_top_shift_ratio*H)))
-        return None if y_top >= H-4 else y_top
+    # --- 3) tokenizasyon: span bilgisi saklanır ---
+    token_re = re.compile(r"\w+", flags=re.UNICODE)
+    def tokenize_with_spans(s: str) -> list[tuple[str,int,int]]:
+        return [(m.group(0), m.start(), m.end()) for m in token_re.finditer(s)]
 
-    def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
-        H, W = img.shape[:2]
-        y_fb = max(1, int(round(H*fallback_top_ratio)))
-        # tablo yoksa üst bantı agresif al
-        y_use = y_fb if (y_top is None or y_top < 180) else y_top
-        up = img[:y_use, :]
-        if debug and show_fig and up is not None and up.size:
-            try:
-                import matplotlib.pyplot as plt
-                mode = f"fallback%{int(fallback_top_ratio*100)}" if y_use==y_fb else "table-top"
-                plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-                plt.title(f"Upper crop (0:{y_use}) | mode={mode}"); plt.axis("off"); plt.show()
-            except Exception: pass
-        return up if (up is not None and up.size and up.shape[0] >= min_upper_px) else None
+    # --- 4) fuzzy skorlayıcı ---
+    try:
+        from rapidfuzz.fuzz import token_set_ratio, partial_ratio
+        def fuzzy_score(a: str, b: str) -> int:
+            return max(token_set_ratio(a, b), partial_ratio(a, b))
+    except Exception:
+        def fuzzy_score(a: str, b: str) -> int:
+            return 0  # RapidFuzz yoksa sadece exact çalışır
 
-    # ---------------------- date ----------------------
-    MONTHS_TR = {
-        1:["ocak","oca"], 2:["şubat","subat","şub","sub"], 3:["mart","mar"], 4:["nisan","nis"],
-        5:["mayıs","mayis","may"], 6:["haziran","haz"], 7:["temmuz","tem"],
-        8:["ağustos","agustos","ağu","agu"], 9:["eylül","eylul","eyl"],
-        10:["ekim","eki"], 11:["kasım","kasim","kas"], 12:["aralık","aralik","ara"],
-    }
-    MONTHS_EN = {
-        1:["january","jan"],2:["february","feb"],3:["march","mar"],4:["april","apr"],5:["may"],
-        6:["june","jun"],7:["july","jul"],8:["august","aug"],9:["september","sep","sept"],
-        10:["october","oct"],11:["november","nov"],12:["december","dec"]
-    }
-    MONTH_WORDS = set(sum(MONTHS_TR.values(), [])) | set(sum(MONTHS_EN.values(), []))
-    MONTH_WORDS_RGX = "|".join(sorted([re.escape(x).replace(r"\ ", r"\s*").replace(r"\.", r".?")
-                                       for x in MONTH_WORDS], key=len, reverse=True))
-    ROMAN_MAP = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
+    # --- 5) type-guard: şirket türü demirleri görülürse o span silinmeyecek
+    TYPE_ANCHOR = re.compile(
+        r"(?:\bANON[İI]M\s+Ş[İI]RKET[İI]\b|\bA\.?\s*Ş\b|\bAŞ\b|\bA\.?\s*S\b|"
+        r"\bLTD\s*\.?\s*ŞT[İI]\b|\bLTD\s*\.?\s*ST[İI]\b|\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]\b|"
+        r"\bHOLD[İI]NG\b|\bKOOPERAT[İI]F\b|\bKOMAND[İI]T\s+Ş[İI]RKET[İI]\b|\bDERNEK\b|\bVAKF[İI]\b|\bVAKIF\b)",
+        re.IGNORECASE
+    )
 
-    def _norm_year(y: str) -> Optional[int]:
-        y = re.sub(r"^\D+","", y or "")
-        if not y: return None
-        if len(y)==2: y = "20"+y
-        if len(y)>4: y = y[-4:]
-        try: return int(y)
-        except: return None
+    def remove_span(text: str, start: int, end: int) -> str:
+        new_text = (text[:start] + " " + text[end:]).strip()
+        return re.sub(r"\s{2,}", " ", new_text)
 
-    def _valid_date(d: int, m: int, y: int) -> bool:
-        return 1<=d<=31 and 1<=m<=12 and 1900<=y<=2100
+    def looks_like_header(s_norm: str) -> bool:
+        # en az bir header kelimesi içermeli
+        return any(k in s_norm for k in header_keywords)
 
-    def _month_from_word(tok: str) -> Optional[int]:
-        t = _nfkc(tok).lower()
-        t = (t.replace("ı","i").replace("ş","s").replace("ğ","g")
-               .replace("ü","u").replace("ö","o").replace("ç","c"))
-        for num, vs in MONTHS_TR.items():
-            if t in [x.replace("ı","i").replace("ş","s").replace("ğ","g")
-                       .replace("ü","u").replace("ö","o").replace("ç","c") for x in vs]:
-                return num
-        for num, vs in MONTHS_EN.items():
-            if t in vs: return num
-        return None
+    def clean_once(original: str) -> tuple[str,bool]:
+        # 0) sadece baştaki kısımda arama yap (çok uzun satırları korur)
+        head_limit = max_header_search_chars
+        search_area = original[:head_limit]
 
-    def _extract_date(text: str) -> Optional[str]:
-        if not text: return None
-        T = _nfkc(text)
-        T = re.sub(r"\s+"," ", T)
+        # a) exact kaldırma
+        new_s, n = exact_re.subn(" ", search_area)
+        if n > 0:
+            cleaned = remove_span(original, 0, len(search_area)).replace(search_area, re.sub(r"\s{2,}"," ", new_s).strip()+" ")
+            return re.sub(r"\s{2,}", " ", cleaned).strip(), True
 
-        m1 = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)", T)
-        if m1:
-            try:
-                d_i, m_i = int(m1.group(1)), int(m1.group(2)); y_i = _norm_year(m1.group(3))
-            except: d_i = m_i = y_i = None
-            if y_i and _valid_date(d_i,m_i,y_i): return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
+        # b) fuzzy alt-dizgi penceresi
+        toks = tokenize_with_spans(search_area)
+        if not toks:
+            return original, False
 
-        m2 = re.search(rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)", T, re.IGNORECASE)
-        if m2:
-            d = int(m2.group(1)); m = _month_from_word(m2.group(2)); y = _norm_year(m2.group(3))
-            if y and m and _valid_date(d,m,y): return f"{d:02d}/{m:02d}/{y:04d}"
+        best = (-1, None, None)  # (score, st, en)
+        for win in range(min_window_tokens, max(min(len(toks), max_window_tokens)+1, min_window_tokens)):
+            for i in range(0, len(toks)-win+1):
+                st = toks[i][1]; en = toks[i+win-1][2]
+                cand = search_area[st:en]
+                n_cand = norm(cand)
+                if not n_cand:
+                    continue
+                # header anahtar kelime şartı
+                if not looks_like_header(n_cand):
+                    continue
+                # type-guard: pencere içinde tür demiri varsa atla
+                if TYPE_ANCHOR.search(cand):
+                    continue
+                # tür demirinin SOLUNDA kalmasına özen göster (eğer satırda varsa)
+                m_type = TYPE_ANCHOR.search(search_area)
+                if m_type and en > m_type.start():
+                    continue
 
-        m3 = re.search(r"(?<!\d)(\d{1,2})\s*(?:[.-/])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[.-/])?\s*(\d{2,4})(?!\d)", T, re.IGNORECASE)
-        if m3:
-            d = int(m3.group(1)); m = ROMAN_MAP.get(m3.group(2).upper()); y = _norm_year(m3.group(3))
-            if y and m and _valid_date(d,m,y): return f"{d:02d}/{m:02d}/{y:04d}"
+                score = max(fuzzy_score(n_cand, norm(t)) for t in templates)
+                if score > best[0]:
+                    best = (score, st, en)
 
-        digits = re.sub(r"\D","", T)
-        if len(digits) >= 8:
-            best=None
-            for i in range(len(digits)-7):
-                try:
-                    d_i=int(digits[i:i+2]); m_i=int(digits[i+2:i+4]); y_i=int(digits[i+4:i+8])
-                except: continue
-                if _valid_date(d_i,m_i,y_i):
-                    cand=(y_i,i,d_i,m_i)
-                    if (best is None) or (cand>best): best=cand
-            if best:
-                y_i,_,d_i,m_i = best
-                return f"{d_i:02d}/{m_i:02d}/{y_i:04d}"
-        return None
+        score, st, en = best
+        if score >= fuzzy_threshold and st is not None:
+            cleaned_head = remove_span(search_area, st, en)
+            # sadece başta aradığımız bölümü değiştir
+            cleaned = original[:0] + cleaned_head + original[len(search_area):]
+            return cleaned, True
 
-    # ------------- type canonicalization (single fn) -------------
-    def _map_type_to_canonical(type_text: str) -> Optional[str]:
-        if not type_text: return None
-        u = _upper_tr(_norm_spaces(type_text))
-        u_ascii = (u.replace("İ","I").replace("Ş","S").replace("Ğ","G")
-                     .replace("Ü","U").replace("Ö","O").replace("Ç","C"))
-        GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        AS_ABBR   = r"(?:A\.?\s*Ş|A\.?\s*S|AŞ|AS)"+GEN
-        ANON_FULL = r"ANON[İI]M\s+" + _spaced_token("ŞİRKET") + GEN
-        LTD_BLOCK = r"(?:LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+" + _spaced_token("ŞİRKET") + r")" + GEN
-        SIRK_GEN  = _spaced_token("ŞİRKET") + GEN
-        RULES = [
-            (rf"(?:\b|^)(?:{AS_ABBR}|{ANON_FULL})(?:\b|$)", "ANONİM ŞİRKETİ"),
-            (rf"(?:\b|^){LTD_BLOCK}(?:\b|$)",               "LİMİTED ŞİRKETİ"),
-            (rf"(?:\b|^)HOLD[İI]NG(?:\b|$)",                "HOLDİNG"),
-            (rf"(?:\b|^)KOOPERAT[İI]F(?:\b|$)",             "KOOPERATİF"),
-            (rf"(?:\b|^)KOLEKT[İI]F\s+{SIRK_GEN}(?:\b|$)",  "KOLEKTİF ŞİRKET"),
-            (rf"(?:\b|^)AD[İI]\s+KOMAND[İI]T\s+{SIRK_GEN}(?:\b|$)", "ADİ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+{SIRK_GEN}(?:\b|$)",
-             "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)KOMAND[İI]T\s+{SIRK_GEN}(?:\b|$)",  "KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)VAKF[Iİ]|VAKIF(?:\b|$)",            "VAKIF"),
-            (rf"(?:\b|^)DERNEK(?:\b|$)",                    "DERNEK"),
-        ]
-        for pat,label in RULES:
-            if re.search(pat, u, re.IGNORECASE): return label
-        flat = re.sub(r"[\s\.\-_/’'`´]+","",u_ascii)
-        if re.search(r"(AS|AŞ|ANONIMSIRKET)", flat): return "ANONİM ŞİRKETİ"
-        if re.search(r"(LTDSTI|LIMITEDSIRKET)", flat): return "LİMİTED ŞİRKETİ"
-        if "HOLDING" in flat: return "HOLDİNG"
-        if "KOOPERATIF" in flat: return "KOOPERATİF"
-        if re.search(r"KOLEKTIF.*SIRKET", flat): return "KOLEKTİF ŞİRKET"
-        if re.search(r"ADIKOMANDIT.*SIRKET", flat): return "ADİ KOMANDİT ŞİRKET"
-        if re.search(r"SERMAYESIPAYLARABOLUNMUSKOMANDIT.*SIRKET", flat): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
-        if re.search(r"KOMANDIT.*SIRKET", flat): return "KOMANDİT ŞİRKET"
-        if "VAKIF" in flat: return "VAKIF"
-        if "DERNEK" in flat: return "DERNEK"
-        return None
+        return original, False
 
-    # ------------- company extraction (left-only) -------------
-    def _extract_company(lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
-        dbg: Dict = {}
-        L = [_norm_spaces(ln) for ln in (lines or []) if isinstance(ln,str) and ln.strip()]
-        if not L: return None, None, {"reason":"empty_lines"}
+    cleaned_vals = []
+    total_changes = 0
+    for val in top_df[text_col].astype(str):
+        s = val
+        changed_any = False
+        for _ in range(max_passes):
+            s, changed = clean_once(s)
+            if not changed:
+                break
+            changed_any = True
+        cleaned_vals.append(s)
+        if changed_any and debug:
+            total_changes += 1
 
-        # tür deseni (kısaltmalar + ek)
-        GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        SIRK = _spaced_token("ŞİRKET")
-        TYPE_PAT = (
-            rf"(?:ANON[İI]M\s+{SIRK}|A\.?\s*Ş|AŞ|A\.?\s*S|"
-            rf"LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+{SIRK}){GEN}"
-        )
-        type_re = re.compile(TYPE_PAT, re.IGNORECASE)
-
-        # 1) sadece türü bulduğumuz satır(lar)
-        anchors = []  # (i, left_text, raw_type, inline)
-        n = len(L)
-        for i in range(n):
-            s = L[i]
-            m = type_re.search(s)
-            if m:
-                anchors.append((i, s[:m.start()], m.group(0), True))
-                continue
-            if i+1 < n:
-                s2 = s + " " + L[i+1]
-                m2 = type_re.search(s2)
-                if m2:
-                    anchors.append((i, s2[:m2.start()], m2.group(0), False))
-
-        if not anchors:
-            return None, None, {"reason":"no_type_in_lines"}
-
-        # başlıkların etkisini azaltmak için SON anchor
-        i, left_of_type, raw_type, _ = anchors[-1]
-        ctype = _map_type_to_canonical(raw_type)
-
-        # 2) yalnızca SOL ve üst satırları topla (PREV_LINES kadar, sınırsız uzunluk)
-        PREV_LINES = 4
-        context_lines = L[max(0, i-PREV_LINES):i] + [left_of_type]
-        context = " ".join([c for c in context_lines if c]).strip()
-
-        # 2a) başlık sınırı: son noktalama/ayraçtan sonrası (virgül, nokta, iki nokta, tire, satır sonu)
-        cut_at = max(context.rfind("."), context.rfind(":"), context.rfind(";"), context.rfind("—"), context.rfind("–"))
-        if cut_at != -1:
-            # eğer ayraçtan sonra çok kısa parça varsa kesme — değilse olduğu gibi bırak
-            tail = context[cut_at+1:].strip()
-            if len(tail) >= 6:
-                context = tail
-
-        # 2b) yumuşak temizlik (içteki kısa kelimeleri KORU, sadece uçları buda)
-        NOISE = {
-            "GENEL","KURUL","TOPLANTISI","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","ÖRNEĞİ",
-            "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","GÜNDEM","TUTANAK","LİSTE","EK-","SAYILI",
-            "KİMLİK","VERGİ","AD/SOYAD","AD SOYAD","UNVANI","ÜNVANI","NUMARA","NUMARASI",
-            "TARİHİ","GRUBU","GRUP","İTİBARİ","DEĞERİ","DEĞER","NOMINAL","NOMİNAL",
-            "İMZA","SIRA","PAY","PAYI","PAYLAR","HİSSE","HİSSELER","MERSİS","TC","T.C.",
-            "ADRESİ","MERKEZİ","ŞUBE","TEMSİLCİ","TEMSİLEN","KATILAN","TOPLAM","EDEN",
-            "ŞEKLİ","TÜRÜ","ŞEKLİ VE TÜRÜ"
-        }
-        STOPTAIL = {"AN","VE","DE","DA","TIC","TİC","SAN","VE.","DE.","DA.","TIC.","TİC.","SAN.","VEYA","İLE"}
-
-        def clean_soft(s: str) -> str:
-            s = re.sub(r"\s+", " ", s)
-            # tür kelimelerini temizle
-            s = re.sub(
-                rf"\b(ANONIM|ANONİM|LIMITED|LİMİTED|{SIRK}|LTD\.?\s*ŞTİ|LTD\.?\s*STİ|A\.?\s*Ş|AŞ|A\.?\s*S)\b",
-                "", s, flags=re.IGNORECASE
-            )
-            toks = [t for t in s.split() if t.upper() not in NOISE]
-            # sadece uçtaki doldurucuları buda; içtekilere dokunma
-            while toks and toks[-1].upper() in STOPTAIL: toks.pop()
-            while toks and toks[0].upper() in STOPTAIL:  toks.pop(0)
-            return " ".join(toks).strip(" ,.-:;’'")
-
-        name = clean_soft(context)
-        if not name or sum(ch.isalpha() for ch in name) < 3:
-            return None, ctype, {"reason":"clean_empty", "type":ctype}
-
-        return _upper_tr(name), ctype, {"reason":"ok", "picked":"prev+inline_left", "type":ctype}
-
-    # ======================= MAIN =======================
-    rows = []
-    for idx, img in enumerate(doc_images):
-        y_top = _detect_table_top(img)
-        if debug:
-            print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback upper ratio used)")
-        upper = _extract_upper(img, y_top)
-        if upper is None:
-            if debug: print(f"[p{idx}] Upper region empty -> skipped.")
-            continue
-
-        text = ocr_fn(upper) or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if debug:
-            print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
-
-        # Tarih
-        date = None
-        for ln in lines:
-            date = _extract_date(ln)
-            if date: break
-
-        # Şirket (sadece soldan ve üst satırlardan)
-        cname, ctype, dbginfo = _extract_company(lines)
-        if debug:
-            print(f"[p{idx}] company_debug:", dbginfo)
-
-        rows.append({
-            "page_index": idx,
-            "tarih": date,
-            "şirket_adı": (cname if (isinstance(cname, str) and cname.strip()) else None),
-            "şirket_türü": (_upper_tr(ctype) if ctype else None),
-            **({"debug_text": text[:1600]} if debug else {})
-        })
-
-    return pd.DataFrame(rows)
+    top_df[text_col] = cleaned_vals
+    if debug:
+        print(f"Updated {total_changes} row(s) in '{text_col}' via guarded header substring removal.")
+    return top_df
