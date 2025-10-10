@@ -2,23 +2,16 @@ def clean_header_phrase_substrings(
     top_df: pd.DataFrame,
     *,
     text_col: str = "şirket_adı",
-    fuzzy_threshold: int = 82,      # istersen 78-85 aralığında oynat
+    fuzzy_threshold: int = 82,
     min_window_tokens: int = 3,
     max_window_tokens: int = 10,
     max_passes: int = 3,
     debug: bool = False,
-    # ---- yeni korumalar ----
-    max_header_search_chars: int = 350,   # sadece metnin ilk kısmında başlık arıyoruz
+    max_header_search_chars: int = 400,   # başlık aramasını metnin ilk kısmıyla sınırla
 ) -> pd.DataFrame:
-    """
-    Satırları silmez. text_col içindeki 'başlık/şablon' cümlesini (örn. GENEL KURULDA HAZIR BULUNANLAR LİSTESİ)
-    yalnızca o blok olarak kaldırır; şirket adı/türüne dokunmaz. OCR gürültüsüne dayanıklı fuzzy alt-dizgi kullanır.
-    """
-
     if text_col not in top_df.columns:
         raise ValueError(f"'{text_col}' column not found")
 
-    # --- 1) sabit şablonlar ---
     exact_patterns = [
         r"GENEL\s+KURULDA\s+HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
         r"HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
@@ -37,10 +30,13 @@ def clean_header_phrase_substrings(
         "GUNDEM MADDELERI",
         "KARARLAR",
     ]
-    # başlık olma olasılığını güçlendiren anahtar kelimeler (en az birini içermeli)
-    header_keywords = {"GENEL","KURUL","HAZIR","BULUNANLAR","LİSTE","LISTE","TOPLANTI","TUTANAK","GÜNDEM","GUNDEM","ÖRNEĞİ","ORNEGI"}
+    header_keywords = {
+        "GENEL","KURUL","KURULDA","KURULUN","HAZIR","BULUNANLAR",
+        "LİSTE","LISTE","LİSTESİ","LISTESI",
+        "TOPLANTI","TOPLANTISI","TOPLANTISINDA",
+        "TUTANAK","GÜNDEM","GUNDEM","ÖRNEĞİ","ORNEGI"
+    }
 
-    # --- 2) normalizasyon yardımcıları ---
     tr_map  = str.maketrans({"İ":"I","I":"I","ı":"I","Ş":"S","ş":"S","Ğ":"G","ğ":"G","Ü":"U","ü":"U","Ö":"O","ö":"O","Ç":"C","ç":"C"})
     ocr_map = str.maketrans({"0":"O","1":"I","5":"S","8":"B","2":"Z","!":"I","|":"I"})
     def norm(s: str) -> str:
@@ -49,21 +45,18 @@ def clean_header_phrase_substrings(
         s = re.sub(r"\s+", " ", s)
         return s.strip().upper()
 
-    # --- 3) tokenizasyon: span bilgisi saklanır ---
     token_re = re.compile(r"\w+", flags=re.UNICODE)
     def tokenize_with_spans(s: str) -> list[tuple[str,int,int]]:
         return [(m.group(0), m.start(), m.end()) for m in token_re.finditer(s)]
 
-    # --- 4) fuzzy skorlayıcı ---
     try:
         from rapidfuzz.fuzz import token_set_ratio, partial_ratio
         def fuzzy_score(a: str, b: str) -> int:
             return max(token_set_ratio(a, b), partial_ratio(a, b))
     except Exception:
         def fuzzy_score(a: str, b: str) -> int:
-            return 0  # RapidFuzz yoksa sadece exact çalışır
+            return 0
 
-    # --- 5) type-guard: şirket türü demirleri görülürse o span silinmeyecek
     TYPE_ANCHOR = re.compile(
         r"(?:\bANON[İI]M\s+Ş[İI]RKET[İI]\b|\bA\.?\s*Ş\b|\bAŞ\b|\bA\.?\s*S\b|"
         r"\bLTD\s*\.?\s*ŞT[İI]\b|\bLTD\s*\.?\s*ST[İI]\b|\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]\b|"
@@ -76,26 +69,24 @@ def clean_header_phrase_substrings(
         return re.sub(r"\s{2,}", " ", new_text)
 
     def looks_like_header(s_norm: str) -> bool:
-        # en az bir header kelimesi içermeli
         return any(k in s_norm for k in header_keywords)
 
     def clean_once(original: str) -> tuple[str,bool]:
-        # 0) sadece baştaki kısımda arama yap (çok uzun satırları korur)
-        head_limit = max_header_search_chars
-        search_area = original[:head_limit]
+        # yalnızca baş bölümde ara
+        search_area = original[:max_header_search_chars]
 
-        # a) exact kaldırma
+        # a) exact
         new_s, n = exact_re.subn(" ", search_area)
         if n > 0:
-            cleaned = remove_span(original, 0, len(search_area)).replace(search_area, re.sub(r"\s{2,}"," ", new_s).strip()+" ")
-            return re.sub(r"\s{2,}", " ", cleaned).strip(), True
+            cleaned_head = re.sub(r"\s{2,}", " ", new_s).strip()
+            return (cleaned_head + " " + original[len(search_area):]).strip(), True
 
-        # b) fuzzy alt-dizgi penceresi
+        # b) fuzzy window
         toks = tokenize_with_spans(search_area)
         if not toks:
             return original, False
 
-        best = (-1, None, None)  # (score, st, en)
+        best = (-1, None, None)
         for win in range(min_window_tokens, max(min(len(toks), max_window_tokens)+1, min_window_tokens)):
             for i in range(0, len(toks)-win+1):
                 st = toks[i][1]; en = toks[i+win-1][2]
@@ -103,17 +94,14 @@ def clean_header_phrase_substrings(
                 n_cand = norm(cand)
                 if not n_cand:
                     continue
-                # header anahtar kelime şartı
                 if not looks_like_header(n_cand):
                     continue
-                # type-guard: pencere içinde tür demiri varsa atla
+                # type guard
                 if TYPE_ANCHOR.search(cand):
                     continue
-                # tür demirinin SOLUNDA kalmasına özen göster (eğer satırda varsa)
                 m_type = TYPE_ANCHOR.search(search_area)
-                if m_type and en > m_type.start():
+                if m_type and en > m_type.start():  # türün sağ tarafına taşma
                     continue
-
                 score = max(fuzzy_score(n_cand, norm(t)) for t in templates)
                 if score > best[0]:
                     best = (score, st, en)
@@ -121,11 +109,28 @@ def clean_header_phrase_substrings(
         score, st, en = best
         if score >= fuzzy_threshold and st is not None:
             cleaned_head = remove_span(search_area, st, en)
-            # sadece başta aradığımız bölümü değiştir
-            cleaned = original[:0] + cleaned_head + original[len(search_area):]
-            return cleaned, True
+            return (cleaned_head + original[len(search_area):]).strip(), True
 
         return original, False
+
+    # --- ek: kenar budama (baş/sondaki artıkları sök) ---
+    EDGE_FILLERS = {
+        "VE","DE","DA","İLE","ILE","VEYA","-","—","–","•"
+    }
+    HEADER_TOKS = header_keywords | {"ÖRNEĞİ","ORNEGI","LİSTESİ","LISTESI","LİSTESİNDEN","LISTESINDEN"}
+
+    def edge_trim(s: str) -> str:
+        toks = re.split(r"\s+", s.strip())
+        # baştan
+        i = 0
+        while i < len(toks) and (toks[i].upper() in HEADER_TOKS or toks[i].upper() in EDGE_FILLERS):
+            i += 1
+        # sondan
+        j = len(toks)
+        while j > i and (toks[j-1].upper() in HEADER_TOKS or toks[j-1].upper() in EDGE_FILLERS):
+            j -= 1
+        out = " ".join(toks[i:j]).strip()
+        return re.sub(r"\s{2,}", " ", out)
 
     cleaned_vals = []
     total_changes = 0
@@ -133,15 +138,18 @@ def clean_header_phrase_substrings(
         s = val
         changed_any = False
         for _ in range(max_passes):
-            s, changed = clean_once(s)
+            s2, changed = clean_once(s)
             if not changed:
                 break
+            s = s2
             changed_any = True
+        # kenar budama
+        s = edge_trim(s)
         cleaned_vals.append(s)
-        if changed_any and debug:
+        if changed_any:
             total_changes += 1
 
     top_df[text_col] = cleaned_vals
     if debug:
-        print(f"Updated {total_changes} row(s) in '{text_col}' via guarded header substring removal.")
+        print(f"Updated {total_changes} row(s) in '{text_col}' with guarded header removal + edge trim.")
     return top_df
