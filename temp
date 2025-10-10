@@ -1,42 +1,138 @@
-def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
-    H, W = img.shape[:2]
-    # fallback: üst %20 ya da parametrede ne verdiysen
-    y_fb = max(1, int(round(H * fallback_top_ratio)))
+def _extract_company(lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
+    """
+    Yalnızca TÜR'ün SOL tarafını ve gerekirse üst satır(lar)ı kullanarak şirket adını çıkarır.
+    Sağ taraf asla alınmaz. Dönüş: (şirket_adı | None, kanonik_tür | None, debug)
+    """
+    import re, unicodedata
+    dbg: Dict = {}
 
-    # tablo tespit edildiyse onu kullan; değilse fallback
-    y_use = y_fb if (y_top is None or y_top < 60) else y_top
-    y_use = max(y_use, min_upper_px)                 # en az şu kadar olsun
+    # ---- normalize lines ----
+    L = [unicodedata.normalize("NFKC", (ln or "")).strip() for ln in (lines or [])]
+    L = [ln for ln in L if ln]
+    if not L:
+        return None, None, {"reason": "empty_lines"}
 
-    up = img[:y_use, :]
+    # ---- helpers
+    def upper_tr(s: str) -> str:
+        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
+        return "".join(mp.get(ch, ch.upper()) for ch in s or "")
 
-    # Güvenlik: kırpılan alanın ALT %10'unda ızgara (siyah piksel) yoğunluğu yüksekse,
-    # kademeli olarak 10px geri çek.
-    try:
-        roi_h = max(4, int(0.10 * up.shape[0]))
-        tail = up[-roi_h:, :]
-        g = cv2.cvtColor(tail, cv2.COLOR_BGR2GRAY) if tail.ndim==3 else tail
-        _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-        density = float(np.count_nonzero(bw)) / (bw.size + 1e-6)
-        retreat = 0
-        while density > grid_density_limit and (y_use - retreat) > min_upper_px+10:
-            retreat += 10
-            tail = up[-(roi_h+retreat):-retreat if retreat>0 else None, :]
-            g = cv2.cvtColor(tail, cv2.COLOR_BGR2GRAY) if tail.ndim==3 else tail
-            _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-            density = float(np.count_nonzero(bw)) / (bw.size + 1e-6)
-        if retreat > 0:
-            y_use = max(min_upper_px, y_use - retreat)
-            up = img[:y_use, :]
-    except Exception:
-        pass
+    def spaced_word(w: str) -> str:
+        # "ŞİRKET" -> Ş\s*İ\s*R\s*K\s*E\s*T (i/ı toleransı)
+        m = {"ş": r"[sşSŞ]", "ı": r"[ıiIİ]", "i": r"[ıiIİ]"}
+        return r"\s*".join(m.get(ch, re.escape(ch)) for ch in w.lower())
 
-    if debug and show_fig and up is not None and up.size:
-        try:
-            import matplotlib.pyplot as plt
-            mode = "fallback%{}".format(int(fallback_top_ratio*100)) if (y_top is None or y_top < 60) else "table-top"
-            plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-            plt.title(f"Upper crop (0:{y_use}) | mode={mode}")
-            plt.axis("off"); plt.show()
-        except: pass
+    SIRKET = spaced_word("şirket")
+    GEN    = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
 
-    return up if (up is not None and up.size and up.shape[0] >= min_upper_px) else None
+    TYPE_PAT = (
+        rf"(?:ANON[İI]M\s+{SIRKET}|A\.?\s*Ş|AŞ|A\.?\s*S|"
+        rf"LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|"
+        rf"L[İI]M[İI]TED\s+{SIRKET}){GEN}"
+    )
+    type_re = re.compile(TYPE_PAT, re.IGNORECASE)
+
+    # Kanonikleştirici (tek noktada)
+    def canon_type(raw: str | None) -> Optional[str]:
+        return _map_type_to_canonical(raw or "")
+
+    # Gürültü kelimeleri (başlık/şablon)
+    NOISE = {
+        "GENEL","KURUL","KURULDA","TOPLANTISI","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","LİSTESI","ÖRNEĞİ","ÖRNEGI",
+        "TARİHLİ","TARIHLI","OLAĞAN","OLAGAN","OLAĞANÜSTÜ","OLAGANUSTU","GÜNDEM","GUNDEM","TUTANAK","TUTANAĞI","TUTANAGI",
+        "LİSTE","EK-","SAYILI","FORMU","FORM",
+        "KİMLİK","KIMLIK","VERGİ","VERGI","AD/SOYAD","AD","SOYAD","UNVANI","ÜNVANI","NUMARA","NUMARASI",
+        "TARİHİ","TARIHI","GRUBU","GRUP","BİRİM","BIRIM","NOMİNAL","NOMINAL","İTİBARİ","ITIBARI","DEĞERİ","DEGERI",
+        "İMZA","IMZA","SIRA","PAY","PAYI","PAYLAR","HİSSE","HISSE","HİSSELER","HISSELER",
+        "MERSİS","MERSIS","TC","T.C.","ADRESİ","ADRESI","MERKEZİ","MERKEZI","ŞUBE","SUBE",
+        "TEMSİLCİ","TEMSILCI","TEMSİLEN","TEMSILEN","KATILAN","TOPLAM","EDEN","ŞEKLİ","SEKLI","TÜRÜ","TURU",
+        "ŞEKLİ VE TÜRÜ","SEKLI VE TURU"
+    }
+    # Son/baş doldurucu ama içte kalırsa koru
+    BORDER_FILLERS = {"VE","DE","DA","TE","TA","VEYA","İLE","ILE","VE.","DE.","DA.","TE.","TA."}
+
+    def strip_type_words(s: str) -> str:
+        return re.sub(
+            rf"\b(ANONIM|ANONİM|LIMITED|LİMİTED|{SIRKET}|LTD\.?\s*ŞTİ|LTD\.?\s*STİ|A\.?\s*Ş|AŞ|A\.?\s*S)\b",
+            "", s, flags=re.IGNORECASE
+        )
+
+    def clean_name_soft(s: str) -> str:
+        # Sadece sol parçayı yumuşak temizle: başlık kelimeleri gitsin, kısa gerçek kelimeler kalsın.
+        s = re.sub(r"\s+", " ", s).strip(" ,.-:;’'")
+        s = strip_type_words(s)
+        toks = s.split()
+        toks = [t for t in toks if t.upper() not in NOISE]
+        # sadece BAŞ/SON’daki doldurucuları sök
+        while toks and toks[-1].upper() in BORDER_FILLERS: toks.pop()
+        while toks and toks[0].upper() in BORDER_FILLERS: toks.pop(0)
+        return " ".join(toks).strip(" ,.-:;’'")
+
+    def score(name: str) -> float:
+        if not name: return 0.0
+        s = unicodedata.normalize("NFKC", name)
+        letters = sum(ch.isalpha() for ch in s)
+        digits  = sum(ch.isdigit() for ch in s)
+        if letters < 3 or letters <= digits: return 0.0
+        toks = name.split()
+        return 0.6*min(len(s)/120,1.0) + 0.4*min(len(toks)/16,1.0)
+
+    # ---- anchor arama (sadece SOL kullanılacak)
+    anchors = []  # (i, left_of_type, raw_type, inline)
+    n = len(L)
+    for i in range(n):
+        s = L[i]
+        m = type_re.search(s)
+        if m:
+            anchors.append((i, s[:m.start()], m.group(0), True))
+            continue
+        if i+1 < n:
+            s2 = s + " " + L[i+1]
+            m2 = type_re.search(s2)
+            if m2:
+                # yine yalnızca SOL: birleşik metnin tipten önceki kısmı
+                left = s2[:m2.start()]
+                anchors.append((i, left, m2.group(0), False))
+
+    if not anchors:
+        return None, None, {"reason": "no_type_in_lines"}
+
+    # Başlıklara takılmamak için en sondaki anchor’ı al
+    i, left_of_type, raw_type, inline = anchors[-1]
+    ctype = canon_type(raw_type)
+
+    # ---- yalnızca SOL ve ÜST satırlar
+    # Üst satırlar + sol parça birleştirme (i-2,i-1 + left)
+    parts = []
+    if i-2 >= 0: parts.append(L[i-2])
+    if i-1 >= 0: parts.append(L[i-1])
+    parts.append(left_of_type)
+    merged = " ".join([p for p in parts if p]).strip()
+
+    candidates = []
+    nm_merged = clean_name_soft(merged)
+    if nm_merged:
+        candidates.append((score(nm_merged) + 0.05, nm_merged, "prev2+prev1+inline_left"))
+
+    nm_inline = clean_name_soft(left_of_type)
+    if nm_inline:
+        candidates.append((score(nm_inline), nm_inline, "inline_left_only"))
+
+    if i-1 >= 0:
+        nm_prev = clean_name_soft(L[i-1])
+        if nm_prev:
+            candidates.append((score(nm_prev), nm_prev, "prev_only"))
+
+    if i-2 >= 0:
+        nm_prev2 = clean_name_soft(L[i-2] + " " + L[i-1])
+        if nm_prev2:
+            candidates.append((score(nm_prev2), nm_prev2, "prev2+prev1"))
+
+    if not candidates:
+        return None, ctype, {"reason": "no_candidate_left", "type": ctype}
+
+    best = max(candidates, key=lambda x: x[0])
+    if best[0] < 0.25:
+        return None, ctype, {"reason": "low_score", "score": best[0], "type": ctype}
+
+    return upper_tr(best[1]), ctype, {"reason": "ok", "picked": best[2], "score": best[0], "type": ctype}
