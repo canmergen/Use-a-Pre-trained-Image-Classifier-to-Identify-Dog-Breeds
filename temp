@@ -1,14 +1,14 @@
 def _extract_company_from_lines(lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
-    """lines bazında şirket adını ve türünü çıkar.
-       Yalnızca türün bulunduğu satır ve üst satırlar incelenir."""
-    dbg = {}
-    L = [unicodedata.normalize("NFKC", (ln or "")).strip() for ln in lines or []]
-    L = [ln for ln in L if ln]
+    import re, unicodedata
+    dbg: Dict = {}
 
+    # ---- normalize lines ----
+    L = [unicodedata.normalize("NFKC", (ln or "")).strip() for ln in (lines or [])]
+    L = [ln for ln in L if ln]
     if not L:
         return None, None, {"reason": "empty_lines"}
 
-    # ---- yardımcılar
+    # helpers
     def upper_tr(s: str) -> str:
         mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
         return "".join(mp.get(ch, ch.upper()) for ch in s or "")
@@ -20,14 +20,13 @@ def _extract_company_from_lines(lines: List[str]) -> Tuple[Optional[str], Option
     SIRKET = spaced_word("şirket")
     GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
 
-    TYPE_ALT = (
-        rf"(?:ANON[İI]M\s+{SIRKET}|A\.?\s*Ş|AŞ|A\.?\s*S"
-        rf"|LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]"
-        rf"|L[İI]M[İI]TED\s+{SIRKET}){GEN}"
+    TYPE_PAT = (
+        rf"(?:ANON[İI]M\s+{SIRKET}|A\.?\s*Ş|AŞ|A\.?\s*S|"
+        rf"LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|"
+        rf"L[İI]M[İI]TED\s+{SIRKET}){GEN}"
     )
-    type_re = re.compile(TYPE_ALT, re.IGNORECASE)
+    type_re = re.compile(TYPE_PAT, re.IGNORECASE)
 
-    # Gürültü/başlıklar
     NOISE = {
         "GENEL","KURUL","TOPLANTISI","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","ÖRNEĞİ",
         "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","GÜNDEM","TUTANAK","LİSTE","EK-","SAYILI",
@@ -45,28 +44,30 @@ def _extract_company_from_lines(lines: List[str]) -> Tuple[Optional[str], Option
             "", s, flags=re.IGNORECASE
         )
 
-    def clean_line(s: str) -> str:
+    def clean_name_soft(s: str) -> str:
         s = re.sub(r"\s+", " ", s)
         s = strip_type_words(s)
         toks = [t for t in s.split() if t.upper() not in NOISE]
-        while toks and (toks[-1].upper() in STOPTAIL or len(toks[-1]) < 2):
+
+        # sadece BAŞ/SON doldurucuları sök; içteki 2 harflileri KORU (örn. ET)
+        while toks and (toks[-1].upper() in STOPTAIL):
             toks.pop()
-        while toks and len(toks[0]) < 2:
+        while toks and (toks[0].upper() in STOPTAIL):
             toks.pop(0)
+
         return " ".join(toks).strip(" ,.-:;’'")
 
-    def score_name(name: str) -> float:
+    def score(name: str) -> float:
         if not name: return 0.0
         s = unicodedata.normalize("NFKC", name)
         letters = sum(ch.isalpha() for ch in s)
         digits  = sum(ch.isdigit() for ch in s)
-        if letters < 3 or letters <= digits:
-            return 0.0
+        if letters < 3 or letters <= digits: return 0.0
         toks = name.split()
-        return 0.6*min(len(s)/90,1.0) + 0.4*min(len(toks)/10,1.0)
+        return 0.6*min(len(s)/90,1.0) + 0.4*min(len(toks)/12,1.0)
 
-    # ---- 1) satır satır türü ara (i ve i+1 birleştirme dahil)
-    anchors = []  # (i, left_text, raw_type, inline_match)
+    # 1) anchora bak (i veya i+i+1)
+    anchors = []  # (i, left_text, raw_type, inline)
     n = len(L)
     for i in range(n):
         s = L[i]
@@ -74,46 +75,52 @@ def _extract_company_from_lines(lines: List[str]) -> Tuple[Optional[str], Option
         if m:
             anchors.append((i, s[:m.start()], m.group(0), True))
             continue
-        # split across lines: i + i+1
         if i+1 < n:
             s2 = s + " " + L[i+1]
             m2 = type_re.search(s2)
             if m2:
-                left = s2[:m2.start()]
-                anchors.append((i, left, m2.group(0), False))
+                anchors.append((i, s2[:m2.start()], m2.group(0), False))
 
     if not anchors:
         return None, None, {"reason": "no_type_in_lines"}
 
-    # En sondaki anchor'ı tercih et (başlıklardan kaçmak için)
-    i, left_raw, raw_type, inline = anchors[-1]
+    # başlıklardan kaçmak için sondaki anchor
+    i, left_of_type, raw_type, _ = anchors[-1]
     ctype = _map_type_to_canonical(raw_type)
 
-    # ---- 2) Sadece SOL ve en fazla 2 üst satır ile aday üret
+    # 2) yalnıza SOL ve üst satırları birleştir
     candidates = []
 
-    # a) aynı satır sol parça
-    nm0 = clean_line(left_raw)
-    if nm0:
-        candidates.append((score_name(nm0), nm0, "inline_left"))
+    # (A) Üst satır(lar) + sol parçayı BİRLEŞTİR —> Avşar Oğulları gibi başı yukarıda kalanı yakalar
+    merged = " ".join([L[j] for j in range(max(0, i-2), i)])  # i-2 ve i-1
+    merged = (merged + " " + left_of_type).strip()
+    merged = clean_name_soft(merged)
+    if merged:
+        # birleşik adaylara küçük bonus ver
+        candidates.append((score(merged) + 0.05, merged, "merged_prev_prev1_inlineleft"))
 
-    # b) i-1 ve (i-2 + i-1) birleştirme
+    # (B) Sadece aynı satır sol
+    nm0 = clean_name_soft(left_of_type)
+    if nm0:
+        candidates.append((score(nm0), nm0, "inline_left"))
+
+    # (C) Sadece i-1 satır
     if i-1 >= 0:
-        nm1 = clean_line(L[i-1])
+        nm1 = clean_name_soft(L[i-1])
         if nm1:
-            candidates.append((score_name(nm1), nm1, "prev_line"))
+            candidates.append((score(nm1), nm1, "prev_line"))
+
+    # (D) i-2 + i-1
     if i-2 >= 0:
-        nm2 = clean_line(L[i-2] + " " + L[i-1])
+        nm2 = clean_name_soft(L[i-2] + " " + L[i-1])
         if nm2:
-            candidates.append((score_name(nm2), nm2, "prev2_prev1"))
+            candidates.append((score(nm2), nm2, "prev2_prev1"))
 
     if not candidates:
         return None, ctype, {"reason": "no_candidate_left", "type": ctype}
 
     best = max(candidates, key=lambda x: x[0])
-    dbg = {"reason": "ok", "picked": best[2], "score": best[0], "type": ctype}
-
     if best[0] < 0.25:
         return None, ctype, {"reason": "low_score_left", "score": best[0], "type": ctype}
 
-    return upper_tr(best[1]), ctype, dbg
+    return upper_tr(best[1]), ctype, {"reason": "ok", "picked": best[2], "score": best[0], "type": ctype}
