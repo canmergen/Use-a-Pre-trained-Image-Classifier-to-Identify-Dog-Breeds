@@ -1,101 +1,117 @@
-def _find_company(
-    lines: List[str],
+import re, unicodedata
+
+def fallback_company_from_text(
+    text: str,
     *,
-    fuzzy_type_thresh: float = 0.82,
-    fuzzy_join_lines: bool = True,
-) -> Tuple[Optional[str], Optional[str]]:
+    left_window: int = 160,     # tipe kadar en fazla kaç karakteri "ad" kabul edelim
+    min_name_len: int = 6,      # temizlik sonrası minimum ad uzunluğu
+) -> tuple[str|None, str|None, dict]:
     """
-    Şirket adını ve türünü satır tabanlı bulur; başarısızsa
-    tüm metin üzerinde dayanıklı (spaced-letters, ekler) fallback uygular.
+    Üst-bant OCR metninden (tek string) şirket adını ve türünü bulur.
+    Harf arası boşluklara, ekli biçimlere (ŞİRKETİNİN), noktalama/bozulmalara toleranslıdır.
+    Dönüş: (company_name | None, canonical_type | None, debug_info)
     """
-    import re, unicodedata
 
-    # --- yardımcılar ---
-    def _fix_breaks(t: str) -> str:
-        t = re.sub(r"\bS\s+AN\b", "SAN", t, flags=re.IGNORECASE)
-        t = re.sub(r"\bT\s*İ?\s*C\b", "TİC", t, flags=re.IGNORECASE)
-        t = re.sub(r"\s+([.,:;])", r"\1", t)
-        return re.sub(r"\s+", " ", t).strip()
+    if not text or not isinstance(text, str):
+        return None, None, {"reason": "empty_text"}
 
-    def _q(name: str) -> float:
-        if not name: return 0.0
-        s = unicodedata.normalize("NFKC", name)
-        letters = sum(ch.isalpha() for ch in s)
-        digits = sum(ch.isdigit() for ch in s)
-        if letters < 3 or letters <= digits: return 0.0
-        toks = [t for t in re.split(r"\s+", s.strip()) if t]
-        return 0.6 * min(len(s)/80, 1.0) + 0.3 * min(len(toks)/8, 1.0) + 0.1 * (letters/(letters+digits+1e-6))
+    dbg = {}
 
-    BAD_ENDS = {"AN","VE","TIC","TİC","SAN","VE.","VE,","TIC.","TİC.","SAN."}
+    # --- Normalizasyon (ama Türkçe büyük harfleri koruyarak) ------------------
+    T = unicodedata.normalize("NFKC", text)
+    # satırları birleştir, çoklu boşluğu tek boşluk yap
+    T = re.sub(r"[ \t\f]+", " ", T.replace("\r", " ").replace("\n", " ").strip())
 
-    # “harf arası boşluk” durumuna toleranslı tip desenleri
-    def spaced(word: str) -> str:
-        # ŞİRKET -> Ş\s*İ\s*R\s*K\s*E\s*T
-        parts = []
-        for ch in word:
-            if ch.isspace(): continue
-            esc = re.escape(ch)
-            parts.append(esc)
+    # Harf arası boşluk toleransı için yardımcı
+    def spaced_token(tok: str) -> str:
+        # "ŞİRKET" -> "Ş\s*İ\s*R\s*K\s*E\s*T"
+        parts = [re.escape(ch) for ch in tok if not ch.isspace()]
         return r"\s*".join(parts)
 
+    # --- Tip desenleri (geniş) ------------------------------------------------
     TYPE_ANCHORS = [
-        r"A\.?\s*Ş\.?", r"A\.?\s*S\.?", r"AŞ", r"AS",
-        r"ANON[İI]M\s+" + spaced("ŞİRKET"),
+        r"A\.?\s*Ş\.?", r"A\.?\s*S\.?", r"\bAŞ\b", r"\bAS\b",
+        r"ANON[İI]M\s+" + spaced_token("ŞİRKET"),
         r"LTD\.?\s*ŞT[İI]", r"LTD\.?\s*ST[İI]",
-        r"L[İI]M[İI]TED\s+" + spaced("ŞİRKET"),
-        spaced("ŞİRKET"),
+        r"L[İI]M[İI]TED\s+" + spaced_token("ŞİRKET"),
+        spaced_token("ŞİRKET"),
         r"HOLD[İI]NG", r"KOOPERAT[İI]F",
-        r"KOLEKT[İI]F\s+" + spaced("ŞİRKET"),
-        r"AD[İI]\s+KOMAND[İI]T\s+" + spaced("ŞİRKET"),
-        r"SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+" + spaced("ŞİRKET"),
-        r"KOMAND[İI]T\s+" + spaced("ŞİRKET"),
-        r"VAKF[ıiIİ]|VAKIF", r"DERNEK"
+        r"KOLEKT[İI]F\s+" + spaced_token("ŞİRKET"),
+        r"AD[İI]\s+KOMAND[İI]T\s+" + spaced_token("ŞİRKET"),
+        r"SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+" + spaced_token("ŞİRKET"),
+        r"KOMAND[İI]T\s+" + spaced_token("ŞİRKET"),
+        r"VAKF[ıiIİ]|VAKIF", r"DERNEK",
     ]
-    TYPE_CORE = r"(?P<type>" + "|".join(TYPE_ANCHORS) + r")"
-    GEN_SUFFIX = r"(?:\s*[’'\"“”]?\s*(NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"  # 'ŞİRKETİNİN' v.b.
-    TYPE_RE = re.compile(rf"^(?P<left>.*?){TYPE_CORE}{GEN_SUFFIX}\b.*$", re.IGNORECASE)
+    GEN_SUFFIX = r"(?:\s*[’'\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"  # ŞİRKETİNİN vb.
+    TYPE_CORE = r"(?P<type>(" + "|".join(TYPE_ANCHORS) + r"))" + GEN_SUFFIX
+    # “solundaki her şey adı” mantığı
+    PAT = re.compile(rf"(?P<left>.{{0,{left_window}}}?){TYPE_CORE}", re.IGNORECASE)
 
-    # satırları hazırla
-    src = [s.strip() for s in (lines or []) if isinstance(s, str) and s.strip()]
-    if not src:
-        return None, None
+    m = PAT.search(T)
+    if not m:
+        dbg["reason"] = "type_not_found"
+        return None, None, dbg
 
-    best = None  # (score, name, type_label)
+    left = (m.group("left") or "").strip(" :;,-—–\u200b")
+    type_raw = m.group("type")
 
-    # 1) Satır satır dene
-    for i, raw in enumerate(src):
-        m = TYPE_RE.search(raw)
-        if not m:
-            continue
-        left = _fix_breaks(m.group("left").strip())
-        # tip etiketini kanonikleştir
-        ctype = _map_type_to_canonical(m.group("type"))
-        # kısa/bozuk bitişler için önceki satırı ekle
-        tail = re.sub(r".*\s", "", left).upper()
-        if (len(left) < 8 or tail in BAD_ENDS) and i > 0:
-            left = _fix_breaks(src[i-1].strip() + " " + left)
-        if tail in BAD_ENDS and i > 1:
-            left = _fix_breaks(src[i-2].strip() + " " + left)
+    # --- Kanonik tipe mapleme -------------------------------------------------
+    def map_type(raw: str) -> str|None:
+        U = unicodedata.normalize("NFKC", raw).upper()
+        if re.search(r"\bA\.?\s*Ş\.?|\bAŞ\b|\bA\.?\s*S\.?\b", U): return "ANONİM ŞİRKETİ"
+        if re.search(r"\bLTD\s*.?\s*ŞT[İI]\b|\bLTD\s*.?\s*ST[İI]\b|\bL[İI]M[İI]TED\s+Ş[İI]RKET[İI]?\b", U): return "LİMİTED ŞİRKETİ"
+        if re.search(r"ANON[İI]M\s+Ş[İI]RKET[İI]?", U): return "ANONİM ŞİRKETİ"
+        if re.search(r"HOLD[İI]NG", U): return "HOLDİNG"
+        if re.search(r"KOOPERAT[İI]F", U): return "KOOPERATİF"
+        if re.search(r"KOLEKT[İI]F\s+Ş[İI]RKET[İI]?", U): return "KOLEKTİF ŞİRKET"
+        if re.search(r"AD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?", U): return "ADİ KOMANDİT ŞİRKET"
+        if re.search(r"SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?", U): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
+        if re.search(r"KOMAND[İI]T\s+Ş[İI]RKET[İI]?", U): return "KOMANDİT ŞİRKET"
+        if re.search(r"\bVAKF[ıiIİ]\b|\bVAKIF\b", U): return "VAKIF"
+        if re.search(r"\bDERNEK\b", U): return "DERNEK"
+        # yalın “ŞİRKET” yakalanmışsa ad üstünden tahmin yapmak mantıksız; None bırak
+        return None
 
-        q = _q(left)
-        if q > 0 and ((best is None) or (q > best[0])):
-            best = (q, left, ctype)
+    ctype = map_type(type_raw)
 
-    if best:
-        return best[1], best[2]
+    # --- Ad temizliği (tip kelimesi ve eklerini kes) --------------------------
+    # Şirket, LTD., A.Ş. vb. çıksın; şirket kelimesinden sonrası atılsın
+    TYPE_CORE_LITE = re.compile(
+        r"(?:A\.?\s*Ş\.?|A\.?\s*S\.?|AŞ|AS|ANON[İI]M\s+Ş[İI]RKET[İI]?|"
+        r"LTD\s*.?\s*ŞT[İI]|LTD\s*.?\s*ST[İI]|L[İI]M[İI]TED\s+Ş[İI]RKET[İI]?|"
+        r"Ş[İI]RKET[İI]?|HOLD[İI]NG|KOOPERAT[İI]F|KOLEKT[İI]F\s+Ş[İI]RKET[İI]?|"
+        r"AD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?|KOMAND[İI]T\s+Ş[İI]RKET[İI]?|VAKF[ıiIİ]|VAKIF|DERNEK)"
+        r"(?:\s*[’'\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?$",
+        re.IGNORECASE
+    )
+    # soldaki son “tip” demirini bulup onun SOLUNU ad olarak bırak
+    cut = TYPE_CORE_LITE.search(left)
+    if cut:
+        name = left[:cut.start()].rstrip(" ,.-:;’'\"“”").strip()
+    else:
+        name = left.strip()
 
-    # 2) Fallback: tüm metni birleştir, ilk görünen tipe göre böl
-    joined = _fix_breaks(" ".join(src))
-    m2 = TYPE_RE.search(joined)
-    if m2:
-        left = _fix_breaks(m2.group("left").strip())
-        ctype = _map_type_to_canonical(m2.group("type"))
-        if not ctype:
-            # son çare: kanonik tip, tüm metinde ara
-            for creg, label in TYPE_REGEX:
-                if creg.search(joined):
-                    ctype = label; break
-        return (left if left else None), ctype
+    # Aşırı temizleme yapmayın: ticari karakterleri tutalım
+    name = re.sub(r"[^\w\s\.-/&ÇĞİÖŞÜçğıöşü]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
 
-    # 3) Yoksa None
-    return None, None
+    # çok kısa ise None
+    if len(name) < min_name_len:
+        dbg.update({"reason": "name_too_short", "name": name, "type": ctype, "matched_left": left})
+        return None, ctype, dbg
+
+    # Türkçe büyük harflerle üst alma
+    def upper_tr(s: str) -> str:
+        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
+        return "".join(mp.get(ch, ch.upper()) for ch in s)
+
+    name_up = upper_tr(name)
+
+    dbg.update({
+        "match_span": (m.start(), m.end()),
+        "matched_type_raw": type_raw,
+        "matched_left": left,
+        "final_name": name_up,
+        "final_type": ctype
+    })
+    return name_up, ctype, dbg
