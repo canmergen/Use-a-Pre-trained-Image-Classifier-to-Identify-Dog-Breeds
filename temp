@@ -5,14 +5,12 @@ def _find_company(
     fuzzy_join_lines: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    OCR satırlarında şirket adını ve türünü yakalar.
-    Tip bulunursa (A.Ş., LTD. ŞTİ., ANONİM ŞİRKETİ vb.),
-    solundaki metni şirket adı olarak alır.
-    Eğer kısaysa veya 'AN/VE/TİC/SAN' gibi bitiyorsa bir önceki satırı da ekler.
+    Şirket adını ve türünü satır tabanlı bulur; başarısızsa
+    tüm metin üzerinde dayanıklı (spaced-letters, ekler) fallback uygular.
     """
-
     import re, unicodedata
 
+    # --- yardımcılar ---
     def _fix_breaks(t: str) -> str:
         t = re.sub(r"\bS\s+AN\b", "SAN", t, flags=re.IGNORECASE)
         t = re.sub(r"\bT\s*İ?\s*C\b", "TİC", t, flags=re.IGNORECASE)
@@ -30,40 +28,52 @@ def _find_company(
 
     BAD_ENDS = {"AN","VE","TIC","TİC","SAN","VE.","VE,","TIC.","TİC.","SAN."}
 
-    # --- Tür regex'i (gruplu) ---
-    _TYPE_ANCHORS = [
-        r"A\.?\s*Ş\.?", r"AŞ", r"ANON[İI]M\s+Ş[İI]RKET[İI]?",
-        r"LTD\.?\s*ŞT[İI]", r"LTD\.?\s*ST[İI]",
-        r"L[İI]M[İI]TED\s+Ş[İI]RKET[İI]?",
-        r"HOLD[İI]NG", r"KOOPERAT[İI]F",
-        r"KOLEKT[İI]F\s+Ş[İI]RKET[İI]?",
-        r"AD[İI]\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?",
-        r"SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+Ş[İI]RKET[İI]?",
-        r"KOMAND[İI]T\s+Ş[İI]RKET[İI]?",
-        r"VAK(I|İ)F", r"DERNEK"
-    ]
-    TYPE_RE = re.compile(rf"^(?P<left>.*?)\b(?P<type>{'|'.join(_TYPE_ANCHORS)})\b.*$", re.IGNORECASE)
+    # “harf arası boşluk” durumuna toleranslı tip desenleri
+    def spaced(word: str) -> str:
+        # ŞİRKET -> Ş\s*İ\s*R\s*K\s*E\s*T
+        parts = []
+        for ch in word:
+            if ch.isspace(): continue
+            esc = re.escape(ch)
+            parts.append(esc)
+        return r"\s*".join(parts)
 
+    TYPE_ANCHORS = [
+        r"A\.?\s*Ş\.?", r"A\.?\s*S\.?", r"AŞ", r"AS",
+        r"ANON[İI]M\s+" + spaced("ŞİRKET"),
+        r"LTD\.?\s*ŞT[İI]", r"LTD\.?\s*ST[İI]",
+        r"L[İI]M[İI]TED\s+" + spaced("ŞİRKET"),
+        spaced("ŞİRKET"),
+        r"HOLD[İI]NG", r"KOOPERAT[İI]F",
+        r"KOLEKT[İI]F\s+" + spaced("ŞİRKET"),
+        r"AD[İI]\s+KOMAND[İI]T\s+" + spaced("ŞİRKET"),
+        r"SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+" + spaced("ŞİRKET"),
+        r"KOMAND[İI]T\s+" + spaced("ŞİRKET"),
+        r"VAKF[ıiIİ]|VAKIF", r"DERNEK"
+    ]
+    TYPE_CORE = r"(?P<type>" + "|".join(TYPE_ANCHORS) + r")"
+    GEN_SUFFIX = r"(?:\s*[’'\"“”]?\s*(NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"  # 'ŞİRKETİNİN' v.b.
+    TYPE_RE = re.compile(rf"^(?P<left>.*?){TYPE_CORE}{GEN_SUFFIX}\b.*$", re.IGNORECASE)
+
+    # satırları hazırla
     src = [s.strip() for s in (lines or []) if isinstance(s, str) and s.strip()]
     if not src:
         return None, None
 
-    best = None  # (score, cname_raw, ctype)
+    best = None  # (score, name, type_label)
 
+    # 1) Satır satır dene
     for i, raw in enumerate(src):
         m = TYPE_RE.search(raw)
         if not m:
             continue
         left = _fix_breaks(m.group("left").strip())
-        ctype = m.group("type").upper()
-
-        # Kısa veya kötü biten adlara bir önceki satırı ekle
+        # tip etiketini kanonikleştir
+        ctype = _map_type_to_canonical(m.group("type"))
+        # kısa/bozuk bitişler için önceki satırı ekle
         tail = re.sub(r".*\s", "", left).upper()
-        if len(left) < 8 or tail in BAD_ENDS:
-            if i > 0:
-                left = _fix_breaks(src[i-1].strip() + " " + left)
-
-        tail = re.sub(r".*\s", "", left).upper()
+        if (len(left) < 8 or tail in BAD_ENDS) and i > 0:
+            left = _fix_breaks(src[i-1].strip() + " " + left)
         if tail in BAD_ENDS and i > 1:
             left = _fix_breaks(src[i-2].strip() + " " + left)
 
@@ -74,10 +84,18 @@ def _find_company(
     if best:
         return best[1], best[2]
 
-    # Fallback: tip bulunmazsa fuzzy join (tam metin)
-    joined = " ".join(src)
-    for creg, label in TYPE_REGEX:
-        if creg.search(joined):
-            return joined, label
+    # 2) Fallback: tüm metni birleştir, ilk görünen tipe göre böl
+    joined = _fix_breaks(" ".join(src))
+    m2 = TYPE_RE.search(joined)
+    if m2:
+        left = _fix_breaks(m2.group("left").strip())
+        ctype = _map_type_to_canonical(m2.group("type"))
+        if not ctype:
+            # son çare: kanonik tip, tüm metinde ara
+            for creg, label in TYPE_REGEX:
+                if creg.search(joined):
+                    ctype = label; break
+        return (left if left else None), ctype
 
+    # 3) Yoksa None
     return None, None
