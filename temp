@@ -4,7 +4,7 @@ def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Option
     if not T.strip():
         return None, None, {"reason":"empty_text"}
 
-    # --- tür desenleri (konum bulma için) ---
+    # --- tür demiri (konum) ---
     GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
     TYPE_CORE = (
         rf"(ANON[İI]M\s+{_spaced_token('ŞİRKET')}"
@@ -12,37 +12,33 @@ def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Option
         rf"|LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]"
         rf"|L[İI]M[İI]TED\s+{_spaced_token('ŞİRKET')}){GEN}"
     )
-    type_iter = list(re.finditer(TYPE_CORE, T, flags=re.IGNORECASE | re.DOTALL))
-    if not type_iter:
-        # Metnin tamamından tip çıkar (en azından tür boş kalmasın)
-        ctype_any = _map_type_to_canonical(T)
-        return None, ctype_any, {"reason":"no_type_anchor"}
+    type_hits = list(re.finditer(TYPE_CORE, T, flags=re.IGNORECASE | re.DOTALL))
+    if not type_hits:
+        # tür yoksa hiç uğraşmayalım, yalnızca türü metinden tahmin et
+        return None, _map_type_to_canonical(T), {"reason":"no_type_anchor"}
 
-    # En sondaki (genelde başlık/ünvan satırına en yakın) eşleşmeyi kullan
-    m = type_iter[-1]
+    m = type_hits[-1]                                 # en sondaki demir
     raw_type = m.group(1)
     ctype = _map_type_to_canonical(raw_type) or _map_type_to_canonical(m.group(0))
 
-    # --- geriye doğru pencere ---
-    LEFT_WIN = 700
+    # --- sol bağlamı satırlara böl ---
+    LEFT_WIN = 900
     left = T[max(0, m.start()-LEFT_WIN):m.start()]
+    left_lines = [ln.strip(" ,.-:;’'") for ln in left.splitlines() if ln.strip()]
 
-    # Pencereyi satırlara böl; boşları at
-    cand_lines = [ln.strip(" ,.-:;’'") for ln in left.splitlines() if ln.strip()]
-    if not cand_lines:
-        return None, ctype, {"reason":"no_left_segment", "type":ctype}
-
-    # Gürültü başlık kelimeleri
+    # Gürültü başlıkları / doldurucular
     NOISE = {
         "GENEL","KURUL","TOPLANTISI","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","ÖRNEĞİ",
-        "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","GÜNDEM","TUTANAK","LİSTE","EK-","SAYILI"
+        "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","GÜNDEM","TUTANAK","LİSTE","EK-","SAYILI",
+        "KİMLİK","VERGİ","AD/SOYAD","NUMARASI","NUMARA","ADRESİ","MERKEZİ","ÜNVANI","ŞUBE"
     }
-    # Anlamsız kuyruklar
     STOPTAIL = {"AN","VE","TIC","TİC","SAN","VE.","TIC.","TİC.","SAN.","DE","DA","VEYA","İLE"}
+    # içeriğe ağırlık veren alan anahtarları
+    DOMAIN_HINTS = {"HİZMETLERİ","SANAYİ","TİCARET","LOJİSTİK","GIDA","İNŞAAT","TEKSTİL","YAZILIM","ENERJİ","OTOMOTİV","MOBİLYA","MADEN","EĞİTİM","SAĞLIK","SİSTEMLERİ"}
 
-    def clean_name(s: str) -> str:
+    def clean_tokens(s: str) -> List[str]:
         s = re.sub(r"\s+", " ", s)
-        # tür kelimelerini ve varyantlarını ad içinden sök
+        # tür varyantlarını sök
         s = re.sub(r"\b(ANONIM|ANONİM|LIMITED|LİMİTED|LTD\.?\s*ŞTİ|LTD\.?\s*STİ|A\.?\s*Ş|AŞ|Ş\s*İ\s*R\s*K\s*E\s*T[İI])\b",
                    "", s, flags=re.IGNORECASE)
         toks = [t for t in s.split() if t.upper() not in NOISE]
@@ -50,41 +46,55 @@ def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Option
             toks.pop()
         while toks and len(toks[0]) < 2:
             toks.pop(0)
-        return " ".join(toks).strip(" ,.-:;’'")
+        return toks
 
-    # Son anlamlı satırı al; yetmezse bir üst satırla birleştir
-    name_candidates: List[str] = []
-    for i in range(len(cand_lines)-1, -1, -1):
-        base = clean_name(cand_lines[i])
-        if base:
-            name_candidates.append(base)
-            # bir üst satır çoğu dokümanda şirket adının ilk kısmıdır
-            if i-1 >= 0:
-                combo = clean_name(cand_lines[i-1] + " " + cand_lines[i])
-                if combo: name_candidates.append(combo)
-            break
+    def score_name_from_tokens(toks: List[str]) -> float:
+        if not toks: return 0.0
+        name = " ".join(toks)
+        base = _score_name(name)
+        # alan ipuçları varsa bonus
+        bonus = 0.12 if any(t.upper() in DOMAIN_HINTS for t in toks) else 0.0
+        return base + bonus
 
-    # Skorla en iyisini seç
-    best = None
-    for nm in name_candidates:
-        sc = _score_name(nm)
-        if best is None or sc > best[0]:
-            best = (sc, nm)
-    if best and best[0] > 0:
-        return _upper_tr(best[1]), ctype, {"reason":"back_window", "best_name":best[1], "type":ctype, "score":best[0]}
+    # --- 6 satıra kadar geri tarayıp aday üret ---
+    candidates: List[Tuple[float, str]] = []
+    n = len(left_lines)
+    for i in range(n-1, max(-1, n-6)-1, -1):                 # son 6 satır
+        toks_i = clean_tokens(left_lines[i]) if i >= 0 else []
+        if toks_i:
+            sc = score_name_from_tokens(toks_i)
+            candidates.append((sc, " ".join(toks_i)))
+        # bir üst satırla birleşim
+        if i-1 >= 0:
+            toks_combo = clean_tokens(left_lines[i-1] + " " + left_lines[i])
+            if toks_combo:
+                sc = score_name_from_tokens(toks_combo)
+                candidates.append((sc, " ".join(toks_combo)))
 
-    # --- satır bazlı yedek: tür geçen satır ve bir üst satır ---
-    T_lines = [ln.strip() for ln in T.splitlines()]
-    for k, ln in enumerate(T_lines):
-        if re.search(TYPE_CORE, ln, flags=re.IGNORECASE):
-            left_inline = ln.split(re.search(TYPE_CORE, ln, flags=re.IGNORECASE).group(0))[0].strip(" ,.-:;’'")
-            left_inline = clean_name(left_inline)
-            if _score_name(left_inline) > 0:
-                return _upper_tr(left_inline), ctype, {"reason":"same_line_left", "type":ctype}
+    # ek: aynı satırda türün SOLU
+    same_line_left = left_lines[-1].split(raw_type, 1)[0].strip(" ,.-:;’'") if left_lines else ""
+    toks_same = clean_tokens(same_line_left)
+    if toks_same:
+        candidates.append((score_name_from_tokens(toks_same), " ".join(toks_same)))
+
+    if candidates:
+        best_sc, best_nm = max(candidates, key=lambda x: x[0])
+        if best_sc > 0.35:                                   # düşük eşiği bilinçli tuttum
+            return _upper_tr(best_nm), ctype, {"reason":"backscan_multi", "score":best_sc, "type":ctype}
+
+    # --- satır bazlı en son yedek: tür geçen satırın bir üstü ---
+    T_lines = [ln.strip() for ln in T.splitlines() if ln.strip()]
+    for k in range(len(T_lines)-1, -1, -1):
+        if re.search(TYPE_CORE, T_lines[k], flags=re.IGNORECASE):
+            # aynı satır solu
+            left_inline = T_lines[k].split(re.search(TYPE_CORE, T_lines[k], flags=re.IGNORECASE).group(0))[0]
+            toks = clean_tokens(left_inline)
+            if toks and _score_name(" ".join(toks)) > 0.3:
+                return _upper_tr(" ".join(toks)), ctype, {"reason":"same_line_left_fallback", "type":ctype}
+            # bir üst satır
             if k > 0:
-                prev = clean_name(T_lines[k-1])
-                if _score_name(prev) > 0:
-                    return _upper_tr(prev), ctype, {"reason":"prev_line", "type":ctype}
+                toks = clean_tokens(T_lines[k-1])
+                if toks and _score_name(" ".join(toks)) > 0.3:
+                    return _upper_tr(" ".join(toks)), ctype, {"reason":"prev_line_fallback", "type":ctype}
 
-    # Hâlâ yoksa: türü döndür, adı None bırak
     return None, ctype, {"reason":"exhausted", "type":ctype}
