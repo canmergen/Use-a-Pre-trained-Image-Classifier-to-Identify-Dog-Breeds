@@ -1,25 +1,21 @@
 def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Optional[str], Dict]:
     """
-    <ŞİRKET ADI> + (boşluk/linebreak) + <TÜR> bloğunu yakalar.
-    Türün solundaki segmentten sağ uçtaki kurumsal-suffix ağırlıklı adı seçer.
-    Dönüş: (şirket_adı, kanonik_tür, debug)
+    Türü bul -> yalnızca SOL segmentte (son 600 char) en sondaki 1–2 satırdan şirket adını seç.
+    Tablo başlıklarını ve doldurucuları agresif şekilde eler.
     """
     dbg: Dict = {}
     T = unicodedata.normalize("NFKC", text or "")
     if not T.strip():
         return None, None, {"reason":"empty_text"}
 
-    # --- yardımcılar ---
+    # --- helpers ---
     def upper_tr(s: str) -> str:
         mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
         return "".join(mp.get(ch, ch.upper()) for ch in s or "")
 
     def spaced_word(w: str) -> str:
         m = {"ş": r"[sşSŞ]", "ı": r"[ıiIİ]", "i": r"[ıiIİ]"}
-        out = []
-        for ch in w.lower():
-            out.append(m[ch] if ch in m else re.escape(ch))
-        return r"\s*".join(out)
+        return r"\s*".join(m.get(ch, re.escape(ch)) for ch in w.lower())
 
     SIRKET = spaced_word("şirket")
     GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
@@ -30,14 +26,33 @@ def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Option
         rf"|L[İI]M[İI]TED\s+{SIRKET}){GEN}"
     )
 
-    # Gürültü / dolgu sözlükleri
+    # metinde türü sondan bul
+    m = None
+    for mm in re.finditer(TYPE_ALT, T, flags=re.IGNORECASE | re.DOTALL):
+        m = mm
+    if not m:
+        return None, _map_type_to_canonical(T), {"reason":"no_type_anchor"}
+
+    raw_type = m.group(0)
+    ctype = _map_type_to_canonical(raw_type)
+
+    # --- yalnızca SOL pencere (sıkı) ---
+    LEFT_WIN = 600
+    left_seg = T[max(0, m.start()-LEFT_WIN):m.start()]
+    left_lines = [ln.strip(" ,.-:;’'") for ln in left_seg.splitlines() if ln.strip()]
+    left_lines = left_lines[-2:]  # sadece en son 1–2 satır
+
+    # Gürültü/başlıklar
     NOISE = {
         "GENEL","KURUL","TOPLANTISI","TOPLANTISINDA","HAZIR","BULUNANLAR","LİSTESİ","ÖRNEĞİ",
         "TARİHLİ","OLAĞAN","OLAĞANÜSTÜ","GÜNDEM","TUTANAK","LİSTE","EK-","SAYILI",
-        "KİMLİK","VERGİ","AD/SOYAD","NUMARASI","NUMARA","ADRESİ","MERKEZİ","ÜNVANI",
-        "ŞUBE","TOPLAM","EDEN","KATILIM","TEMSİLCİ","TEMSİLEN","ŞEKLİ","TÜRÜ"
+        "KİMLİK","VERGİ","AD/SOYAD","AD SOYAD","UNVANI","ÜNVANI","NUMARA","NUMARASI",
+        "TARİHİ","GRUBU","GRUP","BİRİM","NOMİNAL","NOMINAL","İTİBARİ","DEĞERİ","DEĞER",
+        "İMZA","İMZA NO","SIRA","PAY","PAYI","PAYLAR","HİSSE","HİSSELER","MERSİS","TC","T.C.",
+        "ADRESİ","MERKEZİ","ŞUBE","TEMSİLCİ","TEMSİLEN","KATILAN","TOPLAM","EDEN","KİMLİK",
+        "ŞEKLİ","TÜRÜ","ŞEKLİ VE TÜRÜ"
     }
-    STOPTAIL = {"AN","VE","TIC","TİC","SAN","VE.","TIC.","TİC.","SAN.","DE","DA","VEYA","İLE"}
+    STOPTAIL = {"AN","VE","DE","DA","TIC","TİC","SAN","VE.","DE.","DA.","TIC.","TİC.","SAN.","VEYA","İLE"}
 
     DOMAIN_HINTS = {
         "HİZMETLERİ","SANAYİ","TİCARET","LOJİSTİK","GIDA","İNŞAAT","TEKSTİL","YAZILIM",
@@ -45,99 +60,58 @@ def _extract_company(text: str, lines: List[str]) -> Tuple[Optional[str], Option
         "İSTANBUL","ANKARA","İZMİR"
     }
 
-    def clean_tokens(s: str) -> List[str]:
-        # tür kelimelerini ve gürültüyü at
-        s = re.sub(r"\s+", " ", s)
-        s = re.sub(
+    def strip_type_words(s: str) -> str:
+        # tür kelimeleri varsa ayıkla
+        return re.sub(
             rf"\b(ANONIM|ANONİM|LIMITED|LİMİTED|{SIRKET}|LTD\.?\s*ŞTİ|LTD\.?\s*STİ|A\.?\s*Ş|AŞ|A\.?\s*S)\b",
             "", s, flags=re.IGNORECASE
         )
+
+    def clean_line(s: str) -> str:
+        s = re.sub(r"\s+", " ", s)
+        s = strip_type_words(s)
         toks = [t for t in s.split() if t.upper() not in NOISE]
-        # sondan zayıf kuyrukları kes
         while toks and (toks[-1].upper() in STOPTAIL or len(toks[-1]) < 2):
             toks.pop()
-        # baştan tek-harfli kırp
         while toks and len(toks[0]) < 2:
             toks.pop(0)
-        return toks
+        return " ".join(toks)
 
     def score_name(name: str) -> float:
         if not name: return 0.0
         s = unicodedata.normalize("NFKC", name)
         letters = sum(ch.isalpha() for ch in s)
         digits  = sum(ch.isdigit() for ch in s)
-        if letters < 3 or letters <= digits:
-            return 0.0
+        if letters < 3 or letters <= digits: return 0.0
         toks = name.split()
         base = 0.55*min(len(s)/90,1.0) + 0.35*min(len(toks)/9,1.0)
         bonus = 0.20 if any(t.upper() in DOMAIN_HINTS for t in toks) else 0.0
         return base + bonus
 
-    def rightmost_org_suffix(left_text: str, min_tok=2, max_tok=14) -> str:
-        toks = clean_tokens(left_text)
-        if not toks: return ""
-        toks = toks[-(max_tok+6):]   # son tarafa odaklan
-        best_sc, best = 0.0, ""
-        # sağdan sola pencere; domain içerenlere öncelik
-        for start in range(max(0, len(toks)-max_tok), len(toks)-min_tok+1):
-            cand = " ".join(toks[start:])
-            sc = score_name(cand)
-            if sc > best_sc:
-                best_sc, best = sc, cand
-        return best
-
-    # --- 1) Blok taraması: <AD> + (boşluk/linebreak) + <TÜR> ---
-    block_pat = re.compile(
-        rf"(?P<left>[\s\S]{{0,1600}}?)"  # türden önceki segment (yakın bağlam)
-        rf"(?P<gap>[\s\r\n]+)"
-        rf"(?P<type>{TYPE_ALT})",
-        flags=re.IGNORECASE
-    )
-    matches = list(block_pat.finditer(T))
-    if not matches:
-        # hiç tip görünmüyorsa, en azından türü tüm metinden çöz
-        return None, _map_type_to_canonical(T), {"reason":"no_type_anchor"}
-
-    # tür demirini en sondan al (başlık satırları yerine gövdeyi tercih)
-    m = matches[-1]
-    raw_type = m.group("type")
-    ctype = _map_type_to_canonical(raw_type) or _map_type_to_canonical(m.group(0))
-
-    left_seg = m.group("left") or ""
-    # yalnızca son ~1200 char’a indir: önceki başlıklar etkilenmesin
-    left_seg = left_seg[-1200:]
-
-    # Aynı satır içiyse satırdaki türün SOL’undan; değilse de son satırı/alt satırı birlikte dene
-    left_lines = [ln.strip(" ,.-:;’'") for ln in left_seg.splitlines() if ln.strip()]
-    candidates: List[Tuple[float, str]] = []
-
+    # --- sadece SOL ve son satırlar: aday üretimi
+    candidates: List[Tuple[float,str]] = []
     if left_lines:
-        # türle aynı satır ise: o satırın sol parçası
-        inline = left_lines[-1]
-        # tür kalıbını satır içinde ara
-        tm = re.search(TYPE_ALT, inline, flags=re.IGNORECASE)
+        # aynı satırda tür varsa: o satırdaki türün SOL'u
+        tm = re.search(TYPE_ALT, left_lines[-1], flags=re.IGNORECASE)
         if tm:
-            nm = rightmost_org_suffix(inline[:tm.start()])
+            nm = clean_line(left_lines[-1][:tm.start()])
             if nm:
                 candidates.append((score_name(nm), nm))
         else:
-            # satır atlamalıysa: en son satırı (ve bir üstünü) birlikte değerlendir
-            nm1 = rightmost_org_suffix(left_lines[-1])
-            if nm1: candidates.append((score_name(nm1), nm1))
-            if len(left_lines) >= 2:
-                nm2 = rightmost_org_suffix(left_lines[-2] + " " + left_lines[-1])
-                if nm2: candidates.append((score_name(nm2), nm2))
-
-    # Güvenli yedek: tüm sol segment üzerinden de bir aday üret
-    nm_all = rightmost_org_suffix(left_seg)
-    if nm_all:
-        candidates.append((score_name(nm_all), nm_all))
+            # satır atlamalı ise: son satır ve bir üst satır
+            nm1 = clean_line(left_lines[-1])
+            if nm1:
+                candidates.append((score_name(nm1), nm1))
+            if len(left_lines) == 2:
+                nm2 = clean_line(left_lines[-2] + " " + left_lines[-1])
+                if nm2:
+                    candidates.append((score_name(nm2), nm2))
 
     if not candidates:
-        return None, ctype, {"reason":"no_candidate_after_clean", "type":ctype}
+        return None, ctype, {"reason":"no_candidate_leftonly", "type":ctype}
 
     best = max(candidates, key=lambda x: x[0])
-    if best[0] < 0.25:  # eşik düşük ama çöpleri dışarıda tutmak için
-        return None, ctype, {"reason":"low_score", "score":best[0], "type":ctype}
+    if best[0] < 0.25:
+        return None, ctype, {"reason":"low_score_leftonly", "score":best[0], "type":ctype}
 
     return upper_tr(best[1]), ctype, {"reason":"ok", "score":best[0], "type":ctype}
