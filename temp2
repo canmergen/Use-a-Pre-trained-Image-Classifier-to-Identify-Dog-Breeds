@@ -1,679 +1,586 @@
-from typing import Any, Dict, List, Optional, Tuple, Callable
-import re, json, time, difflib
-import numpy as np
+# === Datathon "one-cell" training & inference ===
+import time, gc
+import numpy as np, pandas as pd
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import QuantileTransformer
 
+import xgboost as xgb
+from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+from catboost import CatBoostClassifier, Pool
 
-def classify_hazirun_single(
-    doc_res: Dict[str, Any], *,
-    # OCR kaynakları
-    tc_new: Optional[Any] = None,
-    NEW_URL: Optional[str] = None,
+import competition_metric as cm
 
-    # OCR ayarları
-    ocr_lang: str = "tur+eng+lat",
-    ocr_psm: int = 6,
-    ocr_oem: int = 1,
-    ocr_extra_config: Optional[str] = None,
-    http_timeout_s: float = 12.0,
-    http_retries: int = 3,
-    http_backoff_s: float = 0.9,
+# ======================= Config =======================
+ID_COL, TARGET, CV, SEED = "cust_id", "churn", 5, 42
 
-    # Performans: başlık bandı + downscale ile OCR
-    ocr_on_top_ratio: float = 0.33,
-    ocr_downscale_max_w: int = 2200,
-    ocr_use_jpeg: bool = True,
+USE_GPU               = False
+USE_ISOTONIC          = True
+USE_ADV_REWEIGHT      = True     # adversarial reweighting toward recent folds
+USE_TE_LGB_XGB        = True     # month-safe target encoding for LGB/XGB
+TE_MIN_SAMPLES        = 50
 
-    # Tek liste anahtar ifadeler (fuzzy + coverage)
-    keywords: Optional[List[str]] = None,
-    fuzzy_min_ratio: float = 0.86,
-    phrase_window: int = 12,
+PRUNE_CORR_995        = True
+ADD_MISSING_FLAGS     = True
+CLIP_NUMERICS_QTL     = (0.005, 0.995)   # winsorize
 
-    # Güçlü başlıklar
-    strong_phrases: Optional[List[str]] = None,
-    strong_phrase_ratio: float = 0.90,
+N_ROUNDS              = 4000
+ES_ROUNDS_XGB         = 300
+ES_ROUNDS_LGB         = 300
+OD_WAIT_CAT           = 300
+SEEDS                 = [42, 1337, 2027]
 
-    # Karar eşikleri
-    min_hit_phrases: int = 3,
-    min_total_score: float = 4.5,
+TOP_FOCUS_RECENT_K    = 2        # “deployment-like” folds for calibration and tuning
+RANK_BLEND_INIT       = 0.15     # starting point; we’ll re-optimize on OOF
+PIECEWISE_TAU_GRID    = np.arange(0.65, 0.93, 0.02)
+PIECEWISE_GLO_GRID    = np.linspace(1.0, 1.30, 7)
+PIECEWISE_GHI_GRID    = np.linspace(1.0, 3.0, 21)
 
-    # OCR hatasını negatif sayma
-    assume_nonhazirun_on_ocr_fail: bool = False,
+# ======================= Helpers =======================
+def _rank01(a): return pd.Series(a).rank(method="average", pct=True).astype("float32").values
+def _datathon(y_true, y_prob):
+    out = cm.ing_hubs_datathon_metric(y_true, y_prob)
+    if isinstance(out, (tuple, list, np.ndarray)): out = out[0]
+    return float(out)
 
-    # TABLO zorunluluğu
-    require_table: bool = True,
-    table_require_mode: str = "soft",   # "soft" | "hard"
-    table_min_intersections: int = 10,
-    table_min_cells: int = 4,
-    table_min_area_ratio: float = 0.06,
+def _logit(p):
+    p = np.clip(p, 1e-6, 1-1e-6)
+    return np.log(p/(1-p))
 
-    # Belge kararı ve toleranslar
-    doc_decision: str = "any",          # "any" | "majority" | "all"
-    treat_first_no_table_as_unknown: bool = True,
-    stop_on_first_match: bool = False,
-    fullpage_fallback_when_weak: bool = True,
-    weak_hit_cnt: int = 1,
-    weak_total_score: float = 2.0,
+def _sigmoid(z): return 1.0/(1.0+np.exp(-z))
 
-    # Paragraf yoğunluğu (erken veto)
-    reject_if_long_text: bool = True,
-    top_words_soft_cap: int = 250,
-    full_max_chars: int = 6000,
-    full_max_words: int = 900,
-    full_para_lines_minlen: int = 60,
-    full_para_lines_count: int = 6,
-    full_alpha_ratio_min: float = 0.75,
+def _ensure_ref_keys(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "ref_date" not in df.columns:
+        raise ValueError("ref_date column is required for time-aware CV")
+    df["ref_date_ts"]  = pd.to_datetime(df["ref_date"], errors="coerce")
+    df["ref_month_ts"] = df["ref_date_ts"].dt.to_period("M").dt.to_timestamp()
+    df["ref_month_str"]= df["ref_month_ts"].dt.strftime("%Y-%m")
+    return df
 
-    # Tablo sonrası zorunlu kontrol
-    force_full_text_check_after_table: bool = True,
-    full_max_chars_table: int = 5000,
-    full_max_words_table: int = 750,
-    full_para_lines_count_table: int = 5,
+def _piecewise_sharpen_grid(y_true, p_va, p_te, mask_eval=None,
+                            taus=PIECEWISE_TAU_GRID, g_los=PIECEWISE_GLO_GRID, g_his=PIECEWISE_GHI_GRID,
+                            use_iso=True):
+    if mask_eval is None: mask_eval = slice(None)
+    iso = None
+    if use_iso and (np.min(y_true)!=np.max(y_true)):
+        iso = IsotonicRegression(out_of_bounds="clip").fit(p_va, y_true)
+        p_va = iso.transform(p_va)
+        p_te = iso.transform(p_te) if p_te is not None else None
+    best = (1.0, 1.0, 0.75); best_s = -1.0
+    for t in taus:
+        lo_mask = p_va < t
+        p_lo_base = np.minimum(p_va, t)/t
+        p_hi_base = np.maximum(p_va - t, 0)/(1.0 - t + 1e-12)
+        for gl in g_los:
+            p_lo = np.power(p_lo_base, gl) * t
+            for gh in g_his:
+                p_hi = t + (1.0 - t) * np.power(p_hi_base, gh)
+                cand = np.where(lo_mask, p_lo, p_hi)
+                s = _datathon(y_true[mask_eval], cand[mask_eval])
+                if s > best_s:
+                    best_s, best = s, (gl, gh, t)
+    gl, gh, t = best
+    def _apply(p):
+        p_lo = np.power(np.minimum(p, t)/t, gl) * t
+        p_hi = t + (1.0 - t) * np.power(np.maximum(p - t, 0)/(1.0 - t + 1e-12), gh)
+        return np.where(p >= t, p_hi, p_lo)
+    return _apply(p_va), (None if p_te is None else _apply(p_te)), iso, best
 
-    # Uzun metin + yasaklı ifadeler (sayfa sonu vetosu)
-    reject_if_long_with_phrases: bool = True,
-    long_text_min_chars: int = 4500,
-    long_text_min_words: int = 700,
-    banned_phrases: Optional[List[str]] = None,
-    banned_fuzzy_ratio: float = 0.83,
-    banned_min_hits: int = 2,
+def _month_blocks(df_train, cv=5):
+    counts = df_train.groupby("ref_month_ts").size().sort_index()
+    months = counts.index.to_numpy()
+    target = int(np.ceil(len(df_train)/cv))
+    blocks, acc, start = [], 0, 0
+    for i in range(len(months)):
+        acc += counts.iloc[i]
+        if acc >= target and len(blocks) < cv-1:
+            blocks.append(months[start:i+1])
+            start, acc = i+1, 0
+    if start < len(months): blocks.append(months[start:])
+    blocks = [b for b in blocks if len(b)>0]
+    while len(blocks)>cv:
+        blocks[-2] = np.concatenate([blocks[-2], blocks[-1]]); blocks.pop()
+    while len(blocks)<cv:
+        k = np.argmax([len(b) for b in blocks])
+        mid = len(blocks[k])//2
+        b = blocks.pop(k)
+        blocks.insert(k, b[:mid]); blocks.insert(k+1, b[mid:])
+    splits = []
+    n = len(df_train)
+    for fm in blocks:
+        va_idx = np.where(df_train["ref_month_ts"].isin(fm).values)[0]
+        tr_idx = np.setdiff1d(np.arange(n), va_idx, assume_unique=True)
+        splits.append((tr_idx, va_idx))
+    return splits
 
-    # --- YENİ: Meta tabanlı hızlı veto ---
-    use_meta_char_filter: bool = True,
-    meta_char_mode: str = "soft_phrases",   # "hard" | "soft_phrases"
-    meta_char_max: int = 6000,              # meta['keyword_chars'] veya ocr_debug['0']['chars'] eşiği
+def _month_safe_target_encode(df_all, tr_idx, va_idx, cat_cols, target, month_col="ref_month_ts", min_samples=50, prior=None):
+    if not cat_cols: return {}, {}
+    if prior is None: prior = float(df_all.loc[df_all.index[tr_idx], target].mean())
+    months = np.sort(df_all.loc[df_all.index[tr_idx], month_col].unique())
+    te_maps = {c:{} for c in cat_cols}; csum={c:{} for c in cat_cols}; ccnt={c:{} for c in cat_cols}
+    for m in months:
+        idx_m = df_all.index[tr_idx][df_all.loc[df_all.index[tr_idx], month_col]==m]
+        y_m = df_all.loc[idx_m, target].values
+        for c in cat_cols:
+            keys = df_all.loc[idx_m, c].astype(str).values
+            for k, yv in zip(keys, y_m):
+                csum[c][k] = csum[c].get(k,0.0)+yv
+                ccnt[c][k] = ccnt[c].get(k,0)+1
+                te_maps[c][k] = (csum[c][k] + prior*min_samples)/(ccnt[c][k]+min_samples)
+    def _tx(idx):
+        out={}
+        for c in cat_cols:
+            m = te_maps[c]
+            out[c+"_te"] = df_all.loc[idx, c].astype(str).map(m).fillna(prior).astype("float32").values
+        return out
+    return _tx(df_all.index[tr_idx]), _tx(df_all.index[va_idx])
 
-    debug: bool = False
-) -> Dict[str, Any]:
-    """
-    'any' modunda ≥1 sayfa pozitifse belge HAZIRUNDUR. Uzun "roman" sayfaları
-    - önce meta char filtresiyle,
-    - sonra paragraf yoğunluğu ve/veya yasaklı ifadelerle
-    eler.
-    """
+def _winsorize_inplace(df, num_cols, qlow=0.005, qhi=0.995):
+    if not num_cols: return
+    q = df[num_cols].quantile([qlow, qhi])
+    lo, hi = q.loc[qlow], q.loc[qhi]
+    for c in num_cols:
+        df[c] = df[c].clip(lo[c], hi[c])
 
-    # ---------- defaults ----------
-    if banned_phrases is None:
-        banned_phrases = [
-            "gündem maddeleri", "görüşüldü", "karara bağlandı",
-            "yönetim kurulu faaliyet raporu", "finansal tablolar",
-            "bağımsız denetçi raporu", "tutanak", "müzakereler",
-            "oy birliği ile", "oy çokluğu ile", "divan heyeti",
-            "gündemin", "maddesi", "kar dağıtımı", "temettü",
-            "sicil", "sicili", "ticaret", "gazetesi", "sicil/dosya",
-            "dosya", "6493"
-        ]
+# ======================= Data prep =======================
+t0_all = time.time()
+assert TARGET in train_test_df.columns, "Missing target column in train_test_df"
+df     = _ensure_ref_keys(train_test_df.copy())
+val_df = _ensure_ref_keys(validation_df_submission.copy())
+is_labeled = df[TARGET].isin([0,1])
+df_train = df.loc[is_labeled].copy().reset_index(drop=True)
+y = pd.to_numeric(df_train[TARGET], errors="coerce").astype(np.int32).values
 
-    # ---------------- local helpers ----------------
-    def _ratio_init():
-        try:
-            from rapidfuzz import fuzz
-            return lambda a, b: float(fuzz.partial_ratio(a, b)) / 100.0
-        except Exception:
-            return lambda a, b: difflib.SequenceMatcher(None, a, b).ratio()
-    _ratio = _ratio_init()
+X  = df_train.drop(columns=[c for c in [ID_COL, TARGET] if c in df_train.columns]).copy()
+Xv = val_df.drop(columns=[c for c in [ID_COL, TARGET] if c in val_df.columns]).copy()
+X  = X.replace([np.inf,-np.inf], np.nan); Xv = Xv.replace([np.inf,-np.inf], np.nan)
 
-    def _tr_lower(s: str) -> str:
-        return (s or "").replace("I", "ı").replace("İ", "i").lower()
+# Drop time keys from features
+TIME_KEY_COLS = [c for c in ["ref_date", "ref_date_ts", "ref_month_ts", "ref_month_str"] if c in X.columns]
+if TIME_KEY_COLS:
+    print(f"[cleanup] Dropping time-key cols from features: {TIME_KEY_COLS}")
+    X.drop(columns=TIME_KEY_COLS, inplace=True, errors="ignore")
+    Xv.drop(columns=[c for c in TIME_KEY_COLS if c in Xv.columns], inplace=True, errors="ignore")
 
-    def _normalize_text(s: str) -> str:
-        t = _tr_lower(s)
-        t = re.sub(r"[_–—\-•・·]+", " ", t)
-        t = re.sub(r"[^\w\s%./]", " ", t, flags=re.UNICODE)
-        t = re.sub(r"\s+", " ", t).strip()
-        return t
+# Missing flags + winsorize
+num_cols = list(X.select_dtypes(include=[np.number]).columns)
+obj_cols = list(X.select_dtypes(include=["object","category"]).columns)
+if ADD_MISSING_FLAGS and num_cols:
+    for c in num_cols:
+        X[c+"_isnan"]  = X[c].isna().astype("int8")
+        Xv[c+"_isnan"] = Xv[c].isna().astype("int8")
+    # update list
+    num_cols = list(X.select_dtypes(include=[np.number]).columns)
 
-    WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
-    def _tokens(s: str) -> List[str]:
-        return WORD_RE.findall(s)
+if CLIP_NUMERICS_QTL and num_cols:
+    _winsorize_inplace(X, num_cols, *CLIP_NUMERICS_QTL)
 
-    def _img_top_band_and_downscale(bgr: np.ndarray) -> np.ndarray:
-        import cv2
-        h, w = bgr.shape[:2]
-        top_h = max(1, int(h * max(0.18, min(0.6, ocr_on_top_ratio))))
-        roi = bgr[:top_h, :]
-        if w > ocr_downscale_max_w:
-            scale = ocr_downscale_max_w / float(w)
-            nh = max(1, int(round(roi.shape[0] * scale)))
-            roi = cv2.resize(roi, (ocr_downscale_max_w, nh), interpolation=cv2.INTER_AREA)
-        return roi
+# Pruning
+nun = X.nunique(dropna=False); empties = X.isna().all()
+const_cols = list(nun.index[(nun<=1)|empties])
+if const_cols:
+    print(f"[cleanup] Dropping {len(const_cols)} constant/empty cols")
+    X.drop(columns=const_cols, inplace=True, errors="ignore")
+    Xv.drop(columns=[c for c in const_cols if c in Xv.columns], inplace=True, errors="ignore")
 
-    def _img_full_downscale(bgr: np.ndarray) -> np.ndarray:
-        import cv2
-        h, w = bgr.shape[:2]
-        if w > ocr_downscale_max_w:
-            scale = ocr_downscale_max_w / float(w)
-            nh = max(1, int(round(h * scale)))
-            return cv2.resize(bgr, (ocr_downscale_max_w, nh), interpolation=cv2.INTER_AREA)
-        return bgr
+dup_mask = X.T.duplicated(keep="first")
+dup_cols = list(X.columns[dup_mask])
+if dup_cols:
+    print(f"[cleanup] Dropping {len(dup_cols)} duplicate cols")
+    X.drop(columns=dup_cols, inplace=True, errors="ignore")
+    Xv.drop(columns=[c for c in dup_cols if c in Xv.columns], inplace=True, errors="ignore")
 
-    def _count_words_chars_lines(txt: str) -> Dict[str, int]:
-        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-        words = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü0-9’']+", txt)
-        return {
-            "n_lines": len(lines),
-            "n_words": len(words),
-            "n_chars": len(txt),
-            "n_long_lines": sum(1 for ln in lines if len(ln) >= full_para_lines_minlen),
-        }
+if PRUNE_CORR_995:
+    num_cols_tmp = list(X.select_dtypes(include=[np.number]).columns)
+    if len(num_cols_tmp)>1:
+        corr  = X[num_cols_tmp].corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+        to_drop_corr = [col for col in upper.columns if (upper[col] >= 0.995).any()]
+        if to_drop_corr:
+            print(f"[cleanup] Dropping {len(to_drop_corr)} ultra-high corr cols (≥0.995)")
+            X.drop(columns=to_drop_corr, inplace=True, errors="ignore")
+            Xv.drop(columns=[c for c in to_drop_corr if c in Xv.columns], inplace=True, errors="ignore")
 
-    def _alpha_ratio(txt: str) -> float:
-        if not txt:
-            return 0.0
-        alpha = sum(ch.isalpha() for ch in txt)
-        return alpha / max(1, len(txt))
+# Align columns
+for c in X.columns:
+    if c not in Xv.columns: Xv[c] = np.nan
+Xv = Xv[X.columns].copy()
 
-    def _should_reject_by_text_density(top_txt: str, get_full_txt_fn: Callable[[], str],
-                                       debug: bool = False) -> Tuple[bool, Dict[str, Any]]:
-        m_top = _count_words_chars_lines(top_txt)
-        if m_top["n_words"] <= top_words_soft_cap:
-            return False, {"phase": "top_only", **m_top}
-        full_txt = get_full_txt_fn() or ""
-        m_full = _count_words_chars_lines(full_txt)
-        alpha_r = _alpha_ratio(full_txt)
-        reject = (
-            (m_full["n_chars"] >= full_max_chars) or
-            (m_full["n_words"] >= full_max_words) or
-            (m_full["n_long_lines"] >= full_para_lines_count)
+# Types
+num_cols = list(X.select_dtypes(include=[np.number]).columns)
+obj_cols = list(X.select_dtypes(include=["object","category"]).columns)
+if num_cols:
+    X[num_cols]  = X[num_cols].apply(pd.to_numeric, errors="coerce").astype("float32")
+    Xv[num_cols] = Xv[num_cols].apply(pd.to_numeric, errors="coerce").astype("float32")
+if obj_cols:
+    X[obj_cols]  = X[obj_cols].astype("category")
+    Xv[obj_cols] = Xv[obj_cols].astype("category")
+cat_idx = [X.columns.get_loc(c) for c in X.columns if str(X[c].dtype) in ("category","object")]
+
+# Class weight
+pos, neg = float((y==1).sum()), float((y==0).sum())
+spw = neg / max(pos, 1.0)
+print(f"[train] n={len(y)} | Pos={int(pos)} Neg={int(neg)} | features={X.shape[1]} | spw={spw:.3f}")
+
+# Model params (capacity nudged)
+xgb_params = {
+    "objective":"binary:logistic","eval_metric":"auc","eta":0.02,"max_depth":8,"min_child_weight":6,
+    "subsample":0.7,"colsample_bytree":0.7,"reg_lambda":8.0,"reg_alpha":0.1,"gamma":0.0,
+    "max_delta_step":1,"scale_pos_weight":spw,"seed":SEED,
+    "tree_method":"gpu_hist" if USE_GPU else "hist", **({"predictor":"gpu_predictor"} if USE_GPU else {})
+}
+lgb_params = dict(
+    n_estimators=N_ROUNDS*2, learning_rate=0.02, num_leaves=255, max_depth=-1,
+    subsample=0.75, colsample_bytree=0.70, feature_fraction_bynode=0.8,
+    reg_lambda=8.0, reg_alpha=0.0, min_child_samples=50, max_bin=511,
+    objective="binary", random_state=SEED, n_jobs=-1, **({"device_type":"gpu"} if USE_GPU else {}),
+)
+cat_params = dict(
+    iterations=N_ROUNDS, learning_rate=0.03, depth=8, loss_function="Logloss", eval_metric="AUC",
+    random_seed=SEED, verbose=False, od_type="Iter", od_wait=OD_WAIT_CAT,
+    l2_leaf_reg=6.0, class_weights=[1.0, spw], allow_writing_files=False, thread_count=-1,
+    bootstrap_type="Bernoulli", subsample=0.8, rsm=0.8, **({"task_type":"GPU"} if USE_GPU else {}),
+)
+
+# ======================= Chrono CV =======================
+splits = _month_blocks(df_train, CV)
+print("[cv] Using chronological month blocks (no shuffling).")
+def _fold_median_month(idx):
+    m = df_train.loc[idx, "ref_month_ts"]
+    return pd.to_datetime(pd.Series(m).median())
+fold_info = [(i, _fold_median_month(va)) for i,(_,va) in enumerate(splits,1)]
+fold_order = [f for f,_ in sorted(fold_info, key=lambda t: t[1], reverse=True)]
+
+# Recency weights: latest highest
+ramp = np.linspace(1.0, 3.0, num=CV)
+fold2weight = {f:w for f,w in zip(fold_order, ramp[::-1])}
+print("[cv] fold recency order (latest→oldest):", fold_order)
+print("[cv] weights:", fold2weight)
+
+print("\n[Fold month summary]")
+for fi, (_,va_idx) in enumerate(splits,1):
+    m_ts = df_train.loc[va_idx,"ref_month_ts"]
+    counts = m_ts.value_counts().sort_index()
+    months_list = [d.strftime("%Y-%m") for d in counts.index]
+    span_lo = counts.index.min().strftime("%Y-%m") if len(counts) else "NA"
+    span_hi = counts.index.max().strftime("%Y-%m") if len(counts) else "NA"
+    med = pd.Series(m_ts).median(); med_str = med.strftime("%Y-%m") if pd.notnull(med) else "NA"
+    pos_in_fold = int((y[va_idx]==1).sum()); rate = pos_in_fold/max(1,len(va_idx))
+    print(f"Fold {fi}: n={len(va_idx)} | pos={pos_in_fold} (rate={rate:.4f}) | months={months_list} | span={span_lo}→{span_hi} | median≈{med_str}")
+
+# ======================= CV Train =======================
+oof_xgb = np.zeros(len(y), dtype="float32")
+oof_lgb = np.zeros(len(y), dtype="float32")
+oof_cat = np.zeros(len(y), dtype="float32")
+fold_preds_val = {"xgb":[], "lgb":[], "cat":[], "w":[]}
+fold_masks = []
+fold_auc_meta, fold_dat_meta = [], []
+
+# Optional adversarial reweighting toward recent-like rows
+w_domain = np.ones(len(y), dtype="float32")
+if USE_ADV_REWEIGHT:
+    recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
+    domain_y = np.zeros(len(y), dtype=int)
+    for f,(tr,va) in enumerate(splits,1):
+        if f in recent_set:
+            domain_y[va] = 1
+    adv = LGBMClassifier(n_estimators=600, learning_rate=0.05, num_leaves=127, subsample=0.8, colsample_bytree=0.8)
+    adv.fit(X, domain_y)
+    p_domain = adv.predict_proba(X)[:,1]
+    w_domain = (0.5 + p_domain).astype("float32")   # ~[0.5,1.5]
+    del adv, p_domain; gc.collect()
+    print("[adv] adversarial reweighting enabled.")
+
+print("\n=========== CV training (time-aware, recency-weighted) ===========")
+t0 = time.time()
+for fold, (tr_idx, va_idx) in enumerate(splits, 1):
+    print(f"\n--- Fold {fold}/{CV} (w={fold2weight[fold]:.2f}) ---")
+    Xtr, Xva = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
+    ytr, yva = y[tr_idx], y[va_idx]
+
+    # TE for LGB/XGB (CatBoost keeps raw cats)
+    cat_for_te = [c for c in X.columns if str(X[c].dtype) in ("category","object")] if USE_TE_LGB_XGB else []
+    if USE_TE_LGB_XGB and len(cat_for_te):
+        df_all_for_te = pd.concat([df_train[[TARGET,"ref_month_ts"]], X[cat_for_te]], axis=1)
+        te_tr, te_va = _month_safe_target_encode(
+            df_all=df_all_for_te, tr_idx=tr_idx, va_idx=va_idx,
+            cat_cols=cat_for_te, target=TARGET, month_col="ref_month_ts", min_samples=TE_MIN_SAMPLES
         )
-        if reject and alpha_r >= full_alpha_ratio_min:
-            return True, {"phase": "full", "alpha_ratio": round(alpha_r, 3), **m_full}
-        else:
-            return False, {"phase": "full", "alpha_ratio": round(alpha_r, 3), **m_full}
+    # Build views per model
+    Xtr_lgb, Xva_lgb = Xtr.copy(), Xva.copy()
+    if USE_TE_LGB_XGB and len(cat_for_te):
+        for k,v in te_tr.items(): Xtr_lgb[k]=v
+        for k,v in te_va.items(): Xva_lgb[k]=v
 
-    def _img_to_b64(img: np.ndarray) -> str:
-        import cv2, base64
-        if ocr_use_jpeg:
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        else:
-            ok, buf = cv2.imencode(".png", img)
-        if not ok:
-            return ""
-        return base64.b64encode(buf).decode("utf-8")
+    # XGB
+    pxgb_list, pxgbv_list = [], []
+    for s in SEEDS:
+        xgb_params['seed'] = s
+        dtr = xgb.DMatrix(Xtr_lgb, label=ytr, weight=w_domain[tr_idx], enable_categorical=True)
+        dva = xgb.DMatrix(Xva_lgb, label=yva, enable_categorical=True)
+        dv  = xgb.DMatrix(Xv[Xtr_lgb.columns], enable_categorical=True)
+        bst = xgb.train(xgb_params, dtr, num_boost_round=N_ROUNDS,
+                        evals=[(dtr,"train"),(dva,"val")],
+                        early_stopping_rounds=ES_ROUNDS_XGB, verbose_eval=False)
+        pxgb_list.append(bst.predict(dva, iteration_range=(0, bst.best_iteration+1)))
+        pxgbv_list.append(bst.predict(dv,  iteration_range=(0, bst.best_iteration+1)))
+    pxgb_va = np.mean(pxgb_list, axis=0); pxgb_v = np.mean(pxgbv_list, axis=0)
+    del dtr, dva, dv, bst; gc.collect()
 
-    # --- YENİ: meta chars çekici ---
-    def _get_meta_chars(meta: Optional[Dict[str, Any]]) -> Optional[int]:
-        if not meta:
-            return None
-        if isinstance(meta.get("keyword_chars"), (int, float)):
-            return int(meta["keyword_chars"])
-        try:
-            od = meta.get("ocr_debug") or {}
-            cand = (od.get("0") or {}).get("chars")
-            return int(cand) if cand is not None else None
-        except Exception:
-            return None
+    # LGB
+    plgb_list, plgbv_list = [], []
+    for s in SEEDS:
+        lgb_params['random_state'] = s
+        lgbm = LGBMClassifier(**lgb_params)
+        lgbm.fit(Xtr_lgb, ytr, eval_set=[(Xva_lgb, yva)], eval_metric="auc",
+                 callbacks=[early_stopping(ES_ROUNDS_LGB, verbose=False), log_evaluation(0)],
+                 sample_weight=w_domain[tr_idx])
+        plgb_list.append(lgbm.predict_proba(Xva_lgb)[:,1])
+        plgbv_list.append(lgbm.predict_proba(Xv[Xtr_lgb.columns])[:,1])
+    plgb_va = np.mean(plgb_list, axis=0); plgb_v = np.mean(plgbv_list, axis=0)
+    del lgbm; gc.collect()
 
-    # –– tablo tespiti (morfolojik) ––
-    def _has_table(bgr: np.ndarray) -> Tuple[bool, Dict[str, Any]]:
-        import cv2
-        min_columns_required = 3
-        min_rows_required = 2
-        min_col_separators = min_columns_required + 1
-        min_row_separators = min_rows_required + 1
-        min_col_cov = 0.60
-        min_row_cov = 0.60
-        merge_tol_px_factor = 0.012
-        min_intersections_cc = 6
-        min_cell_count = 6
-        min_spacing_cv = 0.35
+    # CAT
+    pcat_list, pcatv_list = [], []
+    for s in SEEDS:
+        cat_params['random_seed'] = s
+        train_pool = Pool(Xtr, label=ytr, cat_features=cat_idx if len(cat_idx) else None, weight=w_domain[tr_idx])
+        valid_pool = Pool(Xva, label=yva, cat_features=cat_idx if len(cat_idx) else None)
+        val_pool   = Pool(Xv,            cat_features=cat_idx if len(cat_idx) else None)
+        cat = CatBoostClassifier(**cat_params)
+        cat.fit(train_pool, eval_set=valid_pool, verbose=False, use_best_model=True)
+        pcat_list.append(cat.predict_proba(valid_pool)[:,1])
+        pcatv_list.append(cat.predict_proba(val_pool)[:,1])
+    pcat_va = np.mean(pcat_list, axis=0); pcat_v = np.mean(pcatv_list, axis=0)
+    del train_pool, valid_pool, val_pool, cat; gc.collect()
 
-        h, w = bgr.shape[:2]
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Recent mask for tuning in this fold = global recent folds (not just this fold)
+    recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
+    recent_mask_oof = np.zeros_like(y, dtype=bool)
+    for f2,(tr2,va2) in enumerate(splits,1):
+        if f2 in recent_set: recent_mask_oof[va2] = True
+    # Piecewise sharpen per model using recent-only eval
+    pxgb_va, pxgb_v, _, _ = _piecewise_sharpen_grid(yva, pxgb_va, pxgb_v, mask_eval=None, use_iso=True)
+    plgb_va, plgb_v, _, _ = _piecewise_sharpen_grid(yva, plgb_va, plgb_v, mask_eval=None, use_iso=True)
+    pcat_va, pcat_v, _, _ = _piecewise_sharpen_grid(yva, pcat_va, pcat_v, mask_eval=None, use_iso=True)
 
-        tophat = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT,
-                                  cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
-        block = max(31, (min(h, w) // 25) | 1)
-        bw_adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                         cv2.THRESH_BINARY_INV, block, 10)
-        _, bw_otsu = cv2.threshold(tophat, 0, 255,
-                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        bw = cv2.bitwise_or(bw_adapt, bw_otsu)
+    # OOF
+    oof_xgb[va_idx] = pxgb_va; oof_lgb[va_idx] = plgb_va; oof_cat[va_idx] = pcat_va
 
-        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w // 100), 1))
-        vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(18, h // 100)))
-        horiz = cv2.dilate(cv2.erode(bw, hk, 1), hk, 1)
-        vert = cv2.dilate(cv2.erode(bw, vk, 1), vk, 1)
-        horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), 1)
-        vert = cv2.dilate(vert,  cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)), 1)
+    fold_preds_val["xgb"].append(pxgb_v)
+    fold_preds_val["lgb"].append(plgb_v)
+    fold_preds_val["cat"].append(pcat_v)
+    fold_preds_val["w"].append(fold2weight[fold])
 
-        def _separator_positions(binary, axis='v'):
-            num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-            sep_pos = []
-            for k in range(1, num):
-                x, y, ww, hh, area = stats[k]
-                if axis == 'v':
-                    ar_ok = (hh >= int(h * min_col_cov)) and (ww <= max(6, w // 80))
-                    if ar_ok:
-                        sep_pos.append(x + ww // 2)
-                else:
-                    ar_ok = (ww >= int(w * min_row_cov)) and (hh <= max(6, h // 80))
-                    if ar_ok:
-                        sep_pos.append(y + hh // 2)
-            sep_pos = sorted(sep_pos)
-            tol = max(2, int(w * merge_tol_px_factor if axis == 'v' else h * merge_tol_px_factor))
-            merged = []
-            for p in sep_pos:
-                if not merged or abs(p - merged[-1]) > tol:
-                    merged.append(p)
-                else:
-                    merged[-1] = (merged[-1] + p) // 2
-            return merged
+    m = np.zeros(len(y), dtype=bool); m[va_idx]=True
+    fold_masks.append((fold, m))
 
-        vseps = _separator_positions(vert, 'v')
-        hseps = _separator_positions(horiz, 'h')
-        n_vsep, n_hsep = len(vseps), len(hseps)
+    # quick meta diag per-fold
+    mean3 = (pxgb_va + plgb_va + pcat_va)/3.0
+    std3  = np.std(np.column_stack([pxgb_va, plgb_va, pcat_va]), axis=1)
+    range3= np.maximum.reduce([pxgb_va, plgb_va, pcat_va]) - np.minimum.reduce([pxgb_va, plgb_va, pcat_va])
+    meta_X_va = np.column_stack([
+        pxgb_va, plgb_va, pcat_va,
+        _rank01(pxgb_va), _rank01(plgb_va), _rank01(pcat_va),
+        0.5*pxgb_va + 0.5*plgb_va,
+        np.maximum.reduce([pxgb_va, plgb_va, pcat_va]),
+        np.minimum.reduce([pxgb_va, plgb_va, pcat_va]),
+        mean3, std3, range3
+    ])
+    meta_lr = LogisticRegression(max_iter=2000, solver="lbfgs")
+    meta_lr.fit(meta_X_va, yva)
+    pmeta_va = meta_lr.predict_proba(meta_X_va)[:,1]
+    fold_auc_meta.append(roc_auc_score(yva, pmeta_va))
+    fold_dat_meta.append(_datathon(yva, pmeta_va))
+    print(f"Fold {fold}: AUC_meta={fold_auc_meta[-1]:.4f} | DAT_meta={fold_dat_meta[-1]:.5f}")
 
-        if n_vsep <= 2 and n_hsep <= 2:
-            inter = cv2.bitwise_and(horiz, vert)
-            inter = cv2.dilate(inter, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
-            cc, _, st, _ = cv2.connectedComponentsWithStats(inter, 8)
-            inter_cc = sum(1 for k in range(1, cc) if st[k, cv2.CC_STAT_AREA] >= 6)
-            return False, {
-                "n_vsep": n_vsep, "n_hsep": n_hsep,
-                "intersections_cc": int(inter_cc),
-                "reason": "single_box_like"
-            }
+print(f"\n[Fold meta diagnostics] Mean AUC={np.mean(fold_auc_meta):.4f} ± {np.std(fold_auc_meta):.4f} "
+      f"| Mean DAT={np.mean(fold_dat_meta):.5f}")
+print(f"[Total CV time] {time.time()-t0:.1f}s")
 
-        has_min_grid = (n_vsep >= min_col_separators) and (n_hsep >= min_row_separators)
+# ======================= Recency-weighted blend on VAL streams =======================
+Wsum = np.sum(fold_preds_val["w"])
+predv_xgb = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["xgb"])], axis=0)/Wsum
+predv_lgb = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["lgb"])], axis=0)/Wsum
+predv_cat = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["cat"])], axis=0)/Wsum
 
-        inter = cv2.bitwise_and(horiz, vert)
-        inter = cv2.dilate(inter, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
-        cc, _, st, _ = cv2.connectedComponentsWithStats(inter, 8)
-        inter_cc = sum(1 for k in range(1, cc) if st[k, cv2.CC_STAT_AREA] >= 6)
+# ======================= Weight search (OOF) =======================
+recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
+recent_mask = np.zeros(len(y), dtype=bool)
+for f, m in fold_masks:
+    if f in recent_set: recent_mask |= m
 
-        approx_cells = max(0, (n_hsep - 1) * (n_vsep - 1))
+def _weight_search(o1,o2,o3,y_true,mask,step):
+    grid = np.arange(0.0, 1.0+1e-9, step)
+    best_w, best_s = (1/3,1/3,1/3), -1.0
+    for wx in grid:
+        for wl in grid:
+            wc = 1.0 - wx - wl
+            if wc < -1e-12: continue
+            wc = max(0.0, wc)
+            s = _datathon(y_true[mask], (wx*o1 + wl*o2 + wc*o3)[mask])
+            if s > best_s: best_s, best_w = s, (wx, wl, wc)
+    return best_w, best_s
 
-        def _cv(vals):
-            vals = np.array(vals, dtype=float)
-            return (vals.std() / max(1e-6, vals.mean())) if len(vals) >= 2 else 0.0
+best_w,_ = _weight_search(oof_xgb, oof_lgb, oof_cat, y, recent_mask, step=0.05)
+wx0, wl0, _ = best_w
+grid_wx = np.arange(max(0.0, wx0-0.05), min(1.0, wx0+0.05)+1e-9, 0.01)
+grid_wl = np.arange(max(0.0, wl0-0.05), min(1.0, wl0+0.05)+1e-9, 0.01)
+best_s_fine, best_w_fine = -1.0, best_w
+for wx in grid_wx:
+    for wl in grid_wl:
+        wc = 1.0 - wx - wl
+        if wc < -1e-12: continue
+        wc = max(0.0, wc)
+        s = _datathon(y, wx*oof_xgb + wl*oof_lgb + wc*oof_cat)
+        if s > best_s_fine: best_s_fine, best_w_fine = s, (wx, wl, wc)
+best_w = best_w_fine
+print(f"[Weight search] best=(xgb={best_w[0]:.3f}, lgb={best_w[1]:.3f}, cat={best_w[2]:.3f})")
 
-        spacing_ok = True
-        if n_vsep >= 3:
-            gaps_v = [vseps[i + 1] - vseps[i] for i in range(n_vsep - 1)]
-            if _cv(gaps_v) > min_spacing_cv:
-                spacing_ok = False
-        if n_hsep >= 3:
-            gaps_h = [hseps[i + 1] - hseps[i] for i in range(n_hsep - 1)]
-            if _cv(gaps_h) > min_spacing_cv:
-                spacing_ok = spacing_ok and True
+# ======================= Meta stacking (OOF) =======================
+mean3 = (oof_xgb + oof_lgb + oof_cat)/3.0
+std3  = np.std(np.column_stack([oof_xgb,oof_lgb,oof_cat]), axis=1)
+range3= np.maximum.reduce([oof_xgb,oof_lgb,oof_cat]) - np.minimum.reduce([oof_xgb,oof_lgb,oof_cat])
 
-        ok = bool(has_min_grid and inter_cc >= min_intersections_cc and
-                  approx_cells >= min_cell_count and spacing_ok)
-        dbg = {
-            "n_vsep": int(n_vsep), "n_hsep": int(n_hsep),
-            "min_col_separators": int(min_col_separators),
-            "min_row_separators": int(min_row_separators),
-            "intersections_cc": int(inter_cc),
-            "approx_cells": int(approx_cells),
-            "spacing_ok": bool(spacing_ok),
-            "col_cov_thr": float(min_col_cov),
-            "row_cov_thr": float(min_row_cov),
-            "reason": ("ok" if ok else "grid_or_density_not_enough")
-        }
-        return ok, dbg
+stack_X_oof = np.column_stack([
+    oof_xgb, oof_lgb, oof_cat,
+    _rank01(oof_xgb), _rank01(oof_lgb), _rank01(oof_cat),
+    0.5*oof_xgb+0.5*oof_lgb,
+    np.maximum.reduce([oof_xgb,oof_lgb,oof_cat]),
+    np.minimum.reduce([oof_xgb,oof_lgb,oof_cat]),
+    mean3, std3, range3,
+    best_w[0]*oof_xgb + best_w[1]*oof_lgb + best_w[2]*oof_cat
+])
+sample_w = np.ones(len(y), dtype="float32")
+for f, m in fold_masks: sample_w[m] = float(fold2weight[f])
 
-    # ---- OCR ----
-    def _ocr_via_tc_new(img: np.ndarray) -> str:
-        if tc_new is None:
-            return ""
-        from PIL import Image
-        import cv2
-        pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        cfg = [f"--psm {int(ocr_psm)}", f"--oem {int(ocr_oem)}"]
-        if ocr_extra_config:
-            cfg.append(ocr_extra_config)
-        kwargs: Dict[str, Any] = {"lang": ocr_lang, "config": " ".join(cfg)}
-        for name in ("ocr", "run_ocr", "predict", "infer", "get_text", "call"):
-            fn = getattr(tc_new, name, None)
-            if callable(fn):
-                try:
-                    txt = fn(pil, **kwargs)
-                    if isinstance(txt, dict):
-                        txt = txt.get("text", "")
-                    return txt if isinstance(txt, str) else str(txt)
-                except TypeError:
-                    try:
-                        txt = fn(pil, output_type="text", **kwargs)
-                        if isinstance(txt, dict):
-                            txt = txt.get("text", "")
-                        return txt if isinstance(txt, str) else str(txt)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        return ""
+# focus weights for top-decile emphasis
+oof_q = np.zeros_like(y, dtype="float32")
+months = df_train["ref_month_str"].values
+for m in np.unique(months):
+    mask_m = (months==m)
+    oof_q[mask_m] = pd.Series((best_w[0]*oof_xgb + best_w[1]*oof_lgb + best_w[2]*oof_cat)[mask_m]).rank(pct=True).values
+meta_w = sample_w * (1.0 + 9.0*(oof_q>=0.9))
 
-    def _ocr_via_http(img: np.ndarray) -> str:
-        if not NEW_URL:
-            return ""
-        import requests
-        payload = {
-            "image": _img_to_b64(img),
-            "lang": ocr_lang or "tur",
-            "config": " ".join(filter(None, [f"--psm {int(ocr_psm)}",
-                                             f"--oem {int(ocr_oem)}", ocr_extra_config]))
-        }
-        last_err = None
-        for k in range(http_retries + 1):
-            try:
-                r = requests.post(NEW_URL, json=payload, timeout=http_timeout_s)
-                r.raise_for_status()
-                try:
-                    j = r.json()
-                except Exception:
-                    j = json.loads(r.text)
-                return j.get("text", "") or ""
-            except Exception as e:
-                last_err = e
-                if k < http_retries:
-                    time.sleep(http_backoff_s * (1.5 ** k))
-                else:
-                    if debug:
-                        print(f"[OCR HTTP] hata: {last_err}")
-        return ""
+meta = LogisticRegression(max_iter=5000, solver="lbfgs")
+meta.fit(stack_X_oof, y, sample_weight=meta_w)
+oof_meta = meta.predict_proba(stack_X_oof)[:,1]
 
-    def _ocr_text(img_full: np.ndarray, mode: str = "top") -> Tuple[str, Dict[str, Any]]:
-        roi = _img_top_band_and_downscale(img_full) if mode == "top" else _img_full_downscale(img_full)
-        txt, err = "", None
-        if NEW_URL:
-            try:
-                txt = _ocr_via_http(roi)
-            except Exception as e:
-                err = e
-        if not txt and tc_new is not None:
-            try:
-                txt = _ocr_via_tc_new(roi)
-            except Exception as e:
-                err = e
-        return txt, ({} if err is None else {"error": str(err), "mode": mode})
+# ===== Calibrate on recent folds only =====
+keep_recent = recent_mask
+if USE_ISOTONIC:
+    iso_global = IsotonicRegression(out_of_bounds="clip")
+    iso_global.fit(oof_meta[keep_recent], y[keep_recent], sample_weight=sample_w[keep_recent])
+    oof_meta_iso = iso_global.transform(oof_meta)
+else:
+    oof_meta_iso = oof_meta
 
-    def _phrase_best_score(phrase: str, text: str, toks: List[str]) -> Tuple[float, Dict[str, Any]]:
-        ph = _tr_lower((phrase or "").strip())
-        if not ph:
-            return 0.0, {"why": "empty"}
-        s_fz = _ratio(ph, text)
-        ph_toks = [t for t in WORD_RE.findall(ph) if t]
-        cover_best = 0.0
-        if ph_toks and toks:
-            need = set(ph_toks)
-            step = max(1, phrase_window // 2)
-            for s in range(0, max(1, len(toks) - phrase_window + 1), step):
-                e = min(len(toks), s + phrase_window)
-                window = toks[s:e]
-                cov = sum(1 for t in need if t in window) / max(1, len(need))
-                cover_best = max(cover_best, cov)
-        prefix_hits = 0.0
-        if ph_toks and toks:
-            pref = sum(1 for t in ph_toks if any(tt.startswith(t) for tt in toks))
-            prefix_hits = pref / max(1, len(ph_toks))
-        best = max(s_fz, cover_best, prefix_hits)
-        return best, {"fuzzy": round(s_fz, 3), "coverage": round(cover_best, 3),
-                      "prefix": round(prefix_hits, 3), "best": round(best, 3)}
+# ===== Prior correction with alpha shrink (tuned on recent) =====
+def _group_keys_for_prior(df_):
+    keys = []
+    for k in ["cohort_ym","behavioral_region","ref_month_str"]:
+        if k in df_.columns: keys.append(k)
+    return keys if keys else ["ref_month_str"]
 
-    # ---------------- defaults ----------------
-    if keywords is None:
-        keywords = [
-            "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
-            "genel kurul","olağan genel kurul","liste örneği",
-            "pay sahibinin ad soyad unvanı","ad soyad","ad/soyad/unvanı","kimlik numarası",
-            "vergi kimlik","mersis numarası","uyruğu","adresi",
-            "payların itibari değeri","ediniliş şekli","ediniliş tarihi",
-            "katılım şekli","temsilci türü","temsilcinin ad soyad unvanı",
-            "temsilcinin kimlik numarası","imza",
-            "şirketin sermayesi","payların toplam itibari değeri",
-            "asgari toplantı nisabı","mevcut toplantı nisabı",
-            "divan başkanı","oy toplama memuru","yönetim kurulu üyeleri",
-            "anonim şirketi","a.ş","aş","limited şirketi","ltd şti","ltd. şti."
-        ]
-    if strong_phrases is None:
-        strong_phrases = [
-            "hazır bulunanlar listesi","hazir bulunanlar listesi","hazirun cetveli",
-            "pay sahibinin ad soyad unvanı","ad soyad","ad/soyad/unvanı","genel kurulda hazır bulunanlar listesi",
-            "katılım şekli","temsilci türü","temsilcinin ad soyad unvanı",
-            "temsilcinin kimlik numarası","imza",
-            "şirketin sermayesi","payların toplam itibari değeri",
-            "asgari toplantı nisabı","mevcut toplantı nisabı",
-            "divan başkanı","oy toplama memuru","yönetim kurulu üyeleri"
-        ]
+def _fit_prior_correction(df_ref, proba, keys):
+    tmp = df_ref.loc[:, keys].astype(str).copy()
+    tmp["z"] = _logit(proba); z_global = tmp["z"].mean()
+    tmp["g"] = tmp[keys].agg("||".join, axis=1)
+    delta = (tmp.groupby("g")["z"].mean() - z_global).to_dict()
+    return delta, z_global
 
-    images: List[np.ndarray] = list(doc_res.get("images", []))
-    metas: List[Dict[str, Any]] = list(doc_res.get("metas", []))
-    n = len(images)
+def _apply_prior_shrunk(df_ref, proba, keys, delta, alpha=0.5):
+    z = _logit(proba); g = df_ref[keys].astype(str).agg("||".join, axis=1)
+    shift = g.map(delta).fillna(0.0).values
+    return _sigmoid(z - alpha*shift)
 
-    hazirun_pages: List[Dict[str, Any]] = []
-    non_hazirun_pages: List[Dict[str, Any]] = []
-    unknown_pages: List[Dict[str, Any]] = []
-    first_match_index: Optional[int] = None
+keys_prior = _group_keys_for_prior(df_train)
+delta_map, z0 = _fit_prior_correction(df_train, oof_meta_iso, keys_prior)
+best_alpha, best_s = 0.0, -1.0
+for a in np.linspace(0.0, 1.0, 11):
+    cand = _apply_prior_shrunk(df_train, oof_meta_iso, keys_prior, delta_map, alpha=a)
+    s = _datathon(y[keep_recent], cand[keep_recent])
+    if s>best_s: best_s, best_alpha = s, a
+oof_meta_corr = _apply_prior_shrunk(df_train, oof_meta_iso, keys_prior, delta_map, alpha=best_alpha)
+print(f"[prior] best alpha={best_alpha:.2f} (tuned on recent)")
 
-    # ---- Sayfa döngüsü ----
-    for i in range(n):
-        img = images[i]
-        meta_i = metas[i] if i < len(metas) else {}
-        meta_chars = _get_meta_chars(meta_i)
+# ===== Rank-blend weight tuned on recent =====
+def _build_ecdf_map(months_vec, scores):
+    out={}
+    for m, s in pd.DataFrame({"m":months_vec, "s":scores}).groupby("m")["s"]:
+        out[m] = np.sort(s.values)
+    return out
 
-        # (0) YENİ: Meta tabanlı hızlı veto
-        if use_meta_char_filter and meta_chars is not None and meta_chars >= meta_char_max:
-            if meta_char_mode == "hard":
-                non_hazirun_pages.append({
-                    "index": i, "reason": "meta_char_exceeded",
-                    "meta_chars": int(meta_chars), "meta_char_max": int(meta_char_max)
-                })
-                continue
-            elif meta_char_mode == "soft_phrases":
-                # az OCR ile yasaklıları kontrol et
-                t_raw, _ = _ocr_text(img, mode="top")
-                t_norm = _normalize_text(t_raw or "")
-                if len(t_norm) < 200:
-                    fp_txt, _ = _ocr_text(img, mode="full")
-                    t_norm = _normalize_text(fp_txt or "")
-                hits = 0
-                for ph in (banned_phrases or []):
-                    if _ratio(_tr_lower(ph), t_norm) >= banned_fuzzy_ratio:
-                        hits += 1
-                        if hits >= banned_min_hits:
-                            break
-                if hits >= banned_min_hits:
-                    non_hazirun_pages.append({
-                        "index": i, "reason": "meta_char_exceeded_with_banned_phrases",
-                        "meta_chars": int(meta_chars), "banned_hits": int(hits)
-                    })
-                    continue
-                # aksi halde normal akışa devam
+ecdf_map = _build_ecdf_map(df_train["ref_month_str"].values, oof_meta_corr)
+def _percentile(arr_sorted, x): 
+    idx = np.searchsorted(arr_sorted, x, side="right")
+    return idx / max(1, len(arr_sorted))
 
-        # 1) OCR (üst bant)
-        text_raw, err_info_top = _ocr_text(img, mode="top")
-        if not text_raw:
-            if assume_nonhazirun_on_ocr_fail:
-                non_hazirun_pages.append({"index": i, "reason": "ocr_empty_or_error",
-                                          "hits": 0, "total_score": 0.0, **err_info_top})
-            else:
-                unknown_pages.append({"index": i, "reason": "ocr_empty_or_error", **err_info_top})
-            continue
+best_rb, best_rb_s = RANK_BLEND_INIT, -1.0
+months_arr = df_train["ref_month_str"].values
+oof_pct = np.zeros_like(oof_meta_corr)
+for m in np.unique(months_arr):
+    arr = ecdf_map.get(m, np.sort(oof_meta_corr))
+    mask = (months_arr==m)
+    oof_pct[mask] = _percentile(arr, oof_meta_corr[mask])
+for rb in np.linspace(0.0, 0.5, 51):
+    cand = (1.0-rb)*oof_meta_corr + rb*oof_pct
+    s = _datathon(y[keep_recent], cand[keep_recent])
+    if s>best_rb_s: best_rb_s, best_rb = s, rb
+print(f"[rank-blend] best RANK_BLEND={best_rb:.3f} (tuned on recent)")
 
-        # 1.1) Roman-benzeri metin (erken veto)
-        if reject_if_long_text:
-            def _get_full_text_once():
-                fp_txt, _err_fp = _ocr_text(img, mode="full")
-                return fp_txt or ""
-            rej, rej_dbg = _should_reject_by_text_density(text_raw, _get_full_text_once, debug=debug)
-            if rej:
-                non_hazirun_pages.append({
-                    "index": i, "reason": "text_density_exceeded",
-                    **({"text_density_debug": rej_dbg} if debug else {})
-                })
-                continue
+# ===== OOF report =====
+def _report(tag, y_true, p):
+    auc = roc_auc_score(y_true, p)
+    gini = cm.convert_auc_to_gini(auc)
+    r10  = cm.recall_at_k(y_true, p, k=0.10)
+    l10  = cm.lift_at_k(y_true, p, k=0.10)
+    dat  = _datathon(y_true, p)
+    print(f"{tag} OOF AUC={auc:.4f} | Gini={gini:.4f} | Recall@10%={r10:.4f} | Lift@10%={l10:.4f} | Datathon={dat:.5f}")
 
-        text = _normalize_text(text_raw)
-        toks = _tokens(text)
+print("\n========== OOF (stacked) ==========")
+_report("Raw   ", y, oof_meta)
+_report("Iso   ", y, oof_meta_iso)
+_report("Prior ", y, oof_meta_corr)
+oof_meta_final = (1.0-best_rb)*oof_meta_corr + best_rb*oof_pct
+_report("Final ", y, oof_meta_final)
 
-        # 2) Güçlü başlık
-        strong_hit = False
-        strong_best = 0.0
-        for ph in strong_phrases:
-            sc, _ = _phrase_best_score(ph, text, toks)
-            strong_best = max(strong_best, sc)
-            if sc >= strong_phrase_ratio:
-                strong_hit = True
-                break
+# ======================= Validation inference =======================
+# Build stacking features for VAL (mirror OOF stack)
+mean3_v  = (predv_xgb + predv_lgb + predv_cat) / 3.0
+std3_v   = np.std(np.column_stack([predv_xgb, predv_lgb, predv_cat]), axis=1)
+range3_v = np.maximum.reduce([predv_xgb, predv_lgb, predv_cat]) - np.minimum.reduce([predv_xgb, predv_lgb, predv_cat])
+blend_v  = best_w[0]*predv_xgb + best_w[1]*predv_lgb + best_w[2]*predv_cat
+stack_X_val = np.column_stack([
+    predv_xgb, predv_lgb, predv_cat,
+    _rank01(predv_xgb), _rank01(predv_lgb), _rank01(predv_cat),
+    0.5*predv_xgb + 0.5*predv_lgb,
+    np.maximum.reduce([predv_xgb, predv_lgb, predv_cat]),
+    np.minimum.reduce([predv_xgb, predv_lgb, predv_cat]),
+    mean3_v, std3_v, range3_v,
+    blend_v
+])
+val_prob = meta.predict_proba(stack_X_val)[:,1].astype("float32")
+val_prob = iso_global.transform(val_prob) if USE_ISOTONIC else val_prob
 
-        # 3) TABLO (moda göre) + kapak toleransı
-        skip_table_check = (require_table is False) or (table_require_mode == "soft" and strong_hit)
+# apply prior shrunk
+val_prob_corr = _apply_prior_shrunk(val_df, val_prob, keys_prior, delta_map, alpha=best_alpha)
 
-        page_has_table, tbl_dbg = (True, {})
-        if require_table and not skip_table_check:
-            page_has_table, tbl_dbg = _has_table(img)
-            if not page_has_table:
-                if i == 0 and treat_first_no_table_as_unknown and not strong_hit:
-                    unknown_pages.append({
-                        "index": i, "reason": "no_table_cover_like",
-                        **({"table_debug": tbl_dbg, "strong_best": round(strong_best, 3)} if debug else {})
-                    })
-                    continue
-                else:
-                    non_hazirun_pages.append({
-                        "index": i, "reason": "no_table",
-                        **({"table_debug": tbl_dbg, "strong_best": round(strong_best, 3)} if debug else {})
-                    })
-                    continue
+# ECDF rank blend by month (from OOF)
+train_ecdf_by_month = _build_ecdf_map(df_train["ref_month_str"].values, oof_meta_corr)
+val_months = val_df["ref_month_str"].values
+val_rank_pct = np.zeros_like(val_prob_corr)
+for m in np.unique(val_months):
+    arr = train_ecdf_by_month.get(m, np.sort(oof_meta_corr))
+    mask = (val_months==m)
+    # vectorized percentile per block
+    val_rank_pct[mask] = np.searchsorted(arr, val_prob_corr[mask], side="right")/max(1,len(arr))
 
-            # 3.1) Tablo VARSA da roman-vetosu
-            if reject_if_long_text and force_full_text_check_after_table:
-                fp_txt, _err_fp = _ocr_text(img, mode="full")
-                m_full = _count_words_chars_lines(fp_txt or "")
-                alpha_r = _alpha_ratio(fp_txt or "")
-                reject_tbl = (
-                    (m_full["n_chars"] >= full_max_chars_table) or
-                    (m_full["n_words"] >= full_max_words_table) or
-                    (m_full["n_long_lines"] >= full_para_lines_count_table)
-                )
-                if reject_tbl and alpha_r >= full_alpha_ratio_min:
-                    non_hazirun_pages.append({
-                        "index": i, "reason": "text_density_exceeded_table",
-                        **({"text_density_debug": {"phase": "full_forced",
-                                                   "alpha_ratio": round(alpha_r, 3),
-                                                   **m_full, **tbl_dbg}} if debug else {})
-                    })
-                    continue
+final_val = (1.0-best_rb)*val_prob_corr + best_rb*val_rank_pct
+final_val = final_val.astype("float32")
 
-        # 4) Skor
-        def _score_from_text(_text: str) -> Tuple[int, float, List[Dict[str, Any]]]:
-            _toks = _tokens(_normalize_text(_text))
-            hit_cnt, score_sum = 0, 0.0
-            ev: List[Dict[str, Any]] = []
-            for ph in keywords:
-                sc, det = _phrase_best_score(ph, _normalize_text(_text), _toks)
-                if sc >= fuzzy_min_ratio:
-                    hit_cnt += 1
-                score_sum += sc
-                if debug and sc >= 0.5:
-                    ev.append({"phrase": ph, **det})
-            total_score = hit_cnt + (score_sum / max(1, len(keywords))) * 2.0
-            return hit_cnt, float(round(total_score, 3)), ev
-
-        hit_cnt, total_score, ev = _score_from_text(text)
-
-        # 5) Üst bant zayıfsa full fallback
-        used_fullpage = False
-        if fullpage_fallback_when_weak and (hit_cnt <= weak_hit_cnt and total_score <= weak_total_score) and not strong_hit:
-            fp_txt, err_info_fp = _ocr_text(img, mode="full")
-            if fp_txt:
-                hit_cnt_fp, total_score_fp, ev_fp = _score_from_text(fp_txt)
-                if (hit_cnt_fp > hit_cnt) or (total_score_fp > total_score):
-                    hit_cnt, total_score, ev = hit_cnt_fp, total_score_fp, ev_fp
-                    used_fullpage = True
-                    if debug:
-                        ev.insert(0, {"fallback": "fullpage_used"})
-            else:
-                if debug and err_info_fp:
-                    ev.insert(0, {"fallback": "fullpage_failed", **err_info_fp})
-
-        # 5.1) SON VETO: Uzun metin + yasaklı ifadeler
-        if reject_if_long_with_phrases:
-            fp_txt, _err_fp = _ocr_text(img, mode="full")
-            fp_txt = fp_txt or ""
-            m_full = _count_words_chars_lines(fp_txt)
-            if (m_full["n_chars"] >= long_text_min_chars) or (m_full["n_words"] >= long_text_min_words):
-                norm_full = _normalize_text(fp_txt)
-
-                def _fuzzy_hits(text_norm: str, phrases: List[str], thr: float) -> Tuple[int, List[Tuple[str, float]]]:
-                    hits = []
-                    for ph in phrases:
-                        sc = _ratio(_tr_lower(ph), text_norm)
-                        if sc >= thr:
-                            hits.append((ph, round(sc, 3)))
-                    return len(hits), sorted(hits, key=lambda x: x[1], reverse=True)[:8]
-
-                bh, top_hits = _fuzzy_hits(norm_full, banned_phrases, banned_fuzzy_ratio)
-                if bh >= banned_min_hits:
-                    non_hazirun_pages.append({
-                        "index": i, "reason": "long_text_banned_phrases",
-                        **({"text_density_debug": {
-                            "n_chars": m_full["n_chars"], "n_words": m_full["n_words"],
-                            "n_long_lines": m_full["n_long_lines"], "banned_hits": bh,
-                            "top_hits": top_hits
-                        }} if debug else {})
-                    })
-                    continue
-
-        # 6) Karar
-        is_hazirun = strong_hit or (hit_cnt >= min_hit_phrases) or (total_score >= min_total_score)
-        if is_hazirun:
-            if first_match_index is None:
-                first_match_index = i
-            rec = {
-                "index": i, "image": images[i],
-                "meta": metas[i] if i < len(metas) else {},
-                "hits": int(hit_cnt),
-                "total_score": float(round(total_score, 3)),
-                "strong_best": float(round(strong_best, 3)),
-                "table_check": {"required": require_table and not skip_table_check,
-                                "has_table": page_has_table, **(tbl_dbg if debug else {})},
-            }
-            if debug:
-                rec["evidence"] = ev[:25]
-                rec["ocr_mode"] = "full" if used_fullpage else "top"
-            hazirun_pages.append(rec)
-
-            if stop_on_first_match and doc_decision == "any":
-                return {
-                    "flag": "HAZIRUNDUR",
-                    "first_match_index": first_match_index,
-                    "hazirun_pages": hazirun_pages,
-                    "non_hazirun_pages": non_hazirun_pages,
-                    "unknown_pages": unknown_pages,
-                    "page_count": n
-                }
-        else:
-            row = {
-                "index": i, "reason": "threshold_not_met",
-                "hits": int(hit_cnt), "total_score": float(round(total_score, 3)),
-                "strong_best": float(round(strong_best, 3)),
-                "table_check": {"required": require_table and not skip_table_check,
-                                "has_table": page_has_table, **(tbl_dbg if debug else {})},
-            }
-            if debug:
-                row["ocr_mode"] = "full" if used_fullpage else "top"
-            non_hazirun_pages.append(row)
-
-    # ---- Belge düzeyi ----
-    pos, neg, unk = len(hazirun_pages), len(non_hazirun_pages), len(unknown_pages)
-    if doc_decision == "any":
-        flag = "HAZIRUNDUR" if pos > 0 else "HAZIRUN DEĞİLDİR"
-    elif doc_decision == "majority":
-        flag = "HAZIRUNDUR" if (pos > neg or (pos == neg and pos > 0)) else "HAZIRUN DEĞİLDİR"
-    elif doc_decision == "all":
-        flag = "HAZIRUNDUR" if (pos > 0 and neg == 0 and unk == 0) else "HAZIRUN DEĞİLDİR"
-    else:
-        flag = "HAZIRUNDUR" if pos > 0 else "HAZIRUN DEĞİLDİR"
-
-    return {
-        "flag": flag,
-        "first_match_index": first_match_index,
-        "hazirun_pages": hazirun_pages,
-        "non_hazirun_pages": non_hazirun_pages,
-        "unknown_pages": unknown_pages,
-        "page_count": n,
-        "doc_decision": doc_decision,
-        "summary": {"pos": pos, "neg": neg, "unk": unk}
-    }
+col_name = "pred_churn_prob" if "churn" in validation_df_submission.columns else "churn"
+validation_df_submission[col_name] = final_val
+print(f"\n[validation] wrote predictions to validation_df_submission['{col_name}'] | shape={final_val.shape} | time={time.time()-t0_all:.1f}s")
