@@ -1,464 +1,345 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, Callable
-
-import re, difflib, json
+from typing import List, Callable, Optional, Tuple
 import numpy as np
-import cv2, fitz  # PyMuPDF
-from PIL import Image
-Image.MAX_IMAGE_PIXELS = None
+import pandas as pd
+import re, unicodedata, cv2
 
-try:
-    import tifffile as tiff
-    _HAS_TIFF = True
-except Exception:
-    _HAS_TIFF = False
-
-
-def convert_document_with_rotation_and_keywords(
-    path: Union[str, Path],
+def extract_top_info_from_doc_images_fuzzy(
+    doc_images: List[np.ndarray],
+    ocr_fn: Callable[[np.ndarray], str],
     *,
-    # Raster
-    pdf_dpi: int = 600,
-    return_bgr: bool = True,
-    angle_estimation_max_side: int = 1600,   # OSD/OCR/deskew için küçük kopya uzun kenar
+    table_top_shift_ratio: float = 0.02,
+    table_guard_margin_px: int = 1,        # extra safety below top line
+    table_guard_margin_ratio: float = 0.012,
+    fallback_top_ratio: float = 0.18,      # header band when no table
+    min_upper_px: int = 120,
+    debug: bool = False,
+    show_fig: bool = False,
+    show_table_fig: bool = False,
+) -> pd.DataFrame:
+    # ---------- helpers ----------
+    def _upper_tr(s: str) -> str:
+        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
+        return "".join(mp.get(ch, ch.upper()) for ch in (s or ""))
 
-    # OSD (yön) - get_osd_ocr(PIL, output_type='dict') beklenir
-    osd_tc: Any = None,
+    def _nfkc(s: str) -> str:
+        return unicodedata.normalize("NFKC", s or "")
 
-    # OCR & keywords (opsiyonel)
-    ocr_text_fn: Optional[Callable[[np.ndarray], str]] = None,  # kendi OCR fonksiyonun
-    tc_new: Any = None,                    # yedek OCR client (ocr/run_ocr/predict/infer/get_text/__call__)
-    tc_new_lang: str = "tur",
-    tc_new_psm: Optional[int] = None,
-    tc_new_oem: Optional[int] = None,
-    tc_new_config: Optional[str] = None,
+    def _norm_spaces(s: str) -> str:
+        s = (_nfkc(s).replace("\u00A0"," ").replace("\u200B"," ")
+                       .replace("’","'").replace("“",'"').replace("”",'"'))
+        return re.sub(r"\s+"," ", s).strip()
 
-    keywords: Optional[List[str]] = None,
-    enable_keyword_rotation: bool = True,  # kelime bazlı self-check aç/kapa
-    fuzzy_min_ratio: float = 0.86,         # fuzzy benzerlik eşiği
-    keyword_exceptions_prefix: Optional[List[str]] = None,  # örn: ["paylaş"]
+    def _spaced(tok: str) -> str:
+        return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
 
-    # OSD mapping seçim stratejisi
-    osd_mapping_autoselect: bool = True,   # A/B mapping'i mini OCR ile doğrula
-    ocr_min_chars: int = 20,               # “okudu” saymak için min karakter
-    retry_when_empty: bool = True,         # OCR boşsa 0/±90/180 sırayla dene
+    # ---------- table detect & upper crop ----------
+    def _detect_table_top(img: np.ndarray) -> Optional[int]:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        H, W = gray.shape[:2]
 
-    # Deskew (küçük açı)
-    deskew: bool = True,
-    deskew_max_abs: float = 15.0,          # ± aralık
-    deskew_step: float = 0.5,              # derece adımı
-    deskew_min_gain: float = 1.03,         # 0° skoruna göre min iyileşme oranı
-    deskew_min_abs: float = 0.3,           # |açı| küçükse uygulama
+        blur = cv2.GaussianBlur(gray, (3,3), 0)
+        thr = cv2.adaptiveThreshold(
+            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 5
+        )
 
-    # Görselleştirme
-    debug: bool = False,                   # Before/After plot
-    ocr_debug: bool = False                # OCR debug print + meta
-) -> Dict[str, Any]:
-    """
-    PDF/TIFF -> raster -> (TIFF) EXIF -> OSD (0/±90/180; A/B map auto) -> (opsiyonel) keyword/mini-OCR self-check
-              -> deskew (projeksiyon profili; sadece anlamlı ise) -> kırpmasız döndürme.
+        kx = max(12, W // 60)
+        horiz = cv2.morphologyEx(
+            thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), 1
+        )
 
-    return:
-      {
-        "path": str, "doc_str": "pdf_doc"|"tiff_doc", "page_count": int,
-        "images": List[np.ndarray(BGR)],
-        "metas":  List[Dict[str,Any]]  # kararların dökümü
-      }
-    """
+        y_candidates = []
+        lines = cv2.HoughLinesP(
+            horiz, 1, np.pi/180, threshold=90, minLineLength=int(W*0.55), maxLineGap=10
+        )
+        if lines is not None:
+            for x1,y1,x2,y2 in lines[:,0,:]:
+                if abs(y1-y2) <= 2:
+                    y_candidates.append(int((y1+y2)//2))
 
-    # ------------- helpers: image -------------
-    def _ensure_bgr(arr: np.ndarray) -> np.ndarray:
-        if arr.ndim == 2:
-            return cv2.cvtColor(arr.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
-        if arr.ndim == 3 and arr.shape[2] >= 3:
-            return arr[:, :, :3].astype(np.uint8, copy=False)
-        s = np.squeeze(arr)
-        if s.ndim == 2:
-            return cv2.cvtColor(s.astype(np.uint8, copy=False), cv2.COLOR_GRAY2BGR)
-        if s.ndim == 3 and s.shape[2] >= 3:
-            return s[:, :, :3].astype(np.uint8, copy=False)
-        raise ValueError(f"Unsupported array shape: {arr.shape}")
+        proj = horiz.sum(axis=1)
+        ink_thresh = 255 * int(W*0.35)
+        for y in range(0, min(H-1, int(H*0.6))):
+            if proj[y] >= ink_thresh:
+                y_candidates.append(y)
+                break
 
-    def _rgba_to_bgr_on_white(rgba: np.ndarray) -> np.ndarray:
-        rgb = rgba[..., :3].astype(np.float32)
-        a = rgba[..., 3:4].astype(np.float32) / 255.0
-        out = rgb * a + 255.0 * (1.0 - a)
-        return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        if not y_candidates:
+            return None
+        return max(0, min(y_candidates))  # topmost strong line
 
-    def _apply_exif_orientation(bgr: np.ndarray, orient: Optional[int]) -> Tuple[np.ndarray, int]:
-        # TIFF Orientation: 1 normal, 3 180, 6 270 CW(= +90 CCW), 8 90 CW(= -90 CCW)
-        if orient == 3:  return np.rot90(bgr, 2).copy(), 180
-        if orient == 6:  return np.rot90(bgr, 1).copy(),  90
-        if orient == 8:  return np.rot90(bgr, 3).copy(), -90
-        return bgr, 0
+    def _extract_upper(
+        img: np.ndarray,
+        y_table_line: Optional[int],
+        *,
+        guard_px: int = 2,
+        fallback_top_ratio: float = 0.18,
+        fallback_top_px: Optional[int] = None,
+        min_upper_px: int = 100,
+        show_fig: bool = False,
+        title_prefix: str = "Upper crop"
+    ) -> Optional[np.ndarray]:
+        if img is None or not hasattr(img, "shape"):
+            return None
+        H, W = img.shape[:2]
 
-    def _rotate_full_canvas(bgr: np.ndarray, angle_ccw: float) -> np.ndarray:
-        # küçük açıları KIRPMASIZ döndür (canvas genişletilir)
-        if abs(angle_ccw) < 1e-6:
-            return bgr
-        h, w = bgr.shape[:2]
-        c = (w / 2.0, h / 2.0)
-        M = cv2.getRotationMatrix2D(c, angle_ccw, 1.0)  # CCW +
-        cos, sin = abs(M[0, 0]), abs(M[0, 1])
-        nW = int(h * sin + w * cos)
-        nH = int(h * cos + w * sin)
-        M[0, 2] += (nW / 2.0) - c[0]
-        M[1, 2] += (nH / 2.0) - c[1]
-        return cv2.warpAffine(bgr, M, (nW, nH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    def _apply_right_angle_ccw(bgr: np.ndarray, ra: int) -> np.ndarray:
-        # 90k rotasyonları kayıpsız uygula
-        if ra == 0:   return bgr
-        if ra == 90:  return np.rot90(bgr, 1).copy()
-        if ra == 180: return np.rot90(bgr, 2).copy()
-        if ra == -90: return np.rot90(bgr, 3).copy()
-        # acil durumda generic
-        return _rotate_full_canvas(bgr, float(ra))
-
-    def _make_small(bgr: np.ndarray) -> np.ndarray:
-        h, w = bgr.shape[:2]
-        m = max(h, w)
-        if m <= angle_estimation_max_side:
-            return bgr
-        s = angle_estimation_max_side / float(m)
-        return cv2.resize(bgr, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
-
-    # ------------- helpers: OCR -------------
-    def _osd_detect_deg_cw(bgr_small: np.ndarray) -> Tuple[Optional[int], Optional[float]]:
-        if osd_tc is None:
-            return None, None
-        try:
-            pil = Image.fromarray(cv2.cvtColor(bgr_small, cv2.COLOR_BGR2RGB))
-            raw = osd_tc.get_osd_ocr(pil, config='', model='best', output_type='dict')
-            d = raw.get('dict', raw) if isinstance(raw, dict) else {}
-            deg = int(d.get('rotate', d.get('rotation', d.get('rot', 0))) or 0) % 360
-            conf = float(d.get('orientation_conf', d.get('conf', d.get('confidence', 0.0))) or 0.0)
-            return deg, conf
-        except Exception:
-            return None, None
-
-    def _tc_new_text(bgr_small: np.ndarray) -> str:
-        if tc_new is None:
-            return ""
-        pil = Image.fromarray(cv2.cvtColor(bgr_small, cv2.COLOR_BGR2RGB))
-        kwargs: Dict[str, Any] = {}
-        if tc_new_config:
-            kwargs["config"] = tc_new_config
+        if y_table_line is not None and y_table_line > 0:
+            cut_y = max(0, int(y_table_line) - int(max(1, guard_px)))
         else:
-            cfg = []
-            if tc_new_psm is not None: cfg.append(f"--psm {int(tc_new_psm)}")
-            if tc_new_oem is not None: cfg.append(f"--oem {int(tc_new_oem)}")
-            if cfg: kwargs["config"] = " ".join(cfg)
-        if tc_new_lang:
-            kwargs["lang"] = tc_new_lang
+            if fallback_top_px is not None:
+                cut_y = int(fallback_top_px)
+            else:
+                cut_y = int(round(H * float(fallback_top_ratio)))
+            cut_y = max(int(min_upper_px), min(H - 1, cut_y))
 
-        for name in ("ocr","run_ocr","predict","infer","get_text","__call__"):
-            fn = getattr(tc_new, name, None)
-            if callable(fn):
-                try:
-                    txt = fn(pil, **kwargs)
-                    if isinstance(txt, dict): txt = txt.get("text","")
-                    return txt if isinstance(txt, str) else str(txt)
-                except TypeError:
-                    try:
-                        txt = fn(pil, output_type="text", **kwargs)
-                        if isinstance(txt, dict): txt = txt.get("text","")
-                        return txt if isinstance(txt, str) else str(txt)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        return ""
+        cut_y = int(np.clip(cut_y, 1, H - 1))
+        up = img[:cut_y, :]
+        if up is None or up.size == 0 or up.shape[0] < 200:
+            top20 = max(1, int(round(0.20 * H)))
+            cut_y2 = min(H - 1, max(top20, min_upper_px))
+            up = img[:cut_y2, :]
 
-    def _ocr_text(bgr_small: np.ndarray) -> str:
-        if callable(ocr_text_fn):
+        if show_fig:
             try:
-                return ocr_text_fn(bgr_small) or ""
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(8, 4))
+                plt.title(f"{title_prefix} (h={up.shape[0]})")
+                plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
+                plt.axis("off")
+                plt.show()
             except Exception:
                 pass
-        return _tc_new_text(bgr_small)
+        return up
 
-    # ------------- helpers: keywords (fuzzy) -------------
-    _TR_WORD = re.compile(r"[a-zçğıöşü]+", re.IGNORECASE)
-    def _tr_lower(s: str) -> str:
-        return (s.replace("I", "ı").replace("İ", "i")).lower()
-    def _tokenize(s: str) -> List[str]:
-        return [ _tr_lower(m.group(0)) for m in _TR_WORD.finditer(s or "") ]
-    def _kw_score_fuzzy(text: str, kws: List[str],
-                        exceptions_prefix: Optional[List[str]]=None,
-                        min_ratio: float = 0.86) -> int:
-        tks = _tokenize(text)
-        if not tks: return 0
-        tset = set(tks)
-        ex = set(_tr_lower(x) for x in (exceptions_prefix or []))
-        score = 0
-        for kw in kws:
-            kw0 = _tr_lower((kw or "").strip())
-            if not kw0: continue
-            if kw0 in tset:
-                score += 1; continue
-            starts = [tok for tok in tks if tok.startswith(kw0)]
-            if starts:
-                if not any(tok.startswith(tuple(ex)) for tok in starts) if ex else True:
-                    score += 1; continue
-            # fuzzy
-            best = 0.0
-            for tok in tset:
-                r = difflib.SequenceMatcher(None, kw0, tok).ratio()
-                best = best if r < best else r
-            if best >= min_ratio:
-                score += 1
-        return score
+    # ---------- date ----------
+    MONTHS_TR = {1:["ocak","oca"],2:["şubat","subat","şub","sub"],3:["mart","mar"],4:["nisan","nis"],
+                 5:["mayıs","mayis","may"],6:["haziran","haz"],7:["temmuz","tem"],
+                 8:["ağustos","agustos","ağu","agu"],9:["eylül","eylul","eyl"],
+                 10:["ekim","eki"],11:["kasım","kasim","kas"],12:["aralık","aralik","ara"]}
+    MONTHS_EN = {1:["january","jan"],2:["february","feb"],3:["march","mar"],4:["april","apr"],5:["may"],
+                 6:["june","jun"],7:["july","jul"],8:["august","aug"],9:["september","sep","sept"],
+                 10:["october","oct"],11:["november","nov"],12:["december","dec"]}
+    MONTH_WORDS = set(sum(MONTHS_TR.values(),[])) | set(sum(MONTHS_EN.values(),[]))
+    MONTH_WORDS_RGX = "|".join(sorted(
+        [re.escape(x).replace(r"\ ", r"\s*").replace(r"\.", r".?") for x in MONTH_WORDS],
+        key=len, reverse=True
+    ))
+    ROMAN = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
 
-    # ------------- helpers: skew (projection) -------------
-    def _deskew_projection_angle(bgr_small: np.ndarray,
-                                 max_abs: float, step: float) -> Tuple[float, float, float]:
-        gray = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
-        g = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if np.mean(bw) > 127: bw = 255 - bw  # metin=1
-        ink = float(np.count_nonzero(bw)) / bw.size
-        if ink < 0.004:  # neredeyse hiç metin yok
-            return 0.0, 0.0, 0.0
-
-        def _score(arr: np.ndarray) -> float:
-            proj = arr.sum(axis=1).astype(np.float32) / 255.0
-            return float(np.var(proj) + np.var(np.diff(proj)))
-
-        base = _score(bw)
-        best_a, best_sc = 0.0, -1e18
-
-        h, w = bw.shape
-        c = (w / 2.0, h / 2.0)
-        for a in np.arange(-max_abs, max_abs + 1e-6, step, dtype=np.float32):
-            M = cv2.getRotationMatrix2D(c, float(a), 1.0)  # CCW +
-            cos, sin = abs(M[0, 0]), abs(M[0, 1])
-            nW = int(h * sin + w * cos)
-            nH = int(h * cos + w * sin)
-            Mt = M.copy()
-            Mt[0, 2] += (nW / 2.0) - c[0]; Mt[1, 2] += (nH / 2.0) - c[1]
-            rot = cv2.warpAffine(bw, Mt, (nW, nH), flags=cv2.INTER_NEAREST, borderValue=0)
-            sc = _score(rot)
-            if sc > best_sc:
-                best_sc, best_a = sc, float(a)
-        return best_a, best_sc, base
-
-    # ------------- helpers: OSD mapping (A/B) -------------
-    def _osd_map_A(dcw: Optional[int]) -> int:
-        if dcw is None: return 0
-        d = int(dcw) % 360
-        return {0:0, 90:90, 180:180, 270:-90}.get(d, 0)
-    def _osd_map_B(dcw: Optional[int]) -> int:
-        if dcw is None: return 0
-        d = int(dcw) % 360
-        return {0:0, 90:-90, 180:180, 270:90}.get(d, 0)
-
-    def _choose_osd_mapping_with_ocr(bgr: np.ndarray, dcw: Optional[int]) -> int:
-        if dcw is None:
-            return 0
-        if not osd_mapping_autoselect:
-            return _osd_map_A(dcw)
-        raA = _osd_map_A(dcw)
-        raB = _osd_map_B(dcw)
-        txtA = _ocr_text(_make_small(_apply_right_angle_ccw(bgr, raA)))
-        txtB = _ocr_text(_make_small(_apply_right_angle_ccw(bgr, raB)))
-        nA, nB = len(txtA or ""), len(txtB or "")
-        if ocr_debug:
-            print(f"[OSD map] dcw={dcw} | A={raA:+}/{nA} chars | B={raB:+}/{nB} chars")
-        return raA if nA >= nB else raB
-
-    # ------------- viz -------------
-    def _imshow_before_after(before: np.ndarray, after: np.ndarray, title: str):
-        if not debug: return
+    def _norm_year(y: str) -> Optional[int]:
+        y = re.sub(r"^\D+","", y or "")
+        if not y: return None
+        if len(y)==2: y="20"+y
+        if len(y)>4: y=y[-4:]
         try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(12, 6))
-            ax1 = plt.subplot(1, 2, 1); ax1.imshow(cv2.cvtColor(before, cv2.COLOR_BGR2RGB)); ax1.set_title("Before"); ax1.axis("off")
-            ax2 = plt.subplot(1, 2, 2); ax2.imshow(cv2.cvtColor(after,  cv2.COLOR_BGR2RGB)); ax2.set_title("After");  ax2.axis("off")
-            plt.suptitle(title); plt.tight_layout(); plt.show()
-        except Exception:
-            pass
-
-    def _normalize_dpi_tuple(dpi_xy) -> Optional[Tuple[int, int]]:
-        if dpi_xy is None: return None
-        try:
-            x, y = int(dpi_xy[0]), int(dpi_xy[1])
-            if x <= 1 and y <= 1: return None
-            return (x, y)
-        except Exception:
+            return int(y)
+        except:
             return None
 
-    # ------------- rasterize: PDF/TIFF -------------
-    p = Path(path).expanduser().resolve()
-    ext = p.suffix.lower()
-    pages_raw: List[Tuple[int, np.ndarray, Optional[Tuple[int, int]], str, Optional[int]]] = []
-    # (index, BGR, dpi_xy, source, tiff_orientation_tag)
+    def _valid(d, m, y):
+        return 1<=d<=31 and 1<=m<=12 and 1900<=y<=2100
 
-    if ext == ".pdf":
-        doc = fitz.open(p.as_posix())
-        try:
-            for i in range(doc.page_count):
-                page = doc.load_page(i)
-                scale = pdf_dpi / 72.0
-                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-                buf = np.frombuffer(pix.samples, dtype=np.uint8)
-                if pix.n == 3:
-                    arr = buf.reshape(pix.h, pix.w, 3).copy()  # RGB
-                elif pix.n == 1:
-                    arr = cv2.cvtColor(buf.reshape(pix.h, pix.w), cv2.COLOR_GRAY2RGB)
-                else:
-                    rgba = buf.reshape(pix.h, pix.w, pix.n)[:, :, :4].copy()
-                    pages_raw.append((i, _rgba_to_bgr_on_white(rgba), (pdf_dpi, pdf_dpi), "pdf_raster", None))
+    def _month_from_word(tok: str) -> Optional[int]:
+        t = _nfkc(tok).lower()
+        t = (t.replace("ı","i").replace("ş","s").replace("ğ","g")
+               .replace("ü","u").replace("ö","o").replace("ç","c"))
+        for n,vs in MONTHS_TR.items():
+            if t in [x.replace("ı","i").replace("ş","s").replace("ğ","g")
+                       .replace("ü","u").replace("ö","o").replace("ç","c") for x in vs]:
+                return n
+        for n,vs in MONTHS_EN.items():
+            if t in vs: return n
+        return None
+
+    def _extract_date(text: str) -> Optional[str]:
+        if not text: return None
+        T = _norm_spaces(text)
+
+        m = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)", T)
+        if m:
+            try:
+                d,mn,y = int(m.group(1)), int(m.group(2)), _norm_year(m.group(3))
+            except:
+                d=mn=y=None
+            if y and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
+
+        m = re.search(rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)",
+                      T, re.IGNORECASE)
+        if m:
+            d=int(m.group(1)); mn=_month_from_word(m.group(2)); y=_norm_year(m.group(3))
+            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
+
+        m = re.search(r"(?<!\d)(\d{1,2})\s*(?:[./-])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[./-])?\s*(\d{2,4})(?!\d)",
+                      T, re.IGNORECASE)
+        if m:
+            d=int(m.group(1)); mn=ROMAN.get(m.group(2).upper()); y=_norm_year(m.group(3))
+            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
+
+        digits = re.sub(r"\D","", T)
+        if len(digits) >= 8:
+            best = None
+            for i in range(len(digits)-7):
+                try:
+                    d=int(digits[i:i+2]); mn=int(digits[i+2:i+4]); y=int(digits[i+4:i+8])
+                except:
                     continue
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) if return_bgr else arr
-                pages_raw.append((i, bgr, (pdf_dpi, pdf_dpi), "pdf_raster", None))
-        finally:
-            doc.close()
-        doc_str = "pdf_doc"
+                if _valid(d,mn,y):
+                    cand=(y,i,d,mn)
+                    if best is None or cand>best: best=cand
+            if best:
+                y,_,d,mn=best
+                return f"{d:02d}/{mn:02d}/{y:04d}"
+        return None
 
-    elif ext in (".tif", ".tiff"):
-        doc_str = "tiff_doc"
-        if _HAS_TIFF:
-            with tiff.TiffFile(p.as_posix()) as tf:
-                for i, pg in enumerate(tf.pages):
-                    try:
-                        comp = getattr(pg, "compression", None)
-                        if comp is not None and "CCITT" in str(comp):
-                            raise NotImplementedError("CCITT -> Pillow")
-                        arr = pg.asarray()
-                        bgr = _ensure_bgr(arr)
-                        dpi_xy = None
-                        try:
-                            xr, yr, ru = pg.tags.get("XResolution"), pg.tags.get("YResolution"), pg.tags.get("ResolutionUnit")
-                            if xr and yr and ru:
-                                def _rat(tag): num, den = tag.value; return float(num)/float(den)
-                                x, y = _rat(xr), _rat(yr)
-                                if getattr(ru, "value", ru) == 3: x *= 2.54; y *= 2.54
-                                dpi_xy = _normalize_dpi_tuple((int(round(x)), int(round(y))))
-                        except Exception:
-                            dpi_xy = None
-                        orient = None
-                        try: orient = (pg.tags.get("Orientation") or {}).value
-                        except Exception: pass
-                        pages_raw.append((i, bgr, dpi_xy, "tifffile", orient))
-                    except Exception:
-                        with Image.open(p.as_posix()) as im:
-                            im.seek(i)
-                            pil = im.convert("RGB")
-                            arr = np.array(pil)
-                            bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                            dpi_xy = _normalize_dpi_tuple(pil.info.get("dpi")) if isinstance(pil.info.get("dpi"), (tuple, list)) else None
-                            pages_raw.append((i, bgr, dpi_xy, "pillow", None))
-        else:
-            with Image.open(p.as_posix()) as im:
-                n = getattr(im, "n_frames", 1)
-                for i in range(n):
-                    im.seek(i)
-                    pil = im.convert("RGB")
-                    arr = np.array(pil)
-                    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                    dpi_xy = _normalize_dpi_tuple(pil.info.get("dpi")) if isinstance(pil.info.get("dpi"), (tuple, list)) else None
-                    pages_raw.append((i, bgr, dpi_xy, "pillow", None))
-    else:
-        raise ValueError(f"Unsupported extension: {ext}")
+    # ---------- type canonicalization ----------
+    def _map_type_to_canonical(type_text: str) -> Optional[str]:
+        if not type_text: return None
+        u = _upper_tr(_norm_spaces(type_text))
+        u_ascii = (u.replace("İ","I").replace("Ş","S").replace("Ğ","G")
+                     .replace("Ü","U").replace("Ö","O").replace("Ç","C"))
+        GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
+        AS  = r"(?:A\.?\s*Ş|A\.?\s*S|AŞ|AS)"+GEN
+        ANON= r"ANON[İI]M\s+"+_spaced("ŞİRKET")+GEN
+        LTD = r"(?:LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+_spaced("ŞİRKET")+r")"+GEN
+        SIRK= _spaced("ŞİRKET")+GEN
+        RULES = [
+            (rf"(?:\b|^)({AS}|{ANON})(?:\b|$)", "ANONİM ŞİRKETİ"),
+            (rf"(?:\b|^)ANON[İI]M(?:\b|$)",     "ANONİM ŞİRKETİ"),
+            (rf"(?:\b|^){LTD}(?:\b|$)",        "LİMİTED ŞİRKETİ"),
+            (rf"(?:\b|^)HOLD[İI]NG(?:\b|$)",   "HOLDİNG"),
+            (rf"(?:\b|^)KOOPERAT[İI]F(?:\b|$)","KOOPERATİF"),
+            (rf"(?:\b|^)KOLEKT[İI]F\s+{SIRK}(?:\b|$)","KOLEKTİF ŞİRKET"),
+            (rf"(?:\b|^)AD[İI]\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)","ADİ KOMANDİT ŞİRKET"),
+            (rf"(?:\b|^)SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)",
+             "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"),
+            (rf"(?:\b|^)KOMAND[İI]T\s+{SIRK}(?:\b|$)","KOMANDİT ŞİRKET"),
+            (rf"(?:\b|^)VAKF[Iİ]|VAKIF(?:\b|$)","VAKIF"),
+            (rf"(?:\b|^)DERNEK(?:\b|$)","DERNEK"),
+        ]
+        for pat,label in RULES:
+            if re.search(pat, u, re.IGNORECASE): return label
 
-    # ------------- process per page -------------
-    images: List[np.ndarray] = []
-    metas: List[Dict[str, Any]] = []
+        flat = re.sub(r"[\s\.\-_/’'`´]+","", u_ascii)
+        if re.search(r"(AS|AŞ|ANONIMSIRKET)", flat): return "ANONİM ŞİRKETİ"
+        if re.search(r"(ANONİMSIRKETININ)", flat):   return "ANONİM ŞİRKETİ"
+        if re.search(r"(LTDSTI|LIMITEDSIRKET)", flat): return "LİMİTED ŞİRKETİ"
+        if "HOLDING" in flat: return "HOLDİNG"
+        if "KOOPERATIF" in flat: return "KOOPERATİF"
+        if re.search(r"KOLEKTIF.*SIRKET", flat): return "KOLEKTİF ŞİRKET"
+        if re.search(r"ADIKOMANDIT.*SIRKET", flat): return "ADİ KOMANDİT ŞİRKET"
+        if re.search(r"SERMAYESIPAYLARABOLUNMUSKOMANDIT.*SIRKET", flat): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
+        if re.search(r"KOMANDIT.*SIRKET", flat): return "KOMANDİT ŞİRKET"
+        if "VAKIF" in flat: return "VAKIF"
+        if "DERNEK" in flat: return "DERNEK"
+        return None
 
-    kw_enabled = (
-        enable_keyword_rotation and
-        isinstance(keywords, list) and any((k or "").strip() for k in keywords)
-    )
-    kws = [k for k in (keywords or []) if (k or "").strip()]
-    kw_ex = list(keyword_exceptions_prefix or [])
+    # ---------- header phrase cleaner ----------
+    def _clean_header_substrings(s: str) -> str:
+        exact = re.compile("|".join([
+            r"GENEL\s+KURULDA\s+HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
+            r"HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
+            r"TOPLANTIYA\s+KATILANLAR",
+            r"TOPLANTI\s+TUTANA[ĞG][Iİ]",
+            r"G[UÜ]NDEM\s*MADDELER[İI]",
+            r"KARARLAR",
+            r"ŞEKL[İI]\s*VE\s*T[UÜ]R[UÜ]"
+        ]), re.IGNORECASE)
+        s2,_ = exact.subn(" ", s or "")
+        return re.sub(r"\s{2,}"," ", s2).strip()
 
-    for (i, bgr0, dpi_xy, source, orient_tag) in pages_raw:
-        # EXIF
-        exif_deg = 0
-        bgr1 = bgr0
-        if orient_tag is not None:
-            bgr1, exif_deg = _apply_exif_orientation(bgr0, orient_tag)
+    # ---------- company extractor (LEFT-ONLY; prev merge; hard right cut) ----------
+    def _extract_company(lines: List[str],
+                         prev_lines_to_merge: int = 3,
+                         left_char_cap: int = 420) -> Tuple[Optional[str], Optional[str], dict]:
+        L = [_norm_spaces(ln) for ln in (lines or []) if isinstance(ln, str) and ln.strip()]
+        if not L: return None, None, {"reason":"empty_lines"}
 
-        # OSD + mapping (A/B auto seç)
-        osd_deg_cw, osd_conf = _osd_detect_deg_cw(_make_small(bgr1))
-        osd_ra = _choose_osd_mapping_with_ocr(bgr1, osd_deg_cw)  # CCW RA
-        bgr_osd = _apply_right_angle_ccw(bgr1, osd_ra)
+        GEN  = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
+        SIRK = _spaced("ŞİRKET")
+        TYPE = r"(?:ANON[İI]M\s+"+SIRK+r"|A\.?\s*Ş|AŞ|A\.?\s*S|LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+SIRK+r")"+GEN
+        type_re = re.compile(TYPE, re.IGNORECASE)
 
-        # Keyword/OCR döngüsü & boşsa deneme
-        base = bgr_osd
-        best_img = base
-        best_ra_extra = 0
-        best_score = -1
-        best_chars = -1
-        ocr_dbg: Dict[str, Any] = {}
+        anchors=[]
+        for i, s in enumerate(L):
+            m = type_re.search(s)
+            if m:
+                anchors.append((i, m.start(), m.end(), m.group(0)))
+            elif i+1 < len(L):
+                s2 = s + " " + L[i+1]
+                m2 = type_re.search(s2)
+                if m2:
+                    anchors.append((i, min(len(s), m2.start()), m2.end(), m2.group(0)))
+        if not anchors:
+            return None, None, {"reason":"no_type_in_lines"}
 
-        if kw_enabled or retry_when_empty:
-            for ra in [0, 90, 180, -90]:
-                cand = _apply_right_angle_ccw(base, ra) if ra != 0 else base
-                txt = _ocr_text(_make_small(cand))
-                n_chars = len(txt or "")
-                score = _kw_score_fuzzy(txt, kws, exceptions_prefix=kw_ex, min_ratio=fuzzy_min_ratio) if kw_enabled else 0
-                if ocr_debug:
-                    preview = (txt or "")[:400].replace("\n\n","\n")
-                    lines = "\n".join(preview.splitlines()[:3])
-                    print(f"[p{i:02d} RA={ra:+}] chars={n_chars} score={score}\n{lines}\n{'-'*60}")
-                    ocr_dbg[str(ra)] = {"chars": int(n_chars), "score": int(score), "preview": lines}
-                better = (n_chars > best_chars) or (n_chars == best_chars and score > best_score)
-                if better:
-                    best_chars, best_score = n_chars, score
-                    best_ra_extra = ra
-                    best_img = cand
+        i, st, en, raw = anchors[-1]
+        ctype = _map_type_to_canonical(raw)
 
-            if best_chars < ocr_min_chars and not kw_enabled and not retry_when_empty:
-                best_img, best_ra_extra = base, 0
-        # değilse: OSD sonrası haliyle devam
+        left_piece = L[i][:st]
+        merged = " ".join(L[max(0, i-3):i] + [left_piece])
+        merged = _clean_header_substrings(merged)
 
-        # DESKEW (sadece küçük açı; büyükler RA ile)
-        deskew_deg = 0.0
-        proj_best = proj_base = 0.0
-        if deskew:
-            a, s_best, s_base = _deskew_projection_angle(_make_small(best_img), deskew_max_abs, deskew_step)
-            gain = (s_best / max(s_base, 1e-6)) if s_best > 0 else 1.0
-            if abs(a) >= deskew_min_abs and gain >= deskew_min_gain:
-                deskew_deg, proj_best, proj_base = float(a), float(s_best), float(s_base)
+        RIGHT_CUT = re.compile(
+            r"\b(?:ANON[İI]M|L[İI]M[İI]TED|LTD\.?\s*ŞT[İI]|LTD\.?\s*ST[İI]|A\.?\s*Ş|AŞ|"+SIRK+r")\b.*$",
+            re.IGNORECASE
+        )
+        merged = RIGHT_CUT.sub("", merged)
 
-        final = _rotate_full_canvas(best_img, deskew_deg)
-        total = float(exif_deg + osd_ra + best_ra_extra + deskew_deg)
+        NOISE_TAIL = {"VE","DE","DA","İLE","VEYA","KURUL","KURULDA","LİSTESİ","TARİHLİ","ÖRNEĞİ"}
+        toks = merged.split()
+        while toks and toks[0].upper() in NOISE_TAIL: toks.pop(0)
+        while toks and toks[-1].upper() in NOISE_TAIL: toks.pop()
+        name = " ".join(toks).strip(" ,.-:;’'")[:left_char_cap]
 
+        if sum(ch.isalpha() for ch in name) < 3:
+            return None, ctype, {"reason":"too_short_after_cut", "type":ctype}
+
+        return _upper_tr(name), ctype, {"reason":"ok","picked":"left_only+prev_merge","type":ctype}
+
+    # ================= MAIN =================
+    rows = []
+    for idx, img in enumerate(doc_images):
+        y_top = _detect_table_top(img)
         if debug:
-            _imshow_before_after(bgr0, final, f"Page {i} | total={total:.2f}°")
+            print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback)")
+        upper = _extract_upper(
+            img, y_top,
+            guard_px=max(1, table_guard_margin_px),
+            fallback_top_ratio=fallback_top_ratio,
+            min_upper_px=min_upper_px,
+            show_fig=show_fig
+        )
+        if upper is None:
+            if debug: print(f"[p{idx}] Upper empty -> skip")
+            continue
 
-        meta: Dict[str, Any] = {
-            "page_index": i,
-            "dpi": dpi_xy,
-            "shape": tuple(final.shape),
-            "source": source,
-            "exif_orientation_applied_deg": int(exif_deg),
-            "osd_raw_deg_cw": (None if osd_deg_cw is None else int(osd_deg_cw)),
-            "osd_confidence": (None if osd_conf is None else float(osd_conf)),
-            "osd_right_angle_ccw_deg": int(osd_ra),
-            "keyword_rotation_enabled": bool(kw_enabled),
-            "keyword_best_extra_ccw_deg": int(best_ra_extra if (kw_enabled or retry_when_empty) else 0),
-            "keyword_match_score": int(best_score if kw_enabled else 0),
-            "keyword_chars": int(best_chars if (kw_enabled or retry_when_empty) else 0),
-            "deskew_deg": float(deskew_deg),
-            "deskew_projection_best": float(proj_best),
-            "deskew_projection_base": float(proj_base),
-            "total_rotation_applied_deg": total
+        text = (ocr_fn(upper) or "")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if debug:
+            print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
+
+        # robust: keep first valid date; don't overwrite with None
+        date = None
+        for ln in lines:
+            d = _extract_date(ln)
+            if d:
+                date = d
+                break
+
+        # company (never overwrite with None)
+        cname, ctype, dbg = _extract_company(lines)
+        if debug:
+            print(f"[p{idx}] company_debug:", dbg)
+
+        row = {
+            "page_index": idx,
+            "tarih": date,
+            "şirket_adı": (cname if isinstance(cname, str) and cname.strip() else None),
+            "şirketadı":  (cname if isinstance(cname, str) and cname.strip() else None),   # alias
+            "şirket_türü": (_upper_tr(ctype) if ctype else None),
+            "şirkettürü":  (_upper_tr(ctype) if ctype else None),                         # alias
         }
-        if ocr_debug and (kw_enabled or retry_when_empty):
-            meta["ocr_debug"] = ocr_dbg
+        if debug:
+            row["debug_text"] = text[:1600]
+        rows.append(row)
 
-        images.append(final)
-        metas.append(meta)
-
-    return {
-        "path": str(p),
-        "doc_str": "pdf_doc" if ext == ".pdf" else "tiff_doc",
-        "page_count": len(images),
-        "images": images,   # sayfa sayfa BGR
-        "metas": metas
-    }
+    return pd.DataFrame(rows)
