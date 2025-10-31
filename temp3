@@ -1,345 +1,152 @@
-from typing import List, Callable, Optional, Tuple
 import numpy as np
-import pandas as pd
-import re, unicodedata, cv2
+import cv2
+from typing import List, Tuple, Optional, Union
 
-def extract_top_info_from_doc_images_fuzzy(
+def crop_all_lower_from_doc_images(
     doc_images: List[np.ndarray],
-    ocr_fn: Callable[[np.ndarray], str],
     *,
-    table_top_shift_ratio: float = 0.02,
-    table_guard_margin_px: int = 1,        # extra safety below top line
-    table_guard_margin_ratio: float = 0.012,
-    fallback_top_ratio: float = 0.18,      # header band when no table
-    min_upper_px: int = 120,
+    overlap_px: int = 10,
+    margin_below: int = 8,
+    tight_crop: bool = True,
+    include_bboxes: bool = False,
+    strict: bool = False,
     debug: bool = False,
-    show_fig: bool = False,
-    show_table_fig: bool = False,
-) -> pd.DataFrame:
-    # ---------- helpers ----------
-    def _upper_tr(s: str) -> str:
-        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
-        return "".join(mp.get(ch, ch.upper()) for ch in (s or ""))
+) -> Union[List[np.ndarray], Tuple[List[np.ndarray], List[Optional[Tuple[int,int,int,int]]]]]:
+    """
+    For each page image in `doc_images`, detect the table bbox and return the cropped
+    lower text area image beneath the table.
+    """
 
-    def _nfkc(s: str) -> str:
-        return unicodedata.normalize("NFKC", s or "")
-
-    def _norm_spaces(s: str) -> str:
-        s = (_nfkc(s).replace("\u00A0"," ").replace("\u200B"," ")
-                       .replace("’","'").replace("“",'"').replace("”",'"'))
-        return re.sub(r"\s+"," ", s).strip()
-
-    def _spaced(tok: str) -> str:
-        return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
-
-    # ---------- table detect & upper crop ----------
-    def _detect_table_top(img: np.ndarray) -> Optional[int]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        H, W = gray.shape[:2]
-
+    # -----------------------------------------------------------
+    # 1) Helper: detect largest table-like rectangular area (bbox)
+    # -----------------------------------------------------------
+    def detect_table_bbox_from_mask(img: np.ndarray, debug: bool=False) -> Optional[Tuple[int,int,int,int]]:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
         blur = cv2.GaussianBlur(gray, (3,3), 0)
-        thr = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 5
-        )
+        _, bin_img = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bin_inv = cv2.bitwise_not(bin_img)
 
-        kx = max(12, W // 60)
-        horiz = cv2.morphologyEx(
-            thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), 1
-        )
+        # horizontal + vertical line detection
+        h, w = bin_inv.shape
+        hx, hy = max(1, w // 100), max(1, h // 100)
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hx, 1))
+        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, hy))
+        horiz = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
+        vert  = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, vert_kernel, iterations=2)
+        table_mask = cv2.addWeighted(horiz, 0.5, vert, 0.5, 0.0)
 
-        y_candidates = []
-        lines = cv2.HoughLinesP(
-            horiz, 1, np.pi/180, threshold=90, minLineLength=int(W*0.55), maxLineGap=10
-        )
-        if lines is not None:
-            for x1,y1,x2,y2 in lines[:,0,:]:
-                if abs(y1-y2) <= 2:
-                    y_candidates.append(int((y1+y2)//2))
-
-        proj = horiz.sum(axis=1)
-        ink_thresh = 255 * int(W*0.35)
-        for y in range(0, min(H-1, int(H*0.6))):
-            if proj[y] >= ink_thresh:
-                y_candidates.append(y)
-                break
-
-        if not y_candidates:
+        cnts, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            if debug:
+                print("[WARN] no_table_found")
             return None
-        return max(0, min(y_candidates))  # topmost strong line
 
-    def _extract_upper(
+        cnt = max(cnts, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(cnt)
+        if debug:
+            vis = img.copy()
+            cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
+            cv2.imshow("table bbox", vis)
+            cv2.waitKey(0); cv2.destroyAllWindows()
+        return (x, y, w, h)
+
+    # --------------------------------------------------------------------
+    # 2) Helper: extract region BELOW table (lower area) from a single page
+    # --------------------------------------------------------------------
+    def extract_lower_text_area_from_table_v4(
         img: np.ndarray,
-        y_table_line: Optional[int],
-        *,
-        guard_px: int = 2,
-        fallback_top_ratio: float = 0.18,
-        fallback_top_px: Optional[int] = None,
-        min_upper_px: int = 100,
-        show_fig: bool = False,
-        title_prefix: str = "Upper crop"
-    ) -> Optional[np.ndarray]:
-        if img is None or not hasattr(img, "shape"):
+        bbox: Tuple[int,int,int,int],
+        overlap_px: int = 10,
+        margin_below: int = 8,
+        tight_crop: bool = True,
+        debug: bool = False,
+    ) -> np.ndarray:
+        x, y, w, h = bbox
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+        y_bottom = y + h
+        h_img = gray.shape[0]
+
+        # take band below the table
+        band = gray[max(0, y_bottom - overlap_px): min(h_img, y_bottom + int(0.25*h_img)), :]
+        if band.size == 0:
+            if debug: print("Empty band region")
             return None
-        H, W = img.shape[:2]
 
-        if y_table_line is not None and y_table_line > 0:
-            cut_y = max(0, int(y_table_line) - int(max(1, guard_px)))
-        else:
-            if fallback_top_px is not None:
-                cut_y = int(fallback_top_px)
-            else:
-                cut_y = int(round(H * float(fallback_top_ratio)))
-            cut_y = max(int(min_upper_px), min(H - 1, cut_y))
+        # find first nonwhite line below table
+        blur = cv2.GaussianBlur(band, (3,3), 0)
+        _, bin_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        row_sum = np.sum(bin_inv // 255, axis=1)
+        thr = np.max(row_sum) * 0.012
+        nz = np.where(row_sum > thr)[0]
+        if len(nz) == 0:
+            if debug: print("No lower content found.")
+            return None
 
-        cut_y = int(np.clip(cut_y, 1, H - 1))
-        up = img[:cut_y, :]
-        if up is None or up.size == 0 or up.shape[0] < 200:
-            top20 = max(1, int(round(0.20 * H)))
-            cut_y2 = min(H - 1, max(top20, min_upper_px))
-            up = img[:cut_y2, :]
+        y_start = nz[0]
+        y_start_global = max(0, y_bottom - overlap_px + y_start)
+        lower_img = gray[y_start_global:min(h_img, h_img - margin_below), :]
 
-        if show_fig:
-            try:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(8, 4))
-                plt.title(f"{title_prefix} (h={up.shape[0]})")
-                plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-                plt.axis("off")
-                plt.show()
-            except Exception:
-                pass
-        return up
+        if tight_crop:
+            # remove empty white margins
+            _, bin_tight = cv2.threshold(lower_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            pts = cv2.findNonZero(bin_tight)
+            if pts is not None:
+                x_, y_, w_, h_ = cv2.boundingRect(pts)
+                lower_img = lower_img[y_:y_+h_, x_:x_+w_]
+        if debug:
+            print(f"lower_img shape={lower_img.shape} from y={y_start_global}")
+        return lower_img
 
-    # ---------- date ----------
-    MONTHS_TR = {1:["ocak","oca"],2:["şubat","subat","şub","sub"],3:["mart","mar"],4:["nisan","nis"],
-                 5:["mayıs","mayis","may"],6:["haziran","haz"],7:["temmuz","tem"],
-                 8:["ağustos","agustos","ağu","agu"],9:["eylül","eylul","eyl"],
-                 10:["ekim","eki"],11:["kasım","kasim","kas"],12:["aralık","aralik","ara"]}
-    MONTHS_EN = {1:["january","jan"],2:["february","feb"],3:["march","mar"],4:["april","apr"],5:["may"],
-                 6:["june","jun"],7:["july","jul"],8:["august","aug"],9:["september","sep","sept"],
-                 10:["october","oct"],11:["november","nov"],12:["december","dec"]}
-    MONTH_WORDS = set(sum(MONTHS_TR.values(),[])) | set(sum(MONTHS_EN.values(),[]))
-    MONTH_WORDS_RGX = "|".join(sorted(
-        [re.escape(x).replace(r"\ ", r"\s*").replace(r"\.", r".?") for x in MONTH_WORDS],
-        key=len, reverse=True
-    ))
-    ROMAN = {"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
+    # -----------------------------------------------------------
+    # 3) Main iteration through pages
+    # -----------------------------------------------------------
+    def _to_bgr(img: np.ndarray) -> np.ndarray:
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.ndim == 3 and img.shape[2] == 3:
+            return img.copy()
+        if img.ndim == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        raise ValueError(f"Unsupported image shape {img.shape}")
 
-    def _norm_year(y: str) -> Optional[int]:
-        y = re.sub(r"^\D+","", y or "")
-        if not y: return None
-        if len(y)==2: y="20"+y
-        if len(y)>4: y=y[-4:]
+    lower_imgs: List[Optional[np.ndarray]] = []
+    bboxes: List[Optional[Tuple[int,int,int,int]]] = []
+
+    for i, page in enumerate(doc_images):
         try:
-            return int(y)
-        except:
-            return None
+            bgr = _to_bgr(page)
+            bbox = detect_table_bbox_from_mask(bgr, debug=debug)
+            if bbox is None:
+                raise RuntimeError(f"No table detected on page {i}")
+            lower = extract_lower_text_area_from_table_v4(
+                bgr,
+                bbox,
+                overlap_px=overlap_px,
+                margin_below=margin_below,
+                tight_crop=tight_crop,
+                debug=debug,
+            )
+            lower_imgs.append(lower)
+            bboxes.append(bbox)
+            if debug:
+                print(f"[page {i}] done, lower={lower.shape if lower is not None else None}")
+        except Exception as e:
+            if debug:
+                print(f"[page {i}] failed: {e}")
+            if strict:
+                raise
+            lower_imgs.append(None)
+            bboxes.append(None)
 
-    def _valid(d, m, y):
-        return 1<=d<=31 and 1<=m<=12 and 1900<=y<=2100
+    if include_bboxes:
+        return lower_imgs, bboxes
+    return lower_imgs
 
-    def _month_from_word(tok: str) -> Optional[int]:
-        t = _nfkc(tok).lower()
-        t = (t.replace("ı","i").replace("ş","s").replace("ğ","g")
-               .replace("ü","u").replace("ö","o").replace("ç","c"))
-        for n,vs in MONTHS_TR.items():
-            if t in [x.replace("ı","i").replace("ş","s").replace("ğ","g")
-                       .replace("ü","u").replace("ö","o").replace("ç","c") for x in vs]:
-                return n
-        for n,vs in MONTHS_EN.items():
-            if t in vs: return n
-        return None
-
-    def _extract_date(text: str) -> Optional[str]:
-        if not text: return None
-        T = _norm_spaces(text)
-
-        m = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)", T)
-        if m:
-            try:
-                d,mn,y = int(m.group(1)), int(m.group(2)), _norm_year(m.group(3))
-            except:
-                d=mn=y=None
-            if y and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-
-        m = re.search(rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)",
-                      T, re.IGNORECASE)
-        if m:
-            d=int(m.group(1)); mn=_month_from_word(m.group(2)); y=_norm_year(m.group(3))
-            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-
-        m = re.search(r"(?<!\d)(\d{1,2})\s*(?:[./-])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[./-])?\s*(\d{2,4})(?!\d)",
-                      T, re.IGNORECASE)
-        if m:
-            d=int(m.group(1)); mn=ROMAN.get(m.group(2).upper()); y=_norm_year(m.group(3))
-            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-
-        digits = re.sub(r"\D","", T)
-        if len(digits) >= 8:
-            best = None
-            for i in range(len(digits)-7):
-                try:
-                    d=int(digits[i:i+2]); mn=int(digits[i+2:i+4]); y=int(digits[i+4:i+8])
-                except:
-                    continue
-                if _valid(d,mn,y):
-                    cand=(y,i,d,mn)
-                    if best is None or cand>best: best=cand
-            if best:
-                y,_,d,mn=best
-                return f"{d:02d}/{mn:02d}/{y:04d}"
-        return None
-
-    # ---------- type canonicalization ----------
-    def _map_type_to_canonical(type_text: str) -> Optional[str]:
-        if not type_text: return None
-        u = _upper_tr(_norm_spaces(type_text))
-        u_ascii = (u.replace("İ","I").replace("Ş","S").replace("Ğ","G")
-                     .replace("Ü","U").replace("Ö","O").replace("Ç","C"))
-        GEN = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        AS  = r"(?:A\.?\s*Ş|A\.?\s*S|AŞ|AS)"+GEN
-        ANON= r"ANON[İI]M\s+"+_spaced("ŞİRKET")+GEN
-        LTD = r"(?:LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+_spaced("ŞİRKET")+r")"+GEN
-        SIRK= _spaced("ŞİRKET")+GEN
-        RULES = [
-            (rf"(?:\b|^)({AS}|{ANON})(?:\b|$)", "ANONİM ŞİRKETİ"),
-            (rf"(?:\b|^)ANON[İI]M(?:\b|$)",     "ANONİM ŞİRKETİ"),
-            (rf"(?:\b|^){LTD}(?:\b|$)",        "LİMİTED ŞİRKETİ"),
-            (rf"(?:\b|^)HOLD[İI]NG(?:\b|$)",   "HOLDİNG"),
-            (rf"(?:\b|^)KOOPERAT[İI]F(?:\b|$)","KOOPERATİF"),
-            (rf"(?:\b|^)KOLEKT[İI]F\s+{SIRK}(?:\b|$)","KOLEKTİF ŞİRKET"),
-            (rf"(?:\b|^)AD[İI]\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)","ADİ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)",
-             "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)KOMAND[İI]T\s+{SIRK}(?:\b|$)","KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)VAKF[Iİ]|VAKIF(?:\b|$)","VAKIF"),
-            (rf"(?:\b|^)DERNEK(?:\b|$)","DERNEK"),
-        ]
-        for pat,label in RULES:
-            if re.search(pat, u, re.IGNORECASE): return label
-
-        flat = re.sub(r"[\s\.\-_/’'`´]+","", u_ascii)
-        if re.search(r"(AS|AŞ|ANONIMSIRKET)", flat): return "ANONİM ŞİRKETİ"
-        if re.search(r"(ANONİMSIRKETININ)", flat):   return "ANONİM ŞİRKETİ"
-        if re.search(r"(LTDSTI|LIMITEDSIRKET)", flat): return "LİMİTED ŞİRKETİ"
-        if "HOLDING" in flat: return "HOLDİNG"
-        if "KOOPERATIF" in flat: return "KOOPERATİF"
-        if re.search(r"KOLEKTIF.*SIRKET", flat): return "KOLEKTİF ŞİRKET"
-        if re.search(r"ADIKOMANDIT.*SIRKET", flat): return "ADİ KOMANDİT ŞİRKET"
-        if re.search(r"SERMAYESIPAYLARABOLUNMUSKOMANDIT.*SIRKET", flat): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
-        if re.search(r"KOMANDIT.*SIRKET", flat): return "KOMANDİT ŞİRKET"
-        if "VAKIF" in flat: return "VAKIF"
-        if "DERNEK" in flat: return "DERNEK"
-        return None
-
-    # ---------- header phrase cleaner ----------
-    def _clean_header_substrings(s: str) -> str:
-        exact = re.compile("|".join([
-            r"GENEL\s+KURULDA\s+HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
-            r"HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
-            r"TOPLANTIYA\s+KATILANLAR",
-            r"TOPLANTI\s+TUTANA[ĞG][Iİ]",
-            r"G[UÜ]NDEM\s*MADDELER[İI]",
-            r"KARARLAR",
-            r"ŞEKL[İI]\s*VE\s*T[UÜ]R[UÜ]"
-        ]), re.IGNORECASE)
-        s2,_ = exact.subn(" ", s or "")
-        return re.sub(r"\s{2,}"," ", s2).strip()
-
-    # ---------- company extractor (LEFT-ONLY; prev merge; hard right cut) ----------
-    def _extract_company(lines: List[str],
-                         prev_lines_to_merge: int = 3,
-                         left_char_cap: int = 420) -> Tuple[Optional[str], Optional[str], dict]:
-        L = [_norm_spaces(ln) for ln in (lines or []) if isinstance(ln, str) and ln.strip()]
-        if not L: return None, None, {"reason":"empty_lines"}
-
-        GEN  = r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        SIRK = _spaced("ŞİRKET")
-        TYPE = r"(?:ANON[İI]M\s+"+SIRK+r"|A\.?\s*Ş|AŞ|A\.?\s*S|LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+SIRK+r")"+GEN
-        type_re = re.compile(TYPE, re.IGNORECASE)
-
-        anchors=[]
-        for i, s in enumerate(L):
-            m = type_re.search(s)
-            if m:
-                anchors.append((i, m.start(), m.end(), m.group(0)))
-            elif i+1 < len(L):
-                s2 = s + " " + L[i+1]
-                m2 = type_re.search(s2)
-                if m2:
-                    anchors.append((i, min(len(s), m2.start()), m2.end(), m2.group(0)))
-        if not anchors:
-            return None, None, {"reason":"no_type_in_lines"}
-
-        i, st, en, raw = anchors[-1]
-        ctype = _map_type_to_canonical(raw)
-
-        left_piece = L[i][:st]
-        merged = " ".join(L[max(0, i-3):i] + [left_piece])
-        merged = _clean_header_substrings(merged)
-
-        RIGHT_CUT = re.compile(
-            r"\b(?:ANON[İI]M|L[İI]M[İI]TED|LTD\.?\s*ŞT[İI]|LTD\.?\s*ST[İI]|A\.?\s*Ş|AŞ|"+SIRK+r")\b.*$",
-            re.IGNORECASE
-        )
-        merged = RIGHT_CUT.sub("", merged)
-
-        NOISE_TAIL = {"VE","DE","DA","İLE","VEYA","KURUL","KURULDA","LİSTESİ","TARİHLİ","ÖRNEĞİ"}
-        toks = merged.split()
-        while toks and toks[0].upper() in NOISE_TAIL: toks.pop(0)
-        while toks and toks[-1].upper() in NOISE_TAIL: toks.pop()
-        name = " ".join(toks).strip(" ,.-:;’'")[:left_char_cap]
-
-        if sum(ch.isalpha() for ch in name) < 3:
-            return None, ctype, {"reason":"too_short_after_cut", "type":ctype}
-
-        return _upper_tr(name), ctype, {"reason":"ok","picked":"left_only+prev_merge","type":ctype}
-
-    # ================= MAIN =================
-    rows = []
-    for idx, img in enumerate(doc_images):
-        y_top = _detect_table_top(img)
-        if debug:
-            print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback)")
-        upper = _extract_upper(
-            img, y_top,
-            guard_px=max(1, table_guard_margin_px),
-            fallback_top_ratio=fallback_top_ratio,
-            min_upper_px=min_upper_px,
-            show_fig=show_fig
-        )
-        if upper is None:
-            if debug: print(f"[p{idx}] Upper empty -> skip")
-            continue
-
-        text = (ocr_fn(upper) or "")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if debug:
-            print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
-
-        # robust: keep first valid date; don't overwrite with None
-        date = None
-        for ln in lines:
-            d = _extract_date(ln)
-            if d:
-                date = d
-                break
-
-        # company (never overwrite with None)
-        cname, ctype, dbg = _extract_company(lines)
-        if debug:
-            print(f"[p{idx}] company_debug:", dbg)
-
-        row = {
-            "page_index": idx,
-            "tarih": date,
-            "şirket_adı": (cname if isinstance(cname, str) and cname.strip() else None),
-            "şirketadı":  (cname if isinstance(cname, str) and cname.strip() else None),   # alias
-            "şirket_türü": (_upper_tr(ctype) if ctype else None),
-            "şirkettürü":  (_upper_tr(ctype) if ctype else None),                         # alias
-        }
-        if debug:
-            row["debug_text"] = text[:1600]
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+lower_imgs, bboxes = crop_all_lower_from_doc_images(
+    doc_images,
+    overlap_px=10,
+    margin_below=8,
+    tight_crop=True,
+    include_bboxes=True,
+    debug=False
+)
