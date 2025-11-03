@@ -1,244 +1,88 @@
 # -*- coding: utf-8 -*-
 import os
-import json
 import base64
-from io import BytesIO
-from typing import Optional, Union, Sequence, List, Dict, Any
+from typing import List, Optional, Sequence, Dict, Any
 
-import numpy as np
 import cv2
-from PIL import Image
+import numpy as np
 import requests
 
+# ---- Endpoint & auth (unchanged) ----
+TARGET_URL  = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
+TOKEN_ENV   = "INTGW_ACCESS_KEY"   # do not hardcode the token
 
-TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
-TOKEN_ENV  = "INTGW_ACCESS_KEY"  # <- your environment variable name (do not hardcode token)
 
-
-# -------------------------- helpers --------------------------
+# ---------------- helpers ----------------
 def _ensure_uint8(x: np.ndarray) -> np.ndarray:
     if x.dtype != np.uint8:
         x = np.clip(x, 0, 255).astype(np.uint8)
     return x
 
-def _np_to_bgr(img: np.ndarray) -> np.ndarray:
-    """Return BGR/GRAY uint8 for cv2.imencode (no disk I/O)."""
+def _to_bgr(img: np.ndarray) -> np.ndarray:
+    """Return BGR/GRAY uint8 that cv2.imencode accepts."""
     img = _ensure_uint8(img)
-    if img.ndim == 2:  # GRAY
-        return img
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     if img.ndim == 3 and img.shape[2] == 3:
-        # If your arrays are RGB, flip: return img[:, :, ::-1]
+        # If your arrays are RGB, flip channels here:
+        # return img[:, :, ::-1]
         return img
     if img.ndim == 3 and img.shape[2] == 4:
         return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     raise ValueError(f"Unsupported image shape: {img.shape}")
 
-def _resize_max(img: np.ndarray, max_w: int = 2000, max_h: int = 2000) -> np.ndarray:
-    h, w = img.shape[:2]
-    s = min(max_w / w, max_h / h, 1.0)
-    if s < 1.0:
-        img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
-    return img
-
-def _encode_np_to_b64(img: np.ndarray, fmt: str = "jpg", jpg_quality: int = 85) -> str:
-    """Encode NumPy image to base64 entirely in memory."""
-    bgr = _np_to_bgr(img)
-    ext = ".jpg" if fmt.lower() in ("jpg", "jpeg") else ".png"
-    params = []
-    if ext == ".jpg":
-        params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpg_quality)]
-    ok, buf = cv2.imencode(ext, bgr, params)
+def _encode_png_base64(bgr: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".png", bgr)
     if not ok:
-        raise RuntimeError("cv2.imencode failed")
+        raise RuntimeError("PNG encoding failed")
     return base64.b64encode(buf).decode("utf-8")
 
-def _encode_path_to_b64(image_path: str) -> str:
-    """Path → PIL → base64 (keeps your original behavior)."""
-    img = Image.open(image_path)
-    bio = BytesIO()
-    fmt = (img.format or "PNG").upper()
-    img.save(bio, format=fmt)
-    return base64.b64encode(bio.getvalue()).decode("utf-8")
+def _auto_downscale_to_size(img: np.ndarray,
+                            max_mb: float = 4.5,
+                            min_side: int = 600,
+                            verbose: bool = False) -> np.ndarray:
+    """
+    Iteratively downscale until base64 PNG size <= max_mb or min_side is reached.
+    """
+    bgr = _to_bgr(img)
+    # quick try without scaling
+    b64 = _encode_png_base64(bgr)
+    size_mb = len(b64) / 1_000_000.0
+    if verbose:
+        h, w = bgr.shape[:2]
+        print(f"[OCR] initial size={size_mb:.2f} MB, shape={h}x{w}")
 
-def _build_headers() -> Dict[str, str]:
+    if size_mb <= max_mb:
+        return bgr
+
+    h, w = bgr.shape[:2]
+    scale = 0.85
+    while size_mb > max_mb and min(h, w) > min_side:
+        new_w, new_h = int(w * scale), int(h * scale)
+        bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        b64 = _encode_png_base64(bgr)
+        size_mb = len(b64) / 1_000_000.0
+        h, w = new_h, new_w
+        if verbose:
+            print(f"[OCR] scaled -> size={size_mb:.2f} MB, shape={h}x{w}")
+        # tighten scale a bit if still large
+        if size_mb > max_mb:
+            scale *= 0.90
+
+    return bgr
+
+def _headers() -> Dict[str, str]:
     token = os.environ[TOKEN_ENV]
     return {
         "Access-Token": token,
         "Content-Type": "application/json",
     }
 
-def _build_payload_base(image_str: str) -> Dict[str, Any]:
+def _payload_with_content(image_b64: str) -> Dict[str, Any]:
     """
-    Your payload, with correct top-level placement (not nested under requestHeader).
-    Only 'content' is injected; everything else stays as you provided.
+    Your payload exactly as provided; only 'content/fileName/fileType' are set here.
     """
     return {
-        "requestHeader": {
-            "info": {
-                "correlationPair": [
-                    {"key": "AppName", "value": "Postman"}
-                ]
-            }
-        },
-        "customerNo": 10651337,
-        "branchCode": 936,
-        "channelInfo": "Branch",
-        "language": "tr-TR",
-        "transactionCode": "",
-        "clientIP": "1.1.1.1",
-        "clientPort": "0",
-        "registrationNo": 49001,
-        "userInfo": {
-            "userID": 153,
-            "userCode": "49001",
-            "userBranchCode": "936",
-            "roles": [{"roleID": "1501"}]
-        },
-        "performerUserInfo": {
-            "userID": 153,
-            "userCode": "49001",
-            "userBranchCode": "936",
-            "roles": [{"roleID": "1501"}]
-        },
-        "includeBbox": False,
-        "content": image_str
-    }
-
-def _post_ocr(headers: Dict[str, str], payload: Dict[str, Any], *, timeout: int = 30) -> str:
-    resp = requests.post(
-        TARGET_URL,
-        headers=headers,
-        json=payload,
-        verify=False,
-        timeout=timeout,
-    )
-    # Show more context if the backend fails
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        # print first chars of server response for diagnostics
-        try:
-            print("HTTP", resp.status_code, "-", resp.text[:600])
-        except Exception:
-            pass
-        raise e
-
-    data = resp.json()
-    # Be defensive about response shape/casing
-    pages = (
-        data.get("ocrPageResultList")
-        or data.get("OcrPageResultList")
-        or data.get("result", {}).get("ocrPageResultList")
-        or []
-    )
-    parts: List[str] = []
-    for p in pages:
-        t = p.get("extractedText") or ""
-        if isinstance(t, str):
-            parts.append(t)
-    return "\n".join(parts).strip()
-
-
-# -------------------------- public API --------------------------
-def call_paddle_ocr_text_only(image_path: str) -> str:
-    """Path-based version (kept for compatibility)."""
-    image_str = _encode_path_to_b64(image_path)
-    headers = _build_headers()
-    payload = _build_payload_base(image_str)
-    return _post_ocr(headers, payload)
-
-
-def call_paddle_ocr_text_only_array(
-    img: np.ndarray,
-    *,
-    fmt: str = "jpg",          # use "png" if your backend insists on PNG
-    max_w: int = 2000,
-    max_h: int = 2000,
-    jpg_quality: int = 85
-) -> str:
-    """
-    NumPy-array version (preferred). No disk I/O.
-    Accepts GRAY/BGR/RGB/RGBA arrays; downscales large pages to avoid 500s.
-    """
-    if img is None:
-        return ""
-    img = _resize_max(img, max_w=max_w, max_h=max_h)
-    image_str = _encode_np_to_b64(img, fmt=fmt, jpg_quality=jpg_quality)
-    headers = _build_headers()
-    payload = _build_payload_base(image_str)
-    return _post_ocr(headers, payload)
-
-
-def call_paddle_ocr_text_only_batch(
-    imgs: Sequence[Optional[np.ndarray]],
-    *,
-    fmt: str = "jpg",
-    max_w: int = 2000,
-    max_h: int = 2000,
-    jpg_quality: int = 85
-) -> List[Optional[str]]:
-    """Batch over a list such as final_lower_imgs; returns list[str|None] aligned with input."""
-    out: List[Optional[str]] = []
-    for i, im in enumerate(imgs):
-        try:
-            out.append(call_paddle_ocr_text_only_array(
-                im, fmt=fmt, max_w=max_w, max_h=max_h, jpg_quality=jpg_quality
-            ) if im is not None else None)
-        except Exception as e:
-            print(f"[{i}] OCR failed:", e)
-            out.append(None)
-    return out
-
-
-from importlib import reload
-import your_module_name  # replace with the filename of the script above (without .py)
-reload(your_module_name)
-
-# Single image
-# text0 = your_module_name.call_paddle_ocr_text_only_array(final_lower_imgs[0])
-
-# Batch
-texts = your_module_name.call_paddle_ocr_text_only_batch(final_lower_imgs)
-for i, t in enumerate(texts):
-    print(f"\n=== PAGE {i} ===")
-    print(t or "(No text detected / OCR failed)")
-
----
-
-import os, cv2, base64, requests, numpy as np
-
-TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
-ACCESS_TOKEN = os.environ["INTGW_ACCESS_KEY"]
-
-headers = {
-    "Access-Token": ACCESS_TOKEN,
-    "Content-Type": "application/json"
-}
-
-def np_to_base64_png(img: np.ndarray) -> str:
-    """Convert NumPy image to base64-encoded PNG (in memory, no disk I/O)."""
-    if img is None:
-        return ""
-    if img.dtype != np.uint8:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-    if img.ndim == 2:
-        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif img.ndim == 3 and img.shape[2] == 3:
-        bgr = img
-    elif img.ndim == 3 and img.shape[2] == 4:
-        bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    else:
-        raise ValueError(f"Unsupported image shape {img.shape}")
-    ok, buf = cv2.imencode(".png", bgr)
-    if not ok:
-        raise RuntimeError("PNG encoding failed")
-    return base64.b64encode(buf).decode("utf-8")
-
-def call_paddle_ocr_text_only_array(img: np.ndarray):
-    """Send OCR request with NumPy array directly (PNG, no file saving)."""
-    image_str = np_to_base64_png(img)
-
-    payload = {
         "requestHeader": {
             "info": {"correlationPair": [{"key": "AppName", "value": "Postman"}]}
         },
@@ -265,14 +109,22 @@ def call_paddle_ocr_text_only_array(img: np.ndarray):
         "includeBbox": False,
         "fileName": "image.png",
         "fileType": "png",
-        "content": image_str
+        "content": image_b64,
     }
 
-    resp = requests.post(TARGET_URL, headers=headers, json=payload, verify=False, timeout=30)
-    print("HTTP", resp.status_code)
-    if resp.status_code != 200:
-        print("Response text:", resp.text[:500])
-        raise RuntimeError("OCR API failed")
+def _post_ocr(image_b64: str, *, debug: bool = False) -> str:
+    resp = requests.post(
+        TARGET_URL,
+        headers=_headers(),
+        json=_payload_with_content(image_b64),
+        verify=False,
+        timeout=30,
+    )
+    if debug:
+        print("HTTP", resp.status_code)
+        if resp.status_code != 200:
+            print(resp.text[:600])
+    resp.raise_for_status()
 
     data = resp.json()
     pages = (
@@ -281,18 +133,58 @@ def call_paddle_ocr_text_only_array(img: np.ndarray):
         or data.get("result", {}).get("ocrPageResultList")
         or []
     )
-    return "\n".join([p.get("extractedText", "") for p in pages]).strip()
+    return "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
 
 
-# --- Run on your final_lower_imgs (batch mode) ---
-ocr_texts = []
-for i, img in enumerate(final_lower_imgs):
-    try:
-        print(f"Sending page {i}...")
-        text = call_paddle_ocr_text_only_array(img)
-        ocr_texts.append(text)
-        print(f"=== PAGE {i} OCR RESULT ===")
-        print(text or "(No text detected / OCR failed)")
-    except Exception as e:
-        print(f"[{i}] OCR failed:", e)
-        ocr_texts.append(None)
+# ---------------- public API ----------------
+def call_paddle_ocr_text_only_array(
+    img: np.ndarray,
+    *,
+    max_payload_mb: float = 4.5,
+    min_side: int = 600,
+    debug: bool = False,
+) -> str:
+    """
+    OCR a single NumPy array. No disk I/O.
+    Automatically downscales PNG until base64 size <= max_payload_mb.
+    """
+    if img is None:
+        return ""
+
+    bgr = _auto_downscale_to_size(img, max_mb=max_payload_mb, min_side=min_side, verbose=debug)
+    image_b64 = _encode_png_base64(bgr)
+    return _post_ocr(image_b64, debug=debug)
+
+def call_paddle_ocr_text_only_batch(
+    imgs: Sequence[Optional[np.ndarray]],
+    *,
+    max_payload_mb: float = 4.5,
+    min_side: int = 600,
+    debug_each: bool = False,
+) -> List[Optional[str]]:
+    """
+    Batch over a list like final_lower_imgs. Returns list[str|None] aligned with input.
+    """
+    out: List[Optional[str]] = []
+    for i, im in enumerate(imgs):
+        if im is None:
+            out.append(None); continue
+        try:
+            txt = call_paddle_ocr_text_only_array(
+                im, max_payload_mb=max_payload_mb, min_side=min_side, debug=debug_each
+            )
+            out.append(txt if txt else None)
+        except Exception as e:
+            if debug_each:
+                print(f"[{i}] OCR failed:", e)
+            out.append(None)
+    return out
+
+# Single image
+# text0 = call_paddle_ocr_text_only_array(final_lower_imgs[0], debug=True)
+
+# Batch
+texts = call_paddle_ocr_text_only_batch(final_lower_imgs, debug_each=True)
+for i, t in enumerate(texts):
+    print(f"\n=== PAGE {i} ===")
+    print(t or "(No text detected / OCR failed)")
