@@ -1,152 +1,87 @@
+# paddleocr_usage.py
+import os
+import json
+import base64
+import requests
+from io import BytesIO
+from typing import Optional, Union
+
+from PIL import Image
 import numpy as np
-import cv2
-from typing import List, Tuple, Optional, Union
 
-def crop_all_lower_from_doc_images(
-    doc_images: List[np.ndarray],
-    *,
-    overlap_px: int = 10,
-    margin_below: int = 8,
-    tight_crop: bool = True,
-    include_bboxes: bool = False,
-    strict: bool = False,
-    debug: bool = False,
-) -> Union[List[np.ndarray], Tuple[List[np.ndarray], List[Optional[Tuple[int,int,int,int]]]]]:
-    """
-    For each page image in `doc_images`, detect the table bbox and return the cropped
-    lower text area image beneath the table.
-    """
+TARGET_URL = "https://internalgw/neo/mediaoperationsinternal/api/clear-ocr/get/v1"
+ENV_KEY = "INGAI_ACCESS_KEY"  # adjust if your env var name differs
 
-    # -----------------------------------------------------------
-    # 1) Helper: detect largest table-like rectangular area (bbox)
-    # -----------------------------------------------------------
-    def detect_table_bbox_from_mask(img: np.ndarray, debug: bool=False) -> Optional[Tuple[int,int,int,int]]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
-        blur = cv2.GaussianBlur(gray, (3,3), 0)
-        _, bin_img = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        bin_inv = cv2.bitwise_not(bin_img)
+def _encode_image_to_b64(img: Image.Image) -> str:
+    buf = BytesIO()
+    fmt = "PNG"
+    img.save(buf, format=fmt)
+    img_bytes = buf.getvalue()
+    return base64.b64encode(img_bytes).decode("utf-8")
 
-        # horizontal + vertical line detection
-        h, w = bin_inv.shape
-        hx, hy = max(1, w // 100), max(1, h // 100)
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hx, 1))
-        vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, hy))
-        horiz = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
-        vert  = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, vert_kernel, iterations=2)
-        table_mask = cv2.addWeighted(horiz, 0.5, vert, 0.5, 0.0)
+def _post_ocr(image_b64: str) -> str:
+    token = os.environ.get(ENV_KEY)
+    if not token:
+        raise EnvironmentError(f"Missing {ENV_KEY} environment variable")
 
-        cnts, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            if debug:
-                print("[WARN] no_table_found")
-            return None
+    headers = {
+        "Access-Token": token,
+        "Content-Type": "application/json",
+    }
 
-        cnt = max(cnts, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(cnt)
-        if debug:
-            vis = img.copy()
-            cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
-            cv2.imshow("table bbox", vis)
-            cv2.waitKey(0); cv2.destroyAllWindows()
-        return (x, y, w, h)
+    # NOTE: keep only fields your service truly requires.
+    payload = {
+        "requestHeader": {
+            "info": {"correlationPair": [{"key": "AppName", "value": "Postman"}]}
+        },
+        "includeBbox": False,
+        "content": image_b64,
+    }
 
-    # --------------------------------------------------------------------
-    # 2) Helper: extract region BELOW table (lower area) from a single page
-    # --------------------------------------------------------------------
-    def extract_lower_text_area_from_table_v4(
-        img: np.ndarray,
-        bbox: Tuple[int,int,int,int],
-        overlap_px: int = 10,
-        margin_below: int = 8,
-        tight_crop: bool = True,
-        debug: bool = False,
-    ) -> np.ndarray:
-        x, y, w, h = bbox
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
-        y_bottom = y + h
-        h_img = gray.shape[0]
+    resp = requests.post(
+        TARGET_URL,
+        headers=headers,           # ← fixed
+        json=payload,
+        verify=False,              # if your internal CA isn’t trusted
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-        # take band below the table
-        band = gray[max(0, y_bottom - overlap_px): min(h_img, y_bottom + int(0.25*h_img)), :]
-        if band.size == 0:
-            if debug: print("Empty band region")
-            return None
+    # Defensive extraction
+    ocr_pages = data.get("ocrPageResultList") or []
+    text_parts = []
+    for page in ocr_pages:
+        t = page.get("extractedText") or ""
+        if isinstance(t, str):
+            text_parts.append(t)
+    return "\n".join(text_parts).strip()
 
-        # find first nonwhite line below table
-        blur = cv2.GaussianBlur(band, (3,3), 0)
-        _, bin_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        row_sum = np.sum(bin_inv // 255, axis=1)
-        thr = np.max(row_sum) * 0.012
-        nz = np.where(row_sum > thr)[0]
-        if len(nz) == 0:
-            if debug: print("No lower content found.")
-            return None
+def call_paddle_ocr_text_only_path(image_path: str) -> str:
+    """OCR for an image on disk."""
+    img = Image.open(image_path).convert("RGB")
+    image_b64 = _encode_image_to_b64(img)
+    return _post_ocr(image_b64)
 
-        y_start = nz[0]
-        y_start_global = max(0, y_bottom - overlap_px + y_start)
-        lower_img = gray[y_start_global:min(h_img, h_img - margin_below), :]
-
-        if tight_crop:
-            # remove empty white margins
-            _, bin_tight = cv2.threshold(lower_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            pts = cv2.findNonZero(bin_tight)
-            if pts is not None:
-                x_, y_, w_, h_ = cv2.boundingRect(pts)
-                lower_img = lower_img[y_:y_+h_, x_:x_+w_]
-        if debug:
-            print(f"lower_img shape={lower_img.shape} from y={y_start_global}")
-        return lower_img
-
-    # -----------------------------------------------------------
-    # 3) Main iteration through pages
-    # -----------------------------------------------------------
-    def _to_bgr(img: np.ndarray) -> np.ndarray:
+def call_paddle_ocr_text_only_array(img: Union[np.ndarray, Image.Image]) -> str:
+    """OCR for an in-memory image (NumPy array or PIL Image)."""
+    if isinstance(img, np.ndarray):
         if img.ndim == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        if img.ndim == 3 and img.shape[2] == 3:
-            return img.copy()
-        if img.ndim == 3 and img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        raise ValueError(f"Unsupported image shape {img.shape}")
+            pil = Image.fromarray(img).convert("RGB")
+        elif img.ndim == 3:
+            # assume BGR from OpenCV; convert to RGB
+            if img.shape[2] == 3:
+                pil = Image.fromarray(img[:, :, ::-1]).convert("RGB")
+            elif img.shape[2] == 4:
+                pil = Image.fromarray(img[:, :, [2,1,0,3]]).convert("RGB")
+            else:
+                raise ValueError("Unsupported channel count in NumPy array")
+        else:
+            raise ValueError("Unsupported ndarray shape for image")
+    elif isinstance(img, Image.Image):
+        pil = img.convert("RGB")
+    else:
+        raise TypeError("img must be a NumPy array or PIL.Image.Image")
 
-    lower_imgs: List[Optional[np.ndarray]] = []
-    bboxes: List[Optional[Tuple[int,int,int,int]]] = []
-
-    for i, page in enumerate(doc_images):
-        try:
-            bgr = _to_bgr(page)
-            bbox = detect_table_bbox_from_mask(bgr, debug=debug)
-            if bbox is None:
-                raise RuntimeError(f"No table detected on page {i}")
-            lower = extract_lower_text_area_from_table_v4(
-                bgr,
-                bbox,
-                overlap_px=overlap_px,
-                margin_below=margin_below,
-                tight_crop=tight_crop,
-                debug=debug,
-            )
-            lower_imgs.append(lower)
-            bboxes.append(bbox)
-            if debug:
-                print(f"[page {i}] done, lower={lower.shape if lower is not None else None}")
-        except Exception as e:
-            if debug:
-                print(f"[page {i}] failed: {e}")
-            if strict:
-                raise
-            lower_imgs.append(None)
-            bboxes.append(None)
-
-    if include_bboxes:
-        return lower_imgs, bboxes
-    return lower_imgs
-
-lower_imgs, bboxes = crop_all_lower_from_doc_images(
-    doc_images,
-    overlap_px=10,
-    margin_below=8,
-    tight_crop=True,
-    include_bboxes=True,
-    debug=False
-)
+    image_b64 = _encode_image_to_b64(pil)
+    return _post_ocr(image_b64)
