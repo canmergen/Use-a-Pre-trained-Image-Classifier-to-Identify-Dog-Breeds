@@ -1,55 +1,37 @@
 # -*- coding: utf-8 -*-
 import os, base64, cv2, numpy as np, requests
 
-TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
-TOKEN_ENV  = "INTGW_ACCESS_KEY"
+BASE = "https://internalgw/neomediaoperationsinternal/api/clear-ocr"
+URLS = [f"{BASE}/post/v1", f"{BASE}/execute/v1", f"{BASE}/get/v1"]
+TOKEN_ENV = "INTGW_ACCESS_KEY"
 
-def _ensure_uint8(x):
-    return np.clip(x, 0, 255).astype(np.uint8) if x.dtype != np.uint8 else x
-
+def _ensure_uint8(x): return np.clip(x, 0, 255).astype(np.uint8) if x.dtype != np.uint8 else x
 def _to_bgr(img):
     img = _ensure_uint8(img)
-    if img.ndim == 2:
-        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if img.ndim == 3 and img.shape[2] == 3:
-        return img
-    if img.ndim == 3 and img.shape[2] == 4:
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    raise ValueError(f"Unsupported image shape {img.shape}")
+    if img.ndim == 2:  return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] == 3: return img
+    if img.ndim == 3 and img.shape[2] == 4: return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    raise ValueError(f"Unsupported shape {img.shape}")
 
-def _encode_png_b64(img_bgr):
+def _b64_png(img_bgr):
     ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok:
-        raise RuntimeError("PNG encoding failed")
+    if not ok: raise RuntimeError("PNG encode failed")
     return base64.b64encode(buf).decode("utf-8")
 
-def _auto_resize(img, max_mb=4.5, min_side=600, debug=False):
+def _autoshrink(img, max_mb=4.5, min_side=600, debug=False):
     bgr = _to_bgr(img)
-    h, w = bgr.shape[:2]
-    b64 = _encode_png_b64(bgr)
-    mb = len(b64)/1_000_000.0
-    if debug: print(f"[OCR] initial size={mb:.2f} MB, shape={h}x{w}")
-    if mb <= max_mb: return bgr
-    scale = 0.90
-    while mb > max_mb and min(h, w) > min_side:
-        h, w = int(h*scale), int(w*scale)
-        bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-        b64 = _encode_png_b64(bgr); mb = len(b64)/1_000_000.0
-        if debug: print(f"[OCR] rescaled -> {mb:.2f} MB, shape={h}x{w}")
-        scale *= 0.92
-    return bgr
+    b64 = _b64_png(bgr); mb = len(b64)/1_000_000
+    if debug: print(f"[OCR] size={mb:.2f}MB, shape={bgr.shape[:2]}")
+    while mb > max_mb and min(bgr.shape[:2]) > min_side:
+        h, w = bgr.shape[:2]; bgr = cv2.resize(bgr, (int(w*0.9), int(h*0.9)), cv2.INTER_AREA)
+        b64 = _b64_png(bgr); mb = len(b64)/1_000_000
+        if debug: print(f"[OCR] shrink -> {mb:.2f}MB, shape={bgr.shape[:2]}")
+    return bgr, b64
 
-def _headers():
-    return {
-        "Access-Token": os.environ[TOKEN_ENV],
-        "Content-Type": "application/json",
-    }
-
-def _base_fields():
-    # Your exact business fields; only the image-related toggles change
+def _base_payload(image_b64):
     return {
         "requestHeader": {
-            "info": {"correlationPair": [{"key": "AppName", "value": "Postman"}]}
+            "info": {"correlationPair": [{"key":"AppName","value":"Postman"}]}
         },
         "customerNo": "10651337",
         "branchCode": "936",
@@ -67,85 +49,69 @@ def _base_fields():
             "userID": "153", "userCode": "49001", "userBranchCode": "936",
             "roles": [{"roleID": "1501"}]
         },
+        "includeBbox": False,
+        "fileName": "image.png",
+        "fileType": "png",
+        "contentType": "image/png",
+        "content": image_b64
     }
 
-def _try_one(image_b64, *, include_bbox, file_type, add_filename, add_content_type, content_key, debug=False):
-    payload = dict(_base_fields())
-    # image-related toggles
-    payload["includeBbox"] = include_bbox
-    if add_filename:
-        payload["fileName"] = f"image.{file_type.lower()}"
-    payload["fileType"] = file_type
-    if add_content_type:
-        payload["contentType"] = "image/png"
-    payload[content_key] = image_b64
+def _auth_headers(token, mode):
+    # mode: "access", "bearer", "both"
+    base = {
+        "Accept": "application/json",
+        "User-Agent": "athena-ocr-client/1.0",
+        "Content-Type": "application/json",
+    }
+    if mode in ("access", "both"):
+        base["Access-Token"] = token
+    if mode in ("bearer", "both"):
+        base["Authorization"] = f"Bearer {token}"
+    return base
 
-    resp = requests.post(TARGET_URL, headers=_headers(), json=payload, verify=False, timeout=45)
-    if debug:
-        print(f"HTTP {resp.status_code} :: includeBbox={include_bbox!r}, fileType={file_type}, "
-              f"fileName={add_filename}, contentType={add_content_type}, key={content_key}")
-        if resp.status_code != 200:
-            print(resp.text[:400])
-    if resp.status_code != 200:
-        return None, (resp.status_code, resp.text[:400])
+def call_ocr_numpy(img, debug=False):
+    token = os.environ[TOKEN_ENV]
+    bgr, image_b64 = _autoshrink(img, debug=debug)
+    payload = _base_payload(image_b64)
 
-    data = resp.json()
-    pages = (
-        data.get("ocrPageResultList")
-        or data.get("OcrPageResultList")
-        or data.get("result", {}).get("ocrPageResultList")
-        or []
-    )
-    text = "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
-    return text, None
+    for url in URLS:
+        for mode in ("access", "bearer", "both"):
+            try:
+                hdr = _auth_headers(token, mode)
+                resp = requests.post(url, headers=hdr, json=payload, verify=False, timeout=45)
+                if debug:
+                    print(f"TRY {url} auth={mode} -> HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        t = resp.text
+                        print(t[:400] if t else "(no body)")
+                if resp.status_code == 403:
+                    continue  # authorization mismatch
+                if resp.status_code != 200:
+                    continue  # try next combo
+                data = resp.json()
+                pages = (data.get("ocrPageResultList")
+                         or data.get("OcrPageResultList")
+                         or data.get("result", {}).get("ocrPageResultList")
+                         or [])
+                print(f"[OK] url={url} auth={mode}")
+                return "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
+            except requests.RequestException as e:
+                if debug: print("network error:", e)
+                continue
+    raise RuntimeError("All endpoint/auth combinations returned non-200 (likely ACL on POST).")
 
-def call_paddle_ocr_text_only_array_autoprobe(img, debug=False):
-    bgr = _auto_resize(img, debug=debug)
-    b64 = _encode_png_b64(bgr)
-
-    include_bbox_opts = [False, "false"]          # bool vs string
-    file_type_opts    = ["png", "PNG"]            # case differences
-    filename_opts     = [True, False]             # with/without fileName
-    content_type_opts = [True, False]             # with/without contentType
-    content_keys      = ["content", "imageBase64"]# key name differences
-
-    errors = []
-    for ib in include_bbox_opts:
-        for ft in file_type_opts:
-            for fn in filename_opts:
-                for ct in content_type_opts:
-                    for ck in content_keys:
-                        text, err = _try_one(
-                            b64,
-                            include_bbox=ib,
-                            file_type=ft,
-                            add_filename=fn,
-                            add_content_type=ct,
-                            content_key=ck,
-                            debug=debug,
-                        )
-                        if text is not None:
-                            print("\n[OK] schema:",
-                                  f"includeBbox={ib!r}, fileType={ft}, fileName={fn}, contentType={ct}, key={ck}")
-                            return text
-                        else:
-                            errors.append((ib, ft, fn, ct, ck, err[0]))
-    # If all failed, show a short summary of status codes seen
-    codes = sorted(set(code for *_, code in errors))
-    print("[Fail] tried", len(errors), "schemas; status codes:", codes)
-    return ""
-
-def call_paddle_ocr_text_only_batch_autoprobe(imgs, debug_each=False):
-    results = []
+def call_ocr_batch(imgs, debug_each=False):
+    out = []
     for i, im in enumerate(imgs):
-        if im is None:
-            results.append(None); continue
-        print(f"\n[OCR] Sending image {i} ...")
-        txt = call_paddle_ocr_text_only_array_autoprobe(im, debug=debug_each)
-        results.append(txt if txt else None)
-        print(f"[{i}] result length:", len(txt or ""))
-    return results
+        if im is None: out.append(None); continue
+        print(f"\n[OCR] page {i}")
+        try:
+            txt = call_ocr_numpy(im, debug=debug_each)
+            out.append(txt if txt else None)
+        except Exception as e:
+            print(f"[{i}] failed:", e); out.append(None)
+    return out
 
-texts = call_paddle_ocr_text_only_batch_autoprobe(final_lower_imgs, debug_each=True)
+texts = call_ocr_batch(final_lower_imgs, debug_each=True)
 for i, t in enumerate(texts):
-    print(f"\n=== PAGE {i} ===\n", t or "(No text detected / OCR failed)")
+   
