@@ -1,15 +1,22 @@
-def rewrite_regions_texts_using_page_text(paddle_ocr_regions, paddle_ocr_texts):
+def rewrite_regions_texts_strict(paddle_ocr_regions, paddle_ocr_texts,
+                                 flex=1, lookahead=60, min_ratio=0.55):
     """
-    Her sayfada regions[j]['text'] değerlerini, aynı sayfanın paddle_ocr_texts[i]
-    metnine göre yeniden yazar. BBox'lar korunur, yalnızca 'text' güncellenir.
+    Her sayfada regions[j]['text']'i, aynı sayfanın paddle_ocr_texts[i]'ine göre,
+    KUTU SINIRINI BOZMADAN yeniden yazar.
+
+    Parametreler
+    - flex:  her kutu için hedef pencere uzunluğunu ±flex token esnet (örn. n±1)
+    - lookahead: arama, sayfa token akışında cursor'dan itibaren en fazla bu kadar token ileriye bakar
+    - min_ratio: benzerlik (SequenceMatcher) alt sınırı; altındaysa orijinali temizleyip bırakır
+
+    Not: BBox sırası korunur. Yalnızca 'text' güncellenir.
     """
     import re, unicodedata, difflib
 
     assert len(paddle_ocr_regions) == len(paddle_ocr_texts), "Uzunluklar uyuşmuyor."
 
     def _clean(s):
-        if not isinstance(s, str): 
-            return ""
+        if not isinstance(s, str): return ""
         s = unicodedata.normalize("NFKC", s)
         s = (s.replace("•"," ").replace("·"," ").replace("§","S")
                .replace("|"," ").replace("¦"," ").replace("—","-").replace("–","-")
@@ -20,86 +27,73 @@ def rewrite_regions_texts_using_page_text(paddle_ocr_regions, paddle_ocr_texts):
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def _tokens(s):  # temizle + tokenize
+    def _tokens(s):
         s = _clean(s);  return s.split() if s else []
 
-    def _bbox_sort_key(r):
+    def _yx_key(r):
         b = r.get("bbox", {})
         y = (b.get("y1",0)+b.get("y2",0)+b.get("y3",0)+b.get("y4",0))//4
         x = (b.get("x1",0)+b.get("x2",0)+b.get("x3",0)+b.get("x4",0))//4
         return (y, x)
 
-    def _build_spans(regs_sorted):
-        spans = []; cur = 0
-        for r in regs_sorted:
-            n = len(_tokens(r.get("text","")))
-            spans.append((cur, cur+n)); cur += n
-        return spans
-
-    def _map_span(opcodes, a0, a1):
-        j_start, j_end = None, None
-        for tag, i1, i2, j1, j2 in opcodes:
-            if i2 <= a0: 
-                continue
-            if i1 >= a1 and j_start is not None:
-                break
-            take_i1 = max(i1, a0); take_i2 = min(i2, a1)
-            take_len = max(0, take_i2 - take_i1)
-            if take_len == 0:
-                continue
-            if j_start is None:
-                off = take_i1 - i1
-                i_len = i2 - i1
-                j_len = j2 - j1
-                ratio = 0 if i_len == 0 else min(1.0, max(0.0, off / i_len))
-                j_start = j1 + int(round(ratio * j_len))
-            j_len = j2 - j1
-            i_len = (i2 - i1) or 1
-            mapped = int(round(j_len * (take_len / i_len)))
-            j_end = (j_start if j_end is None else j_end) + max(1, mapped)
-        if j_start is None: j_start = 0
-        if j_end is None or j_end < j_start: j_end = j_start
-        return j_start, j_end
-
-    for i, (regions, page_text) in enumerate(zip(paddle_ocr_regions, paddle_ocr_texts)):
-        if not regions:
+    for page_regions, page_text in zip(paddle_ocr_regions, paddle_ocr_texts):
+        if not page_regions: 
             continue
 
-        regs_sorted = sorted(regions, key=_bbox_sort_key)
+        # Yukarıdan-aşağı, soldan-sağa
+        regs_sorted = sorted(page_regions, key=_yx_key)
 
-        # kaynak (bbox metin akışı) ve hedef (sayfa metni) tokenları
-        src_tokens = []
-        for r in regs_sorted:
-            src_tokens.extend(_tokens(r.get("text","")))
-        if not src_tokens:
-            continue
         tgt_tokens = _tokens(page_text)
+        if not tgt_tokens:
+            # Sayfa düz metin boşsa kutu metinlerini sadece temizle
+            for r in regs_sorted:
+                r["text"] = _clean(r.get("text",""))
+            continue
 
-        # hizalama
-        sm = difflib.SequenceMatcher(a=src_tokens, b=tgt_tokens, autojunk=False)
-        opcodes = sm.get_opcodes()
+        cursor = 0  # hedef akışta ilerleyen imleç
 
-        # bbox->hedef aralık projeksiyonu ve text yazımı
-        for r, (a0, a1) in zip(regs_sorted, _build_spans(regs_sorted)):
-            if a1 <= a0:
+        for r in regs_sorted:
+            src_clean = _clean(r.get("text",""))
+            src_toks  = src_clean.split() if src_clean else []
+            n = len(src_toks)
+
+            if n == 0:
                 r["text"] = ""
                 continue
-            j0, j1 = _map_span(opcodes, a0, a1)
-            j0 = max(0, min(j0, len(tgt_tokens)))
-            j1 = max(j0, min(j1, len(tgt_tokens)))
-            new_tokens = tgt_tokens[j0:j1]
 
-            if not new_tokens and len(tgt_tokens) > 0:
-                want = a1 - a0
-                left = max(0, j0 - want//2)
-                right = min(len(tgt_tokens), left + max(1, want))
-                new_tokens = tgt_tokens[left:right]
+            # Arama penceresi: cursor'dan itibaren lookahead token
+            start = max(0, cursor)
+            end   = min(len(tgt_tokens), start + max(lookahead, n + 2*flex))
 
-            r["text"] = " ".join(new_tokens)
+            best = (0.0, start, start)  # (ratio, j0, j1)
+            min_len = max(1, n - flex)
+            max_len = min(n + flex, max(1, end - start))
+
+            src_join = " ".join(src_toks)
+
+            # Aynı uzunlukta (±flex) alt-dilimler üzerinde benzerlik ara
+            for L in range(min_len, max_len + 1):
+                j0 = start
+                while j0 + L <= end:
+                    cand = " ".join(tgt_tokens[j0:j0+L])
+                    ratio = difflib.SequenceMatcher(a=src_join, b=cand, autojunk=False).ratio()
+                    if ratio > best[0]:
+                        best = (ratio, j0, j0+L)
+                    j0 += 1
+
+            ratio, j0, j1 = best
+            if ratio >= min_ratio:
+                r["text"] = " ".join(tgt_tokens[j0:j1])
+                cursor = j1  # sırayı koru, ileri kay
+            else:
+                # eşleşme zayıf: sadece kendi metnini temizle (sınırları bozma)
+                r["text"] = src_clean
 
     return paddle_ocr_regions
 
-paddle_ocr_regions = rewrite_regions_texts_using_page_text(
-    paddle_ocr_regions,
-    paddle_ocr_texts
+paddle_ocr_regions = rewrite_regions_texts_strict(
+    paddle_ocr_regions, paddle_ocr_texts,
+    flex=1,          # kutu başına ±1 token esneklik
+    lookahead=60,    # ileri bakan pencere
+    min_ratio=0.55   # benzerlik alt sınırı
 )
