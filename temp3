@@ -1,116 +1,169 @@
-def llm_rewrite_regions_texts_using_page_text(paddle_ocr_regions, paddle_ocr_texts,
-                                              temperature: float = 0.0,
-                                              max_tokens: int = 180,
-                                              window_chars: int = 280):
+def fix_regions_with_llm_or_diff(paddle_ocr_regions, paddle_ocr_texts,
+                                 temperature=0.0, max_tokens=200,
+                                 window_chars=300, flex_tokens=0,
+                                 min_ratio=0.62):
     """
-    LLM (Gemma) kullanarak regions[j]['text'] değerlerini, aynı sayfanın
-    paddle_ocr_texts[i] metnine göre düzeltir. BBox'lar korunur, sadece 'text' güncellenir.
+    Her bbox 'text'ini, aynı sayfanın metnine göre düzeltir.
+    1) LLM'den JSON {start,end} indeksleri istenir (yalnızca indeks!).
+    2) İndeks geçerliyse sayfa metninden kesilip yazılır.
+    3) LLM başarısızsa, difflib ile aynı uzunlukta en benzer dilim seçilir.
+    4) Sayı ve uzunluk koruması var; bozulursa normalize edilmiş orijinale döner.
 
-    Gereken: paddleocr_usage.response_generation_v_gemma(system_message, user_input, temp, max_t)
+    Gereken wrapper: paddleocr_usage.response_generation_v_gemma(system_message, user_input, temp, max_t)
     """
-
-    import re, unicodedata
+    import re, json, unicodedata, difflib
 
     assert len(paddle_ocr_regions) == len(paddle_ocr_texts), "Uzunluklar uyuşmuyor."
 
-    # --- Normalizasyon yardımcıları ---
-    def _norm(s: str) -> str:
-        if not isinstance(s, str): return ""
+    def _norm(s:str)->str:
+        if not isinstance(s,str): return ""
         s = unicodedata.normalize("NFKC", s)
         s = (s.replace("•"," ").replace("·"," ").replace("§","S")
                .replace("|"," ").replace("¦"," ").replace("—","-").replace("–","-")
                .replace("İ","İ").replace("i̇","i")
                .replace("Ş","Ş").replace("Ğ","Ğ").replace("Ç","Ç").replace("Ü","Ü")
                .replace("ş","ş").replace("ğ","ğ").replace("ç","ç").replace("ü","ü"))
-        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)     # 25 . 000 , 00 -> 25.000,00
+        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def _digits_mask(s: str) -> str:
-        return re.sub(r"\d", "#", s or "")
+    def _digits_mask(s:str)->str:
+        return re.sub(r"\d","#", s or "")
 
-    def _slice_with_query(page_text: str, box_text: str, radius: int) -> str:
-        """
-        Sayfa metninden, bbox metni benzeri bir parça etrafında bağlam penceresi çıkar.
-        Basit arama: normalize edip ilk geçen küçük alt ifadeyi arar,
-        bulunamazsa sayfayı kısaltıp döner.
-        """
-        pt = _norm(page_text)
-        q  = _norm(box_text)[:40]  # kısa ipucu
-        idx = -1
-        if q:
-            # 20+ karakterlik bir parça yakalamaya çalış
-            for k in range(min(len(q), 40), 8, -2):
-                sub = q[:k]
-                idx = pt.find(sub)
-                if idx != -1: break
-        if idx == -1:
-            # bulunamadıysa sayfanın ortasından pencere
-            mid = max(0, len(pt)//2 - radius)
-            return pt[mid: mid + 2*radius]
-        start = max(0, idx - radius)
-        end   = min(len(pt), idx + len(q) + radius)
-        return pt[start:end]
+    def _tokens(s:str):
+        s=_norm(s); return s.split() if s else []
 
-    # --- Sert kurallı sistem mesajı ---
-    SYSTEM_PROMPT = (
-        "Türkçe OCR düzeltme yardımcısısın.\n"
+    def _yx_key(r):
+        b=r.get("bbox",{})
+        y=(b.get("y1",0)+b.get("y2",0)+b.get("y3",0)+b.get("y4",0))//4
+        x=(b.get("x1",0)+b.get("x2",0)+b.get("x3",0)+b.get("x4",0))//4
+        return (y,x)
+
+    def _best_slice_by_diff(src_clean:str, page_clean:str, start_hint:int=0,
+                            flex=0, lookahead_chars=120, min_ratio=0.6)->str:
+        src_toks=_tokens(src_clean); n=len(src_toks)
+        if n==0: return src_clean
+        # token bazlı gezinmek için kaba bir bölme
+        tgt_toks=_tokens(page_clean)
+        # cursor'u yaklaşık harf/kelime eşlemesiyle belirle
+        cursor_tokens = max(0, min(len(tgt_toks)-1, start_hint))
+        # arama penceresi
+        start=max(0, cursor_tokens)
+        end=min(len(tgt_toks), start + max(n + 2*max(1,flex), lookahead_chars//4))
+        best=(0.0,start,start)
+        src_join=" ".join(src_toks)
+        min_len=max(1, n-flex); max_len=min(n+flex, max(1, end-start))
+        for L in range(min_len, max_len+1):
+            j0=start
+            while j0+L<=end:
+                cand=" ".join(tgt_toks[j0:j0+L])
+                if _digits_mask(cand)!=_digits_mask(src_join):
+                    j0+=1; continue
+                ratio=difflib.SequenceMatcher(a=src_join,b=cand,autojunk=False).ratio()
+                if ratio>best[0]: best=(ratio,j0,j0+L)
+                j0+=1
+        ratio,j0,j1=best
+        return " ".join(tgt_toks[j0:j1]) if ratio>=min_ratio else src_clean
+
+    SYSTEM = (
+        "Sen bir OCR düzeltme yardımcısısın. Yalnızca JSON döndür.\n"
         "Kurallar:\n"
-        "1) Yalnızca yazım/boşluk/diakritik düzelt; içerik ekleme/çıkarma yapma.\n"
-        "2) Sayıları ve biçimlerini (binlik/ondalık) KESİNLİKLE koru.\n"
-        "3) Mümkünse ÇIKTI, verilen SAYFA METNİ içinde birebir geçen EN YAKIN ifadeyi seçsin.\n"
-        "4) ÇIKTI tek satır düz metin olacak; başka açıklama, etiket veya alıntı işareti ekleme.\n"
+        "- İçerik ekleme/çıkarma yok, sadece SAYFA METNİ içinde en uygun dilimi seç.\n"
+        "- Rakam ve biçimler korunacak.\n"
+        "- ÇIKTI SADECE şu şablonda olmalı: {\"start\":<int>,\"end\":<int>} (karakter indeksleri, Python slice mantığı).\n"
+        "- Başka hiçbir metin, açıklama, alıntı, kod bloğu yazma."
     )
 
-    for page_idx, (regions, page_text) in enumerate(zip(paddle_ocr_regions, paddle_ocr_texts)):
-        if not regions: 
+    for page_regions, page_text_raw in zip(paddle_ocr_regions, paddle_ocr_texts):
+        if not page_regions: continue
+
+        page_text = _norm(page_text_raw)
+        if not page_text:
+            # sayfa boşsa: sadece normalize et
+            for r in page_regions: r["text"]=_norm(r.get("text",""))
             continue
 
-        # Her bbox için LLM çağrısı
-        for r in regions:
-            src_raw  = r.get("text", "")
-            src_norm = _norm(src_raw)
-            if not src_norm:
-                r["text"] = ""
+        # sırayı sabitle
+        regs_sorted = sorted(page_regions, key=_yx_key)
+
+        # kaba karakter cursor'ını ilerletmek için basit sayaç
+        char_cursor = 0
+
+        for r in regs_sorted:
+            src_raw = r.get("text","")
+            src_clean = _norm(src_raw)
+            if not src_clean:
+                r["text"]=""
                 continue
 
-            context = _slice_with_query(page_text, src_norm, radius=window_chars//2)
+            # sayfadan lokal pencere (gereksiz token israfını önlemek için)
+            L = max(window_chars, len(src_clean)*4)
+            left = max(0, char_cursor - L//4)
+            right = min(len(page_text), char_cursor + L)
+            context = page_text[left:right]
 
-            user_prompt = (
-                "SAYFA METNİ:\n"
-                f"{context}\n\n"
-                "BBOX METNİ (hatalı olabilir):\n"
-                f"{src_norm}\n\n"
-                "Görev: BBOX METNİ'ni SAYFA METNİ içinden en uygun ifadeyle eşleştir ve "
-                "yalnızca düzeltilmiş ifadeyi yaz. Numara ve noktalama biçimini koru."
+            user = (
+                f"SAYFA METNİ (karakter aralığı {left}:{right}):\n{context}\n\n"
+                f"BBOX METNİ (hatalı olabilir):\n{src_clean}\n\n"
+                "Görev: BBOX METNİ'ne en çok benzeyen ifadeyi SAYFA METNİ içinde bul.\n"
+                "Sadece JSON ver: {\"start\":<global_index>, \"end\":<global_index>}.\n"
+                f"Global indeks = SAYFA METNİ'nin orijinalindeki indeks; bu pencerede yerel değil. "
+                "Bulamazsan, en yakın eşleşmeyi tahmini indeksle ver."
             )
 
+            # --- LLM denemesi ---
+            fixed = None
             try:
-                fixed = paddleocr_usage.response_generation_v_gemma(
-                    system_message=SYSTEM_PROMPT,
-                    user_input=user_prompt,
+                js = paddleocr_usage.response_generation_v_gemma(
+                    system_message=SYSTEM,
+                    user_input=user,
                     temp=temperature,
                     max_t=max_tokens
                 )
-                fixed = (fixed or "").strip()
+                # Yalnız sayı/boşluk olabilir; JSON yakala
+                js = (js or "").strip()
+                d = json.loads(js)
+                s = int(d.get("start", -1)); e = int(d.get("end", -1))
+                if 0 <= s < e <= len(page_text):
+                    cand = page_text[s:e]
+                    # güvenlik: sayı maskesi ve uzunluk mantıklı mı?
+                    if _digits_mask(cand)==_digits_mask(src_clean):
+                        fixed = _norm(cand)
+                        char_cursor = e  # ilerle
             except Exception:
-                fixed = src_norm
+                fixed = None
 
-            # Güvenlik kontrolleri: sayı ve aşırı uzama
-            if _digits_mask(fixed) != _digits_mask(src_norm):
-                # sayılar bozulmuşsa aslına dön
-                fixed = src_norm
-            if len(fixed) > max(len(src_norm) * 2, 2000):
-                fixed = src_norm
+            # --- Yedek: difflib ile aynı uzunlukta (±flex) en iyi dilim ---
+            if not fixed:
+                fixed = _best_slice_by_diff(src_clean, page_text,
+                                            start_hint=char_cursor,
+                                            flex=flex_tokens,
+                                            lookahead_chars=window_chars,
+                                            min_ratio=min_ratio)
+                # char_cursor'u kaba şekilde güncelle
+                try:
+                    pos = page_text.find(fixed, char_cursor)
+                    if pos != -1:
+                        char_cursor = pos + len(fixed)
+                except Exception:
+                    pass
+
+            # Son güvenlik
+            if _digits_mask(fixed) != _digits_mask(src_clean):
+                fixed = src_clean
+            if len(fixed) > max(len(src_clean)*2, 2000):
+                fixed = src_clean
 
             r["text"] = fixed
 
     return paddle_ocr_regions
 
-paddle_ocr_regions = llm_rewrite_regions_texts_using_page_text(
+paddle_ocr_regions = fix_regions_with_llm_or_diff(
     paddle_ocr_regions,
     paddle_ocr_texts,
-    temperature=0.0,     # deterministik
-    max_tokens=180,
-    window_chars=280     # bağlam penceresi
+    temperature=0.0,
+    max_tokens=200,
+    window_chars=300,
+    flex_tokens=0,      # birebir uzunluk hedefi
+    min_ratio=0.62
 )
