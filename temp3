@@ -1,70 +1,27 @@
-# -*- coding: utf-8 -*-
 import os
-import io
-import json
-import base64
+import cv2
+import tempfile
 import requests
-import numpy as np
-from PIL import Image
-from typing import List, Optional, Sequence
+import base64
+import json
 
-TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"  # as requested
-TOKEN_ENV  = "INTGW_ACCESS_KEY"  # exact env var name you showed
+def call_paddle_ocr_text_only(image_path):
+    """Send a PNG file path to the OCR API and return extracted text."""
+    with open(image_path, "rb") as f:
+        image_byte = f.read()
+    image_base64 = base64.b64encode(image_byte).decode("utf-8")
 
-def _ensure_uint8(x: np.ndarray) -> np.ndarray:
-    if x.dtype != np.uint8:
-        x = np.clip(x, 0, 255).astype(np.uint8)
-    return x
-
-def _np_to_pil(img: np.ndarray) -> Image.Image:
-    """
-    Accepts GRAY (H,W), BGR/RGB (H,W,3), or BGRA/RGBA (H,W,4).
-    Converts to PIL.Image in RGB for safe PNG encoding.
-    """
-    if img.ndim == 2:
-        # GRAY -> RGB
-        return Image.fromarray(_ensure_uint8(img), mode="L").convert("RGB")
-    if img.ndim == 3:
-        h, w, c = img.shape
-        if c == 3:
-            # Heuristic: most OpenCV pipelines are BGR; convert by channel flip.
-            # If your source is already RGB, set force_rgb=True below and skip flip.
-            bgr = _ensure_uint8(img)
-            rgb = bgr[..., ::-1]  # BGR->RGB
-            return Image.fromarray(rgb, mode="RGB")
-        if c == 4:
-            # Assume BGRA/RGBA -> convert to RGB
-            rgba = _ensure_uint8(img)
-            pil = Image.fromarray(rgba, mode="RGBA").convert("RGB")
-            return pil
-    raise ValueError(f"Unsupported ndarray shape: {img.shape}")
-
-def _pil_png_base64(pil_img: Image.Image) -> str:
-    """
-    Encode a PIL image to PNG in-memory and return base64 string.
-    """
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    b = buf.getvalue()
-    return base64.b64encode(b).decode("utf-8")
-
-def _headers() -> dict:
-    token = os.environ[TOKEN_ENV]  # will raise KeyError if missing, which is OK
-    return {
-        "Access-Token": token,          # exact header you used
-        "Content-Type": "application/json",
+    ACCESS_TOKEN = os.environ["INTGW_ACCESS_KEY"]
+    TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
+    headers = {
+        "Access-Token": ACCESS_TOKEN,
+        "Content-Type": "application/json"
     }
 
-def _payload(image_b64: str) -> dict:
-    """
-    Your payload, unchanged except that 'content' is set from the in-memory PNG.
-    """
-    return {
+    payload = {
         "requestHeader": {
             "info": {
-                "correlationPair": [
-                    {"key": "AppName", "value": "Postman"}
-                ]
+                "correlationPair": [{"key": "AppName", "value": "Postman"}]
             }
         },
         "customerNo": 10651337,
@@ -88,66 +45,47 @@ def _payload(image_b64: str) -> dict:
             "roles": [{"roleID": "1501"}]
         },
         "includeBbox": False,
-        "content": image_b64,   # <-- in-memory PNG base64
+        "content": image_base64
     }
 
-def call_paddle_ocr_text_only_array(img: np.ndarray, *, timeout: int = 45, debug: bool = False) -> Optional[str]:
-    """
-    One image (numpy array) -> OCR text (str) or None.
-    """
-    if img is None:
-        return None
-
-    pil = _np_to_pil(img)
-    image_b64 = _pil_png_base64(pil)
-
-    resp = requests.post(
-        TARGET_URL,
-        headers=_headers(),
-        json=_payload(image_b64),
-        verify=False,
-        timeout=timeout,
-    )
-
-    if debug:
-        print(f"HTTP {resp.status_code}")
-        try:
-            print(resp.text[:400])
-        except Exception:
-            pass
-
+    resp = requests.post(TARGET_URL, headers=headers, json=payload, verify=False, timeout=60)
     if resp.status_code != 200:
+        print(f"OCR failed ({resp.status_code}):", resp.text[:400])
         return None
 
     data = resp.json()
     pages = data.get("ocrPageResultList", [])
-    if not isinstance(pages, list):
-        return None
-
-    # Concatenate page texts if multiple are returned for a single image.
     texts = [(p.get("extractedText") or "") for p in pages]
-    doc_text = "\n".join(texts).strip()
-    return doc_text if doc_text else None
+    return "\n".join(texts).strip() if texts else None
 
-def call_paddle_ocr_text_only_batch(imgs: Sequence[Optional[np.ndarray]], *, debug_each: bool = False) -> List[Optional[str]]:
-    """
-    Batch over a list like `final_lower_imgs` and return one text per image.
-    """
-    out: List[Optional[str]] = []
-    for i, im in enumerate(imgs):
-        if im is None:
-            out.append(None)
+
+def run_ocr_on_numpy_list(final_lower_imgs):
+    """Save NumPy images as temporary PNGs, run OCR, and delete the files."""
+    results = []
+    for i, img in enumerate(final_lower_imgs):
+        if img is None:
+            results.append(None)
             continue
-        try:
-            txt = call_paddle_ocr_text_only_array(im, debug=debug_each)
-            out.append(txt)
-        except Exception as e:
-            if debug_each:
-                print(f"[{i}] OCR failed: {e}")
-            out.append(None)
-    return out
 
-# final_lower_imgs is a list of numpy arrays
-texts = call_paddle_ocr_text_only_batch(final_lower_imgs, debug_each=True)
+        # Save to temp PNG
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+            cv2.imwrite(tmp_path, img)
+        
+        try:
+            print(f"[{i}] Sending {tmp_path} to OCR...")
+            text = call_paddle_ocr_text_only(tmp_path)
+            results.append(text)
+        except Exception as e:
+            print(f"[{i}] OCR failed:", e)
+            results.append(None)
+        finally:
+            # Always delete the temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    return results
+
+texts = run_ocr_on_numpy_list(final_lower_imgs)
 for i, t in enumerate(texts):
     print(f"\n=== PAGE {i} ===\n", t or "(No text detected / OCR failed)")
