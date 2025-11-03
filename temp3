@@ -1,34 +1,39 @@
-def rewrite_regions_texts_strict(paddle_ocr_regions, paddle_ocr_texts,
-                                 flex=1, lookahead=60, min_ratio=0.55):
+def rewrite_regions_texts_exactlike(paddle_ocr_regions, paddle_ocr_texts,
+                                    flex=0, lookahead=80, min_ratio=0.65):
     """
-    Her sayfada regions[j]['text']'i, aynı sayfanın paddle_ocr_texts[i]'ine göre,
-    KUTU SINIRINI BOZMADAN yeniden yazar.
+    Her bbox'ın 'text'ini, aynı sayfanın metnindeki EN BENZER aynı-uzunluklu
+    (±flex) dilimle değiştirir. Kutu sınırları korunur; yalnızca yazım/boşluk/
+    diakritik düzeltmesi yapılır. Eşleşme zayıfsa, bbox'ın kendi temiz hâli bırakılır.
 
-    Parametreler
-    - flex:  her kutu için hedef pencere uzunluğunu ±flex token esnet (örn. n±1)
-    - lookahead: arama, sayfa token akışında cursor'dan itibaren en fazla bu kadar token ileriye bakar
-    - min_ratio: benzerlik (SequenceMatcher) alt sınırı; altındaysa orijinali temizleyip bırakır
+    flex=0  -> birebir aynı token sayısı (önerilen)
+    lookahead -> cursor'dan ileri bakılacak max token
+    min_ratio -> benzerlik tabanı (0.65 tipik; veri kalitesine göre 0.55–0.75)
 
-    Not: BBox sırası korunur. Yalnızca 'text' güncellenir.
+    Beklenen veri:
+      paddle_ocr_regions: List[List[{'text': str, 'bbox': {...}, ...}]]
+      paddle_ocr_texts  : List[str]
     """
     import re, unicodedata, difflib
 
     assert len(paddle_ocr_regions) == len(paddle_ocr_texts), "Uzunluklar uyuşmuyor."
 
-    def _clean(s):
-        if not isinstance(s, str): return ""
+    # --- normalizasyon yardımcıları ---
+    def _norm(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
         s = unicodedata.normalize("NFKC", s)
         s = (s.replace("•"," ").replace("·"," ").replace("§","S")
                .replace("|"," ").replace("¦"," ").replace("—","-").replace("–","-")
                .replace("İ","İ").replace("i̇","i")
                .replace("Ş","Ş").replace("Ğ","Ğ").replace("Ç","Ç").replace("Ü","Ü")
                .replace("ş","ş").replace("ğ","ğ").replace("ç","ç").replace("ü","ü"))
-        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)
+        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)     # 25 . 000 , 00 -> 25.000,00
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def _tokens(s):
-        s = _clean(s);  return s.split() if s else []
+    def _tokens(s: str):
+        s = _norm(s)
+        return s.split() if s else []
 
     def _yx_key(r):
         b = r.get("bbox", {})
@@ -36,24 +41,28 @@ def rewrite_regions_texts_strict(paddle_ocr_regions, paddle_ocr_texts,
         x = (b.get("x1",0)+b.get("x2",0)+b.get("x3",0)+b.get("x4",0))//4
         return (y, x)
 
+    def _digits_mask(s: str) -> str:
+        # Sayı kalıbını koruma (örn. 25.000.000,00) için hızlı kontrol
+        return re.sub(r"\d", "#", s)
+
     for page_regions, page_text in zip(paddle_ocr_regions, paddle_ocr_texts):
-        if not page_regions: 
+        if not page_regions:
             continue
 
-        # Yukarıdan-aşağı, soldan-sağa
         regs_sorted = sorted(page_regions, key=_yx_key)
 
-        tgt_tokens = _tokens(page_text)
-        if not tgt_tokens:
-            # Sayfa düz metin boşsa kutu metinlerini sadece temizle
+        tgt_toks = _tokens(page_text)
+        if not tgt_toks:
+            # sayfa metni boşsa: yalnızca kendi metnini normalize et
             for r in regs_sorted:
-                r["text"] = _clean(r.get("text",""))
+                r["text"] = _norm(r.get("text",""))
             continue
 
         cursor = 0  # hedef akışta ilerleyen imleç
 
         for r in regs_sorted:
-            src_clean = _clean(r.get("text",""))
+            src_raw  = r.get("text","")
+            src_clean = _norm(src_raw)
             src_toks  = src_clean.split() if src_clean else []
             n = len(src_toks)
 
@@ -61,21 +70,25 @@ def rewrite_regions_texts_strict(paddle_ocr_regions, paddle_ocr_texts,
                 r["text"] = ""
                 continue
 
-            # Arama penceresi: cursor'dan itibaren lookahead token
             start = max(0, cursor)
-            end   = min(len(tgt_tokens), start + max(lookahead, n + 2*flex))
+            end   = min(len(tgt_toks), start + max(lookahead, n + 2*max(1,flex)))
 
             best = (0.0, start, start)  # (ratio, j0, j1)
             min_len = max(1, n - flex)
             max_len = min(n + flex, max(1, end - start))
 
             src_join = " ".join(src_toks)
+            src_mask = _digits_mask(src_join)
 
-            # Aynı uzunlukta (±flex) alt-dilimler üzerinde benzerlik ara
             for L in range(min_len, max_len + 1):
                 j0 = start
                 while j0 + L <= end:
-                    cand = " ".join(tgt_tokens[j0:j0+L])
+                    cand_tokens = tgt_toks[j0:j0+L]
+                    cand = " ".join(cand_tokens)
+                    # hızlı sayı kalıbı kontrolü (sayılar yer/biçim olarak benzer kalsın)
+                    if _digits_mask(cand) != src_mask:
+                        j0 += 1
+                        continue
                     ratio = difflib.SequenceMatcher(a=src_join, b=cand, autojunk=False).ratio()
                     if ratio > best[0]:
                         best = (ratio, j0, j0+L)
@@ -83,17 +96,17 @@ def rewrite_regions_texts_strict(paddle_ocr_regions, paddle_ocr_texts,
 
             ratio, j0, j1 = best
             if ratio >= min_ratio:
-                r["text"] = " ".join(tgt_tokens[j0:j1])
-                cursor = j1  # sırayı koru, ileri kay
+                r["text"] = " ".join(tgt_toks[j0:j1])
+                cursor = j1
             else:
-                # eşleşme zayıf: sadece kendi metnini temizle (sınırları bozma)
+                # Eşleşme zayıfsa: kutuyu bozma, yalnız kendi metnini düzgünleştir
                 r["text"] = src_clean
 
     return paddle_ocr_regions
 
-paddle_ocr_regions = rewrite_regions_texts_strict(
+paddle_ocr_regions = rewrite_regions_texts_exactlike(
     paddle_ocr_regions, paddle_ocr_texts,
-    flex=1,          # kutu başına ±1 token esneklik
-    lookahead=60,    # ileri bakan pencere
-    min_ratio=0.55   # benzerlik alt sınırı
+    flex=0,          # birebir uzunluk
+    lookahead=100,
+    min_ratio=0.65
 )
