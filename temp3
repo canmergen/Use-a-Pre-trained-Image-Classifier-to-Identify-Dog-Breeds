@@ -2,7 +2,7 @@
 import os, base64, cv2, numpy as np, requests
 
 TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
-TOKEN_ENV = "INTGW_ACCESS_KEY"
+TOKEN_ENV  = "INTGW_ACCESS_KEY"
 
 def _ensure_uint8(x):
     return np.clip(x, 0, 255).astype(np.uint8) if x.dtype != np.uint8 else x
@@ -17,8 +17,8 @@ def _to_bgr(img):
         return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     raise ValueError(f"Unsupported image shape {img.shape}")
 
-def _encode_png_b64(img):
-    ok, buf = cv2.imencode(".png", img)
+def _encode_png_b64(img_bgr):
+    ok, buf = cv2.imencode(".png", img_bgr)
     if not ok:
         raise RuntimeError("PNG encoding failed")
     return base64.b64encode(buf).decode("utf-8")
@@ -27,32 +27,26 @@ def _auto_resize(img, max_mb=4.5, min_side=600, debug=False):
     bgr = _to_bgr(img)
     h, w = bgr.shape[:2]
     b64 = _encode_png_b64(bgr)
-    size_mb = len(b64) / 1_000_000.0
-    if debug:
-        print(f"[OCR] Initial size={size_mb:.2f} MB, shape={h}x{w}")
-
-    if size_mb <= max_mb:
-        return bgr
-
-    scale = 0.9
-    while size_mb > max_mb and min(h, w) > min_side:
-        h, w = int(h * scale), int(w * scale)
+    mb = len(b64)/1_000_000.0
+    if debug: print(f"[OCR] initial size={mb:.2f} MB, shape={h}x{w}")
+    if mb <= max_mb: return bgr
+    scale = 0.90
+    while mb > max_mb and min(h, w) > min_side:
+        h, w = int(h*scale), int(w*scale)
         bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-        b64 = _encode_png_b64(bgr)
-        size_mb = len(b64) / 1_000_000.0
-        if debug:
-            print(f"[OCR] Rescaled -> {size_mb:.2f} MB, shape={h}x{w}")
-        scale *= 0.9
+        b64 = _encode_png_b64(bgr); mb = len(b64)/1_000_000.0
+        if debug: print(f"[OCR] rescaled -> {mb:.2f} MB, shape={h}x{w}")
+        scale *= 0.92
     return bgr
 
 def _headers():
-    token = os.environ[TOKEN_ENV]
     return {
-        "Access-Token": token,
-        "Content-Type": "application/json"
+        "Access-Token": os.environ[TOKEN_ENV],
+        "Content-Type": "application/json",
     }
 
-def _payload(image_b64):
+def _base_fields():
+    # Your exact business fields; only the image-related toggles change
     return {
         "requestHeader": {
             "info": {"correlationPair": [{"key": "AppName", "value": "Postman"}]}
@@ -66,32 +60,35 @@ def _payload(image_b64):
         "clientPort": "0",
         "registrationNo": "49001",
         "userInfo": {
-            "userID": "153",
-            "userCode": "49001",
-            "userBranchCode": "936",
+            "userID": "153", "userCode": "49001", "userBranchCode": "936",
             "roles": [{"roleID": "1501"}]
         },
         "performerUserInfo": {
-            "userID": "153",
-            "userCode": "49001",
-            "userBranchCode": "936",
+            "userID": "153", "userCode": "49001", "userBranchCode": "936",
             "roles": [{"roleID": "1501"}]
         },
-        "includeBbox": "false",  # send as string
-        "fileName": "image.png",
-        "fileType": "png",
-        "contentType": "image/png",
-        "sourceSystem": "OCRApp",
-        "content": image_b64
     }
 
-def _post_ocr(image_b64, debug=False):
-    resp = requests.post(TARGET_URL, headers=_headers(), json=_payload(image_b64), verify=False, timeout=45)
+def _try_one(image_b64, *, include_bbox, file_type, add_filename, add_content_type, content_key, debug=False):
+    payload = dict(_base_fields())
+    # image-related toggles
+    payload["includeBbox"] = include_bbox
+    if add_filename:
+        payload["fileName"] = f"image.{file_type.lower()}"
+    payload["fileType"] = file_type
+    if add_content_type:
+        payload["contentType"] = "image/png"
+    payload[content_key] = image_b64
+
+    resp = requests.post(TARGET_URL, headers=_headers(), json=payload, verify=False, timeout=45)
     if debug:
-        print(f"HTTP {resp.status_code}")
-        print(resp.text[:400])
+        print(f"HTTP {resp.status_code} :: includeBbox={include_bbox!r}, fileType={file_type}, "
+              f"fileName={add_filename}, contentType={add_content_type}, key={content_key}")
+        if resp.status_code != 200:
+            print(resp.text[:400])
     if resp.status_code != 200:
-        raise RuntimeError(f"OCR API failed: {resp.status_code} - {resp.text[:300]}")
+        return None, (resp.status_code, resp.text[:400])
+
     data = resp.json()
     pages = (
         data.get("ocrPageResultList")
@@ -99,30 +96,56 @@ def _post_ocr(image_b64, debug=False):
         or data.get("result", {}).get("ocrPageResultList")
         or []
     )
-    return "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
+    text = "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
+    return text, None
 
-def call_paddle_ocr_text_only_array(img, *, debug=False):
-    if img is None:
-        return ""
+def call_paddle_ocr_text_only_array_autoprobe(img, debug=False):
     bgr = _auto_resize(img, debug=debug)
-    image_b64 = _encode_png_b64(bgr)
-    return _post_ocr(image_b64, debug=debug)
+    b64 = _encode_png_b64(bgr)
 
-def call_paddle_ocr_text_only_batch(imgs, *, debug_each=False):
+    include_bbox_opts = [False, "false"]          # bool vs string
+    file_type_opts    = ["png", "PNG"]            # case differences
+    filename_opts     = [True, False]             # with/without fileName
+    content_type_opts = [True, False]             # with/without contentType
+    content_keys      = ["content", "imageBase64"]# key name differences
+
+    errors = []
+    for ib in include_bbox_opts:
+        for ft in file_type_opts:
+            for fn in filename_opts:
+                for ct in content_type_opts:
+                    for ck in content_keys:
+                        text, err = _try_one(
+                            b64,
+                            include_bbox=ib,
+                            file_type=ft,
+                            add_filename=fn,
+                            add_content_type=ct,
+                            content_key=ck,
+                            debug=debug,
+                        )
+                        if text is not None:
+                            print("\n[OK] schema:",
+                                  f"includeBbox={ib!r}, fileType={ft}, fileName={fn}, contentType={ct}, key={ck}")
+                            return text
+                        else:
+                            errors.append((ib, ft, fn, ct, ck, err[0]))
+    # If all failed, show a short summary of status codes seen
+    codes = sorted(set(code for *_, code in errors))
+    print("[Fail] tried", len(errors), "schemas; status codes:", codes)
+    return ""
+
+def call_paddle_ocr_text_only_batch_autoprobe(imgs, debug_each=False):
     results = []
     for i, im in enumerate(imgs):
         if im is None:
             results.append(None); continue
-        try:
-            print(f"\n[OCR] Sending image {i} ...")
-            text = call_paddle_ocr_text_only_array(im, debug=debug_each)
-            results.append(text)
-            print(f"[{i}] Done. Length={len(text)}")
-        except Exception as e:
-            print(f"[{i}] OCR failed:", e)
-            results.append(None)
+        print(f"\n[OCR] Sending image {i} ...")
+        txt = call_paddle_ocr_text_only_array_autoprobe(im, debug=debug_each)
+        results.append(txt if txt else None)
+        print(f"[{i}] result length:", len(txt or ""))
     return results
 
-texts = call_paddle_ocr_text_only_batch(final_lower_imgs, debug_each=True)
+texts = call_paddle_ocr_text_only_batch_autoprobe(final_lower_imgs, debug_each=True)
 for i, t in enumerate(texts):
     print(f"\n=== PAGE {i} ===\n", t or "(No text detected / OCR failed)")
