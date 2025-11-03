@@ -1,38 +1,105 @@
-import cv2
-import os
+def rewrite_regions_texts_using_page_text(paddle_ocr_regions, paddle_ocr_texts):
+    """
+    Her sayfada regions[j]['text'] değerlerini, aynı sayfanın paddle_ocr_texts[i]
+    metnine göre yeniden yazar. BBox'lar korunur, yalnızca 'text' güncellenir.
+    """
+    import re, unicodedata, difflib
 
-# Save resized PNGs in current working directory
-png_paths = []
-scale = 0.5  # reduce size to 50%; adjust as you wish
+    assert len(paddle_ocr_regions) == len(paddle_ocr_texts), "Uzunluklar uyuşmuyor."
 
-for i, img in enumerate(final_lower_imgs):
-    if img is None:
-        continue
-    # Resize image
-    h, w = img.shape[:2]
-    resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    def _clean(s):
+        if not isinstance(s, str): 
+            return ""
+        s = unicodedata.normalize("NFKC", s)
+        s = (s.replace("•"," ").replace("·"," ").replace("§","S")
+               .replace("|"," ").replace("¦"," ").replace("—","-").replace("–","-")
+               .replace("İ","İ").replace("i̇","i")
+               .replace("Ş","Ş").replace("Ğ","Ğ").replace("Ç","Ç").replace("Ü","Ü")
+               .replace("ş","ş").replace("ğ","ğ").replace("ç","ç").replace("ü","ü"))
+        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    # Save resized image
-    filename = f"temp_page_{i}.png"
-    cv2.imwrite(filename, resized)
-    png_paths.append(filename)
-    print(f"Saved smaller image: {filename} ({resized.shape[1]}x{resized.shape[0]})")
+    def _tokens(s):  # temizle + tokenize
+        s = _clean(s);  return s.split() if s else []
 
-# Delete the PNGs afterward
-for path in png_paths:
-    try:
-        os.remove(path)
-        print(f"Deleted: {path}")
-    except Exception as e:
-        print(f"Could not delete {path}: {e}")
+    def _bbox_sort_key(r):
+        b = r.get("bbox", {})
+        y = (b.get("y1",0)+b.get("y2",0)+b.get("y3",0)+b.get("y4",0))//4
+        x = (b.get("x1",0)+b.get("x2",0)+b.get("x3",0)+b.get("x4",0))//4
+        return (y, x)
 
-# You can now open your working directory and see the PNGs.
-# Run your OCR or any processing here...
+    def _build_spans(regs_sorted):
+        spans = []; cur = 0
+        for r in regs_sorted:
+            n = len(_tokens(r.get("text","")))
+            spans.append((cur, cur+n)); cur += n
+        return spans
 
-# Delete the PNGs afterward
-for path in png_paths:
-    try:
-        os.remove(path)
-        print(f"Deleted: {path}")
-    except Exception as e:
-        print(f"Could not delete {path}: {e}")
+    def _map_span(opcodes, a0, a1):
+        j_start, j_end = None, None
+        for tag, i1, i2, j1, j2 in opcodes:
+            if i2 <= a0: 
+                continue
+            if i1 >= a1 and j_start is not None:
+                break
+            take_i1 = max(i1, a0); take_i2 = min(i2, a1)
+            take_len = max(0, take_i2 - take_i1)
+            if take_len == 0:
+                continue
+            if j_start is None:
+                off = take_i1 - i1
+                i_len = i2 - i1
+                j_len = j2 - j1
+                ratio = 0 if i_len == 0 else min(1.0, max(0.0, off / i_len))
+                j_start = j1 + int(round(ratio * j_len))
+            j_len = j2 - j1
+            i_len = (i2 - i1) or 1
+            mapped = int(round(j_len * (take_len / i_len)))
+            j_end = (j_start if j_end is None else j_end) + max(1, mapped)
+        if j_start is None: j_start = 0
+        if j_end is None or j_end < j_start: j_end = j_start
+        return j_start, j_end
+
+    for i, (regions, page_text) in enumerate(zip(paddle_ocr_regions, paddle_ocr_texts)):
+        if not regions:
+            continue
+
+        regs_sorted = sorted(regions, key=_bbox_sort_key)
+
+        # kaynak (bbox metin akışı) ve hedef (sayfa metni) tokenları
+        src_tokens = []
+        for r in regs_sorted:
+            src_tokens.extend(_tokens(r.get("text","")))
+        if not src_tokens:
+            continue
+        tgt_tokens = _tokens(page_text)
+
+        # hizalama
+        sm = difflib.SequenceMatcher(a=src_tokens, b=tgt_tokens, autojunk=False)
+        opcodes = sm.get_opcodes()
+
+        # bbox->hedef aralık projeksiyonu ve text yazımı
+        for r, (a0, a1) in zip(regs_sorted, _build_spans(regs_sorted)):
+            if a1 <= a0:
+                r["text"] = ""
+                continue
+            j0, j1 = _map_span(opcodes, a0, a1)
+            j0 = max(0, min(j0, len(tgt_tokens)))
+            j1 = max(j0, min(j1, len(tgt_tokens)))
+            new_tokens = tgt_tokens[j0:j1]
+
+            if not new_tokens and len(tgt_tokens) > 0:
+                want = a1 - a0
+                left = max(0, j0 - want//2)
+                right = min(len(tgt_tokens), left + max(1, want))
+                new_tokens = tgt_tokens[left:right]
+
+            r["text"] = " ".join(new_tokens)
+
+    return paddle_ocr_regions
+
+paddle_ocr_regions = rewrite_regions_texts_using_page_text(
+    paddle_ocr_regions,
+    paddle_ocr_texts
+)
