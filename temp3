@@ -1,117 +1,153 @@
 # -*- coding: utf-8 -*-
-import os, base64, cv2, numpy as np, requests
+import os
+import io
+import json
+import base64
+import requests
+import numpy as np
+from PIL import Image
+from typing import List, Optional, Sequence
 
-BASE = "https://internalgw/neomediaoperationsinternal/api/clear-ocr"
-URLS = [f"{BASE}/post/v1", f"{BASE}/execute/v1", f"{BASE}/get/v1"]
-TOKEN_ENV = "INTGW_ACCESS_KEY"
+TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"  # as requested
+TOKEN_ENV  = "INTGW_ACCESS_KEY"  # exact env var name you showed
 
-def _ensure_uint8(x): return np.clip(x, 0, 255).astype(np.uint8) if x.dtype != np.uint8 else x
-def _to_bgr(img):
-    img = _ensure_uint8(img)
-    if img.ndim == 2:  return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if img.ndim == 3 and img.shape[2] == 3: return img
-    if img.ndim == 3 and img.shape[2] == 4: return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    raise ValueError(f"Unsupported shape {img.shape}")
+def _ensure_uint8(x: np.ndarray) -> np.ndarray:
+    if x.dtype != np.uint8:
+        x = np.clip(x, 0, 255).astype(np.uint8)
+    return x
 
-def _b64_png(img_bgr):
-    ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok: raise RuntimeError("PNG encode failed")
-    return base64.b64encode(buf).decode("utf-8")
+def _np_to_pil(img: np.ndarray) -> Image.Image:
+    """
+    Accepts GRAY (H,W), BGR/RGB (H,W,3), or BGRA/RGBA (H,W,4).
+    Converts to PIL.Image in RGB for safe PNG encoding.
+    """
+    if img.ndim == 2:
+        # GRAY -> RGB
+        return Image.fromarray(_ensure_uint8(img), mode="L").convert("RGB")
+    if img.ndim == 3:
+        h, w, c = img.shape
+        if c == 3:
+            # Heuristic: most OpenCV pipelines are BGR; convert by channel flip.
+            # If your source is already RGB, set force_rgb=True below and skip flip.
+            bgr = _ensure_uint8(img)
+            rgb = bgr[..., ::-1]  # BGR->RGB
+            return Image.fromarray(rgb, mode="RGB")
+        if c == 4:
+            # Assume BGRA/RGBA -> convert to RGB
+            rgba = _ensure_uint8(img)
+            pil = Image.fromarray(rgba, mode="RGBA").convert("RGB")
+            return pil
+    raise ValueError(f"Unsupported ndarray shape: {img.shape}")
 
-def _autoshrink(img, max_mb=4.5, min_side=600, debug=False):
-    bgr = _to_bgr(img)
-    b64 = _b64_png(bgr); mb = len(b64)/1_000_000
-    if debug: print(f"[OCR] size={mb:.2f}MB, shape={bgr.shape[:2]}")
-    while mb > max_mb and min(bgr.shape[:2]) > min_side:
-        h, w = bgr.shape[:2]; bgr = cv2.resize(bgr, (int(w*0.9), int(h*0.9)), cv2.INTER_AREA)
-        b64 = _b64_png(bgr); mb = len(b64)/1_000_000
-        if debug: print(f"[OCR] shrink -> {mb:.2f}MB, shape={bgr.shape[:2]}")
-    return bgr, b64
+def _pil_png_base64(pil_img: Image.Image) -> str:
+    """
+    Encode a PIL image to PNG in-memory and return base64 string.
+    """
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    b = buf.getvalue()
+    return base64.b64encode(b).decode("utf-8")
 
-def _base_payload(image_b64):
+def _headers() -> dict:
+    token = os.environ[TOKEN_ENV]  # will raise KeyError if missing, which is OK
+    return {
+        "Access-Token": token,          # exact header you used
+        "Content-Type": "application/json",
+    }
+
+def _payload(image_b64: str) -> dict:
+    """
+    Your payload, unchanged except that 'content' is set from the in-memory PNG.
+    """
     return {
         "requestHeader": {
-            "info": {"correlationPair": [{"key":"AppName","value":"Postman"}]}
+            "info": {
+                "correlationPair": [
+                    {"key": "AppName", "value": "Postman"}
+                ]
+            }
         },
-        "customerNo": "10651337",
-        "branchCode": "936",
+        "customerNo": 10651337,
+        "branchCode": 936,
         "channelInfo": "Branch",
         "language": "tr-TR",
         "transactionCode": "",
         "clientIP": "1.1.1.1",
         "clientPort": "0",
-        "registrationNo": "49001",
+        "registrationNo": 49001,
         "userInfo": {
-            "userID": "153", "userCode": "49001", "userBranchCode": "936",
+            "userID": 153,
+            "userCode": "49001",
+            "userBranchCode": "936",
             "roles": [{"roleID": "1501"}]
         },
         "performerUserInfo": {
-            "userID": "153", "userCode": "49001", "userBranchCode": "936",
+            "userID": 153,
+            "userCode": "49001",
+            "userBranchCode": "936",
             "roles": [{"roleID": "1501"}]
         },
         "includeBbox": False,
-        "fileName": "image.png",
-        "fileType": "png",
-        "contentType": "image/png",
-        "content": image_b64
+        "content": image_b64,   # <-- in-memory PNG base64
     }
 
-def _auth_headers(token, mode):
-    # mode: "access", "bearer", "both"
-    base = {
-        "Accept": "application/json",
-        "User-Agent": "athena-ocr-client/1.0",
-        "Content-Type": "application/json",
-    }
-    if mode in ("access", "both"):
-        base["Access-Token"] = token
-    if mode in ("bearer", "both"):
-        base["Authorization"] = f"Bearer {token}"
-    return base
+def call_paddle_ocr_text_only_array(img: np.ndarray, *, timeout: int = 45, debug: bool = False) -> Optional[str]:
+    """
+    One image (numpy array) -> OCR text (str) or None.
+    """
+    if img is None:
+        return None
 
-def call_ocr_numpy(img, debug=False):
-    token = os.environ[TOKEN_ENV]
-    bgr, image_b64 = _autoshrink(img, debug=debug)
-    payload = _base_payload(image_b64)
+    pil = _np_to_pil(img)
+    image_b64 = _pil_png_base64(pil)
 
-    for url in URLS:
-        for mode in ("access", "bearer", "both"):
-            try:
-                hdr = _auth_headers(token, mode)
-                resp = requests.post(url, headers=hdr, json=payload, verify=False, timeout=45)
-                if debug:
-                    print(f"TRY {url} auth={mode} -> HTTP {resp.status_code}")
-                    if resp.status_code != 200:
-                        t = resp.text
-                        print(t[:400] if t else "(no body)")
-                if resp.status_code == 403:
-                    continue  # authorization mismatch
-                if resp.status_code != 200:
-                    continue  # try next combo
-                data = resp.json()
-                pages = (data.get("ocrPageResultList")
-                         or data.get("OcrPageResultList")
-                         or data.get("result", {}).get("ocrPageResultList")
-                         or [])
-                print(f"[OK] url={url} auth={mode}")
-                return "\n".join([(p.get("extractedText") or "") for p in pages]).strip()
-            except requests.RequestException as e:
-                if debug: print("network error:", e)
-                continue
-    raise RuntimeError("All endpoint/auth combinations returned non-200 (likely ACL on POST).")
+    resp = requests.post(
+        TARGET_URL,
+        headers=_headers(),
+        json=_payload(image_b64),
+        verify=False,
+        timeout=timeout,
+    )
 
-def call_ocr_batch(imgs, debug_each=False):
-    out = []
-    for i, im in enumerate(imgs):
-        if im is None: out.append(None); continue
-        print(f"\n[OCR] page {i}")
+    if debug:
+        print(f"HTTP {resp.status_code}")
         try:
-            txt = call_ocr_numpy(im, debug=debug_each)
-            out.append(txt if txt else None)
+            print(resp.text[:400])
+        except Exception:
+            pass
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json()
+    pages = data.get("ocrPageResultList", [])
+    if not isinstance(pages, list):
+        return None
+
+    # Concatenate page texts if multiple are returned for a single image.
+    texts = [(p.get("extractedText") or "") for p in pages]
+    doc_text = "\n".join(texts).strip()
+    return doc_text if doc_text else None
+
+def call_paddle_ocr_text_only_batch(imgs: Sequence[Optional[np.ndarray]], *, debug_each: bool = False) -> List[Optional[str]]:
+    """
+    Batch over a list like `final_lower_imgs` and return one text per image.
+    """
+    out: List[Optional[str]] = []
+    for i, im in enumerate(imgs):
+        if im is None:
+            out.append(None)
+            continue
+        try:
+            txt = call_paddle_ocr_text_only_array(im, debug=debug_each)
+            out.append(txt)
         except Exception as e:
-            print(f"[{i}] failed:", e); out.append(None)
+            if debug_each:
+                print(f"[{i}] OCR failed: {e}")
+            out.append(None)
     return out
 
-texts = call_ocr_batch(final_lower_imgs, debug_each=True)
+# final_lower_imgs is a list of numpy arrays
+texts = call_paddle_ocr_text_only_batch(final_lower_imgs, debug_each=True)
 for i, t in enumerate(texts):
-   
+    print(f"\n=== PAGE {i} ===\n", t or "(No text detected / OCR failed)")
