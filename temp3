@@ -1,26 +1,59 @@
-# paddleocr_usage.py
-import os
-import json
-import base64
-import requests
+# -*- coding: utf-8 -*-
+"""
+In-memory OCR client for NumPy/PIL images.
+- Accepts np.ndarray (GRAY, BGR, RGB, RGBA) or PIL.Image
+- No disk I/O
+- Returns extracted text ('' if none)
+"""
+
+import os, base64, json
 from io import BytesIO
-from typing import Optional, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
-from PIL import Image
 import numpy as np
+from PIL import Image
+import requests
 
-TARGET_URL = "https://internalgw/neo/mediaoperationsinternal/api/clear-ocr/get/v1"
-ENV_KEY = "INGAI_ACCESS_KEY"  # adjust if your env var name differs
+# --- config ---
+TARGET_URL = "https://internalgw/neomediaoperationsinternal/api/clear-ocr/get/v1"
+ENV_KEY    = "INGAI_ACCESS_KEY"   # must be set in the kernel env
 
-def _encode_image_to_b64(img: Image.Image) -> str:
+
+# ---------- helpers ----------
+def _np_to_pil(img: np.ndarray) -> Image.Image:
+    """Convert np.ndarray -> PIL.Image in RGB (uint8)."""
+    if img.dtype != np.uint8:
+        # keep it simple & safe; clip then cast
+        img = np.clip(img, 0, 255).astype(np.uint8)
+
+    if img.ndim == 2:
+        # GRAY -> RGB
+        return Image.fromarray(img, mode="L").convert("RGB")
+
+    if img.ndim == 3:
+        h, w, c = img.shape
+        if c == 3:
+            # assume BGR (OpenCV) if it *looks* BGR; convert by channel flip
+            # We can't auto-detect reliably, but most OpenCV pipelines are BGR.
+            # If your source is already RGB, set force_rgb=True in caller if you add it.
+            return Image.fromarray(img[:, :, ::-1]).convert("RGB")
+        if c == 4:
+            # BGRA -> RGBA -> RGB
+            return Image.fromarray(img[:, :, [2, 1, 0, 3]], mode="RGBA").convert("RGB")
+        raise ValueError(f"Unsupported channel count: {c}")
+
+    raise ValueError(f"Unsupported ndarray shape: {img.shape}")
+
+
+def _pil_to_b64_png(pil: Image.Image) -> str:
+    """Encode PIL image to base64 PNG string (no disk I/O)."""
     buf = BytesIO()
-    fmt = "PNG"
-    img.save(buf, format=fmt)
-    img_bytes = buf.getvalue()
-    return base64.b64encode(img_bytes).decode("utf-8")
+    pil.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def _post_ocr(image_b64: str) -> str:
-    token = os.environ.get(ENV_KEY)
+
+def _post_ocr(image_b64: str, timeout: int = 30, debug: bool = False) -> str:
+    token = os.getenv(ENV_KEY)
     if not token:
         raise EnvironmentError(f"Missing {ENV_KEY} environment variable")
 
@@ -29,10 +62,10 @@ def _post_ocr(image_b64: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # NOTE: keep only fields your service truly requires.
+    # Trim the payload to the fields your service actually needs.
     payload = {
         "requestHeader": {
-            "info": {"correlationPair": [{"key": "AppName", "value": "Postman"}]}
+            "info": {"correlationPair": [{"key": "AppName", "value": "Notebook"}]}
         },
         "includeBbox": False,
         "content": image_b64,
@@ -40,72 +73,73 @@ def _post_ocr(image_b64: str) -> str:
 
     resp = requests.post(
         TARGET_URL,
-        headers=headers,           # ← fixed
+        headers=headers,          # <- important: not "headers-headers"
         json=payload,
-        verify=False,              # if your internal CA isn’t trusted
-        timeout=30,
+        verify=False,             # keep as required by your network
+        timeout=timeout,
     )
+
+    if debug:
+        print("HTTP", resp.status_code)
+        # print first chars to avoid flooding logs
+        print("Raw:", resp.text[:500])
+
     resp.raise_for_status()
     data = resp.json()
 
-    # Defensive extraction
-    ocr_pages = data.get("ocrPageResultList") or []
-    text_parts = []
-    for page in ocr_pages:
-        t = page.get("extractedText") or ""
+    # endpoint may differ in capitalization; be defensive
+    pages = (
+        data.get("ocrPageResultList")
+        or data.get("OcrPageResultList")
+        or data.get("result", {}).get("ocrPageResultList")
+        or []
+    )
+
+    texts: List[str] = []
+    for p in pages:
+        t = p.get("extractedText") or ""
         if isinstance(t, str):
-            text_parts.append(t)
-    return "\n".join(text_parts).strip()
+            texts.append(t)
 
-def call_paddle_ocr_text_only_path(image_path: str) -> str:
-    """OCR for an image on disk."""
-    img = Image.open(image_path).convert("RGB")
-    image_b64 = _encode_image_to_b64(img)
-    return _post_ocr(image_b64)
+    return "\n".join(texts).strip()
 
-def call_paddle_ocr_text_only_array(img: Union[np.ndarray, Image.Image]) -> str:
-    """OCR for an in-memory image (NumPy array or PIL Image)."""
-    if isinstance(img, np.ndarray):
-        if img.ndim == 2:
-            pil = Image.fromarray(img).convert("RGB")
-        elif img.ndim == 3:
-            # assume BGR from OpenCV; convert to RGB
-            if img.shape[2] == 3:
-                pil = Image.fromarray(img[:, :, ::-1]).convert("RGB")
-            elif img.shape[2] == 4:
-                pil = Image.fromarray(img[:, :, [2,1,0,3]]).convert("RGB")
-            else:
-                raise ValueError("Unsupported channel count in NumPy array")
-        else:
-            raise ValueError("Unsupported ndarray shape for image")
-    elif isinstance(img, Image.Image):
-        pil = img.convert("RGB")
-    else:
-        raise TypeError("img must be a NumPy array or PIL.Image.Image")
 
-    image_b64 = _encode_image_to_b64(pil)
-    return _post_ocr(image_b64)
+# ---------- public API ----------
+def call_paddle_ocr_text_only_array(img: Union[np.ndarray, Image.Image],
+                                    *, debug: bool = False) -> str:
+    """OCR a single in-memory image (np.ndarray or PIL.Image)."""
+    pil = img if isinstance(img, Image.Image) else _np_to_pil(img)
+    b64 = _pil_to_b64_png(pil)  # still PNG, but in memory
+    return _post_ocr(b64, debug=debug)
+
+
+def call_paddle_ocr_text_only_batch(imgs: Sequence[Union[np.ndarray, Image.Image]],
+                                    *, skip_none: bool = True,
+                                    debug_each: bool = False) -> List[Optional[str]]:
+    """OCR a list/sequence of images; returns list[str|None] aligned with input."""
+    out: List[Optional[str]] = []
+    for i, im in enumerate(imgs):
+        if im is None and skip_none:
+            out.append(None)
+            continue
+        try:
+            txt = call_paddle_ocr_text_only_array(im, debug=debug_each)
+            out.append(txt if txt else None)
+        except Exception as e:
+            if debug_each:
+                print(f"[Batch {i}] OCR failed:", e)
+            out.append(None)
+    return out
 
 from importlib import reload
-import paddleocr_usage
-reload(paddleocr_usage)  # ensure latest code
+import paddleocr_numpy_usecase as ocru
+reload(ocru)
 
-from paddleocr_usage import call_paddle_ocr_text_only_array
+# Single image
+# text0 = ocru.call_paddle_ocr_text_only_array(final_lower_imgs[0], debug=True)
 
-ocr_results = []
-for i, img in enumerate(final_lower_imgs):
-    if img is None:
-        ocr_results.append(None)
-        continue
-    try:
-        print(f"[Page {i}] Sending image to OCR API…")
-        text = call_paddle_ocr_text_only_array(img)
-        print(f"[Page {i}] OCR done.")
-        ocr_results.append(text if text else None)
-    except Exception as e:
-        print(f"[Page {i}] OCR failed: {e}")
-        ocr_results.append(None)
-
-for i, text in enumerate(ocr_results):
-    print(f"\n=== PAGE {i} : OCR RESULT ===")
-    print(text or "(No text detected / OCR failed)")
+# Batch
+ocr_texts = ocru.call_paddle_ocr_text_only_batch(final_lower_imgs, debug_each=False)
+for i, t in enumerate(ocr_texts):
+    print(f"\n=== PAGE {i} ===")
+    print(t or "(No text detected / OCR failed)")
