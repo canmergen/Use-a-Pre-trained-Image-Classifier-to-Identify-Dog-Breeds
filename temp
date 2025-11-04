@@ -1,351 +1,107 @@
-def extract_top_info_from_doc_images_fuzzy(
-    doc_images: List[np.ndarray],
-    ocr_fn: Callable[[np.ndarray], str],
-    *,
-    table_top_shift_ratio: float = 0.02,
-    table_guard_margin_px: int = 12,        # ↑ tablo çizgisinden ekstra güvenlik
-    table_guard_margin_ratio: float = 0.012, # ↑ yükseklik oranı kadar ekstra pay
-    fallback_top_ratio: float = 0.18,        # tablo yoksa daha az alan (üst bant)
-    min_upper_px: int = 120,
-    debug: bool = False,
-    show_fig: bool = False,
-    show_table_fig: bool = False,
-) -> pd.DataFrame:
-    import re, unicodedata, cv2, numpy as np, pandas as pd
+import os
+import cv2
+import numpy as np
+from typing import List, Dict, Any, Tuple, Union
+import matplotlib.pyplot as plt
 
-    # ---------- helpers ----------
-    def _upper_tr(s: str) -> str:
-        mp = {"i":"İ","ı":"I","ş":"Ş","ğ":"Ğ","ü":"Ü","ö":"Ö","ç":"Ç"}
-        return "".join(mp.get(ch, ch.upper()) for ch in s or "")
-    def _nfkc(s: str) -> str: return unicodedata.normalize("NFKC", s or "")
-    def _norm_spaces(s: str) -> str:
-        s = (_nfkc(s).replace("\u00A0"," ").replace("\u200B"," ")
-                     .replace("’","'").replace("“",'\"').replace("”",'\"'))
-        return re.sub(r"\s+"," ", s).strip()
-    def _spaced(tok: str) -> str:
-        return r"\s*".join(re.escape(ch) for ch in tok if not ch.isspace())
-
-    # ---------- table detect & upper crop ----------
-    def _detect_table_top(img: np.ndarray) -> Optional[int]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
-        H, W = gray.shape[:2]
-        thr = cv2.adaptiveThreshold(
-            cv2.GaussianBlur(gray,(3,3),0),255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 5
-        )
-        kx, ky = max(12, W//60), max(12, H//60)
-        horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(kx,1)),1)
-        vert  = cv2.morphologyEx(thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT,(1,ky)),1)
-        mask = cv2.bitwise_or(horiz, vert)
-        lines = cv2.HoughLinesP(horiz,1,np.pi/180,threshold=80,minLineLength=int(W*0.55),maxLineGap=10)
-        cand=[]
-        if lines is not None:
-            for x1,y1,x2,y2 in lines[:,0,:]:
-                if abs(y1-y2)<=2: cand.append(int((y1+y2)//2))
-        cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            x,y,w,h = cv2.boundingRect(c)
-            if w>=int(W*0.5) and h>=max(8,H//120): cand.append(y)
-        if not cand: return None
-        y=min(cand); H=int(H)
-        y=int(y + max(2, round(table_top_shift_ratio*H)))
-        # tabloya sızmama payı:
-        guard = int(max(table_guard_margin_px, table_guard_margin_ratio*H))
-        y = max(0, y - guard)
-        return None if y>=H-4 else y
-
-    def _extract_upper(img: np.ndarray, y_top: Optional[int]) -> Optional[np.ndarray]:
-        H = img.shape[0]
-        y_fb = max(1, int(round(H*fallback_top_ratio)))
-        y_use = y_fb if (y_top is None or y_top < y_fb) else y_top
-        up = img[:y_use,:]
-        if up is None or not up.size or up.shape[0] < min_upper_px: return None
-        if debug and show_fig:
-            try:
-                import matplotlib.pyplot as plt
-                plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(up, cv2.COLOR_BGR2RGB))
-                plt.title(f"Upper crop (0:{y_use}) | mode={'fallback' if y_use==y_fb else 'table-top'}")
-                plt.axis("off"); plt.show()
-            except Exception: pass
-        return up
-
-    # ---------- date ----------
-    MONTHS_TR = {1:["ocak","oca"],2:["şubat","subat","şub","sub"],3:["mart","mar"],4:["nisan","nis"],
-                 5:["mayıs","mayis","may"],6:["haziran","haz"],7:["temmuz","tem"],
-                 8:["ağustos","agustos","ağu","agu"],9:["eylül","eylul","eyl"],
-                 10:["ekim","eki"],11:["kasım","kasim","kas"],12:["aralık","aralik","ara"]}
-    MONTHS_EN = {1:["january","jan"],2:["february","feb"],3:["march","mar"],4:["april","apr"],5:["may"],
-                 6:["june","jun"],7:["july","jul"],8:["august","aug"],9:["september","sep","sept"],
-                 10:["october","oct"],11:["november","nov"],12:["december","dec"]}
-    MONTH_WORDS=set(sum(MONTHS_TR.values(),[]))|set(sum(MONTHS_EN.values(),[]))
-    MONTH_WORDS_RGX="|".join(sorted([re.escape(x).replace(r"\ ",r"\s*").replace(r"\.",r".?")
-                                     for x in MONTH_WORDS],key=len,reverse=True))
-    ROMAN={"I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,"XI":11,"XII":12}
-    def _norm_year(y:str)->Optional[int]:
-        y=re.sub(r"^\D+","",y or "")
-        if not y: return None
-        if len(y)==2: y="20"+y
-        if len(y)>4: y=y[-4:]
-        try: return int(y)
-        except: return None
-    def _valid(d,m,y): return 1<=d<=31 and 1<=m<=12 and 1900<=y<=2100
-    def _month_from_word(tok:str)->Optional[int]:
-        t=_nfkc(tok).lower()
-        t=t.replace("ı","i").replace("ş","s").replace("ğ","g").replace("ü","u").replace("ö","o").replace("ç","c")
-        for n,vs in MONTHS_TR.items():
-            if t in [x.replace("ı","i").replace("ş","s").replace("ğ","g").replace("ü","u").replace("ö","o").replace("ç","c") for x in vs]:
-                return n
-        for n,vs in MONTHS_EN.items():
-            if t in vs: return n
-        return None
-    def _extract_date(text:str)->Optional[str]:
-        if not text: return None
-        T=_norm_spaces(text)
-        m=re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{2,4})(?!\d)",T)
-        if m:
-            try: d,mn,y=int(m.group(1)),int(m.group(2)),_norm_year(m.group(3))
-            except: d=mn=y=None
-            if y and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-        m=re.search(rf"(?<!\d)(\d{{1,2}})\s*(?:[.-])?\s*({MONTH_WORDS_RGX})\s*(?:[.-])?\s*(\d{{2,4}})(?!\d)",T,re.IGNORECASE)
-        if m:
-            d=int(m.group(1)); mn=_month_from_word(m.group(2)); y=_norm_year(m.group(3))
-            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-        m=re.search(r"(?<!\d)(\d{1,2})\s*(?:[./-])?\s*(I{1,3}|IV|V|VI{0,3}|IX|X|XI|XII)\s*(?:[./-])?\s*(\d{2,4})(?!\d)",T,re.IGNORECASE)
-        if m:
-            d=int(m.group(1)); mn=ROMAN.get(m.group(2).upper()); y=_norm_year(m.group(3))
-            if y and mn and _valid(d,mn,y): return f"{d:02d}/{mn:02d}/{y:04d}"
-        digits=re.sub(r"\D","",T)
-        if len(digits)>=8:
-            best=None
-            for i in range(len(digits)-7):
-                try:
-                    d=int(digits[i:i+2]); mn=int(digits[i+2:i+4]); y=int(digits[i+4:i+8])
-                except: continue
-                if _valid(d,mn,y):
-                    cand=(y,i,d,mn)
-                    if best is None or cand>best: best=cand
-            if best:
-                y,_,d,mn=best
-                return f"{d:02d}/{mn:02d}/{y:04d}"
-        return None
-
-    # ---------- type canonicalization ----------
-    def _map_type_to_canonical(type_text: str) -> Optional[str]:
-        if not type_text: return None
-        u=_upper_tr(_norm_spaces(type_text))
-        u_ascii=(u.replace("İ","I").replace("Ş","S").replace("Ğ","G").replace("Ü","U").replace("Ö","O").replace("Ç","C"))
-        GEN=r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        AS=r"(?:A\.?\s*Ş|A\.?\s*S|AŞ|AS)"+GEN
-        ANON=r"ANON[İI]M\s+"+_spaced("ŞİRKET")+GEN
-        LTD=r"(?:LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+_spaced("ŞİRKET")+r")"+GEN
-        SIRK=_spaced("ŞİRKET")+GEN
-        RULES=[
-            (rf"(?:\b|^)({AS}|{ANON})(?:\b|$)", "ANONİM ŞİRKETİ"),
-            (rf"(?:\b|^){LTD}(?:\b|$)",        "LİMİTED ŞİRKETİ"),
-            (rf"(?:\b|^)HOLD[İI]NG(?:\b|$)","HOLDİNG"),
-            (rf"(?:\b|^)KOOPERAT[İI]F(?:\b|$)","KOOPERATİF"),
-            (rf"(?:\b|^)KOLEKT[İI]F\s+{SIRK}(?:\b|$)","KOLEKTİF ŞİRKET"),
-            (rf"(?:\b|^)AD[İI]\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)","ADİ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)SERMAYES[İI]\s+PAYLARA\s+BÖLÜNMÜŞ\s+KOMAND[İI]T\s+{SIRK}(?:\b|$)","SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)KOMAND[İI]T\s+{SIRK}(?:\b|$)","KOMANDİT ŞİRKET"),
-            (rf"(?:\b|^)VAKF[Iİ]|VAKIF(?:\b|$)","VAKIF"),
-            (rf"(?:\b|^)DERNEK(?:\b|$)","DERNEK"),
-        ]
-        for pat,label in RULES:
-            if re.search(pat,u,re.IGNORECASE): return label
-        flat=re.sub(r"[\s\.\-_/’'`´]+","",u_ascii)
-        if re.search(r"(AS|AŞ|ANONIMSIRKET)",flat): return "ANONİM ŞİRKETİ"
-        if re.search(r"(LTDSTI|LIMITEDSIRKET)",flat): return "LİMİTED ŞİRKETİ"
-        if "HOLDING" in flat: return "HOLDİNG"
-        if "KOOPERATIF" in flat: return "KOOPERATİF"
-        if re.search(r"KOLEKTIF.*SIRKET",flat): return "KOLEKTİF ŞİRKET"
-        if re.search(r"ADIKOMANDIT.*SIRKET",flat): return "ADİ KOMANDİT ŞİRKET"
-        if re.search(r"SERMAYESIPAYLARABOLUNMUSKOMANDIT.*SIRKET",flat): return "SERMAYESİ PAYLARA BÖLÜNMÜŞ KOMANDİT ŞİRKET"
-        if re.search(r"KOMANDIT.*SIRKET",flat): return "KOMANDİT ŞİRKET"
-        if "VAKIF" in flat: return "VAKIF"
-        if "DERNEK" in flat: return "DERNEK"
-        return None
-
-    # ---------- header phrase cleaner ----------
-    def _clean_header_substrings(s: str) -> str:
-        exact = re.compile("|".join([
-            r"GENEL\s+KURULDA\s+HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
-            r"HAZ[İI]R\s+BULUNANLAR\s+L[İI]STES[İI]",
-            r"TOPLANTIYA\s+KATILANLAR", r"TOPLANTI\s+TUTANA[ĞG][Iİ]",
-            r"G[UÜ]NDEM\s*MADDELER[İI]", r"KARARLAR", r"ŞEKL[İI]\s*VE\s*T[UÜ]R[UÜ]"
-        ]), re.IGNORECASE)
-        s2,_=exact.subn(" ", s or "")
-        return re.sub(r"\s{2,}"," ",s2).strip()
-
-    # ---------- company extractor (LEFT-ONLY; prev merge; hard right cut) ----------
-    def _extract_company(lines: List[str],
-                         prev_lines_to_merge: int = 3,
-                         left_char_cap: int = 420) -> Tuple[Optional[str], Optional[str], dict]:
-        L=[_norm_spaces(ln) for ln in (lines or []) if isinstance(ln,str) and ln.strip()]
-        if not L: return None, None, {"reason":"empty_lines"}
-        GEN=r"(?:\s*[’'`´\"“”]?\s*(?:NIN|NİN|NUN|NÜN|IN|İN|UN|ÜN))?"
-        SIRK=_spaced("ŞİRKET")
-        TYPE=r"(?:ANON[İI]M\s+"+SIRK+r"|A\.?\s*Ş|AŞ|A\.?\s*S|LTD\s*\.?\s*ŞT[İI]|LTD\s*\.?\s*ST[İI]|L[İI]M[İI]TED\s+"+SIRK+r")"+GEN
-        type_re=re.compile(TYPE,re.IGNORECASE)
-
-        anchors=[]
-        for i,s in enumerate(L):
-            m=type_re.search(s)
-            if m: anchors.append((i,m.start(),m.end(),m.group(0)))
-            elif i+1<len(L):
-                s2=s+" "+L[i+1]; m2=type_re.search(s2)
-                if m2: anchors.append((i, min(len(s),m2.start()), m2.end(), m2.group(0)))
-        if not anchors: return None,None,{"reason":"no_type_in_lines"}
-
-        i,st,en,raw=anchors[-1]
-        ctype=_map_type_to_canonical(raw)
-
-        # sadece SOL
-        left_piece = L[i][:st]
-
-        # prev merge
-        merged = " ".join(L[max(0,i-3):i] + [left_piece])
-        merged = _clean_header_substrings(merged)
-
-        # SAĞ KESİCİ: herhangi bir tip/ŞİRKET çekirdeği görüldüğü anda sağını at
-        RIGHT_CUT = re.compile(
-            r"\b(?:ANON[İI]M|L[İI]M[İI]TED|LTD\.?\s*ŞT[İI]|LTD\.?\s*ST[İI]|A\.?\s*Ş|AŞ|"+SIRK+r")\b.*$",
-            re.IGNORECASE
-        )
-        merged = RIGHT_CUT.sub("", merged)
-
-        # baş/son gürültü
-        NOISE_TAIL = {"VE","DE","DA","İLE","VEYA","KURUL","KURULDA","LİSTESİ","TARİHLİ","ÖRNEĞİ"}
-        toks = merged.split()
-        while toks and toks[0].upper() in NOISE_TAIL: toks.pop(0)
-        while toks and toks[-1].upper() in NOISE_TAIL: toks.pop()
-        name = " ".join(toks).strip(" ,.-:;’'")[:left_char_cap]
-
-        if sum(ch.isalpha() for ch in name) < 3:
-            return None, ctype, {"reason":"too_short_after_cut", "type":ctype}
-
-        return _upper_tr(name), ctype, {"reason":"ok","picked":"left_only+prev_merge","type":ctype}
-
-    # ================= MAIN =================
-    rows=[]
-    for idx,img in enumerate(doc_images):
-        y_top=_detect_table_top(img)
-        if debug: print(f"[p{idx}] table_top:", y_top if y_top is not None else "None (fallback)")
-        upper=_extract_upper(img,y_top)
-        if upper is None:
-            if debug: print(f"[p{idx}] Upper empty -> skip"); 
-            continue
-        text=ocr_fn(upper) or ""
-        lines=[ln.strip() for ln in text.splitlines() if ln.strip()]
-        if debug: print(f"[p{idx}] OCR chars={len(text)} lines={len(lines)}")
-
-        date=None
-        for ln in lines:
-            date=_extract_date(ln)
-            if date: break
-
-        cname,ctype,dbg=_extract_company(lines)
-        if debug: print(f"[p{idx}] company_debug:", dbg)
-
-        rows.append({
-            "page_index": idx,
-            "tarih": date,
-            "şirket_adı": (cname if isinstance(cname,str) and cname.strip() else None),
-            "şirket_türü": (_upper_tr(ctype) if ctype else None),
-            **({"debug_text": text[:1600]} if debug else {})
-        })
-    return pd.DataFrame(rows)
-
-# === Sadece bu iki fonksiyonu değiştirin ===
-
-def _detect_table_top(img: np.ndarray) -> Optional[int]:
+def draw_paddle_regions_on_images(
+    images: List[np.ndarray],
+    regions_pages: Union[List[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    scale: Tuple[float, float] = (1.0, 1.0),   # (sx, sy) eğer bbox orijinal ölçekte, image resize edilmişse
+    put_text: bool = True,
+    max_label_len: int = 40,
+    thickness: int = 2,
+    save_dir: str = None,                      # örn: "debug_boxes" -> PNG kaydeder
+    show: bool = True                          # matplotlib ile göster
+) -> List[np.ndarray]:
     """
-    Dönüş: y_table_line  (tablonun en üst yatay çizgisinin piksel y'si)
-    - Hem morfolojik hatlar hem de yatay projeksiyon tepe noktasıyla doğrulanır.
-    - Bulunamazsa None döner (fallback devreye girer).
+    images            : final_lower_imgs (List[np.ndarray], GRAY veya BGR)
+    regions_pages     : paddle_ocr_regions veya paddle_ocr_regions_aligned
+    scale             : bbox koordinatlarını ölçeklemek için (sx, sy)
+    put_text          : kutunun üstüne kısa etiket yaz
+    max_label_len     : etiketi kısaltma sınırı
+    thickness         : çizgi kalınlığı
+    save_dir          : klasör verilirse her sayfayı 'page_{i}.png' olarak kaydeder
+    show              : True ise ekrana basar
+    returns           : üzerinde çizim yapılmış görüntü listesi
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    H, W = gray.shape[:2]
+    # çok sayfa mı?
+    is_multi = len(regions_pages) > 0 and isinstance(regions_pages[0], list)
+    pages = regions_pages if is_multi else [regions_pages]
 
-    # hafif normalize
-    blur = cv2.GaussianBlur(gray, (3,3), 0)
+    assert len(images) >= len(pages), "Görüntü sayısı, region sayfalarından az görünüyor."
 
-    # İnce çizgi yakalamaya uygun eşik
-    thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 5
-    )
+    os.makedirs(save_dir, exist_ok=True) if save_dir else None
+    out_imgs: List[np.ndarray] = []
 
-    # Morfoloji: yatay çizgileri çıkar
-    kx = max(12, W // 60)
-    horiz = cv2.morphologyEx(
-        thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), 1
-    )
+    sx, sy = scale
 
-    # ---- 1) Hough ile uzun yatay çizgiler
-    y_candidates = []
-    lines = cv2.HoughLinesP(
-        horiz, 1, np.pi/180, threshold=90, minLineLength=int(W*0.55), maxLineGap=10
-    )
-    if lines is not None:
-        for x1,y1,x2,y2 in lines[:,0,:]:
-            if abs(y1-y2) <= 2:
-                y_candidates.append(int((y1+y2)//2))
+    for i, (img, regs) in enumerate(zip(images, pages)):
+        # BGR'ye çevir
+        if img.ndim == 2:
+            canvas = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            canvas = img.copy()
 
-    # ---- 2) Yatay projeksiyon (çizgi yoğunluğu)
-    proj = horiz.sum(axis=1)  # her y satırının “mürekkep” toplamı
-    # en üstteki kuvvetli tepe = tablo üstü
-    # (gürültü eşiği: genişliğin %35'i kadar siyahlık)
-    ink_thresh = 255 * int(W*0.35)
-    for y in range(0, min(H-1, int(H*0.6))):
-        if proj[y] >= ink_thresh:
-            y_candidates.append(y)
-            break
+        h, w = canvas.shape[:2]
 
-    if not y_candidates:
-        return None
+        for idx, r in enumerate(regs):
+            bbox = r.get("bbox", {})
+            # 1) dört köşe varsa poligon
+            if all(k in bbox for k in ("x1","y1","x2","y2","x3","y3","x4","y4")):
+                pts = np.array([
+                    [int(bbox["x1"]*sx), int(bbox["y1"]*sy)],
+                    [int(bbox["x2"]*sx), int(bbox["y2"]*sy)],
+                    [int(bbox["x3"]*sx), int(bbox["y3"]*sy)],
+                    [int(bbox["x4"]*sx), int(bbox["y4"]*sy)]
+                ], dtype=np.int32)
+                cv2.polylines(canvas, [pts], isClosed=True, color=(0,255,0), thickness=thickness)
+                # label pozisyonu: üst sol köşe
+                lx, ly = pts[0][0], max(0, pts[0][1]-5)
+            # 2) x,y,w,h varsa dikdörtgen
+            elif all(k in bbox for k in ("x","y","width","height")):
+                x = int(bbox["x"]*sx); y = int(bbox["y"]*sy)
+                ww = int(bbox["width"]*sx); hh = int(bbox["height"]*sy)
+                cv2.rectangle(canvas, (x,y), (x+ww, y+hh), (0,255,0), thickness)
+                lx, ly = x, max(0, y-5)
+            else:
+                continue  # tanınmayan bbox
 
-    y_top_line = max(0, min(y_candidates))  # en üst güçlü yatay çizgi
-    return y_top_line
+            if put_text:
+                txt = r.get("text","")
+                if len(txt) > max_label_len:
+                    txt = txt[:max_label_len-1] + "…"
+                # arka planı okunur yapmak için sınır
+                cv2.putText(canvas, txt, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 3, cv2.LINE_AA)
+                cv2.putText(canvas, txt, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
 
+        out_imgs.append(canvas)
 
-def _extract_upper(img: np.ndarray, y_table_line: Optional[int],
-                   hard_guard_px: int = 6,
-                   soft_guard_ratio: float = 0.008,
-                   fallback_top_ratio: float = 0.18,
-                   min_upper_px: int = 120,
-                   debug: bool = False, show_fig: bool = False) -> Optional[np.ndarray]:
-    """
-    - y_table_line verilirse: kesim_y = max(min_upper_px, y_table_line - guard)
-      ==> tablo çizgisi dahile edilmeyecek.
-    - Aksi halde fallback oranıyla üst bant alınır.
-    """
-    H, W = img.shape[:2]
-    # dinamik güvenlik payı
-    guard = int(max(hard_guard_px, soft_guard_ratio * H))
+        if save_dir:
+            cv2.imwrite(os.path.join(save_dir, f"page_{i}.png"), canvas)
 
-    if y_table_line is not None and y_table_line > 0:
-        cut_y = max(min_upper_px, y_table_line - guard)
-    else:
-        cut_y = max(min_upper_px, int(round(H * fallback_top_ratio)))
+        if show:
+            plt.figure(figsize=(10,6))
+            plt.axis("off")
+            plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+            plt.title(f"Page {i}")
+            plt.show()
 
-    cut_y = min(cut_y, H-1)  # güvenlik
-    up = img[:cut_y, :]
+    return out_imgs
 
-    if (up is None) or (not up.size) or (up.shape[0] < min_upper_px):
-        return None
+# 1) Region olarak düzeltilmiş listeyi kullan (önerilir)
+regions = paddle_ocr_regions_aligned  # veya paddle_ocr_regions
 
-    if debug and show_fig:
-        try:
-            import matplotlib.pyplot as plt
-            vis = img.copy()
-            if y_table_line is not None:
-                cv2.line(vis, (0, y_table_line), (W-1, y_table_line), (0,255,0), 2)   # tablo üst çizgisi
-            cv2.line(vis, (0, cut_y), (W-1, cut_y), (255,0,0), 2)                     # kesim çizgisi
-            plt.figure(figsize=(9,3)); plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-            mode = "table-top" if y_table_line is not None else f"fallback%{int(fallback_top_ratio*100)}"
-            plt.title(f"Upper crop end y={cut_y} | mode={mode} | guard={guard}px")
-            plt.axis("off"); plt.show()
-        except Exception:
-            pass
-
-    return up
+# 2) Çiz ve göster; PNG kaydetmek istersen save_dir ver
+_ = draw_paddle_regions_on_images(
+    images=final_lower_imgs,
+    regions_pages=regions,
+    scale=(1.0, 1.0),        # eğer OCR bbox'ları orijinal çözünürlükte ve resmi sonradan resize ettiysen burayı değiştir
+    put_text=True,
+    max_label_len=55,
+    thickness=2,
+    save_dir="debug_boxes",  # klasör oluşturup her sayfayı kaydeder
+    show=True
+)
