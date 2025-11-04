@@ -1,51 +1,71 @@
-def fix_bboxes_inplace(paddle_ocr_regions_aligned):
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Dict, Any, Tuple, Union
+
+def draw_paddle_regions_on_images(
+    images: List[np.ndarray],
+    regions_pages: Union[List[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    *,
+    scale: Tuple[float, float] = (1.0, 1.0),     # bbox'lar orijinal ölçekteyse (sx, sy) ver
+    save_dir: str | None = None,                 # örn: "debug_boxes"
+    show: bool = True,                           # matplotlib ile ekranda göster
+    put_text: bool = True,                       # kutu üstüne text yaz
+    max_label_len: int = 55,                     # text kısaltma sınırı
+    thickness: int = 2                           # çizgi kalınlığı
+) -> List[np.ndarray]:
     """
-    In-place: region['bbox'] -> {'x': int, 'y': int, 'w': int, 'h': int, 'x2': int, 'y2': int}
-    Accepts polygon-style (x1..x4/y1..y4), min-max, left-top-wh, or list-of-points dicts.
+    images           : GRAY veya BGR NumPy görüntü listesi.
+    regions_pages    : Her sayfa için region listesi (liste-içinde-liste) veya tek liste (tek sayfa).
+    scale            : Bbox koordinatlarını (sx, sy) ile ölçeklemek için kullan (ör. resmi yeniden boyutladıysan).
+    save_dir         : Verilirse her sayfayı 'page_{i}.png' olarak kaydeder.
+    show             : Matplotlib ile ekranda gösterir.
+    put_text         : Kutu üstüne region['text'] yaz.
+    Dönüş            : Kutular çizilmiş görüntülerin listesi.
     """
 
-    def _num(v):
-        # cast strings like "141", "141.0", "141px" safely to int
-        if isinstance(v, (int, float)):
-            return int(round(float(v)))
+    def _to_bgr(img: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
+
+    def _num(v) -> int:
+        if isinstance(v, (int, float)): return int(round(float(v)))
         if isinstance(v, str):
             s = "".join(ch for ch in v if (ch.isdigit() or ch in ".-"))
-            if s in ("", "-", ".", "-."):
-                return 0
+            if s in ("", ".", "-", "-."): return 0
             return int(round(float(s)))
         return 0
 
-    def _rect_from_bbox(b):
-        # Case A: polygon x1..x4 / y1..y4
-        xs = [b[k] for k in b.keys() if k.lower().startswith("x")]
-        ys = [b[k] for k in b.keys() if k.lower().startswith("y")]
+    def _rect_from_bbox(b: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        """Her türlü bbox'ı (polygon/minmax/rect) x,y,w,h dikdörtgene çevirir."""
+        kl = {k.lower(): k for k in b.keys()}
+
+        # 1) Polygon (x1..x4/y1..y4) ya da genel x*/y* anahtarları
+        xs = [_num(b[k]) for k in b.keys() if k.lower().startswith("x")]
+        ys = [_num(b[k]) for k in b.keys() if k.lower().startswith("y")]
         if len(xs) >= 2 and len(ys) >= 2:
-            xs = [_num(v) for v in xs]
-            ys = [_num(v) for v in ys]
             x_min, x_max = min(xs), max(xs)
             y_min, y_max = min(ys), max(ys)
             return x_min, y_min, x_max - x_min, y_max - y_min
 
-        # Case B: explicit min/max
-        keys = {k.lower(): k for k in b.keys()}
-        if {"x_min","y_min","x_max","y_max"}.issubset(keys):
-            x_min = _num(b[keys["x_min"]]); y_min = _num(b[keys["y_min"]])
-            x_max = _num(b[keys["x_max"]]); y_max = _num(b[keys["y_max"]])
+        # 2) Min/Max
+        if {"x_min","y_min","x_max","y_max"}.issubset(set(k.lower() for k in b.keys())):
+            x_min = _num(b[kl["x_min"]]); y_min = _num(b[kl["y_min"]])
+            x_max = _num(b[kl["x_max"]]); y_max = _num(b[kl["y_max"]])
             return x_min, y_min, x_max - x_min, y_max - y_min
 
-        # Case C: left/top/width/height
-        if {"left","top","width","height"}.issubset(keys):
-            x = _num(b[keys["left"]]); y = _num(b[keys["top"]])
-            w = _num(b[keys["width"]]); h = _num(b[keys["height"]])
-            return x, y, w, h
+        # 3) Rect (x,y,width,height) veya (left,top,width,height)
+        for xk, yk in (("x","y"), ("left","top")):
+            if {xk, yk, "width", "height"}.issubset(set(k.lower() for k in b.keys())):
+                x = _num(b[kl[xk]]); y = _num(b[kl[yk]])
+                w = _num(b[kl["width"]]); h = _num(b[kl["height"]])
+                return x, y, w, h
 
-        # Case D: list of points under 'points'/'poly'
-        for name in ("points", "poly", "vertices"):
+        # 4) Nokta listesi (points/poly/vertices)
+        for name in ("points","poly","vertices"):
             if name in b and isinstance(b[name], (list, tuple)) and b[name]:
-                pts = b[name]
-                # pts like [(x,y), ...] or [{'x':..,'y':..}, ...]
                 xs, ys = [], []
-                for p in pts:
+                for p in b[name]:
                     if isinstance(p, (list, tuple)) and len(p) >= 2:
                         xs.append(_num(p[0])); ys.append(_num(p[1]))
                     elif isinstance(p, dict):
@@ -55,16 +75,78 @@ def fix_bboxes_inplace(paddle_ocr_regions_aligned):
                     y_min, y_max = min(ys), max(ys)
                     return x_min, y_min, x_max - x_min, y_max - y_min
 
-        # Fallback: nothing usable
         return 0, 0, 0, 0
 
-    for region in paddle_ocr_regions_aligned:
-        b = region.get("bbox", None)
-        if isinstance(b, dict):
+    # Tek liste mi çoklu mu?
+    is_multi = isinstance(regions_pages, list) and regions_pages and isinstance(regions_pages[0], list)
+    pages = regions_pages if is_multi else [regions_pages]
+    assert len(images) >= len(pages), "Görüntü sayısı, region sayfalarından az görünüyor."
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    sx, sy = scale
+    out_imgs: List[np.ndarray] = []
+
+    for i, (img, regs) in enumerate(zip(images, pages)):
+        canvas = _to_bgr(img)
+        H, W = canvas.shape[:2]
+
+        for r in regs:
+            b = r.get("bbox", None)
+            if not isinstance(b, dict): 
+                continue
             x, y, w, h = _rect_from_bbox(b)
-            region["bbox"] = {"x": x, "y": y, "w": w, "h": h, "x2": x + w, "y2": y + h}
 
-    return paddle_ocr_regions_aligned
+            # ölçek uygula
+            x = int(x * sx); y = int(y * sy)
+            w = int(w * sx); h = int(h * sy)
 
-paddle_ocr_regions_aligned = fix_bboxes_inplace(paddle_ocr_regions_aligned)
-# Artık region['bbox'] -> {'x','y','w','h','x2','y2'} standardında.
+            # sınırla
+            x = max(0, min(x, W-1))
+            y = max(0, min(y, H-1))
+            w = max(1, min(w, W - x))
+            h = max(1, min(h, H - y))
+
+            # kutu
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), thickness)
+
+            # etiket
+            if put_text:
+                txt = str(r.get("text", ""))[:max_label_len]
+                # kutunun üst-sol köşesine, okunur küçük fontla
+                cv2.putText(canvas, txt, (x, max(10, y - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(canvas, txt, (x, max(10, y - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        out_imgs.append(canvas)
+
+        if save_dir:
+            cv2.imwrite(os.path.join(save_dir, f"page_{i}.png"), canvas)
+
+        if show:
+            plt.figure(figsize=(10, 6))
+            plt.axis("off")
+            plt.title(f"Page {i}")
+            plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+            plt.show()
+
+    return out_imgs
+
+# 1) OCR sonrası listelerini kullan
+regions = paddle_ocr_regions_aligned          # veya paddle_ocr_regions
+images  = final_lower_imgs                    # GRAY veya BGR
+
+# 2) Eğer resimleri yeniden boyutladıysan, bbox ölçeğini ver (sx, sy).
+#    Aksi halde scale=(1.0, 1.0) bırak.
+drawn = draw_paddle_regions_on_images(
+    images=images,
+    regions_pages=regions,        # tek sayfa listesi de verebilirsin; fonksiyon otomatik algılar
+    scale=(1.0, 1.0),
+    save_dir="debug_boxes",       # klasöre PNG olarak kaydeder
+    show=True,                    # ekranda gösterir
+    put_text=True,
+    max_label_len=55,
+    thickness=2
+)
