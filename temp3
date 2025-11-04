@@ -1,169 +1,92 @@
-def fix_regions_with_llm_or_diff(paddle_ocr_regions, paddle_ocr_texts,
-                                 temperature=0.0, max_tokens=200,
-                                 window_chars=300, flex_tokens=0,
-                                 min_ratio=0.62):
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Any, List
+
+# --- Normalizasyon yardımcıları ---
+_TURKISH_MAP = str.maketrans({
+    "İ": "I", "I": "I", "ı": "i",
+    "Ş": "S", "ş": "s",
+    "Ğ": "G", "ğ": "g",
+    "Ü": "U", "ü": "u",
+    "Ö": "O", "ö": "o",
+    "Ç": "C", "ç": "c",
+})
+
+def _normalize(s: str) -> str:
+    """Aksan/boşluk/noktalama temizleyip lower'a çeker: 'DİVAN HEYETİ' -> 'divanheyeti'."""
+    if not isinstance(s, str):
+        return ""
+    s = s.translate(_TURKISH_MAP)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^A-Za-z0-9]+", "", s).lower()
+    return s
+
+def _get_text(x: Any) -> str:
+    """dict ya da string girdiden metni güvenle al."""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        for k in ("text", "extractedText", "extracted_text", "full_text"):
+            if k in x and isinstance(x[k], str):
+                return x[k]
+    return ""
+
+def _sim(a: str, b: str) -> float:
+    """difflib benzerlik skoru (0–100)."""
+    return SequenceMatcher(a=a, b=b).ratio() * 100.0
+
+# --- Ana fonksiyon ---
+def build_paddleocr_regions_aligned(
+    paddle_ocr_texts: List[Any],
+    paddle_ocr_regions: List[List[dict]],
+    fuzzy_threshold: float | None = None,
+) -> List[List[dict]]:
     """
-    Her bbox 'text'ini, aynı sayfanın metnine göre düzeltir.
-    1) LLM'den JSON {start,end} indeksleri istenir (yalnızca indeks!).
-    2) İndeks geçerliyse sayfa metninden kesilip yazılır.
-    3) LLM başarısızsa, difflib ile aynı uzunlukta en benzer dilim seçilir.
-    4) Sayı ve uzunluk koruması var; bozulursa normalize edilmiş orijinale döner.
+    Girdi:
+      - paddle_ocr_texts: sayfa başına tek bir 'doğru' metin (string veya dict)
+      - paddle_ocr_regions: sayfa başına region listesi (her region dict)
+    Çıktı:
+      - Aynı yapıdaki yeni liste (sadece region['text'] güncellenmiş olabilir).
 
-    Gereken wrapper: paddleocr_usage.response_generation_v_gemma(system_message, user_input, temp, max_t)
+    Eşleştirme kuralı:
+      - normalize(region.text) == normalize(page_text) ise region['text'] = page_text
+      - fuzzy_threshold verilirse, normalize metinler arası benzerlik >= eşik ise günceller.
+    Ek:
+      - Her region'a debug için 'text_norm' ve 'canonical_norm' alanları eklenir,
+        fuzzy kullanılırsa 'match_score' eklenir.
     """
-    import re, json, unicodedata, difflib
+    # Derin kopya (input'u bozmamak için)
+    out_pages: List[List[dict]] = []
+    for i, regions_on_page in enumerate(paddle_ocr_regions):
+        page_copy = [dict(r) for r in regions_on_page]
+        canonical_raw = _get_text(paddle_ocr_texts[i]) if i < len(paddle_ocr_texts) else ""
+        canonical_norm = _normalize(canonical_raw)
 
-    assert len(paddle_ocr_regions) == len(paddle_ocr_texts), "Uzunluklar uyuşmuyor."
+        for r in page_copy:
+            r_text = _get_text(r)
+            r_norm = _normalize(r_text)
+            r["text_norm"] = r_norm
+            r["canonical_norm"] = canonical_norm
 
-    def _norm(s:str)->str:
-        if not isinstance(s,str): return ""
-        s = unicodedata.normalize("NFKC", s)
-        s = (s.replace("•"," ").replace("·"," ").replace("§","S")
-               .replace("|"," ").replace("¦"," ").replace("—","-").replace("–","-")
-               .replace("İ","İ").replace("i̇","i")
-               .replace("Ş","Ş").replace("Ğ","Ğ").replace("Ç","Ç").replace("Ü","Ü")
-               .replace("ş","ş").replace("ğ","ğ").replace("ç","ç").replace("ü","ü"))
-        s = re.sub(r"\s*([.,:;/()\-])\s*", r"\1", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+            match = (r_norm == canonical_norm) and bool(canonical_raw)
+            score = None
+            if not match and fuzzy_threshold is not None and canonical_norm and r_norm:
+                score = _sim(r_norm, canonical_norm)
+                r["match_score"] = round(score, 1)
+                match = score >= fuzzy_threshold
 
-    def _digits_mask(s:str)->str:
-        return re.sub(r"\d","#", s or "")
+            if match:
+                r["text"] = canonical_raw  # kanonik yazımı birebir uygula
 
-    def _tokens(s:str):
-        s=_norm(s); return s.split() if s else []
+        out_pages.append(page_copy)
 
-    def _yx_key(r):
-        b=r.get("bbox",{})
-        y=(b.get("y1",0)+b.get("y2",0)+b.get("y3",0)+b.get("y4",0))//4
-        x=(b.get("x1",0)+b.get("x2",0)+b.get("x3",0)+b.get("x4",0))//4
-        return (y,x)
+    return out_pages
 
-    def _best_slice_by_diff(src_clean:str, page_clean:str, start_hint:int=0,
-                            flex=0, lookahead_chars=120, min_ratio=0.6)->str:
-        src_toks=_tokens(src_clean); n=len(src_toks)
-        if n==0: return src_clean
-        # token bazlı gezinmek için kaba bir bölme
-        tgt_toks=_tokens(page_clean)
-        # cursor'u yaklaşık harf/kelime eşlemesiyle belirle
-        cursor_tokens = max(0, min(len(tgt_toks)-1, start_hint))
-        # arama penceresi
-        start=max(0, cursor_tokens)
-        end=min(len(tgt_toks), start + max(n + 2*max(1,flex), lookahead_chars//4))
-        best=(0.0,start,start)
-        src_join=" ".join(src_toks)
-        min_len=max(1, n-flex); max_len=min(n+flex, max(1, end-start))
-        for L in range(min_len, max_len+1):
-            j0=start
-            while j0+L<=end:
-                cand=" ".join(tgt_toks[j0:j0+L])
-                if _digits_mask(cand)!=_digits_mask(src_join):
-                    j0+=1; continue
-                ratio=difflib.SequenceMatcher(a=src_join,b=cand,autojunk=False).ratio()
-                if ratio>best[0]: best=(ratio,j0,j0+L)
-                j0+=1
-        ratio,j0,j1=best
-        return " ".join(tgt_toks[j0:j1]) if ratio>=min_ratio else src_clean
-
-    SYSTEM = (
-        "Sen bir OCR düzeltme yardımcısısın. Yalnızca JSON döndür.\n"
-        "Kurallar:\n"
-        "- İçerik ekleme/çıkarma yok, sadece SAYFA METNİ içinde en uygun dilimi seç.\n"
-        "- Rakam ve biçimler korunacak.\n"
-        "- ÇIKTI SADECE şu şablonda olmalı: {\"start\":<int>,\"end\":<int>} (karakter indeksleri, Python slice mantığı).\n"
-        "- Başka hiçbir metin, açıklama, alıntı, kod bloğu yazma."
-    )
-
-    for page_regions, page_text_raw in zip(paddle_ocr_regions, paddle_ocr_texts):
-        if not page_regions: continue
-
-        page_text = _norm(page_text_raw)
-        if not page_text:
-            # sayfa boşsa: sadece normalize et
-            for r in page_regions: r["text"]=_norm(r.get("text",""))
-            continue
-
-        # sırayı sabitle
-        regs_sorted = sorted(page_regions, key=_yx_key)
-
-        # kaba karakter cursor'ını ilerletmek için basit sayaç
-        char_cursor = 0
-
-        for r in regs_sorted:
-            src_raw = r.get("text","")
-            src_clean = _norm(src_raw)
-            if not src_clean:
-                r["text"]=""
-                continue
-
-            # sayfadan lokal pencere (gereksiz token israfını önlemek için)
-            L = max(window_chars, len(src_clean)*4)
-            left = max(0, char_cursor - L//4)
-            right = min(len(page_text), char_cursor + L)
-            context = page_text[left:right]
-
-            user = (
-                f"SAYFA METNİ (karakter aralığı {left}:{right}):\n{context}\n\n"
-                f"BBOX METNİ (hatalı olabilir):\n{src_clean}\n\n"
-                "Görev: BBOX METNİ'ne en çok benzeyen ifadeyi SAYFA METNİ içinde bul.\n"
-                "Sadece JSON ver: {\"start\":<global_index>, \"end\":<global_index>}.\n"
-                f"Global indeks = SAYFA METNİ'nin orijinalindeki indeks; bu pencerede yerel değil. "
-                "Bulamazsan, en yakın eşleşmeyi tahmini indeksle ver."
-            )
-
-            # --- LLM denemesi ---
-            fixed = None
-            try:
-                js = paddleocr_usage.response_generation_v_gemma(
-                    system_message=SYSTEM,
-                    user_input=user,
-                    temp=temperature,
-                    max_t=max_tokens
-                )
-                # Yalnız sayı/boşluk olabilir; JSON yakala
-                js = (js or "").strip()
-                d = json.loads(js)
-                s = int(d.get("start", -1)); e = int(d.get("end", -1))
-                if 0 <= s < e <= len(page_text):
-                    cand = page_text[s:e]
-                    # güvenlik: sayı maskesi ve uzunluk mantıklı mı?
-                    if _digits_mask(cand)==_digits_mask(src_clean):
-                        fixed = _norm(cand)
-                        char_cursor = e  # ilerle
-            except Exception:
-                fixed = None
-
-            # --- Yedek: difflib ile aynı uzunlukta (±flex) en iyi dilim ---
-            if not fixed:
-                fixed = _best_slice_by_diff(src_clean, page_text,
-                                            start_hint=char_cursor,
-                                            flex=flex_tokens,
-                                            lookahead_chars=window_chars,
-                                            min_ratio=min_ratio)
-                # char_cursor'u kaba şekilde güncelle
-                try:
-                    pos = page_text.find(fixed, char_cursor)
-                    if pos != -1:
-                        char_cursor = pos + len(fixed)
-                except Exception:
-                    pass
-
-            # Son güvenlik
-            if _digits_mask(fixed) != _digits_mask(src_clean):
-                fixed = src_clean
-            if len(fixed) > max(len(src_clean)*2, 2000):
-                fixed = src_clean
-
-            r["text"] = fixed
-
-    return paddle_ocr_regions
-
-paddle_ocr_regions = fix_regions_with_llm_or_diff(
-    paddle_ocr_regions,
+# Yeni adıyla, sadece text’leri düzeltilmiş kopya:
+paddle_ocr_regions_aligned = build_paddleocr_regions_aligned(
     paddle_ocr_texts,
-    temperature=0.0,
-    max_tokens=200,
-    window_chars=300,
-    flex_tokens=0,      # birebir uzunluk hedefi
-    min_ratio=0.62
+    paddle_ocr_regions,
+    fuzzy_threshold=None      # istersen 95.0 gibi bir eşik ver
 )
