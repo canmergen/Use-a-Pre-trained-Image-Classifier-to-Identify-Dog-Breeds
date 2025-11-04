@@ -1,5 +1,5 @@
 import re, unicodedata
-from typing import Any, List
+from typing import Any, List, Tuple
 from rapidfuzz import fuzz
 
 _TR_MAP = str.maketrans({
@@ -30,28 +30,31 @@ def _get_text(x: Any) -> str:
                 return v
     return ""
 
-def _build_norm_stream_with_map(src: str):
-    norm_chars = []
-    norm_to_orig = []
-    orig_i = 0
-    for ch in src:
-        ch_tr = ch.translate(_TR_MAP)
+def _build_norm_stream_with_map(src: str) -> Tuple[str, List[int]]:
+    norm_chars, norm2orig = [], []
+    for i, ch in enumerate(src):
+        ch_tr  = ch.translate(_TR_MAP)
         ch_dec = unicodedata.normalize("NFKD", ch_tr)
-        base = "".join(c for c in ch_dec if not unicodedata.combining(c))
-        base = re.sub(r"[^A-Za-z0-9]+", "", base)
-        if base:
-            for _ in base.lower():
-                norm_chars.append(_)
-                norm_to_orig.append(orig_i)
-        orig_i += 1
-    return "".join(norm_chars), norm_to_orig
+        base   = "".join(c for c in ch_dec if not unicodedata.combining(c))
+        base   = re.sub(r"[^A-Za-z0-9]+", "", base)
+        for _ in base.lower():
+            norm_chars.append(_)
+            norm2orig.append(i)
+    return "".join(norm_chars), norm2orig
 
-def align_region_texts_by_substring_fuzzy(
+def align_region_texts_by_substring_fuzzy_v2(
     paddle_ocr_texts: Any,
     paddle_ocr_regions: Any,
-    fuzzy_threshold: int = 90
+    fuzzy_threshold: int = 90,
+    length_tolerance: int = 2,  # norm penceresine ± tolerans
 ):
-    """Normalize-substring + fuzzy ratio eşleşmesi ile region text düzeltir."""
+    """
+    Sadece region['text']'i düzeltir:
+      1) norm alt-dizi direkt eşleşirse: birebir parça.
+      2) Aksi halde: norm akışında sabit uzunluklu (±tolerans) kaydırmalı fuzzy arama.
+         En iyi skor >= threshold ise, tam o norm aralığının orijinal karşılığını al.
+    Yapıyı korur (tek/çok sayfa).
+    """
     is_multi = len(paddle_ocr_regions) > 0 and isinstance(paddle_ocr_regions[0], list)
     pages = paddle_ocr_regions if is_multi else [paddle_ocr_regions]
     page_texts = paddle_ocr_texts if isinstance(paddle_ocr_texts, list) else [paddle_ocr_texts]*len(pages)
@@ -63,40 +66,46 @@ def align_region_texts_by_substring_fuzzy(
 
         page_out = [dict(r) for r in regs]
         for r in page_out:
-            r_txt = _get_text(r)
+            r_txt  = _get_text(r)
             r_norm = _norm(r_txt)
             if not r_norm:
                 continue
 
-            # 1️⃣ direkt alt dizi araması
+            L = len(r_norm)
+            # 1) Doğrudan norm alt-dizi
             j = norm_stream.find(r_norm)
             if j != -1:
-                start_orig = norm2orig[j]
-                end_norm_idx = j + len(r_norm) - 1
-                end_orig = norm2orig[min(end_norm_idx, len(norm2orig)-1)]
-                canonical_piece = page_text_raw[start_orig:end_orig+1]
-                if canonical_piece.strip():
-                    r["text"] = canonical_piece
+                s_o = norm2orig[j]
+                e_o = norm2orig[j + L - 1]
+                r["text"] = page_text_raw[s_o:e_o+1]
+                continue
+
+            # 2) Fuzzy: norm akışında sabit pencere (± tolerans)
+            best_score, best_s, best_len = -1, None, None
+            min_len = max(1, L - length_tolerance)
+            max_len = min(len(norm_stream), L + length_tolerance)
+
+            for win_len in range(min_len, max_len + 1):
+                if win_len > len(norm_stream):
                     continue
+                for start in range(0, len(norm_stream) - win_len + 1):
+                    cand = norm_stream[start:start+win_len]
+                    score = fuzz.ratio(cand, r_norm)
+                    if score > best_score:
+                        best_score, best_s, best_len = score, start, win_len
 
-            # 2️⃣ alt dizi bulunamazsa fuzzy eşleşme (yakın ama birebir olmayanlar için)
-            best_score = 0
-            best_piece = None
-            # sayfa metnini parçalayarak arama (window kaydırma)
-            for k in range(0, len(page_text_raw) - len(r_txt)//2, max(10, len(r_txt)//2)):
-                piece = page_text_raw[k:k+len(r_txt)+20]
-                score = fuzz.ratio(_norm(piece), r_norm)
-                if score > best_score:
-                    best_score, best_piece = score, piece
-            if best_score >= fuzzy_threshold and best_piece:
-                r["text"] = best_piece.strip()
-
+            if best_score is not None and best_score >= fuzzy_threshold:
+                s_o = norm2orig[best_s]
+                e_o = norm2orig[best_s + best_len - 1]
+                r["text"] = page_text_raw[s_o:e_o+1]  # sadece tam eşleşen parça
+                # eşik altıysa dokunma
         out_pages.append(page_out)
 
     return out_pages if is_multi else out_pages[0]
 
-paddle_ocr_regions_aligned = align_region_texts_by_substring_fuzzy(
+paddle_ocr_regions_aligned = align_region_texts_by_substring_fuzzy_v2(
     paddle_ocr_texts,
     paddle_ocr_regions,
-    fuzzy_threshold=88  # 85–92 arası iyi tolerans
+    fuzzy_threshold=88,      # 85–92 arası pratik
+    length_tolerance=2       # ekleme/silme için küçük tolerans
 )
