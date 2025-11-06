@@ -1,102 +1,95 @@
-from ultralytics import YOLO
-import numpy as np
-import cv2
+from typing import Any, Dict, Iterable, List, Tuple
+import copy
 
-def _to_rgb_uint8(img: np.ndarray) -> np.ndarray:
+REQ_KEYS = ("x_min", "y_min", "x_max", "y_max")
+
+def _iter_bbox_containers(obj: Any) -> Iterable[Tuple[Dict[str, Any], str | None]]:
     """
-    Normalize any OpenCV/NumPy image to uint8 RGB (H,W,3).
-    Handles GRAY, BGR, BGRA, and float arrays.
+    Yields (container, key) pairs for every bbox found.
+    - If bbox is nested like {"bbox": {...}}, yields (container, "bbox")
+    - If bbox is flat like {"x_min":..., ...}, yields (container, None)
+    Traverses dicts, lists, and tuples.
     """
-    if img is None:
-        raise ValueError("Received None image.")
-    arr = img
-
-    # dtype normalize
-    if arr.dtype != np.uint8:
-        # assume 0..1 or arbitrary float; clip to 0..255
-        arr = np.clip(arr, 0, 255)
-        if arr.max() <= 1.0:
-            arr = (arr * 255.0)
-        arr = arr.astype(np.uint8)
-
-    # shape normalize
-    if arr.ndim == 2:  # GRAY
-        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
-    elif arr.ndim == 3:
-        c = arr.shape[2]
-        if c == 1:
-            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
-        elif c == 3:
-            # OpenCV kaynaklı ise muhtemelen BGR; RGB'ye çevir
-            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-        elif c == 4:
-            arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+    if isinstance(obj, dict):
+        if "bbox" in obj and isinstance(obj["bbox"], dict) and all(k in obj["bbox"] for k in REQ_KEYS):
+            yield obj, "bbox"
+        elif all(k in obj for k in REQ_KEYS):
+            yield obj, None
         else:
-            raise ValueError(f"Unsupported channel count: {c}")
-    else:
-        raise ValueError(f"Unsupported ndim: {arr.ndim}")
+            for v in obj.values():
+                yield from _iter_bbox_containers(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_bbox_containers(v)
 
-    return np.ascontiguousarray(arr)
-
-def predict_on_memory_images(final_lower_imgs, best_model_path, conf=0.25, imgsz=None):
+def rescale_paddleocr_bboxes_iso(
+    pages: List[Any],
+    orig_shapes: List[Tuple[int, int]],   # [(H, W), ...] for final_lower_imgs
+    small_max: int = 1024,
+    in_place: bool = False,
+    clamp: bool = True,
+) -> List[Any]:
     """
-    - final_lower_imgs: np.ndarray veya list[np.ndarray] (OpenCV okuyup getirdiğin tipler)
-    - best_model_path: .pt yolu
-    Dönen:
-      all_boxes: [ {image_index, orig_shape, boxes:[{xyxy:[x1,y1,x2,y2], conf, class_id}]} , ... ]
-      results: Ultralytics Results listesi (görselleştirme için .plot() kullanılabilir)
+    For each page i:
+      - compute s = max(H, W) / small_max
+      - multiply every bbox coord by s (x_min, x_max, y_min, y_max)
+      - optionally clamp to image bounds and refresh width/height
+    Only bbox values are changed. Structure and non-bbox fields stay intact.
     """
-    model = YOLO(best_model_path)
+    if not in_place:
+        pages = copy.deepcopy(pages)
 
-    # Listeye normalize et
-    imgs_in = [final_lower_imgs] if isinstance(final_lower_imgs, np.ndarray) else list(final_lower_imgs)
+    assert len(pages) == len(orig_shapes), "pages and orig_shapes length mismatch"
 
-    # Orijinal şekilleri not et ve RGB'ye çevir
-    orig_shapes = [im.shape for im in imgs_in]
-    imgs_rgb = [_to_rgb_uint8(im) for im in imgs_in]
+    for i, (H, W) in enumerate(orig_shapes):
+        s = max(H, W) / float(small_max)
 
-    # Tahmin (disk yazımı kapalı)
-    results = model.predict(
-        source=imgs_rgb,
-        conf=conf,
-        save=False,
-        save_txt=False,
-        verbose=False,
-        imgsz=imgsz  # None bırakabilirsin; istersen 1280 gibi bir değer verebilirsin
-    )
+        for container, key in _iter_bbox_containers(pages[i]):
+            b = container["bbox"] if key == "bbox" else container
 
-    # Çıktıları topla
-    all_boxes = []
-    for i, (r, oshp) in enumerate(zip(results, orig_shapes)):
-        boxes = []
-        if hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
-            xyxy  = r.boxes.xyxy.cpu().numpy()        # (N,4)  [x1,y1,x2,y2]
-            confs = r.boxes.conf.cpu().numpy()        # (N,)
-            clsid = r.boxes.cls.cpu().numpy().astype(int)  # (N,)
-            for b, c, cl in zip(xyxy, confs, clsid):
-                x1, y1, x2, y2 = b.tolist()
-                boxes.append({
-                    "xyxy": [float(x1), float(y1), float(x2), float(y2)],
-                    "conf": float(c),
-                    "class_id": int(cl)
-                })
-        all_boxes.append({
-            "image_index": i,
-            "orig_shape": oshp,   # (H,W,3)
-            "boxes": boxes
-        })
-    return all_boxes, results
+            # scale
+            x_min = int(round(b["x_min"] * s))
+            y_min = int(round(b["y_min"] * s))
+            x_max = int(round(b["x_max"] * s))
+            y_max = int(round(b["y_max"] * s))
 
-# --- Kullanım örneği ---
-# all_boxes, results = predict_on_memory_images(final_lower_imgs, "/home/athena/KYCops/TB_KYC_Ops/notebooks/shared/best.pt", conf=0.25)
-# annotated_rgb = results[0].plot()  # RGB numpy; istersen cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR) ile göster
+            if clamp:
+                # clamp to image bounds and ensure min<=max
+                x_min = max(0, min(x_min, W - 1))
+                y_min = max(0, min(y_min, H - 1))
+                x_max = max(x_min, min(x_max, W - 1))
+                y_max = max(y_min, min(y_max, H - 1))
 
-# Jupyter için güvenli görselleştirme
+            b["x_min"], b["y_min"], b["x_max"], b["y_max"] = x_min, y_min, x_max, y_max
+            b["width"]  = x_max - x_min
+            b["height"] = y_max - y_min
+
+    return pages
+
+# --- helper to visualize on final_lower_imgs (OpenCV) ---
+def visualize_boxes(img, regions, thickness: int = 3):
+    import cv2
+    vis = img.copy()
+    for container, key in _iter_bbox_containers(regions):
+        b = container["bbox"] if key == "bbox" else container
+        cv2.rectangle(vis, (b["x_min"], b["y_min"]), (b["x_max"], b["y_max"]), (0, 255, 0), thickness)
+    return vis
+
+# 1) Make per-page shapes from original final_lower_imgs
+orig_shapes = [ (img.shape[0], img.shape[1]) for img in final_lower_imgs ]  # (H, W)
+
+# 2) Ensure 'pages' is a list-of-pages structure
+#    If your OCR is already list-of-pages, use it directly. If it's a single page, wrap it.
+pages = paddleocr_regions_aligned if isinstance(paddleocr_regions_aligned, list) else [paddleocr_regions_aligned]
+
+# 3) Rescale assuming the SMALL side was derived from max_dim=1024
+pages_scaled = rescale_paddleocr_bboxes_iso(pages, orig_shapes, small_max=1024, in_place=False, clamp=True)
+
+# 4) (Optional) visualize per page
+#    Example for page 0:
+overlay0 = visualize_boxes(final_lower_imgs[0], pages_scaled[0])
+# show with matplotlib
 import matplotlib.pyplot as plt
-
-annotated = results[0].plot()  # RGB numpy (H,W,3)
-
-plt.figure(figsize=(10,10))
-plt.imshow(annotated)          # RGB, doğrudan göster
+plt.imshow(overlay0[..., ::-1])  # if img is BGR; remove this slice if it's already RGB
 plt.axis('off')
 plt.show()
