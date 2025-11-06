@@ -188,162 +188,185 @@ sermaye_df, bottom_df2 = extract_and_merge_sermaye_v2(pages_scaled, bottom_df=bo
 display(sermaye_df.head())      # all detections
 display(bottom_df2.head())      # your original df + sermaye_value + sermaye_bbox
 
+# -------- PyTorch tabanlı Ad-Soyad çıkarımı (tek dosya / tek hücre) --------
+# pip install torch>=2.2 transformers>=4.40 rapidfuzz
 
-def extract_name_boxes(
-    pages_scaled,
-    ner_backend: str = "hf",    # "hf" (transformers) | "spacy" | "regex_only"
-    min_conf: float = 0.70,     # NER güven eşiği
-    allow_single_token: bool = True,  # Tek kelime PERSON'ları kabul et (imzalar için faydalı)
-    blacklist_words=None        # Rol/ünvan kara listesi
-):
+from typing import List, Dict, Any, Optional
+import re
+import pandas as pd
+import torch
+from transformers import pipeline
+
+def extract_names_hybrid_pt(
+    pages_scaled: List[List[Dict[str, Any]]],
+    model_name_or_path: str = "Davlan/xlm-roberta-base-ner-hrl",
+    max_dx: int = 1400,        # aynı satır sağ komşu aralığı (px)
+    line_tol: float = 0.9,     # satır toleransı (etiket yüksekliği ile çarpılır)
+    accept_single_token: bool = False,
+    topk_per_page: int = 5,
+    min_conf: float = 0.70     # NER skor eşiği (0-1)
+) -> pd.DataFrame:
     """
-    Ad-Soyad içerdiği düşünülen bbox'ları döndürür.
-    Girdi: pages_scaled -> List[List[{'text': str, 'bbox': {...}}]]
-    Çıktı: pandas.DataFrame[page_idx, text, bbox, score, method]
+    Anchor (etiket) + kural + PyTorch NER birleşik yaklaşım.
+    Girdi:  pages_scaled -> her sayfa listesi; elemanlar {'text': str, 'bbox': {x_min,y_min,x_max,y_max,...}}
+    Çıktı:  DataFrame[page_idx, label_text, cand_text, cand_bbox, score_total, score_breakdown]
     """
-    import re
-    import pandas as pd
 
-    # --- Kara liste (ad-soyad olmayan PERSON benzeri kalıplar/ünvanlar) ---
-    if blacklist_words is None:
-        blacklist_words = {
-            "başkanı","başkan","yönetim","kurulu","üyesi","katip",
-            "müdür","komiser","noter","vekili","temsilci","imza",
-            "denetçi","raportör","sekreter","yeminli","smmm","ymm"
-        }
+    # -------------------- 1) NER (PyTorch) --------------------
+    device = 0 if torch.cuda.is_available() else -1
+    ner = pipeline(
+        "token-classification",
+        model=model_name_or_path,
+        aggregation_strategy="simple",
+        framework="pt",
+        device=device
+    )
 
-    # --- Regex yedek (Türkçe karakter destekli: En az 2 kelime, Baş harf büyük) ---
+    def ner_person_conf(text: str) -> float:
+        t = (text or "").strip()
+        if not t:
+            return 0.0
+        ents = ner(t)
+        scores = [float(e.get("score", 0.0))
+                  for e in ents
+                  if e.get("entity_group", "").upper() in {"PER", "PERSON"}]
+        # eşiği bu fonksiyonda uygula; dışarıya [0..1] döndür
+        m = max(scores) if scores else 0.0
+        return m if m >= min_conf else 0.0
+
+    # -------------------- 2) Kurallar & yardımcılar --------------------
+    label_kw = [
+        "ad soyad","adı soyadı","adı ve soyadı","ad ve soyad",
+        "adi soyadi","adı", "ad", "soyadı","soyad"
+    ]
+    blacklist = {"başkanı","başkan","yönetim","kurulu","üyesi","katip","müdür","komiser",
+                 "noter","vekili","temsilci","imza","denetçi","raportör","sekreter",
+                 "yeminli","smmm","ymm","av.","avukat","dr.","doç.","prof."}
+
     U = "A-ZÇĞİÖŞÜ"
     L = "a-zçğıöşü"
-    NAME_RX = re.compile(rf"\b[{U}][{L}]+(?:\s+[{U}][{L}]+)+\b")
+    NAME_RX  = re.compile(rf"\b[{U}][{L}]+(?:\s+[{U}][{L}]+){{1,3}}\b")  # 2–4 kelime
+    TOKEN_RX = re.compile(rf"^[{U}][{L}]+$")
 
-    def likely_role(s: str) -> bool:
-        s_norm = (s or "").casefold()
-        return any(w in s_norm for w in blacklist_words)
+    def _norm(s): return (s or "").casefold().strip()
+    def _h(b): return b.get("height", b["y_max"] - b["y_min"])
+    def _same_line(a, b):
+        ya = (a["y_min"] + a["y_max"]) / 2.0
+        yb = (b["y_min"] + b["y_max"]) / 2.0
+        return abs(ya - yb) <= line_tol * max(_h(a), 1)
 
-    # --- NER backend hazırlığı ---
-    nlp_hf = None
-    nlp_spacy = None
+    def _right_neighbor(items, idx_label):
+        A = items[idx_label]["bbox"]; cxA = (A["x_min"] + A["x_max"]) / 2.0
+        best_i, best_dx = None, None
+        for i, it in enumerate(items):
+            if i == idx_label: continue
+            B = it["bbox"]
+            if B["x_min"] <= cxA: continue
+            if not _same_line(A, B): continue
+            dx = B["x_min"] - cxA
+            if 0 <= dx <= max_dx and (best_dx is None or dx < best_dx):
+                best_i, best_dx = i, dx
+        return best_i
 
-    if ner_backend == "hf":
-        # Çok dilli, Türkçe'yi iyi taşıyan bir model
-        from transformers import pipeline
-        # Alternatifler:
-        #   "Davlan/xlm-roberta-base-ner-hrl"
-        #   "savasy/bert-base-turkish-ner-cased"
-        nlp_hf = pipeline(
-            "token-classification",
-            model="Davlan/xlm-roberta-base-ner-hrl",
-            aggregation_strategy="simple"
-        )
-    elif ner_backend == "spacy":
-        import spacy
-        try:
-            nlp_spacy = spacy.load("tr_core_news_lg")
-        except Exception:
-            nlp_spacy = spacy.load("xx_ent_wiki_sm")  # fallback (zayıf ama çalışır)
+    def _looks_like_name(text: str) -> float:
+        t = (text or "").strip()
+        if not t: return 0.0
+        tcf = t.casefold()
+        if any(w in tcf for w in blacklist): return 0.0
+        if any(ch.isdigit() for ch in t): return 0.0
 
+        m = NAME_RX.search(t)
+        if m:
+            toks = m.group(0).split()
+            if not (2 <= len(toks) <= 4): return 0.0
+            if not all(TOKEN_RX.match(tok) for tok in toks): return 0.0
+            # 0.75–0.85 arası kural skoru
+            return min(0.75 + 0.05 * (len(toks)-2), 0.85)
+
+        if accept_single_token and TOKEN_RX.match(t) and len(t) >= 2:
+            return 0.55  # tek kelime adlar için düşük güven
+        return 0.0
+
+    # -------------------- 3) Çıkarım --------------------
     rows = []
-
     for pidx, items in enumerate(pages_scaled or []):
-        if not items:
+        if not items: 
             continue
 
-        for it in items:
-            text = (it.get("text") or "").strip()
-            if not text:
-                continue
-            if likely_role(text):
-                continue  # rol/ünvan cümleleri ele
+        # Etiket kutularını bul
+        label_idxs = [i for i, it in enumerate(items)
+                      if (t:=_norm(it.get("text",""))) and any(kw in t for kw in label_kw)]
 
-            found = False
-            best_score = 0.0
-            method = None
+        # Etiket-temelli çıkarım
+        for li in label_idxs:
+            lbl = items[li]
+            cand_i = _right_neighbor(items, li)
+            cands = [ci for ci in [cand_i, li] if ci is not None]  # sağ kutu + etiket kutusu
 
-            # --- 1) NER (HF) ---
-            if ner_backend == "hf" and nlp_hf is not None:
-                ents = nlp_hf(text)
-                # PERSON olanları grupla
-                person_spans = [e for e in ents if e.get("entity_group","") == "PER"]
-                # Çoklu token içerenleri veya tek token’ı isteğe bağlı kabul et
-                for e in person_spans:
-                    # transformers çıktısı: {'word','score','start','end',...}
-                    ent_text = text[e['start']:e['end']].strip()
-                    if likely_role(ent_text):
-                        continue
-                    # kaç kelime?
-                    wc = len(ent_text.split())
-                    if wc >= 2 or (allow_single_token and wc >= 1):
-                        score = float(e.get("score", 0.0))
-                        if score >= min_conf and score > best_score:
-                            best_score = score
-                            found = True
-                            method = "hf"
-                # HF yöntemi PERSON bulduysa kutuyu işaretle
-                if found:
-                    rows.append({
-                        "page_idx": pidx,
-                        "text": text,
-                        "bbox": it["bbox"],
-                        "score": best_score,
-                        "method": method
-                    })
+            seen = set()
+            for ci in cands:
+                if ci in seen: 
                     continue
+                seen.add(ci)
 
-            # --- 2) NER (spaCy) ---
-            if ner_backend == "spacy" and nlp_spacy is not None:
-                doc = nlp_spacy(text)
-                for ent in doc.ents:
-                    if ent.label_.upper() in {"PER","PERSON"}:
-                        ent_text = ent.text.strip()
-                        if likely_role(ent_text):
-                            continue
-                        wc = len(ent_text.split())
-                        if wc >= 2 or (allow_single_token and wc >= 1):
-                            found = True
-                            best_score = 1.0  # spaCy skor vermiyor; 1.0 kabul
-                            method = "spacy"
-                            break
-                if found:
-                    rows.append({
-                        "page_idx": pidx,
-                        "text": text,
-                        "bbox": it["bbox"],
-                        "score": best_score,
-                        "method": method
-                    })
+                ct = (items[ci].get("text") or "").strip()
+                cb = items[ci]["bbox"]
+                s_rule = _looks_like_name(ct)
+                s_ner  = ner_person_conf(ct)
+
+                # toplam skor: anchor=1.0, kural=0.6, NER=0.4
+                score_total = 1.0 + 0.6*s_rule + 0.4*s_ner
+
+                rows.append({
+                    "page_idx": pidx,
+                    "label_text": lbl.get("text",""),
+                    "cand_text": ct,
+                    "cand_bbox": cb,
+                    "score_total": round(score_total,3),
+                    "score_breakdown": {"anchor":1.0, "rule":round(s_rule,3), "ner":round(s_ner,3)}
+                })
+
+        # Etiket bulunamadıysa: kural+NER taraması
+        if not label_idxs:
+            for it in items:
+                ct = (it.get("text") or "").strip()
+                cb = it["bbox"]
+                s_rule = _looks_like_name(ct)
+                if s_rule <= 0:
                     continue
+                s_ner  = ner_person_conf(ct)
+                score_total = 0.6*s_rule + 0.4*s_ner
+                rows.append({
+                    "page_idx": pidx, "label_text": None,
+                    "cand_text": ct, "cand_bbox": cb,
+                    "score_total": round(score_total,3),
+                    "score_breakdown": {"anchor":0.0, "rule":round(s_rule,3), "ner":round(s_ner,3)}
+                })
 
-            # --- 3) Regex yedek ---
-            m = NAME_RX.search(text)
-            if m:
-                ent_text = m.group(0)
-                if not likely_role(ent_text):
-                    rows.append({
-                        "page_idx": pidx,
-                        "text": text,
-                        "bbox": it["bbox"],
-                        "score": 0.60,   # regex güveni
-                        "method": "regex"
-                    })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-    import pandas as pd
-    adsoyad_df = pd.DataFrame(rows).sort_values(["page_idx","method","score"], ascending=[True, True, False]).reset_index(drop=True)
-    return adsoyad_df
+    # sayfa başına en iyi N adayı
+    df = (df.sort_values(["page_idx","score_total"], ascending=[True, False])
+            .groupby("page_idx", as_index=False)
+            .head(topk_per_page)
+            .reset_index(drop=True))
+    return df
 
-# 1) Transformers ile (önerilen)
-adsoyad_df = extract_name_boxes(pages_scaled, ner_backend="hf", min_conf=0.70)
+# Sadece PyTorch + Transformers (TF yok)
+name_df = extract_names_hybrid_pt(
+    pages_scaled,
+    accept_single_token=True,  # imza satırlarında yararlı
+    topk_per_page=5,
+    min_conf=0.70
+)
+display(name_df.head())
 
-# 2) spaCy ile
-# adsoyad_df = extract_name_boxes(pages_scaled, ner_backend="spacy")
-
-# 3) Sadece regex yedeği (internet/kurulum yoksa)
-# adsoyad_df = extract_name_boxes(pages_scaled, ner_backend="regex_only")
-
-display(adsoyad_df.head())
-
-# İstersen en iyi adayları sayfa bazında filtrele:
-top_names = (adsoyad_df
-             .sort_values(["page_idx","score"], ascending=[True, False])
-             .groupby("page_idx", as_index=False)
-             .head(5))  # her sayfadan ilk 5 kutu
+# Görselleştirmek istersen (OpenCV):
+# import cv2, matplotlib.pyplot as plt
+# vis = final_lower_imgs[0].copy()
+# for _, row in name_df[name_df.page_idx==0].iterrows():
+#     b = row.cand_bbox
+#     cv2.rectangle(vis, (b["x_min"], b["y_min"]), (b["x_max"], b["y_max"]), (0,255,0), 2)
+# plt.imshow(vis[..., ::-1]); plt.axis("off"); plt.show()
