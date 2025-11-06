@@ -1,153 +1,212 @@
-# pip: rapidfuzz
-from typing import List, Dict, Any, Tuple, Optional
-import re
-import pandas as pd
-from rapidfuzz import fuzz
-
-DIGIT_RX = re.compile(r"[\d][\d\.\,\s]*")
-
-def _norm(s: str) -> str:
-    return (s or "").casefold()
-
-def _has_digits(s: str) -> bool:
-    return bool(DIGIT_RX.search(s or ""))
-
-def _extract_number_str(s: str) -> Optional[str]:
-    m = DIGIT_RX.search(s or "")
-    return m.group(0).strip() if m else None
-
-def _parse_tr_number(num_str: str) -> Optional[float]:
-    """
-    Turkish-style parsing:
-      12.050,00  -> 12050.00
-      12,050.00  -> 12050.00 (fallback)
-      12050      -> 12050.0
-    """
-    if not num_str:
-        return None
-    s = num_str.strip()
-    # Choose pattern by last separator
-    if "," in s and s.rfind(",") > s.rfind("."):
-        # comma decimal, dot thousands
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        # dot decimal, comma thousands
-        s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def _get_center(b: Dict[str, int]) -> Tuple[float, float]:
-    return ( (b["x_min"] + b["x_max"]) / 2.0, (b["y_min"] + b["y_max"]) / 2.0 )
-
-def _height(b: Dict[str, int]) -> int:
-    return b.get("height", b["y_max"] - b["y_min"])
-
-def _reading_order(items: List[Dict[str, Any]]) -> List[int]:
-    # Sort top-to-bottom, then left-to-right
-    return sorted(range(len(items)), key=lambda i: (items[i]["bbox"]["y_min"], items[i]["bbox"]["x_min"]))
-
-def _same_line(a: Dict[str,int], b: Dict[str,int], line_tol: float) -> bool:
-    # same line if vertical centers within tolerance of label height
-    ya = (a["y_min"] + a["y_max"]) / 2
-    yb = (b["y_min"] + b["y_max"]) / 2
-    h  = max(_height(a), 1)
-    return abs(ya - yb) <= line_tol * h
-
-def _nearest_value_on_right(items, idx_label, max_dx: int, line_tol: float) -> Optional[int]:
-    A = items[idx_label]["bbox"]
-    cxA, _ = _get_center(A)
-    best_i, best_dx = None, None
-    for i, it in enumerate(items):
-        if i == idx_label:
-            continue
-        B = it["bbox"]
-        # must be on right, same line
-        if B["x_min"] <= cxA:
-            continue
-        if not _same_line(A, B, line_tol):
-            continue
-        if not _has_digits(it.get("text","")):
-            continue
-        dx = B["x_min"] - cxA
-        if 0 <= dx <= max_dx and (best_dx is None or dx < best_dx):
-            best_i, best_dx = i, dx
-    return best_i
-
-def extract_sermaye_df(
-    pages_scaled: List[List[Dict[str, Any]]],
+def extract_and_merge_sermaye(
+    pages_scaled,
+    bottom_df=None,
     fuzzy_threshold: int = 80,
     line_tol: float = 0.8,
-    max_dx: int = 1600,    # pixels to the right to search
-) -> pd.DataFrame:
+    max_dx: int = 1600
+):
     """
-    Returns a DataFrame with:
-      page_idx, label_text, label_bbox, value_text, value_bbox, value_str, value_num
+    End-to-end 'sermaye' extractor with robust number parsing.
+    Inputs
+    ------
+    pages_scaled : List[List[Dict]]   # OCR regions per page, each region has {"text": str, "bbox": {x_min,y_min,x_max,y_max,...}}
+    bottom_df    : Optional[pd.DataFrame]  # if given, merged output is returned
+    fuzzy_threshold : int             # RapidFuzz partial-ratio threshold
+    line_tol     : float              # same-line tolerance as a multiple of label height
+    max_dx       : int                # max horizontal distance (pixels) to search on the right
+
+    Returns
+    -------
+    sermaye_df if bottom_df is None; otherwise merged_df
     """
+    import re
+    import pandas as pd
+    from rapidfuzz import fuzz
+
+    # --------------------- helpers (scoped; not polluting global space) ---------------------
+    REQ_KEYS = ("x_min", "y_min", "x_max", "y_max")
+
+    # generous digit capture (allows thousands & decimals with mixed separators and spaces)
+    DIGIT_RX = re.compile(r"\d[\d\s\.,]*")
+
+    # strict detectors to avoid mis-parsing:
+    _RX_COMMA_DEC  = re.compile(r"^\s*\d{1,3}(?:\.\d{3})*,\d{1,2}\s*$")   # 1.234,56
+    _RX_DOT_DEC    = re.compile(r"^\s*\d{1,3}(?:,\d{3})*\.\d{1,2}\s*$")   # 1,234.56
+    _RX_DOTS_THOUS = re.compile(r"^\s*\d{1,3}(?:\.\d{3})+\s*$")           # 12.050.000
+    _RX_COMM_THOUS = re.compile(r"^\s*\d{1,3}(?:,\d{3})+\s*$")            # 12,050,000
+    _RX_INTEGER    = re.compile(r"^\s*\d+\s*$")                           # 12050000
+
+    def _norm(s: str) -> str:
+        return (s or "").casefold()
+
+    def _has_digits(s: str) -> bool:
+        return bool(DIGIT_RX.search(s or ""))
+
+    def _extract_number_str(s: str):
+        if not s:
+            return None
+        # take the *longest* digit-like span; OCR sometimes emits noise fragments
+        cands = [m.group(0).strip() for m in DIGIT_RX.finditer(s)]
+        if not cands:
+            return None
+        return max(cands, key=len)
+
+    def _parse_tr_number(num_str: str):
+        """
+        Robust parsing for:
+          '12.050.000' -> 12050000
+          '12,050,000' -> 12050000
+          '12.050,00'  -> 12050.00
+          '12,050.00'  -> 12050.00
+          '12050000'   -> 12050000
+        Also tolerates trailing currency text (TL, ₺, TRY).
+        """
+        if not num_str:
+            return None
+        s = num_str.strip()
+        # strip currency/labels (OCR variants included)
+        for tok in ["TL", "tl", "Tl", "tL", "₺", "TRY", "try", "Try"]:
+            s = s.replace(tok, "")
+        s = s.strip()
+
+        # normalize internal spaces around separators
+        s = re.sub(r"\s+", "", s)
+
+        # explicit patterns (highest confidence first)
+        if _RX_COMMA_DEC.match(s):
+            s_norm = s.replace(".", "").replace(",", ".")
+            try: return float(s_norm)
+            except ValueError: return None
+
+        if _RX_DOT_DEC.match(s):
+            s_norm = s.replace(",", "")
+            try: return float(s_norm)
+            except ValueError: return None
+
+        if _RX_DOTS_THOUS.match(s):
+            s_norm = s.replace(".", "")
+            try: return float(s_norm)
+            except ValueError: return None
+
+        if _RX_COMM_THOUS.match(s):
+            s_norm = s.replace(",", "")
+            try: return float(s_norm)
+            except ValueError: return None
+
+        if _RX_INTEGER.match(s):
+            try: return float(s)
+            except ValueError: return None
+
+        # fallback heuristic by last separator role
+        last_dot   = s.rfind(".")
+        last_comma = s.rfind(",")
+        if last_comma > last_dot >= 0:
+            s_norm = s.replace(".", "").replace(",", ".")   # comma-decimal
+        elif last_dot > last_comma >= 0:
+            s_norm = s.replace(",", "")                     # dot-decimal
+        else:
+            s_norm = s.replace(".", "").replace(",", "")    # ambiguous ⇒ integer
+
+        try:
+            return float(s_norm)
+        except ValueError:
+            return None
+
+    def _height(b):
+        return b.get("height", b["y_max"] - b["y_min"])
+
+    def _reading_order(items):
+        return sorted(range(len(items)), key=lambda i: (items[i]["bbox"]["y_min"], items[i]["bbox"]["x_min"]))
+
+    def _same_line(bA, bB, tol):
+        ya = (bA["y_min"] + bA["y_max"]) / 2.0
+        yb = (bB["y_min"] + bB["y_max"]) / 2.0
+        h  = max(_height(bA), 1)
+        return abs(ya - yb) <= tol * h
+
+    def _nearest_value_on_right(items, idx_label, max_dx, line_tol):
+        A = items[idx_label]["bbox"]
+        cxA = (A["x_min"] + A["x_max"]) / 2.0
+        best_i, best_dx = None, None
+        for i, it in enumerate(items):
+            if i == idx_label:
+                continue
+            B = it["bbox"]
+            if B["x_min"] <= cxA:
+                continue
+            if not _same_line(A, B, line_tol):
+                continue
+            if not _has_digits(it.get("text", "")):
+                continue
+            dx = B["x_min"] - cxA
+            if 0 <= dx <= max_dx and (best_dx is None or dx < best_dx):
+                best_i, best_dx = i, dx
+        return best_i
+
+    # --------------------- extraction ---------------------
     rows = []
-    for pidx, items in enumerate(pages_scaled):
+    for pidx, items in enumerate(pages_scaled or []):
         if not items:
             continue
 
-        # prepare reading order
         order = _reading_order(items)
         pos = {i: k for k, i in enumerate(order)}
 
         for i, itm in enumerate(items):
-            txt = _norm(itm.get("text",""))
-            if not txt:
-                continue
+            txt = _norm(itm.get("text", ""))
 
-            # fuzzy match against 'sermaye' variants
+            # fuzzy match any sermaye variant
             score = max(
                 fuzz.partial_ratio(txt, "sermaye"),
                 fuzz.partial_ratio(txt, "sermayesi"),
                 fuzz.partial_ratio(txt, "ödenmiş sermaye"),
                 fuzz.partial_ratio(txt, "çıkarılmış sermaye"),
+                fuzz.partial_ratio(txt, "sermayenin"),
             )
-
             if score < fuzzy_threshold:
-                continue  # not a sermaye label
+                continue
 
             label_bbox = itm["bbox"]
-            value_i = None
             value_txt = None
             value_bbox = None
             value_str = None
             value_num = None
 
-            # 1) try same box
-            value_str = _extract_number_str(itm.get("text",""))
-            if value_str:
-                value_txt = itm.get("text","")
-                value_bbox = label_bbox
-                value_num = _parse_tr_number(value_str)
-            else:
-                # 2) try right neighbor on same line
+            # 1) same box
+            value_str = _extract_number_str(itm.get("text", ""))
+            value_num = _parse_tr_number(value_str) if value_str else None
+            if value_num is None:
+                # 2) right neighbor on same line
                 cand = _nearest_value_on_right(items, i, max_dx=max_dx, line_tol=line_tol)
                 if cand is not None:
-                    value_i = cand
-                else:
-                    # 3) fall back to reading-order neighbor (next then previous)
-                    k = pos[i]
-                    neigh = []
-                    if k+1 < len(order): neigh.append(order[k+1])
-                    if k-1 >= 0:        neigh.append(order[k-1])
-                    for j in neigh:
-                        if _has_digits(items[j].get("text","")):
-                            value_i = j
-                            break
-
-                if value_i is not None:
-                    value_txt = items[value_i].get("text","")
-                    value_bbox = items[value_i]["bbox"]
+                    value_txt = items[cand].get("text", "")
+                    value_bbox = items[cand]["bbox"]
                     value_str  = _extract_number_str(value_txt)
                     value_num  = _parse_tr_number(value_str) if value_str else None
 
+                # 3) fallback to next/prev in reading order
+                if value_num is None:
+                    k = pos[i]
+                    neigh = []
+                    if k + 1 < len(order): neigh.append(order[k + 1])
+                    if k - 1 >= 0:         neigh.append(order[k - 1])
+                    for j in neigh:
+                        if _has_digits(items[j].get("text", "")):
+                            value_txt = items[j].get("text", "")
+                            value_bbox = items[j]["bbox"]
+                            value_str  = _extract_number_str(value_txt)
+                            value_num  = _parse_tr_number(value_str) if value_str else None
+                            if value_num is not None:
+                                break
+
+            # default texts if we only had the label itself
+            if value_txt is None and value_str is not None:
+                value_txt = itm.get("text", "")
+                value_bbox = label_bbox
+
             rows.append({
-                "page_idx": pidx,
-                "label_text": itm.get("text",""),
+                "page_idx":   pidx,
+                "label_text": itm.get("text", ""),
                 "label_bbox": label_bbox,
                 "value_text": value_txt,
                 "value_bbox": value_bbox,
@@ -155,119 +214,33 @@ def extract_sermaye_df(
                 "value_num":  value_num,
             })
 
-    return pd.DataFrame(rows)
+    sermaye_df = pd.DataFrame(rows)
 
-def merge_into_bottom_df(bottom_df: pd.DataFrame, sermaye_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Example merge policy:
-      - keep only rows with a parsed numeric value
-      - pick the largest 'value_num' per page (often the correct capital figure)
-      - append/merge into bottom_df with columns ['page_idx','sermaye_value','sermaye_bbox']
-    Adjust to your schema.
-    """
-    valid = sermaye_df.dropna(subset=["value_num"]).copy()
-    if valid.empty:
+    # If caller doesn't provide bottom_df, just return extracted table.
+    if bottom_df is None:
+        return sermaye_df
+
+    # Merge policy: keep the highest value per page (typical for capital amounts)
+    if sermaye_df.empty or sermaye_df["value_num"].dropna().empty:
         return bottom_df
 
-    best = (valid.sort_values(["page_idx","value_num"], ascending=[True,False])
-                 .groupby("page_idx", as_index=False)
-                 .first()[["page_idx","value_num","value_bbox"]]
-                 .rename(columns={"value_num":"sermaye_value","value_bbox":"sermaye_bbox"}))
+    best = (sermaye_df.dropna(subset=["value_num"])
+                      .sort_values(["page_idx", "value_num"], ascending=[True, False])
+                      .groupby("page_idx", as_index=False)
+                      .first()[["page_idx", "value_num", "value_bbox"]]
+                      .rename(columns={"value_num": "sermaye_value", "value_bbox": "sermaye_bbox"}))
 
-    # left-join on page_idx; create if missing
-    if bottom_df is None or bottom_df.empty:
-        return best
-    out = bottom_df.merge(best, on="page_idx", how="left")
-    return out
+    # align/merge by page_idx
+    if "page_idx" not in bottom_df.columns:
+        # make a minimal index if needed
+        bottom_df = bottom_df.copy()
+        bottom_df["page_idx"] = 0
 
-sermaye_df = extract_sermaye_df(pages_scaled, fuzzy_threshold=80, line_tol=0.8, max_dx=1600)
-# Inspect
-display(sermaye_df.head(10))
+    merged = bottom_df.merge(best, on="page_idx", how="left")
+    return merged
 
-# Merge into your bottom_df (adapt to your schema)
-bottom_df = merge_into_bottom_df(bottom_df, sermaye_df)
+# If you want the extracted table only:
+sermaye_df = extract_and_merge_sermaye(pages_scaled)
 
-import re
-
-# Recognize common Turkish/EN money formats
-_RX_COMMA_DEC  = re.compile(r"^\s*\d{1,3}(?:\.\d{3})*,\d{1,2}\s*")   # 1.234,56
-_RX_DOT_DEC    = re.compile(r"^\s*\d{1,3}(?:,\d{3})*\.\d{1,2}\s*")   # 1,234.56
-_RX_DOTS_THOUS = re.compile(r"^\s*\d{1,3}(?:\.\d{3})+\s*$")          # 12.050.000
-_RX_COMM_THOUS = re.compile(r"^\s*\d{1,3}(?:,\d{3})+\s*$")           # 12,050,000
-_RX_INTEGER    = re.compile(r"^\s*\d+\s*$")                          # 12050000
-
-def _parse_tr_number(num_str: str) -> float | None:
-    """
-    Robust parsing for:
-      - '12.050.000' -> 12050000
-      - '12,050,000' -> 12050000
-      - '12.050,00'  -> 12050.00
-      - '12,050.00'  -> 12050.00
-      - '12050000'   -> 12050000
-    Ignores currency symbols and spaces.
-    """
-    if not num_str:
-        return None
-
-    s = num_str.strip()
-    # remove currency/text noise
-    s = s.replace("TL", "").replace("₺", "").replace("TRY", "")
-    s = s.replace("tL", "").replace("Tl", "")
-    s = s.strip()
-
-    # Detect patterns in priority order
-    if _RX_COMMA_DEC.match(s):
-        # comma is decimal, dots are thousands
-        s = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    if _RX_DOT_DEC.match(s):
-        # dot is decimal, commas are thousands
-        s = s.replace(",", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    if _RX_DOTS_THOUS.match(s):
-        # only thousands dots
-        s = s.replace(".", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    if _RX_COMM_THOUS.match(s):
-        # only thousands commas
-        s = s.replace(",", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    if _RX_INTEGER.match(s):
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    # Fallback: last separator heuristic
-    last_dot   = s.rfind(".")
-    last_comma = s.rfind(",")
-    if last_comma > last_dot >= 0:
-        # treat comma as decimal, dots as thousands
-        s = s.replace(".", "").replace(",", ".")
-    elif last_dot > last_comma >= 0:
-        # treat dot as decimal, commas as thousands
-        s = s.replace(",", "")
-    else:
-        # no clear decimal: strip both
-        s = s.replace(".", "").replace(",", "")
-
-    try:
-        return float(s)
-    except ValueError:
-        return None
+# If you want it merged into your existing bottom_df:
+bottom_df = extract_and_merge_sermaye(pages_scaled, bottom_df=bottom_df)
