@@ -1,39 +1,34 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import re
 
-# --- opsiyonel: RapidFuzz varsa daha iyi fuzzy; yoksa difflib fallback ---
+# ---- opsiyonel hızlı fuzzy (RapidFuzz varsa kullan) ----
 try:
     from rapidfuzz.fuzz import ratio as _fz_ratio
 except Exception:
     from difflib import SequenceMatcher
-    def _fz_ratio(a, b):
+    def _fz_ratio(a, b):  # 0-100
         return int(100 * SequenceMatcher(None, a, b).ratio())
 
-def extract_name_boxes_ner_only(
+def extract_name_boxes_ner_only_strong(
     pages_scaled: Any,
-    # NER iki biçimde gelebilir:
-    # 1) spaCy nlp objesi (doc.ents => .start_char/.end_char/.label_)
-    spacy_nlp: Optional[Any] = None,
-    # 2) Harici öngörü: ner_predict(text) -> List[Dict|Tuple]
-    #    Kabul edilen örnekler:
-    #      [{"start":s,"end":e,"label":"PERSON","score":0.97}, ...]
-    #      [(s,e,"PERSON"), ...]
-    ner_predict: Optional[Callable[[str], List[Union[Dict, Tuple]]]] = None,
-    ocr_conf_min: float = 0.90,          # OCR kutusu eşiği
+    spacy_nlp,                              # ZORUNLU: spaCy NER (tr_core_news_trf önerilir)
+    ocr_conf_min: float = 0.80,             # 0.80 başla; ihtiyaç olursa yükselt
     fuzzy_blacklist: Optional[List[str]] = None,
-    fuzzy_cutoff: int = 88,              # 0-100; 88 genelde “imza/ımza” gibi varyantları yakalar
-    min_tokens: Tuple[int, int] = (2, 3) # (min, max) token sayısı
+    fuzzy_cutoff: int = 92,                 # yalnız bağımsız token eşleşirse sil
+    min_tokens: Tuple[int, int] = (2, 3),   # ad-soyad veya ad-ikinciad-soyad
+    debug: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Yalnızca NER ile ad-soyad (PERSON) çıkarır.
+    Yalnızca spaCy NER ile ad-soyad (PERSON) çıkarır.
+    Ham metin + truecase normalize metinde NER çalıştırır, güvenli filtre uygular.
     Dönüş: [{page_index, role='ad_soyad', name, matched_text, name_span, bbox, confidence, source}]
     """
 
-    # --- varsayılan kara liste ---
     if fuzzy_blacklist is None:
-        fuzzy_blacklist = ["imza", "mühür", "muhur", "kaşe", "kase", "stamp",
-                           "seal", "signature", "tasdik", "tescil", "onay", "noter"]
+        fuzzy_blacklist = ["imza","mühür","muhur","kaşe","kase","stamp","seal",
+                           "signature","tasdik","tescil","onay","noter"]
 
+    # ---- yardımcılar ----
     def _ensure_pages(pages_obj: Any) -> List[List[Dict[str, Any]]]:
         if not pages_obj:
             return []
@@ -41,52 +36,46 @@ def extract_name_boxes_ner_only(
             return [pages_obj]
         return pages_obj
 
-    def _norm(s: str) -> str:
-        s = s.replace("|", "l").replace("’","'").replace("“",'"').replace("”",'"')
+    def _norm_ws(s: str) -> str:
+        s = s.replace("|","l").replace("’","'").replace("“",'"').replace("”",'"')
         return re.sub(r"\s+", " ", s).strip()
 
-    def _fuzzy_clean(text: str) -> str:
-        # kelime kelime dolaş, blacklist ile fuzzy >= cutoff ise kelimeyi sil
-        toks = re.findall(r"\w+|\W+", text)  # kelime + ayrac
+    def _safe_blacklist_clean(text: str) -> str:
+        # Sadece bağımsız token’ı (harf/rakam dizisi) sil; alt-dizini silme.
+        toks = re.findall(r"\w+|\W+", text, flags=re.UNICODE)
         out = []
         for t in toks:
-            if t.strip() and t.strip().isalnum():
-                t_low = t.lower()
-                if any(_fz_ratio(t_low, b) >= fuzzy_cutoff for b in fuzzy_blacklist):
+            core = t.strip()
+            if core and re.fullmatch(r"\w+", core, flags=re.UNICODE):
+                low = core.lower()
+                if any(_fz_ratio(low, b) >= fuzzy_cutoff for b in fuzzy_blacklist):
+                    if debug: print(f"[blk] drop token '{core}'")
                     continue
             out.append(t)
         return "".join(out)
 
-    def _iter_person_spans(text: str) -> List[Tuple[int,int,str]]:
-        spans: List[Tuple[int,int,str]] = []
-        if spacy_nlp is not None:
-            doc = spacy_nlp(text)
-            for ent in getattr(doc, "ents", []):
-                if str(ent.label_).upper() == "PERSON":
-                    spans.append((int(ent.start_char), int(ent.end_char), "PERSON"))
-        if ner_predict is not None:
-            for item in ner_predict(text) or []:
-                if isinstance(item, (list, tuple)) and len(item) >= 3:
-                    s, e, lab = int(item[0]), int(item[1]), str(item[2])
-                    if lab.upper() == "PERSON":
-                        spans.append((s, e, "PERSON"))
-                elif isinstance(item, dict):
-                    if str(item.get("label","")).upper() == "PERSON":
-                        spans.append((int(item["start"]), int(item["end"]), "PERSON"))
-        return spans
+    def _truecase_for_ocr(s: str) -> str:
+        # ALLCAPS blokları Title Case yap (kısaltma/tek harf kısaltmaya dokunma)
+        words = s.split()
+        fixed = []
+        for w in words:
+            if len(w) > 1 and re.fullmatch(r"[A-ZÇĞİÖŞÜ]+", w):
+                fixed.append(w.title())
+            else:
+                fixed.append(w)
+        return " ".join(fixed)
 
-    def _looks_like_name(fragment: str) -> bool:
-        # 2-3 kelime, rakam yok, tamamen alfabetik (noktaya izin)
-        if any(ch.isdigit() for ch in fragment):
+    def _looks_like_name(frag: str) -> bool:
+        if any(ch.isdigit() for ch in frag):
             return False
-        parts = fragment.split()
+        parts = frag.split()
         if not (min_tokens[0] <= len(parts) <= min_tokens[1]):
             return False
         return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü.]+", p) for p in parts)
 
     def _casefix(s: str) -> str:
-        parts, out = s.split(), []
-        for p in parts:
+        out = []
+        for p in s.split():
             if len(p) == 2 and p.endswith(".") and p[0].isalpha():
                 out.append(p.upper())
             elif p.isupper():
@@ -95,33 +84,58 @@ def extract_name_boxes_ner_only(
                 out.append(p)
         return " ".join(out)
 
+    def _run_spacy(text: str) -> List[Tuple[int,int]]:
+        ents = []
+        try:
+            doc = spacy_nlp(text)
+            for e in getattr(doc, "ents", []):
+                if str(e.label_).upper() == "PERSON":
+                    ents.append((int(e.start_char), int(e.end_char)))
+        except Exception as ex:
+            if debug: print("[spacy] error:", ex)
+        return ents
+
     pages = _ensure_pages(pages_scaled)
-    out: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
 
     for pi, items in enumerate(pages):
         for it in items:
+            # OCR güveni
             conf = it.get("confidence")
             if isinstance(conf, (int, float)) and conf < ocr_conf_min:
-                continue  # düşük OCR güveni
+                if debug: print(f"[skip] low conf {conf:.2f}")
+                continue
 
             raw = it.get("text") or it.get("txt") or ""
             if not raw:
                 continue
 
-            text = _norm(raw)
-            text = _fuzzy_clean(text)  # kara liste temizliği (yakın eşleşmeleri de siler)
+            text0 = _norm_ws(raw)
+            text0 = _safe_blacklist_clean(text0)
 
-            spans = _iter_person_spans(text)
+            # 1) Ham metinde NER
+            spans = _run_spacy(text0)
+
+            # 2) Hiç bulamazsa: truecase ile yeniden dene
+            source = "ner_raw"
+            if not spans:
+                text1 = _truecase_for_ocr(text0)
+                if text1 != text0:
+                    spans = _run_spacy(text1)
+                    source = "ner_truecase"
+                else:
+                    source = "ner_raw"
+
             if not spans:
                 continue
 
-            # span bazında doğrulama ve çıktı
             bbox = it.get("bbox") or {}
-            for s, e, _ in spans:
-                frag = text[s:e].strip()
+            for s, e in spans:
+                frag = (text1 if source == "ner_truecase" else text0)[s:e].strip()
                 if not _looks_like_name(frag):
+                    if debug: print(f"[skip] not name '{frag}'")
                     continue
-                out.append({
+                results.append({
                     "page_index": pi,
                     "role": "ad_soyad",
                     "name": _casefix(frag),
@@ -134,27 +148,27 @@ def extract_name_boxes_ner_only(
                         "height": bbox.get("height"),
                     },
                     "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-                    "source": "ner"
+                    "source": source
                 })
 
-    # tekilleştir (aynı sayfa + bbox + span)
+    # tekilleştir
     def _k(r):
         b = r["bbox"]; s = r["name_span"]
         return (r["page_index"], r["name"], b.get("x_min"), b.get("y_min"), b.get("width"), b.get("height"), s)
     uniq, seen = [], set()
-    for r in out:
+    for r in results:
         k = _k(r)
         if k not in seen:
             seen.add(k); uniq.append(r)
     return uniq
 
-# 1) Sadece spaCy ile
-# import spacy; nlp = spacy.load("tr_core_news_trf")
-names = extract_name_boxes_ner_only(pages_scaled, spacy_nlp=nlp, ocr_conf_min=0.90)
+import spacy
+nlp = spacy.load("tr_core_news_trf")
 
-# 2) Kendi NER çıktılarınla (start,end,label[,score])
-# def my_ner(text): return [{"start":s,"end":e,"label":"PERSON","score":0.98}, ...]
-# names = extract_name_boxes_ner_only(pages_scaled, ner_predict=my_ner, ocr_conf_min=0.90)
-
-# 3) Kara liste eşiğini değiştir
-# names = extract_name_boxes_ner_only(pages_scaled, spacy_nlp=nlp, fuzzy_cutoff=92)
+names = extract_name_boxes_ner_only_strong(
+    pages_scaled,
+    spacy_nlp=nlp,
+    ocr_conf_min=0.80,   # önce 0.80 dene; fazla gelirse 0.85–0.90
+    fuzzy_cutoff=92,
+    debug=False
+)
