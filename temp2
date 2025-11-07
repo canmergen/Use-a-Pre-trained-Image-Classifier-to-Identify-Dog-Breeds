@@ -1,50 +1,36 @@
-name_boxes = extract_name_boxes(
-    pages_scaled=pages_scaled,
-    nlp=nlp,
-    ocr_conf_min=0.70,        # düşük güvenli kutuları at
-    min_tokens=(2,3),         # en az iki kelime (ad-soyad)
-    fuzzy_blacklist=None,     # varsayılan imza/mühür/noter filtresi
-    line_merge_px=None,       # otomatik satır birleştirme
-    debug=False               # True yaparsan neden atladığını görürsün
-)
-
 from typing import Any, Dict, List, Optional, Tuple, Union
 import re
-import math
 
-def extract_name_boxes(
+def extract_name_boxes_ner_only_strong(
     pages_scaled: Union[List[Dict[str, Any]], Dict[str, Any]],
-    nlp,                              # spaCy model: tr_core_news_trf önerilir
-    ocr_conf_min: float = 0.70,       # düşük konf. kutuları atla
-    min_tokens: Tuple[int,int] = (2,3),  # ad-soyad veya ad-ikinciad-soyad
-    fuzzy_blacklist: Optional[List[str]] = None,  # single-token blacklist
-    line_merge_px: Optional[int] = None,      # satır birleştirme eşiği (px). None => otomatik
-    x_gap_max_px: Optional[int] = None,       # satır içinde kelime birleştirme max boşluk (px)
+    nlp,                               # spaCy model (tr_core_news_trf önerilir)
+    ocr_conf_min: float = 0.70,        # düşük konf. kutuları at
+    min_tokens: Tuple[int,int] = (2,4),# ad-soyad(2) + ikinci ad(3) + nadiren 4
+    fuzzy_blacklist: Optional[List[str]] = None,  # tekil token blacklist
+    line_merge_px: Optional[int] = None,          # satır birleştirme eşiği (px)
+    x_gap_max_px: Optional[int] = None,           # (şimdilik bilgilendirici)
+    use_rule_fallback: bool = True,               # NER kaçırırsa kural tabanlı
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Sadece PERSON (ad-soyad) kutularını NER ile çıkarır.
-    - Önce satır bazında OCR item'larını birleştirir,
-    - NER'i satır metni üzerinde çalıştırır,
-    - Span'a düşen kelime kutularının birleşik bbox'ını döndürür.
-
-    Dönüş: [{page_index, role:'PERSON', name, matched_text, name_span:(s,e), boxes:{...}, confidence:None, source}]
+    Sadece PERSON (ad-soyad) kutularını döndürür.
+    1) Aynı satırdaki OCR kutularını birleştirir
+    2) Satır metninde spaCy NER uygular
+    3) NER yoksa/eksikse kural tabanlı adaylar üretir
+    4) Span'a düşen kelime kutularının birleşik bbox'unu verir
     """
 
-    # --- yardımcılar ---
+    # ---------- yardımcılar ----------
     def _ensure_pages(obj):
-        if not obj:
-            return []
+        if not obj: return []
         if isinstance(obj, dict):
             if "items" in obj and isinstance(obj["items"], list):
                 return [obj]
             return [{"items": obj if isinstance(obj, list) else []}]
         out = []
         for p in obj:
-            if isinstance(p, dict) and "items" in p:
-                out.append(p)
-            elif isinstance(p, list):
-                out.append({"items": p})
+            if isinstance(p, dict) and "items" in p: out.append(p)
+            elif isinstance(p, list): out.append({"items": p})
         return out
 
     def _norm_ws(s: str) -> str:
@@ -52,55 +38,79 @@ def extract_name_boxes(
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    # tekil token blacklist temizliği (alt-dizini değil, sadece tek kelimeyi düş)
+    # Tek kelimelik blacklist (mühür/kaşe/noter vs) – tek başına görünürse elenir
     if fuzzy_blacklist is None:
         fuzzy_blacklist = [
             "imza","mühür","muhur","kaşe","kase","stamp","seal",
             "signature","tasdik","tescil","onay","noter","sayfa","page"
         ]
-    BLK = set([_norm_ws(b).lower() for b in fuzzy_blacklist])
+    BLK_SINGLE = set(_norm_ws(b).lower() for b in fuzzy_blacklist)
+
+    # İsim dışı negatif sözlük (iki+ kelimelik şirket/kalıp sözcükler)
+    NEG_MULTI = {
+        "asli", "gibidir", "ticaret", "sicil", "mudurlugu", "müdürlüğü",
+        "anonim", "limited", "sirketi", "şirketi", "bankasi", "bankası",
+        "sanayi", "ve", "ticaret", "merkezi"
+    }
 
     def _is_blacklisted_token(tok: str) -> bool:
-        t = tok.lower()
-        return t in BLK
-
-    def _looks_like_name(text: str) -> bool:
-        # rakam içermesin
-        if any(ch.isdigit() for ch in text):
-            return False
-        parts = [p for p in text.split() if p]
-        if not (min_tokens[0] <= len(parts) <= min_tokens[1]):
-            return False
-        # tekil token blacklist varsa eler
-        if any(_is_blacklisted_token(p) for p in parts):
-            return False
-        # her parça harflerden oluşsun (Türkçe harfler dahil)
-        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts)
+        return tok.lower() in BLK_SINGLE
 
     def _title_soft(s: str) -> str:
-        # ALLCAPS satırlarda isim tanımını kolaylaştırır
         words = s.split()
         out = []
         for w in words:
             if len(w) == 1:
-                out.append(w)  # tek harfe dokunma
+                out.append(w)          # tek harfe dokunma
             elif re.fullmatch(r"[A-ZÇĞİÖŞÜ]+", w):
-                out.append(w.title())
+                out.append(w.title())  # ALLCAPS -> Title
             else:
                 out.append(w)
         return " ".join(out)
 
+    def _looks_like_name(text: str) -> bool:
+        # Rakam içermez
+        if any(ch.isdigit() for ch in text): return False
+        parts = [p for p in text.split() if p]
+        if not (min_tokens[0] <= len(parts) <= min_tokens[1]): return False
+        # Negatif sözlük parçası içermez
+        if any(p.lower() in NEG_MULTI for p in parts): return False
+        # Tekil token blacklist içermez
+        if any(_is_blacklisted_token(p) for p in parts): return False
+        # Her parça harflerden oluşsun (TR destekli)
+        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts)
+
     def _union_bbox(bxs):
-        x1 = min(b["x_min"] for b in bxs)
-        y1 = min(b["y_min"] for b in bxs)
-        x2 = max(b["x_min"] + b["width"]  for b in bxs)
+        x1 = min(b["x_min"] for b in bxs); y1 = min(b["y_min"] for b in bxs)
+        x2 = max(b["x_min"] + b["width"] for b in bxs)
         y2 = max(b["y_min"] + b["height"] for b in bxs)
         return {"x_min": int(x1), "y_min": int(y1),
                 "width": int(x2 - x1), "height": int(y2 - y1)}
 
-    # --- sayfaları hazırla ---
-    pages = _ensure_pages(pages_scaled)
+    # Basit kural tabanlı ad-soyad yakalayıcı (TitleCase üzerinden)
+    # 2–4 ardışık "isim benzeri" kelimeyi span olarak işaretler.
+    def _rule_name_spans(text_title: str) -> List[Tuple[int,int]]:
+        spans = []
+        # Kelime sınırlarına göre ilerle
+        pat = re.compile(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?")
+        tokens = [(m.group(0), m.start(), m.end()) for m in pat.finditer(text_title)]
+        i, n = 0, len(tokens)
+        while i < n:
+            buf = [tokens[i]]
+            j = i + 1
+            while j < n and (tokens[j][1] - tokens[j-1][2]) <= 2:  # arada en fazla 2 boşluk/char
+                buf.append(tokens[j]); j += 1
+                if len(buf) == min_tokens[1]: break
+            # 2–4 kelime ise aday
+            if min_tokens[0] <= len(buf) <= min_tokens[1]:
+                cand = " ".join(t[0] for t in buf)
+                if _looks_like_name(cand):
+                    spans.append((buf[0][1], buf[-1][2]))
+            i += 1
+        return spans
 
+    # ---------- sayfaları hazırla ----------
+    pages = _ensure_pages(pages_scaled)
     results: List[Dict[str,Any]] = []
 
     for pi, page in enumerate(pages):
@@ -110,104 +120,74 @@ def extract_name_boxes(
         for it in items:
             conf = it.get("confidence")
             if isinstance(conf, (int,float)) and conf < ocr_conf_min:
-                if debug: print(f"[skip] low conf {conf:.2f}")
-                continue
+                if debug: print(f"[skip] low conf {conf:.2f}"); continue
             txt = _norm_ws(it.get("text") or it.get("txt") or "")
-            if not txt:
-                continue
-            good.append({
-                "text": txt,
-                "bbox": it.get("bbox") or {},
-                "conf": conf
-            })
-        if not good:
-            continue
+            if not txt: continue
+            good.append({"text": txt, "bbox": it.get("bbox") or {}, "conf": conf})
+        if not good: continue
 
-        # satır birleştirme (y merkezine göre)
-        # otomatik eşik: görüntü yüksekliğinin %2'si kadar veya 20px (hangisi büyükse)
-        # bbox yoksa varsayılan 20
+        # ---- satır birleştirme (y-orta yakınlığına göre) ----
+        def y_center(it): 
+            b = it["bbox"]; return b.get("y_min",0) + b.get("height",0)/2
         if line_merge_px is None:
-            # en yaygın yükseklikten kaba bir H çıkar
-            ys = [g["bbox"].get("y_min",0) for g in good]
-            H_est = (max(ys) - min(ys) + 1000)  # güvenli varsayım
-            line_thr = max(20, int(H_est * 0.02))
+            # genel sağlam varsayım: 24 px
+            line_thr = 24
         else:
             line_thr = int(line_merge_px)
 
-        # x arası boşluk eşiği
-        x_thr = int( x_gap_max_px if x_gap_max_px is not None else 80 )
-
-        # y merkezine göre sırala
-        def y_center(it): 
-            b = it["bbox"]; return b.get("y_min",0) + b.get("height",0)/2
         good.sort(key=lambda it: (y_center(it), it["bbox"].get("x_min",0)))
-
-        lines = []
-        cur = []
-        last_y = None
+        lines, cur, last_y = [], [], None
         for it in good:
             yc = y_center(it)
             if last_y is None or abs(yc - last_y) <= line_thr:
-                cur.append(it)
-                last_y = yc if last_y is None else (last_y*0.7 + yc*0.3)
+                cur.append(it); last_y = yc if last_y is None else (0.7*last_y + 0.3*yc)
             else:
                 lines.append(cur); cur = [it]; last_y = yc
-        if cur:
-            lines.append(cur)
+        if cur: lines.append(cur)
 
-        # her satır içinde sola göre sırala ve yakın kutuları metin sırasıyla birleştir
+        # ---- her satırda NER + kural tabanlı ----
         for line in lines:
             line.sort(key=lambda it: it["bbox"].get("x_min",0))
 
-            # line metni ve segment char aralıklarını üret
-            segs = []  # [{text, bbox, start, end}]
-            cursor = 0
-            for j, it in enumerate(line):
+            # seg dizisi ve char aralıkları
+            segs = []; cursor = 0
+            for it in line:
                 t = _norm_ws(it["text"])
-                if not t:
-                    continue
-                # araya boşluk ekle
-                if segs:
-                    segs.append({"text":" ", "bbox":None, "start":cursor, "end":cursor+1})
-                    cursor += 1
+                if not t: continue
+                if segs: segs.append({"text":" ", "bbox":None, "start":cursor, "end":cursor+1}); cursor += 1
                 segs.append({"text":t, "bbox":it["bbox"], "start":cursor, "end":cursor+len(t)})
                 cursor += len(t)
-
-            if not segs:
-                continue
+            if not segs: continue
 
             raw_line = "".join(s["text"] for s in segs)
             text_for_ner = _title_soft(raw_line)
 
-            # NER
+            spans = []
+            # 1) spaCy NER
             try:
                 doc = nlp(text_for_ner)
+                spans += [(int(e.start_char), int(e.end_char))
+                          for e in doc.ents if str(e.label_).upper() == "PERSON"]
             except Exception as ex:
                 if debug: print("spaCy error:", ex)
-                continue
 
-            # span -> seg kapsama eşlemesi
-            for ent in doc.ents:
-                if str(ent.label_).upper() != "PERSON":
-                    continue
-                s, e = int(ent.start_char), int(ent.end_char)
+            # 2) Kural tabanlı yedek
+            if use_rule_fallback:
+                spans += _rule_name_spans(text_for_ner)
+
+            # --- span -> bbox eşleme ---
+            for (s, e) in spans:
                 cand_boxes = []
                 matched_text = raw_line[s:e]
-
-                # span ile kesişen segmentleri topla
                 for sg in segs:
-                    if sg["bbox"] is None:
-                        continue
+                    if sg["bbox"] is None: continue
                     if not (e <= sg["start"] or s >= sg["end"]):
                         cand_boxes.append(sg["bbox"])
-
-                if not cand_boxes:
-                    continue
+                if not cand_boxes: continue
 
                 name = _norm_ws(matched_text)
                 if not _looks_like_name(name):
-                    if debug: print(f"[skip] not name: '{name}'")
-                    continue
+                    if debug: print(f"[skip] not name: '{name}'"); continue
 
                 fused = _union_bbox(cand_boxes)
                 results.append({
@@ -218,18 +198,28 @@ def extract_name_boxes(
                     "name_span": (s, e),
                     "boxes": fused,
                     "confidence": None,
-                    "source": "line_ner"
+                    "source": "line_ner+rule" if use_rule_fallback else "line_ner",
                 })
 
     # sayfa+isim+bbox ile dedup
-    seen = set()
-    uniq = []
+    seen, uniq = set(), []
     for r in results:
         b = r["boxes"]
         k = (r["page_index"], r["name"], b["x_min"], b["y_min"], b["width"], b["height"])
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(r)
+        if k in seen: continue
+        seen.add(k); uniq.append(r)
 
     return uniq
+
+import spacy
+nlp = spacy.load("tr_core_news_trf")  # GPU yoksa md/lg de olur
+
+name_boxes = extract_name_boxes_ner_only_strong(
+    pages_scaled,
+    nlp=nlp,
+    ocr_conf_min=0.60,     # adlar damgaya yakın, konf. düşebilir
+    min_tokens=(2,4),      # HÜSEYİN MUSTAFA ÇEVİK = 3; gerekirse 4'e kadar
+    line_merge_px=24,      # satır yakınlığı (px); çok kaçırıyorsa 30-36 deneyebilirsin
+    use_rule_fallback=True,
+    debug=False
+)
