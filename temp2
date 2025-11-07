@@ -3,18 +3,15 @@ import re
 
 def extract_name_boxes_ner_only_strong(
     pages_scaled: Union[List[Dict[str, Any]], Dict[str, Any]],
-    nlp,                               # spaCy model: tr_core_news_trf önerilir
-    ocr_conf_min: float = 0.70,        # düşük konf. kutuları at
-    min_tokens: Tuple[int,int] = (2,4),# ad-soyad(+ikinci ad) 2–4 kelime
-    fuzzy_blacklist: Optional[List[str]] = None,  # single-token blacklist
-    line_merge_px: Optional[int] = None,          # KULLANILMAZ (geriye uyum için)
-    x_gap_max_px: Optional[int] = None,           # KULLANILMAZ (geriye uyum için)
+    nlp,                               # spaCy model (tr_core_news_trf önerilir)
+    ocr_conf_min: float = 0.70,        # düşük konf. kutuları at (ama güçlü-ad istisnası var)
+    min_tokens: Tuple[int,int] = (2,4),
+    fuzzy_blacklist: Optional[List[str]] = None,  # tekil kelime kara listesi
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Her OCR kutusunu bağımsız değerlendirir; kutu metni PERSON ise aynı bbox ile döndürür.
-    Bbox üzerinde hiçbir genişletme/birleştirme yapılmaz.
-    Dönüş: [{page_index, role:'PERSON', name, matched_text, boxes, confidence, source}]
+    Bbox üzerinde hiçbir değişiklik yapılmaz.
     """
 
     # --- yardımcılar ---
@@ -35,28 +32,31 @@ def extract_name_boxes_ner_only_strong(
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    # tekil token blacklist (sadece tek kelime halinde görünürse elenir)
+    # Tekil kelime kara listesi (tek başına gelirse elenir)
     if fuzzy_blacklist is None:
         fuzzy_blacklist = [
             "imza","mühür","muhur","kaşe","kase","stamp","seal",
             "signature","tasdik","tescil","onay","noter","sayfa","page"
         ]
-    BLK = set(_norm_ws(b).lower() for b in fuzzy_blacklist)
+    BLK_SINGLE = set(_norm_ws(b).lower() for b in fuzzy_blacklist)
+
+    # Rol/kurum negatif sözlük (varsa PERSON değildir)
+    ROLE_NEG = {
+        "toplanti","toplantı","baskan","başkan","baskani","başkanı","divan",
+        "katip","kâtip","uyesi","üyesi","temsilcisi","noter","müdürü","muduru",
+        "asli","gibidir","ticaret","sicil","mudurlugu","müdürlüğü","şirketi","sirketi",
+        "limited","anonim","bankasi","bankası","merkezi"
+    }
+
+    def _has_role_words(text: str) -> bool:
+        toks = text.lower().split()
+        return any(t in ROLE_NEG for t in toks)
 
     def _is_blacklisted_token(tok: str) -> bool:
-        return tok.lower() in BLK
-
-    def _looks_like_name(text: str) -> bool:
-        # Rakam içermez
-        if any(ch.isdigit() for ch in text): return False
-        parts = [p for p in text.split() if p]
-        if not (min_tokens[0] <= len(parts) <= min_tokens[1]): return False
-        if any(_is_blacklisted_token(p) for p in parts): return False
-        # Her parça (Türkçe harfler dahil) harflerden oluşmalı
-        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts)
+        return tok.lower() in BLK_SINGLE
 
     def _title_soft(s: str) -> str:
-        # ALLCAPS metni TitleCase'e yumuşatır (HÜSEYİN -> Hüseyin)
+        # ALLCAPS -> TitleCase (HÜSEYİN MUSTAFA ÇEVİK -> Hüseyin Mustafa Çevik)
         words = s.split()
         out = []
         for w in words:
@@ -68,55 +68,99 @@ def extract_name_boxes_ner_only_strong(
                 out.append(w)
         return " ".join(out)
 
+    def _looks_like_name_tokens(parts: List[str]) -> bool:
+        # 2–4 kelime, rakam yok, sadece harf (TR dahil), kara liste ve rol kelimesi yok
+        if not (min_tokens[0] <= len(parts) <= min_tokens[1]): return False
+        if any(p.isdigit() or any(ch.isdigit() for ch in p) for p in parts): return False
+        if any(_is_blacklisted_token(p) for p in parts): return False
+        if any(p.lower() in ROLE_NEG for p in parts): return False
+        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts)
+
+    def _strong_name_check(raw: str) -> bool:
+        """
+        Güçlü ad-soyad sezgisi:
+        - TitleCase üzerinde 2–4 kelime, kurumsal/rol kelimesi yoksa kabul
+        - Ya da ALLCAPS formunda aynı şartlarla kabul
+        """
+        txt = _norm_ws(raw)
+        if not txt: return False
+
+        # rol kelimesi içeriyorsa asla PERSON değil
+        if _has_role_words(txt): 
+            return False
+
+        parts_title = _title_soft(txt).split()
+        if _looks_like_name_tokens(parts_title):
+            return True
+
+        # ALLCAPS varyantı (OCR tamamen büyük harf vermiş olabilir)
+        parts_caps = txt.split()
+        if all(re.fullmatch(r"[A-ZÇĞİÖŞÜ]+\.?", w) for w in parts_caps) and _looks_like_name_tokens(parts_caps):
+            return True
+
+        return False
+
     pages = _ensure_pages(pages_scaled)
     results: List[Dict[str,Any]] = []
 
     for pi, page in enumerate(pages):
         for it in page.get("items", []) or []:
             if not isinstance(it, dict): continue
-            conf = it.get("confidence")
-            if isinstance(conf, (int,float)) and conf < ocr_conf_min:
-                if debug: print(f"[skip] low conf {conf:.2f}")
-                continue
 
             raw = _norm_ws(it.get("text") or it.get("txt") or "")
-            if not raw: continue
+            if not raw: 
+                continue
+
+            # 0) Rol kelimesi varsa direkt PERSON değildir
+            if _has_role_words(raw):
+                if debug: print(f"[skip-role] {raw}")
+                continue
+
+            conf = it.get("confidence")
             bbox = it.get("bbox") or {}
 
-            # 1) spaCy NER: kutu metninin tamamında PERSON var mı?
-            text_for_ner = _title_soft(raw)
+            # 1) spaCy NER (kutu metni üzerinde)
             is_person = False
             matched_text = raw
             try:
-                doc = nlp(text_for_ner)
-                # PERSON etiketli tek bir entity çıkarsa ve metnin büyük kısmını kapsıyorsa kabul
+                doc = nlp(_title_soft(raw))
                 for ent in doc.ents:
                     if str(ent.label_).upper() != "PERSON":
                         continue
-                    # kapsama oranı (boşluklar hariç) >= 0.8
-                    ent_txt = text_for_ner[ent.start_char:ent.end_char]
-                    cov = len(ent_txt.replace(" ","")) / max(1, len(text_for_ner.replace(" ","")))
-                    if cov >= 0.8:
+                    ent_txt = doc.text[ent.start_char:ent.end_char]
+                    cov = len(ent_txt.replace(" ","")) / max(1, len(doc.text.replace(" ","")))
+                    if cov >= 0.8:  # metnin %80+ kısmını kapsasın
                         is_person = True
                         matched_text = raw[ent.start_char:ent.end_char] if (0 <= ent.start_char < len(raw)) else raw
                         break
             except Exception as ex:
                 if debug: print("spaCy error:", ex)
 
-            # 2) NER kaçırırsa: kural tabanlı kontrol (yalnızca KUTU metninde)
-            if not is_person and _looks_like_name(_title_soft(raw)):
+            # 2) Güçlü ad-soyad sezgisi (NER kaçırırsa; conf filtresinden bağımsız)
+            if not is_person and _strong_name_check(raw):
                 is_person = True
                 matched_text = raw
 
+            # 3) OCR conf filtresi — yalnızca kişi olduğuna karar veremediysek uygula
             if not is_person:
-                continue
+                if isinstance(conf, (int,float)) and conf < ocr_conf_min:
+                    if debug: print(f"[skip-conf] {conf:.2f} -> {raw}")
+                    continue
+                # conf iyi olsa bile adı andırmıyorsa alma
+                # (yanlış pozitif azaltmak için)
+                if not _strong_name_check(raw):
+                    continue
 
+                is_person = True
+                matched_text = raw
+
+            # çıktı
             results.append({
                 "page_index": pi,
                 "role": "PERSON",
                 "name": _norm_ws(matched_text).upper(),
                 "matched_text": matched_text,
-                "name_span": None,   # kutu bazlı çalıştığımız için karakter aralığı opsiyonel
+                "name_span": None,
                 "boxes": {
                     "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
                     "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
@@ -124,10 +168,10 @@ def extract_name_boxes_ner_only_strong(
                     "height": int(bbox.get("height", bbox.get("h", 0))),
                 },
                 "confidence": float(conf) if isinstance(conf, (int,float)) else None,
-                "source": "box_ner" if matched_text != raw else "box_rule_or_ner",
+                "source": "box_ner" if is_person and matched_text != raw else "box_rule",
             })
 
-    # Dedup: aynı sayfa + aynı isim + aynı bbox
+    # Dedup
     seen, uniq = set(), []
     for r in results:
         b = r["boxes"]
@@ -135,4 +179,5 @@ def extract_name_boxes_ner_only_strong(
         if k in seen: 
             continue
         seen.add(k); uniq.append(r)
+
     return uniq
