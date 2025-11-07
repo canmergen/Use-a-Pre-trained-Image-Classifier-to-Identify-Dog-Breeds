@@ -1,174 +1,208 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
-import re
-
-# ---- opsiyonel hızlı fuzzy (RapidFuzz varsa kullan) ----
-try:
-    from rapidfuzz.fuzz import ratio as _fz_ratio
-except Exception:
-    from difflib import SequenceMatcher
-    def _fz_ratio(a, b):  # 0-100
-        return int(100 * SequenceMatcher(None, a, b).ratio())
-
-def extract_name_boxes_ner_only_strong(
-    pages_scaled: Any,
-    spacy_nlp,                              # ZORUNLU: spaCy NER (tr_core_news_trf önerilir)
-    ocr_conf_min: float = 0.80,             # 0.80 başla; ihtiyaç olursa yükselt
-    fuzzy_blacklist: Optional[List[str]] = None,
-    fuzzy_cutoff: int = 92,                 # yalnız bağımsız token eşleşirse sil
-    min_tokens: Tuple[int, int] = (2, 3),   # ad-soyad veya ad-ikinciad-soyad
-    debug: bool = False
-) -> List[Dict[str, Any]]:
+def extract_role_boxes(
+    pages_scaled,
+    fuzzy_cutoff: int = 86,
+    use_fuzzy: bool = True,
+):
     """
-    Yalnızca spaCy NER ile ad-soyad (PERSON) çıkarır.
-    Ham metin + truecase normalize metinde NER çalıştırır, güvenli filtre uygular.
-    Dönüş: [{page_index, role='ad_soyad', name, matched_text, name_span, bbox, confidence, source}]
+    OCR metinlerinden rol yakalar ve bbox ile döner.
+    Çıktı: en yüksek skorlu tek kayıt/bbox.
     """
-
-    if fuzzy_blacklist is None:
-        fuzzy_blacklist = ["imza","mühür","muhur","kaşe","kase","stamp","seal",
-                           "signature","tasdik","tescil","onay","noter"]
-
-    # ---- yardımcılar ----
-    def _ensure_pages(pages_obj: Any) -> List[List[Dict[str, Any]]]:
-        if not pages_obj:
-            return []
-        if isinstance(pages_obj, list) and pages_obj and isinstance(pages_obj[0], dict):
-            return [pages_obj]
-        return pages_obj
-
-    def _norm_ws(s: str) -> str:
-        s = s.replace("|","l").replace("’","'").replace("“",'"').replace("”",'"')
-        return re.sub(r"\s+", " ", s).strip()
-
-    def _safe_blacklist_clean(text: str) -> str:
-        # Sadece bağımsız token’ı (harf/rakam dizisi) sil; alt-dizini silme.
-        toks = re.findall(r"\w+|\W+", text, flags=re.UNICODE)
-        out = []
-        for t in toks:
-            core = t.strip()
-            if core and re.fullmatch(r"\w+", core, flags=re.UNICODE):
-                low = core.lower()
-                if any(_fz_ratio(low, b) >= fuzzy_cutoff for b in fuzzy_blacklist):
-                    if debug: print(f"[blk] drop token '{core}'")
-                    continue
-            out.append(t)
-        return "".join(out)
-
-    def _truecase_for_ocr(s: str) -> str:
-        # ALLCAPS blokları Title Case yap (kısaltma/tek harf kısaltmaya dokunma)
-        words = s.split()
-        fixed = []
-        for w in words:
-            if len(w) > 1 and re.fullmatch(r"[A-ZÇĞİÖŞÜ]+", w):
-                fixed.append(w.title())
-            else:
-                fixed.append(w)
-        return " ".join(fixed)
-
-    def _looks_like_name(frag: str) -> bool:
-        if any(ch.isdigit() for ch in frag):
-            return False
-        parts = frag.split()
-        if not (min_tokens[0] <= len(parts) <= min_tokens[1]):
-            return False
-        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü.]+", p) for p in parts)
-
-    def _casefix(s: str) -> str:
-        out = []
-        for p in s.split():
-            if len(p) == 2 and p.endswith(".") and p[0].isalpha():
-                out.append(p.upper())
-            elif p.isupper():
-                out.append(p.title())
-            else:
-                out.append(p)
-        return " ".join(out)
-
-    def _run_spacy(text: str) -> List[Tuple[int,int]]:
-        ents = []
+    # --- opsiyonel RapidFuzz ---
+    _HAS_RF = False
+    if use_fuzzy:
         try:
-            doc = spacy_nlp(text)
-            for e in getattr(doc, "ents", []):
-                if str(e.label_).upper() == "PERSON":
-                    ents.append((int(e.start_char), int(e.end_char)))
-        except Exception as ex:
-            if debug: print("[spacy] error:", ex)
-        return ents
+            from rapidfuzz import fuzz  # type: ignore
+            _HAS_RF = True
+        except Exception:
+            _HAS_RF = False
 
-    pages = _ensure_pages(pages_scaled)
-    results: List[Dict[str, Any]] = []
+    import re
 
-    for pi, items in enumerate(pages):
-        for it in items:
-            # OCR güveni
-            conf = it.get("confidence")
-            if isinstance(conf, (int, float)) and conf < ocr_conf_min:
-                if debug: print(f"[skip] low conf {conf:.2f}")
+    # --- 1) Kanonik roller ve varyantları ---
+    ROLE_ALIASES_DEFAULT = {
+        "toplantı başkanı": [
+            "toplantı başkanı","toplanti baskani","topl bsk","topl bşk",
+            "toplanti bsk","topl bşkan","divan başkanı","divan baskani"
+        ],
+        "tutanak yazmanı": [
+            "tutanak yazmanı","tutanak yazmani","yazman","yazmanı"
+        ],
+        "bakanlık temsilcisi": [
+            "bakanlık temsilcisi","bakanlik temsilcisi",
+            "ticaret bakanligi temsilcisi","ticaret bakanlığı temsilcisi"
+        ],
+        "yönetim kurulu başkanı": [
+            "yönetim kurulu başkanı","yonetim kurulu baskani",
+            "yk başkanı","yk baskani","yk bşk","yk bsk"
+        ],
+        "yönetim kurulu üyesi": [
+            "yönetim kurulu üyesi","yonetim kurulu uyesi",
+            "yk üyesi","yk uyesi","yk üye","yk uye"
+        ],
+        "katip": ["katip","kâtip","ka tip"],
+        "divan başkanı": ["divan başkanı","divan baskani","divan bşk","divan bsk"],
+        "oy toplama memuru": [
+            "oy toplama memuru","oy sayım memuru","oy sayim memuru",
+            "oy toplama görevlisi","oy toplama gorevlisi"
+        ],
+        "noter": ["noter","noterce","noter onaylı","noter onayli"],
+    }
+
+    # --- 2) Normalize yardımcıları ---
+    def fold(s: str) -> str:
+        s = (s or "").lower()
+        s = (s.replace("â","a").replace("î","i").replace("û","u")
+               .replace("ş","s").replace("ç","c").replace("ğ","g")
+               .replace("ö","o").replace("ü","u").replace("ı","i"))
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _tokens(s_norm: str):
+        return set(s_norm.split())
+
+    # tüm varyantları normalize + uzunları önce dene
+    all_variants = []  # [(variant_norm, canon)]
+    for canon, vars_ in ROLE_ALIASES_DEFAULT.items():
+        for v in vars_:
+            all_variants.append((fold(v), canon))
+    all_variants.sort(key=lambda t: len(t[0]), reverse=True)
+
+    # --- 3) Girdi normalizasyonu ---
+    def ensure_pages(obj):
+        if not obj:
+            return []
+        if isinstance(obj, dict):
+            if "items" in obj and isinstance(obj["items"], list):
+                return [obj]
+            return [{"items": obj if isinstance(obj, list) else []}]
+        pages = []
+        for p in obj:
+            if isinstance(p, dict) and "items" in p:
+                pages.append(p)
+            elif isinstance(p, list):
+                pages.append({"items": p})
+        return pages
+
+    pages = ensure_pages(pages_scaled)
+
+    # --- 4) Anchor & Ambiguity kuralları ---
+    TOPLAM_RE   = re.compile(r"\btoplam[a-z]*\b")
+    OY_RE       = re.compile(r"\boy\b")
+    SAYIM_RE    = re.compile(r"\bsayi?m\b")       # sayım/sayim
+    TOPLANTI_RE = re.compile(r"\btoplanti\w*\b")
+
+    def passes_anchor_rules(canon_norm: str, raw_norm: str) -> bool:
+        # 'toplam' tek başına -> yasak
+        toplam_alone = bool(TOPLAM_RE.search(raw_norm) and not OY_RE.search(raw_norm))
+        if canon_norm == "oy toplama memuru":
+            if toplam_alone:
+                return False
+            return bool(OY_RE.search(raw_norm) or SAYIM_RE.search(raw_norm))
+        if canon_norm == "toplanti baskani":
+            if toplam_alone:
+                return False
+            return bool(TOPLANTI_RE.search(raw_norm))
+        return True
+
+    # --- 4b) Rol-özel zorunlu kelimeler (aynı item içinde bulunmalı) ---
+    ROLE_REQUIRED = {
+        "bakanlık temsilcisi": {"bakanlik", "temsilcisi"},
+        "oy toplama memuru": {"oy"},             # 'oy' şart, 'sayim' opsiyonel
+        "toplantı başkanı": {"toplanti"},
+    }
+    def passes_required_tokens(canon: str, raw_norm: str) -> bool:
+        need = ROLE_REQUIRED.get(canon, set())
+        if not need:
+            return True
+        have = _tokens(raw_norm)
+        return need.issubset(have)
+
+    # kısa metinlerde fuzzy'i kapat
+    MIN_RAW_LEN_FOR_FUZZY = 5
+    MIN_RAW_TOKENS_FOR_FUZZY = 2
+
+    # --- 5) Eşleme ---
+    out = []
+    for pi, page in enumerate(pages):
+        for it in page.get("items", []):
+            txt = it.get("text") or ""
+            if not txt.strip():
                 continue
-
-            raw = it.get("text") or it.get("txt") or ""
-            if not raw:
-                continue
-
-            text0 = _norm_ws(raw)
-            text0 = _safe_blacklist_clean(text0)
-
-            # 1) Ham metinde NER
-            spans = _run_spacy(text0)
-
-            # 2) Hiç bulamazsa: truecase ile yeniden dene
-            source = "ner_raw"
-            if not spans:
-                text1 = _truecase_for_ocr(text0)
-                if text1 != text0:
-                    spans = _run_spacy(text1)
-                    source = "ner_truecase"
-                else:
-                    source = "ner_raw"
-
-            if not spans:
-                continue
-
             bbox = it.get("bbox") or {}
-            for s, e in spans:
-                frag = (text1 if source == "ner_truecase" else text0)[s:e].strip()
-                if not _looks_like_name(frag):
-                    if debug: print(f"[skip] not name '{frag}'")
-                    continue
-                results.append({
+            conf = it.get("confidence")
+
+            raw_norm = fold(txt)
+            raw_ns   = raw_norm.replace(" ", "")
+            raw_toks = _tokens(raw_norm)
+
+            best = None  # (canon, matched_variant_norm, score)
+
+            # Özel sinyal: yönetim kurulu başkanı
+            if ("yonetimkurulubaskan" in raw_ns) or ("yönetimkurulubaskan" in raw_ns) or ("ykbask" in raw_ns):
+                best = ("yönetim kurulu başkanı", "yönetim kurulu başkanı", 100.0)
+            else:
+                for v_norm, canon in all_variants:
+                    hit = False
+                    score = 0.0
+
+                    if v_norm in raw_norm:
+                        hit = True
+                        score = 100.0
+                    else:
+                        use_local_fuzzy = (
+                            _HAS_RF and
+                            (len(raw_norm) >= MIN_RAW_LEN_FOR_FUZZY) and
+                            (len(raw_toks) >= MIN_RAW_TOKENS_FOR_FUZZY)
+                        )
+                        if use_local_fuzzy:
+                            # token_set_ratio kısa-uzun karma metinlerde daha güvenli
+                            score = float(fuzz.token_set_ratio(v_norm, raw_norm))
+                            hit = score >= float(fuzzy_cutoff)
+
+                    if hit:
+                        canon_norm = fold(canon)               # 'toplanti baskani' vb.
+                        if not passes_anchor_rules(canon_norm, raw_norm):
+                            continue
+                        if not passes_required_tokens(canon, raw_norm):
+                            continue
+                        # uzun varyanta küçük bonus
+                        score += min(5.0, len(v_norm) * 0.2)
+                        if (best is None) or (score > best[2]):
+                            best = (canon, v_norm, score)
+
+            if best:
+                canon, matched_variant, score = best
+
+                # üye vs başkan düzeltmesi
+                if canon == "yönetim kurulu üyesi":
+                    if ("yönetim kurulu baskan" in raw_norm) or ("yk bask" in raw_norm):
+                        canon = "yönetim kurulu başkanı"
+
+                out.append({
                     "page_index": pi,
-                    "role": "ad_soyad",
-                    "name": _casefix(frag),
-                    "matched_text": frag,
-                    "name_span": (s, e),
+                    "role": canon.upper(),
+                    "matched_text": txt,
                     "bbox": {
-                        "x_min": bbox.get("x_min"),
-                        "y_min": bbox.get("y_min"),
-                        "width": bbox.get("width"),
-                        "height": bbox.get("height"),
+                        "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
+                        "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
+                        "width": int(bbox.get("width", bbox.get("w", 0))),
+                        "height": int(bbox.get("height", bbox.get("h", 0))),
                     },
                     "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-                    "source": source
+                    "score": float(score),
+                    "matched_variant": fold(matched_variant),
                 })
 
-    # tekilleştir
+    # --- 6) Aynı bbox için en yüksek skoru tut ---
     def _k(r):
-        b = r["bbox"]; s = r["name_span"]
-        return (r["page_index"], r["name"], b.get("x_min"), b.get("y_min"), b.get("width"), b.get("height"), s)
-    uniq, seen = [], set()
-    for r in results:
+        b = r["bbox"]
+        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
+
+    best_by_box = {}
+    for r in out:
         k = _k(r)
-        if k not in seen:
-            seen.add(k); uniq.append(r)
-    return uniq
+        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
+            best_by_box[k] = r
 
-import spacy
-nlp = spacy.load("tr_core_news_trf")
-
-names = extract_name_boxes_ner_only_strong(
-    pages_scaled,
-    spacy_nlp=nlp,
-    ocr_conf_min=0.80,   # önce 0.80 dene; fazla gelirse 0.85–0.90
-    fuzzy_cutoff=92,
-    debug=False
-)
+    return list(best_by_box.values())
