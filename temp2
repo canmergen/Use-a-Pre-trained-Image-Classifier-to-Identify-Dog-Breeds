@@ -1,29 +1,38 @@
-import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import re, json
 
-def extract_ad_soyad_boxes_roleformat(
+def extract_name_boxes(
     pages_scaled: Any,
-    ner_predict: Optional[Callable[[str], List[Tuple[int, int, str]]]] = None,
-    blacklist_words: Optional[List[str]] = None,
-    role_blocklist: Optional[List[str]] = None,
-    min_len: int = 2,
+    # Opsiyonel: kendi NER’in. İmza: ner(text) -> [(start, end, "PERSON"), ...]
+    ner_predict: Optional[Callable[[str], List[Tuple[int,int,str]]]] = None,
+    # Opsiyonel: spaCy modeli (tr_core_news_trf vb.). ent.label_ == "PERSON" alınır.
+    spacy_nlp: Optional[Any] = None,
+    # Opsiyonel: Gemma gibi LLM ile onarım. İmza: llm_post(system, user) -> str (raw text)
+    llm_post: Optional[Callable[[str, str], str]] = None,
+    # Heuristikler
+    precision_mode: bool = True,         # True -> isim sinyali zorunlu
+    use_llm_when_empty: bool = True,     # sayfa/öğe bazında isim çıkmazsa LLM dener
+    use_llm_when_suspect: bool = True    # metin uzun ve rol/sayı içeriyor ama isim yoksa LLM dener
 ) -> List[Dict[str, Any]]:
     """
-    OCR item'larından SADECE ad-soyadları rol çıktısı gibi döndürür.
+    Sadece kişi ad-soyad içeren OCR kutularını döndürür.
 
-    Dönüş örneği:
-    [{
-      "page_index": 0,
-      "role": "ad_soyad",
-      "name": "Cem Altay",
-      "matched_text": "Cem Altay",
-      "bbox": {"x_min":..., "y_min":..., "width":..., "height":...},
-      "confidence": 0.93,
-      "source": "ner"|"regex"
-    }, ...]
+    Dönüş:
+    [
+      {
+        "page_index": int,
+        "role": "ad_soyad",
+        "name": str,                 # Case fix uygulanmış
+        "matched_text": str,         # Span metni
+        "name_span": (start,end) | None,
+        "bbox": {"x_min":..., "y_min":..., "width":..., "height":...},
+        "confidence": float|None,
+        "source": "ner"|"spacy"|"regex"|"llm"
+      }, ...
+    ]
     """
 
-    # ---------- yardımcılar ----------
+    # ---------- Yardımcılar ----------
     def ensure_pages(pages_obj: Any) -> List[List[Dict[str, Any]]]:
         if not pages_obj:
             return []
@@ -40,82 +49,191 @@ def extract_ad_soyad_boxes_roleformat(
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    if blacklist_words is None:
-        blacklist_words = ["imza","mühür","kaşe","stamp","seal","signature","onay","tasdik","tescil"]
-    if role_blocklist is None:
-        role_blocklist = [
-            "baskan","başkan","toplanti baskani","toplantı başkanı",
-            "divan baskani","divan başkanı","yk","yk uyesi",
-            "yonetim kurulu","yönetim kurulu","yonetim kurulu uyesi","yönetim kurulu üyesi",
-            "yonetim kurulu baskani","yönetim kurulu başkanı",
-            "katip","kâtip","yazman","oy toplama memuru","bakanlik temsilcisi",
-            "ticaret bakanligi temsilcisi","noter"
-        ]
-    role_blocklist_norm = {fold(x) for x in role_blocklist}
+    # Alan/rol stop-listesi (isim adayının parçası ise eleme yapılır)
+    DOMAIN_STOP = {
+        "sirket","sirketin","sermaye","sermayesi","sahibi","pay","paylari","toplami","itibari",
+        "asgari","toplanti","mevcut","yonetim","yönetim","kurulu","kurul","uyesi","baskani",
+        "tutanak","yazmani","bakanlik","temsilcisi","noter","muhur","mühür","kase","kaşe","imza",
+        "iban","sicil","numarasi","adres","genel","merkez"
+    }
 
-    # Ad-soyad regex (2–3 parçalı; TitleCase/ALLCAPS/kısaltma A. destekli)
+    # Türkçe isim sinyalleri (precision için çıpa)
+    NAME_SIGNALS = {
+        "mehmet","ahmet","ali","veli","ayse","ayşe","fatma","emre","can","cem","murat",
+        "mustafa","hasan","huseyin","hüseyin","omer","ömer","elif","zeynep","ibrahim",
+        "yusuf","burak","serkan","gokhan","gökhan","nazli","nazlı","mergen","altay"
+    }
+
+    # Kara liste (kutunun tamamından kaldırılmaz; yalnızca spansız gürültüyü etkilemesin diye kullanılır)
+    BLACKLIST = {"imza","mühür","kaşe","stamp","seal","signature","onay","tasdik","tescil"}
+
+    # 2–3 parçalı isim; A., MEHMET, Mehmet biçimleri
     NAME_RE = re.compile(
-        r"""
-        (?<!\S)
+        r"""(?<!\S)
         (?:[A-ZÇĞİÖŞÜ][a-zçğıöşü]+|[A-ZÇĞİÖŞÜ]{2,}|[A-ZÇĞİÖŞÜ]\.)
         (?:\s+(?:[A-ZÇĞİÖŞÜ][a-zçğıöşü]+|[A-ZÇĞİÖŞÜ]{2,}|[A-ZÇĞİÖŞÜ]\.)){1,2}
-        (?!\S)
-        """,
+        (?!\S)""",
         re.VERBOSE
     )
 
-    def clean_blacklist(s: str) -> str:
-        out = s
-        for bad in blacklist_words:
-            out = re.sub(r"\b" + re.escape(bad) + r"\b", "", out, flags=re.IGNORECASE)
-        # (İMZA) gibi parantezli artıkları da temizle
-        out = re.sub(r"\(\s*(?:{})\s*\)".format("|".join(map(re.escape, blacklist_words))), "", out, flags=re.IGNORECASE)
-        out = re.sub(r"\s+", " ", out).strip()
-        return out
+    def token_checks(name: str) -> bool:
+        # Aday üzerinde rakam yok; 2–3 parça; her parça alfabetik ve domain-stop değil
+        if any(ch.isdigit() for ch in name):
+            return False
+        parts = name.split()
+        if not (2 <= len(parts) <= 3):
+            return False
+        for p in parts:
+            core = re.sub(r"[^\wçğıöşüÇĞİÖŞÜ.]", "", p)
+            if len(core.replace(".","")) < 2 or len(core) > 20:
+                return False
+            if fold(core.replace(".","")) in DOMAIN_STOP:
+                return False
+            if not re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşü.]+", core):
+                return False
+        return True
 
-    def is_role_like(fragment: str) -> bool:
-        f = fold(fragment).replace(".", "")
-        return f in role_blocklist_norm
+    def has_name_signal(name: str) -> bool:
+        f = fold(name)
+        for s in sorted(NAME_SIGNALS, key=len, reverse=True):
+            if s in f:
+                return True
+        return any(fold(p) in NAME_SIGNALS for p in name.split())
 
+    def looks_like_person(name: str) -> bool:
+        if not token_checks(name):
+            return False
+        if precision_mode and not has_name_signal(name):
+            return False
+        return True
+
+    def casefix(s: str) -> str:
+        # CEM MERGEN -> Cem Mergen ; M. CAN -> M. Can
+        parts, out = s.split(), []
+        for p in parts:
+            if len(p) == 2 and p.endswith(".") and p[0].isalpha():
+                out.append(p.upper())
+            elif p.isupper():
+                out.append(p.title())
+            else:
+                out.append(p)
+        return " ".join(out)
+
+    def call_llm_spans(text: str) -> List[Tuple[int,int,str]]:
+        """LLM'den yalnızca PERSON spanları JSON ile al; sunucu tarafında doğrula."""
+        if llm_post is None:
+            return []
+        system = (
+            "Görev: Verilen metindeki KİŞİ ADI (ad soyad) spanlarını çıkar.\n"
+            "Kurallar:\n"
+            "- Yalnızca metinden seç; yeni metin üretme.\n"
+            "- Her span 2-3 kelime, rakam yok.\n"
+            "- JSON ver: {\"persons\":[{\"start\":int,\"end\":int}]}\n"
+            "- Rol/alan kelimelerini (toplantı, sermaye, kurul, başkanı vb.) dahil etme."
+        )
+        user = f"Metin:\n{text}\n\nSadece JSON ver."
+        try:
+            raw = llm_post(system, user)
+        except Exception:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+        spans = []
+        for p in data.get("persons", []):
+            try:
+                s, e = int(p["start"]), int(p["end"])
+            except Exception:
+                continue
+            frag = text[s:e]
+            if 3 <= len(frag) <= 60 and looks_like_person(frag):
+                spans.append((s, e, "PERSON"))
+        return spans
+
+    # ---------- Çekirdek çıkarım ----------
     pages = ensure_pages(pages_scaled)
     results: List[Dict[str, Any]] = []
 
     for pi, items in enumerate(pages):
         for it in items:
-            raw = it.get("text") or it.get("txt") or ""
-            if not raw:
-                continue
-
-            # Kara liste temizliği
-            txt = clean_blacklist(raw)
-            if len(txt) < min_len:
+            text = (it.get("text") or it.get("txt") or "").strip()
+            if not text:
                 continue
 
             bbox = it.get("bbox") or {}
-            conf = it.get("confidence") if isinstance(it.get("confidence"), (int, float)) else None
+            conf = it.get("confidence") if isinstance(it.get("confidence"), (int,float)) else None
 
-            # 1) NER kullan
-            spans: List[Tuple[int, int, str]] = []
+            # 1) Harici NER
+            used_ner = False
             if ner_predict is not None:
                 try:
-                    spans = [t for t in ner_predict(txt) if len(t) >= 3 and str(t[2]).upper() == "PERSON"]
+                    spans = [t for t in ner_predict(text) if len(t) >= 3 and str(t[2]).upper() == "PERSON"]
                 except Exception:
                     spans = []
+                for s,e,_ in spans:
+                    cand = text[s:e].strip()
+                    if looks_like_person(cand):
+                        results.append({
+                            "page_index": pi,
+                            "role": "ad_soyad",
+                            "name": casefix(cand),
+                            "matched_text": cand,
+                            "name_span": (int(s), int(e)),
+                            "bbox": {
+                                "x_min": bbox.get("x_min"),
+                                "y_min": bbox.get("y_min"),
+                                "width": bbox.get("width"),
+                                "height": bbox.get("height"),
+                            },
+                            "confidence": conf,
+                            "source": "ner"
+                        })
+                        used_ner = True
+            if used_ner:
+                continue  # aynı item'ı tekrar işlemedik
 
-            if spans:
-                for s, e, _ in spans:
-                    cand = txt[s:e].strip()
-                    if any(ch.isdigit() for ch in cand):  # rakam içeriyorsa at
-                        continue
-                    if is_role_like(cand):
-                        continue
-                    if len(cand) < min_len:
-                        continue
+            # 2) spaCy
+            used_spacy = False
+            if spacy_nlp is not None:
+                try:
+                    doc = spacy_nlp(text)
+                    for ent in doc.ents:
+                        if ent.label_.upper() == "PERSON":
+                            cand = ent.text.strip()
+                            if looks_like_person(cand):
+                                results.append({
+                                    "page_index": pi,
+                                    "role": "ad_soyad",
+                                    "name": casefix(cand),
+                                    "matched_text": cand,
+                                    "name_span": (int(ent.start_char), int(ent.end_char)),
+                                    "bbox": {
+                                        "x_min": bbox.get("x_min"),
+                                        "y_min": bbox.get("y_min"),
+                                        "width": bbox.get("width"),
+                                        "height": bbox.get("height"),
+                                    },
+                                    "confidence": conf,
+                                    "source": "spacy"
+                                })
+                                used_spacy = True
+                except Exception:
+                    pass
+            if used_spacy:
+                continue
+
+            # 3) Regex fallback (metin içinde sayı/rol olsa da sadece isim span'ını yakalar)
+            any_regex = False
+            for m in NAME_RE.finditer(text):
+                cand = m.group(0).strip()
+                if looks_like_person(cand):
                     results.append({
                         "page_index": pi,
                         "role": "ad_soyad",
-                        "name": cand,
+                        "name": casefix(cand),
                         "matched_text": cand,
+                        "name_span": (int(m.start()), int(m.end())),
                         "bbox": {
                             "x_min": bbox.get("x_min"),
                             "y_min": bbox.get("y_min"),
@@ -123,38 +241,35 @@ def extract_ad_soyad_boxes_roleformat(
                             "height": bbox.get("height"),
                         },
                         "confidence": conf,
-                        "source": "ner"
+                        "source": "regex"
                     })
-                continue  # bu item için regex'e geçme
+                    any_regex = True
 
-            # 2) Regex fallback
-            for m in NAME_RE.finditer(txt):
-                cand = m.group(0).strip()
-                if any(ch.isdigit() for ch in cand):
-                    continue
-                if is_role_like(cand):
-                    continue
-                if len(cand) < min_len:
-                    continue
-                results.append({
-                    "page_index": pi,
-                    "role": "ad_soyad",
-                    "name": cand,
-                    "matched_text": cand,
-                    "bbox": {
-                        "x_min": bbox.get("x_min"),
-                        "y_min": bbox.get("y_min"),
-                        "width": bbox.get("width"),
-                        "height": bbox.get("height"),
-                    },
-                    "confidence": conf,
-                    "source": "regex"
-                })
+            # 4) LLM onarım (gerekiyorsa)
+            suspect = (len(text) > 30 and any(w in fold(text) for w in ["toplanti","baskan","başkan","kurulu","sermaye","sahibi","pay"]))
+            if llm_post is not None and ((use_llm_when_empty and not any_regex) or (use_llm_when_suspect and suspect and not any_regex)):
+                for s,e,_ in call_llm_spans(text):
+                    frag = text[s:e].strip()
+                    results.append({
+                        "page_index": pi,
+                        "role": "ad_soyad",
+                        "name": casefix(frag),
+                        "matched_text": frag,
+                        "name_span": (int(s), int(e)),
+                        "bbox": {
+                            "x_min": bbox.get("x_min"),
+                            "y_min": bbox.get("y_min"),
+                            "width": bbox.get("width"),
+                            "height": bbox.get("height"),
+                        },
+                        "confidence": conf,
+                        "source": "llm"
+                    })
 
-    # Tekilleştir (aynı bbox+isim)
+    # ---------- Tekilleştirme ----------
     def _k(r):
-        b = r["bbox"]
-        return (r["page_index"], r["name"], b["x_min"], b["y_min"], b["width"], b["height"])
+        b = r["bbox"]; s = r.get("name_span")
+        return (r["page_index"], r["name"], b.get("x_min"), b.get("y_min"), b.get("width"), b.get("height"), s)
     uniq, seen = [], set()
     for r in results:
         k = _k(r)
@@ -163,9 +278,15 @@ def extract_ad_soyad_boxes_roleformat(
 
     return uniq
 
-# Sadece regex ile:
-adsoyad_items = extract_ad_soyad_boxes_roleformat(pages_scaled)
+# Sadece deterministik çekirdek (önerilen başlangıç)
+names = extract_name_boxes(pages_scaled)
 
-# Kendi spaCy/HF NER’ini kullanarak:
-# def my_ner(text): return [(start,end,"PERSON"), ...]
-# adsoyad_items = extract_ad_soyad_boxes_roleformat(pages_scaled, ner_predict=my_ner)
+# Harici NER’in varsa:
+# names = extract_name_boxes(pages_scaled, ner_predict=my_ner)
+
+# spaCy ile:
+# import spacy; nlp = spacy.load("tr_core_news_trf")
+# names = extract_name_boxes(pages_scaled, spacy_nlp=nlp)
+
+# Gemma onarımı eklemek için:
+# names = extract_name_boxes(pages_scaled, llm_post=response_fix_w_gemma)
