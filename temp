@@ -1,372 +1,212 @@
-def extract_and_merge_sermaye_v2(
+def extract_role_boxes(
     pages_scaled,
-    bottom_df=None,
-    fuzzy_threshold: int = 80,
-    line_tol: float = 0.8,
-    max_dx: int = 1600
+    fuzzy_cutoff: int = 86,
+    use_fuzzy: bool = True,
 ):
-    import re
-    import pandas as pd
-    from rapidfuzz import fuzz
+    """
+    OCR metinlerinden rol yakalar ve bbox ile döner.
 
-    # ---------------- number parsing helpers ----------------
-    DIGIT_RX = re.compile(r"\d[\d\s\.,]*")
-    _RX_COMMA_DEC  = re.compile(r"^\s*\d{1,3}(?:\.\d{3})*,\d{1,2}\s*$")   # 1.234,56
-    _RX_DOT_DEC    = re.compile(r"^\s*\d{1,3}(?:,\d{3})*\.\d{1,2}\s*$")   # 1,234.56
-    _RX_DOTS_THOUS = re.compile(r"^\s*\d{1,3}(?:\.\d{3})+\s*$")           # 12.050.000
-    _RX_COMM_THOUS = re.compile(r"^\s*\d{1,3}(?:,\d{3})+\s*$")            # 12,050,000
-    _RX_INTEGER    = re.compile(r"^\s*\d+\s*$")
+    Parameters
+    ----------
+    pages_scaled : List[Dict] | Dict
+        Her sayfa için OCR item listesi. Her item en azından:
+        {
+          "text": str,
+          "bbox": {"x_min": int, "y_min": int, "width": int, "height": int},
+          "confidence": float | int | None
+        }
+    fuzzy_cutoff : int
+        Fuzzy skor eşiği (0-100). RapidFuzz yoksa kullanılmaz.
+    use_fuzzy : bool
+        RapidFuzz mevcutsa partial_ratio ile eşleşmeye izin ver.
 
-    def _extract_number_str(s: str):
-        if not s:
-            return None
-        cands = [m.group(0).strip() for m in DIGIT_RX.finditer(s)]
-        return max(cands, key=len) if cands else None
-
-    def _parse_tr_number(num_str: str):
-        if not num_str:
-            return None
-        s = num_str.strip()
-        for tok in ["TL","tl","Tl","tL","₺","TRY","try","Try"]:
-            s = s.replace(tok, "")
-        s = re.sub(r"\s+", "", s)
-
-        if _RX_COMMA_DEC.match(s):
-            s = s.replace(".", "").replace(",", ".")
-        elif _RX_DOT_DEC.match(s):
-            s = s.replace(",", "")
-        elif _RX_DOTS_THOUS.match(s):
-            s = s.replace(".", "")
-        elif _RX_COMM_THOUS.match(s):
-            s = s.replace(",", "")
-        elif _RX_INTEGER.match(s):
-            pass
-        else:
-            # fallback heuristic
-            last_dot, last_comma = s.rfind("."), s.rfind(",")
-            if last_comma > last_dot >= 0:
-                s = s.replace(".", "").replace(",", ".")
-            elif last_dot > last_comma >= 0:
-                s = s.replace(",", "")
-            else:
-                s = s.replace(".", "").replace(",", "")
+    Returns
+    -------
+    List[Dict]
+        [
+          {
+            "page_index": int,
+            "role": str,              # KANONIK (UPPER)
+            "matched_text": str,      # OCR ham metin
+            "bbox": {"x_min": int, "y_min": int, "width": int, "height": int},
+            "confidence": float | None,
+            "score": float,           # 0-100
+            "matched_variant": str    # normalize edilmiş eşleşen varyant
+          },
+          ...
+        ]
+    """
+    # --- opsiyonel RapidFuzz ---
+    _HAS_RF = False
+    if use_fuzzy:
         try:
-            return float(s)
-        except ValueError:
-            return None
+            from rapidfuzz import fuzz  # type: ignore
+            _HAS_RF = True
+        except Exception:
+            _HAS_RF = False
 
-    # ---------------- geometry helpers ----------------
-    def _h(b): return b.get("height", b["y_max"] - b["y_min"])
-    def _same_line(a, b, tol):
-        ya = (a["y_min"] + a["y_max"]) / 2.0
-        yb = (b["y_min"] + b["y_max"]) / 2.0
-        return abs(ya - yb) <= tol * max(_h(a), 1)
-    def _reading_order(items):
-        return sorted(range(len(items)), key=lambda i: (items[i]["bbox"]["y_min"], items[i]["bbox"]["x_min"]))
-    def _nearest_value_on_right(items, idx_label, max_dx, line_tol):
-        A = items[idx_label]["bbox"]
-        cxA = (A["x_min"] + A["x_max"]) / 2.0
-        best_i, best_dx = None, None
-        for i, it in enumerate(items):
-            if i == idx_label: 
+    import re
+
+    # --- 1) Kanonik roller ve varyantları (geniş tut) ---
+    ROLE_ALIASES_DEFAULT = {
+        "toplantı başkanı": [
+            "toplantı başkanı", "toplanti baskani", "topl bsk", "topl bşk",
+            "toplanti bsk", "topl bşkan", "divan başkanı", "divan baskani"
+        ],
+        "tutanak yazmanı": [
+            "tutanak yazmanı", "tutanak yazmani", "yazman", "yazmanı"
+        ],
+        "bakanlık temsilcisi": [
+            "bakanlık temsilcisi", "bakanlik temsilcisi", "ticaret bakanligi temsilcisi",
+            "ticaret bakanlığı temsilcisi"
+        ],
+        "yönetim kurulu başkanı": [
+            "yönetim kurulu başkanı", "yonetim kurulu baskani", "yk başkanı", "yk baskani",
+            "yk bşk", "yk bsk"
+        ],
+        "yönetim kurulu üyesi": [
+            "yönetim kurulu üyesi", "yonetim kurulu uyesi", "yk üyesi", "yk uyesi",
+            "yk üye", "yk uye"
+        ],
+        "katip": ["katip", "kâtip", "ka tip"],
+        "divan başkanı": ["divan başkanı", "divan baskani", "divan bşk", "divan bsk"],
+        "oy toplama memuru": [
+            "oy toplama memuru", "oy sayım memuru", "oy sayim memuru",
+            "oy toplama görevlisi", "oy toplama gorevlisi"
+        ],
+        "noter": ["noter", "noterce", "noter onaylı", "noter onayli"],
+    }
+
+    # --- 2) Normalize yardımcıları ---
+    def fold(s: str) -> str:
+        s = (s or "").lower()
+        s = (s.replace("â", "a").replace("î", "i").replace("û", "u")
+                 .replace("ş", "s").replace("ç", "c").replace("ğ", "g")
+                 .replace("ö", "o").replace("ü", "u")
+                 .replace("ı", "i"))
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # tüm varyantları normalize + uzunları önce dene
+    all_variants = []  # [(variant_norm, canon)]
+    for canon, vars_ in ROLE_ALIASES_DEFAULT.items():
+        for v in vars_:
+            all_variants.append((fold(v), canon))
+    all_variants.sort(key=lambda t: len(t[0]), reverse=True)
+
+    # --- 3) Girdi normalizasyonu ---
+    def ensure_pages(obj):
+        if not obj:
+            return []
+        # tek sayfa dict'i gelmiş olabilir -> listele
+        if isinstance(obj, dict):
+            # tek sayfa ise "items" bekler; değilse doğrudan item listesi
+            if "items" in obj and isinstance(obj["items"], list):
+                return [obj]
+            return [{"items": obj if isinstance(obj, list) else []}]
+        # zaten liste
+        pages = []
+        for p in obj:
+            if isinstance(p, dict) and "items" in p:
+                pages.append(p)
+            elif isinstance(p, list):
+                pages.append({"items": p})
+        return pages
+
+    pages = ensure_pages(pages_scaled)
+
+    # --- 4) Anchor & Ambiguity kuralları ---
+    TOPLAM_RE = re.compile(r"\btoplam[a-z]*\b")
+    OY_RE = re.compile(r"\boy\b")
+    SAYIM_RE = re.compile(r"\bsayi?m\b")  # sayım/sayim
+    TOPLANTI_RE = re.compile(r"\btoplanti\w*\b")
+
+    def passes_anchor_rules(canon_norm: str, raw_norm: str) -> bool:
+        toplam_alone = bool(TOPLAM_RE.search(raw_norm) and not OY_RE.search(raw_norm))
+        if canon_norm == "oy toplama memuru":
+            if toplam_alone:
+                return False
+            return bool(OY_RE.search(raw_norm) or SAYIM_RE.search(raw_norm))
+        if canon_norm == "toplanti baskani" or canon_norm == "toplanti başkanı":
+            if toplam_alone:
+                return False
+            return bool(TOPLANTI_RE.search(raw_norm))
+        # diğer roller için kural yok
+        return True
+
+    # --- 5) Eşleme ---
+    out = []
+    for pi, page in enumerate(pages):
+        for it in page.get("items", []):
+            txt = it.get("text") or ""
+            if not txt.strip():
                 continue
-            B = it["bbox"]
-            if B["x_min"] <= cxA: 
-                continue
-            if not _same_line(A, B, line_tol): 
-                continue
-            if not DIGIT_RX.search(it.get("text","")): 
-                continue
-            dx = B["x_min"] - cxA
-            if 0 <= dx <= max_dx and (best_dx is None or dx < best_dx):
-                best_i, best_dx = i, dx
-        return best_i
+            bbox = it.get("bbox") or {}
+            conf = it.get("confidence")
 
-    # ---------------- extract sermaye per page ----------------
-    rows = []
-    for pidx, items in enumerate(pages_scaled or []):
-        if not items: 
-            continue
+            raw_norm = fold(txt)
+            raw_ns = raw_norm.replace(" ", "")
 
-        order = _reading_order(items)
-        pos = {i: k for k, i in enumerate(order)}
+            best = None  # (canon, matched_variant_norm, score)
 
-        for i, it in enumerate(items):
-            txt = (it.get("text","") or "").casefold()
-            score = max(
-                fuzz.partial_ratio(txt, "sermaye"),
-                fuzz.partial_ratio(txt, "sermayesi"),
-                fuzz.partial_ratio(txt, "ödenmiş sermaye"),
-                fuzz.partial_ratio(txt, "çıkarılmış sermaye"),
-                fuzz.partial_ratio(txt, "sermayenin"),
-            )
-            if score < fuzzy_threshold:
-                continue
+            # Özel durum: 'yönetim kurulu' sinyali
+            if ("yonetimkurulubaskan" in raw_ns) or ("yönetimkurulubaskan" in raw_ns) or ("ykbask" in raw_ns):
+                best = ("yönetim kurulu başkanı", "yönetim kurulu başkanı", 100.0)
+            else:
+                for v_norm, canon in all_variants:
+                    hit = False
+                    score = 0.0
 
-            label_bbox = it["bbox"]
-            value_txt = None
-            value_bbox = None
-            value_str  = _extract_number_str(it.get("text",""))
-            value_num  = _parse_tr_number(value_str) if value_str else None
+                    if v_norm in raw_norm:
+                        hit = True
+                        score = 100.0
+                    elif _HAS_RF:
+                        score = float(fuzz.partial_ratio(v_norm, raw_norm))
+                        hit = score >= float(fuzzy_cutoff)
 
-            if value_num is None:
-                cand = _nearest_value_on_right(items, i, max_dx=max_dx, line_tol=line_tol)
-                if cand is not None:
-                    value_txt = items[cand].get("text","")
-                    value_bbox = items[cand]["bbox"]
-                    value_str  = _extract_number_str(value_txt)
-                    value_num  = _parse_tr_number(value_str) if value_str else None
+                    if hit:
+                        # anchor kuralları
+                        if not passes_anchor_rules(fold(canon), raw_norm):
+                            continue
+                        # skor iyileştirme: uzun eşleşmeye küçük bonus
+                        score += min(5.0, len(v_norm) * 0.2)
+                        if (best is None) or (score > best[2]):
+                            best = (canon, v_norm, score)
 
-            if value_num is None:
-                k = pos[i]
-                for j in [order[k+1]] if k+1 < len(order) else []:
-                    if DIGIT_RX.search(items[j].get("text","")):
-                        value_txt  = items[j].get("text","")
-                        value_bbox = items[j]["bbox"]
-                        value_str  = _extract_number_str(value_txt)
-                        value_num  = _parse_tr_number(value_str) if value_str else None
-                        if value_num is not None:
-                            break
-                if value_num is None and k-1 >= 0:
-                    j = order[k-1]
-                    if DIGIT_RX.search(items[j].get("text","")):
-                        value_txt  = items[j].get("text","")
-                        value_bbox = items[j]["bbox"]
-                        value_str  = _extract_number_str(value_txt)
-                        value_num  = _parse_tr_number(value_str) if value_str else None
+            if best:
+                canon, matched_variant, score = best
 
-            if value_txt is None and value_str is not None:
-                value_txt  = it.get("text","")
-                value_bbox = label_bbox
+                # 'yönetim kurulu üyesi' vs 'başkanı' düzeltmesi:
+                if canon == "yönetim kurulu üyesi":
+                    if ("yönetim kurulu baskan" in raw_norm) or ("yk bask" in raw_norm):
+                        canon = "yönetim kurulu başkanı"
 
-            rows.append({
-                "page_idx":   pidx,
-                "label_text": it.get("text",""),
-                "label_bbox": label_bbox,
-                "value_text": value_txt,
-                "value_bbox": value_bbox,
-                "value_str":  value_str,
-                "value_num":  value_num,
-            })
-
-    sermaye_df = pd.DataFrame(rows)
-
-    # ---------------- robust merge into bottom_df ----------------
-    n_pages = len(pages_scaled or [])
-    # pick best (largest) value per page
-    best = (sermaye_df.dropna(subset=["value_num"])
-                      .sort_values(["page_idx","value_num"], ascending=[True,False])
-                      .groupby("page_idx", as_index=False)
-                      .first()[["page_idx","value_num","value_bbox"]]
-                      .rename(columns={"value_num":"sermaye_value","value_bbox":"sermaye_bbox"}))
-
-    # If no values found, still return a bottom_df with page_idx column
-    if bottom_df is None or (isinstance(bottom_df, pd.DataFrame) and bottom_df.empty):
-        skeleton = pd.DataFrame({"page_idx": list(range(n_pages))})
-        merged = skeleton.merge(best, on="page_idx", how="left")
-        return sermaye_df, merged
-
-    # Ensure there's a page_idx to merge on
-    bd = bottom_df.copy()
-    if "page_idx" not in bd.columns:
-        # If length matches page count, assign indices 0..n_pages-1
-        if len(bd) == n_pages:
-            bd = bd.reset_index(drop=True)
-            bd["page_idx"] = range(n_pages)
-        else:
-            # Create a skeleton and left-join existing data onto it
-            sk = pd.DataFrame({"page_idx": list(range(n_pages))})
-            bd = sk.merge(bd, left_index=True, right_index=True, how="left")
-
-    merged = bd.merge(best, on="page_idx", how="left")
-    return sermaye_df, merged
-
-# 1) Run extraction + merge (works even if you pass None/empty bottom_df)
-sermaye_df, bottom_df2 = extract_and_merge_sermaye_v2(pages_scaled, bottom_df=bottom_df)
-
-# 2) Inspect
-display(sermaye_df.head())      # all detections
-display(bottom_df2.head())      # your original df + sermaye_value + sermaye_bbox
-
-# -------- PyTorch tabanlı Ad-Soyad çıkarımı (tek dosya / tek hücre) --------
-# pip install torch>=2.2 transformers>=4.40 rapidfuzz
-
-from typing import List, Dict, Any, Optional
-import re
-import pandas as pd
-import torch
-from transformers import pipeline
-
-def extract_names_hybrid_pt(
-    pages_scaled: List[List[Dict[str, Any]]],
-    model_name_or_path: str = "Davlan/xlm-roberta-base-ner-hrl",
-    max_dx: int = 1400,        # aynı satır sağ komşu aralığı (px)
-    line_tol: float = 0.9,     # satır toleransı (etiket yüksekliği ile çarpılır)
-    accept_single_token: bool = False,
-    topk_per_page: int = 5,
-    min_conf: float = 0.70     # NER skor eşiği (0-1)
-) -> pd.DataFrame:
-    """
-    Anchor (etiket) + kural + PyTorch NER birleşik yaklaşım.
-    Girdi:  pages_scaled -> her sayfa listesi; elemanlar {'text': str, 'bbox': {x_min,y_min,x_max,y_max,...}}
-    Çıktı:  DataFrame[page_idx, label_text, cand_text, cand_bbox, score_total, score_breakdown]
-    """
-
-    # -------------------- 1) NER (PyTorch) --------------------
-    device = 0 if torch.cuda.is_available() else -1
-    ner = pipeline(
-        "token-classification",
-        model=model_name_or_path,
-        aggregation_strategy="simple",
-        framework="pt",
-        device=device
-    )
-
-    def ner_person_conf(text: str) -> float:
-        t = (text or "").strip()
-        if not t:
-            return 0.0
-        ents = ner(t)
-        scores = [float(e.get("score", 0.0))
-                  for e in ents
-                  if e.get("entity_group", "").upper() in {"PER", "PERSON"}]
-        # eşiği bu fonksiyonda uygula; dışarıya [0..1] döndür
-        m = max(scores) if scores else 0.0
-        return m if m >= min_conf else 0.0
-
-    # -------------------- 2) Kurallar & yardımcılar --------------------
-    label_kw = [
-        "ad soyad","adı soyadı","adı ve soyadı","ad ve soyad",
-        "adi soyadi","adı", "ad", "soyadı","soyad"
-    ]
-    blacklist = {"başkanı","başkan","yönetim","kurulu","üyesi","katip","müdür","komiser",
-                 "noter","vekili","temsilci","imza","denetçi","raportör","sekreter",
-                 "yeminli","smmm","ymm","av.","avukat","dr.","doç.","prof."}
-
-    U = "A-ZÇĞİÖŞÜ"
-    L = "a-zçğıöşü"
-    NAME_RX  = re.compile(rf"\b[{U}][{L}]+(?:\s+[{U}][{L}]+){{1,3}}\b")  # 2–4 kelime
-    TOKEN_RX = re.compile(rf"^[{U}][{L}]+$")
-
-    def _norm(s): return (s or "").casefold().strip()
-    def _h(b): return b.get("height", b["y_max"] - b["y_min"])
-    def _same_line(a, b):
-        ya = (a["y_min"] + a["y_max"]) / 2.0
-        yb = (b["y_min"] + b["y_max"]) / 2.0
-        return abs(ya - yb) <= line_tol * max(_h(a), 1)
-
-    def _right_neighbor(items, idx_label):
-        A = items[idx_label]["bbox"]; cxA = (A["x_min"] + A["x_max"]) / 2.0
-        best_i, best_dx = None, None
-        for i, it in enumerate(items):
-            if i == idx_label: continue
-            B = it["bbox"]
-            if B["x_min"] <= cxA: continue
-            if not _same_line(A, B): continue
-            dx = B["x_min"] - cxA
-            if 0 <= dx <= max_dx and (best_dx is None or dx < best_dx):
-                best_i, best_dx = i, dx
-        return best_i
-
-    def _looks_like_name(text: str) -> float:
-        t = (text or "").strip()
-        if not t: return 0.0
-        tcf = t.casefold()
-        if any(w in tcf for w in blacklist): return 0.0
-        if any(ch.isdigit() for ch in t): return 0.0
-
-        m = NAME_RX.search(t)
-        if m:
-            toks = m.group(0).split()
-            if not (2 <= len(toks) <= 4): return 0.0
-            if not all(TOKEN_RX.match(tok) for tok in toks): return 0.0
-            # 0.75–0.85 arası kural skoru
-            return min(0.75 + 0.05 * (len(toks)-2), 0.85)
-
-        if accept_single_token and TOKEN_RX.match(t) and len(t) >= 2:
-            return 0.55  # tek kelime adlar için düşük güven
-        return 0.0
-
-    # -------------------- 3) Çıkarım --------------------
-    rows = []
-    for pidx, items in enumerate(pages_scaled or []):
-        if not items: 
-            continue
-
-        # Etiket kutularını bul
-        label_idxs = [i for i, it in enumerate(items)
-                      if (t:=_norm(it.get("text",""))) and any(kw in t for kw in label_kw)]
-
-        # Etiket-temelli çıkarım
-        for li in label_idxs:
-            lbl = items[li]
-            cand_i = _right_neighbor(items, li)
-            cands = [ci for ci in [cand_i, li] if ci is not None]  # sağ kutu + etiket kutusu
-
-            seen = set()
-            for ci in cands:
-                if ci in seen: 
-                    continue
-                seen.add(ci)
-
-                ct = (items[ci].get("text") or "").strip()
-                cb = items[ci]["bbox"]
-                s_rule = _looks_like_name(ct)
-                s_ner  = ner_person_conf(ct)
-
-                # toplam skor: anchor=1.0, kural=0.6, NER=0.4
-                score_total = 1.0 + 0.6*s_rule + 0.4*s_ner
-
-                rows.append({
-                    "page_idx": pidx,
-                    "label_text": lbl.get("text",""),
-                    "cand_text": ct,
-                    "cand_bbox": cb,
-                    "score_total": round(score_total,3),
-                    "score_breakdown": {"anchor":1.0, "rule":round(s_rule,3), "ner":round(s_ner,3)}
+                out.append({
+                    "page_index": pi,
+                    "role": canon.upper(),
+                    "matched_text": txt,
+                    "bbox": {
+                        "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
+                        "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
+                        "width": int(bbox.get("width", bbox.get("w", 0))),
+                        "height": int(bbox.get("height", bbox.get("h", 0))),
+                    },
+                    "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+                    "score": float(score),
+                    "matched_variant": fold(matched_variant),
                 })
 
-        # Etiket bulunamadıysa: kural+NER taraması
-        if not label_idxs:
-            for it in items:
-                ct = (it.get("text") or "").strip()
-                cb = it["bbox"]
-                s_rule = _looks_like_name(ct)
-                if s_rule <= 0:
-                    continue
-                s_ner  = ner_person_conf(ct)
-                score_total = 0.6*s_rule + 0.4*s_ner
-                rows.append({
-                    "page_idx": pidx, "label_text": None,
-                    "cand_text": ct, "cand_bbox": cb,
-                    "score_total": round(score_total,3),
-                    "score_breakdown": {"anchor":0.0, "rule":round(s_rule,3), "ner":round(s_ner,3)}
-                })
+    # --- 6) Aynı bbox için en yüksek skoru tut ---
+    def _k(r):
+        b = r["bbox"]
+        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    best_by_box = {}
+    for r in out:
+        k = _k(r)
+        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
+            best_by_box[k] = r
 
-    # sayfa başına en iyi N adayı
-    df = (df.sort_values(["page_idx","score_total"], ascending=[True, False])
-            .groupby("page_idx", as_index=False)
-            .head(topk_per_page)
-            .reset_index(drop=True))
-    return df
+    return list(best_by_box.values())
 
-# Sadece PyTorch + Transformers (TF yok)
-name_df = extract_names_hybrid_pt(
-    pages_scaled,
-    accept_single_token=True,  # imza satırlarında yararlı
-    topk_per_page=5,
-    min_conf=0.70
-)
-display(name_df.head())
-
-# Görselleştirmek istersen (OpenCV):
-# import cv2, matplotlib.pyplot as plt
-# vis = final_lower_imgs[0].copy()
-# for _, row in name_df[name_df.page_idx==0].iterrows():
-#     b = row.cand_bbox
-#     cv2.rectangle(vis, (b["x_min"], b["y_min"]), (b["x_max"], b["y_max"]), (0,255,0), 2)
-# plt.imshow(vis[..., ::-1]); plt.axis("off"); plt.show()
