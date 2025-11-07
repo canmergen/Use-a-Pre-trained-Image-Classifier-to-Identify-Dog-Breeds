@@ -1,10 +1,10 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
-import re
+import re, unicodedata
 
 def extract_name_boxes_ner_only_strong(
     pages_scaled: Union[List[Dict[str, Any]], Dict[str, Any]],
     nlp,                               # spaCy model (tr_core_news_trf önerilir)
-    ocr_conf_min: float = 0.70,        # düşük konf. kutuları at (isim sezgisi geçerse esner)
+    ocr_conf_min: float = 0.70,
     min_tokens: Tuple[int, int] = (2, 4),
     fuzzy_blacklist: Optional[List[str]] = None,
     debug: bool = False,
@@ -33,57 +33,56 @@ def extract_name_boxes_ner_only_strong(
         return s
 
     def _fold_tr(s: str) -> str:
+        # Unicode -> NFKD, diakritik temizle, TR harf eşlemeleri
+        s = s or ""
         s = s.lower()
-        s = (
-            s.replace("ş", "s")
-            .replace("ç", "c")
-            .replace("ğ", "g")
-            .replace("ö", "o")
-            .replace("ü", "u")
-            .replace("ı", "i")
-        )
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # diacritics off
+        # bazı ortamlarda 'i̇' birleşik gelir; aşağıdaki replace garanti eder
+        s = s.replace("ı", "i").replace("İ", "i").replace("i̇", "i")
+        s = (s.replace("ş","s").replace("ç","c").replace("ğ","g")
+               .replace("ö","o").replace("ü","u"))
         return s
 
-    # Tekil kelime blacklist (tek başına gelirse elenir)
     if fuzzy_blacklist is None:
         fuzzy_blacklist = [
-            "imza", "mühür", "muhur", "kaşe", "kase", "stamp", "seal",
-            "signature", "tasdik", "tescil", "onay", "noter", "sayfa", "page",
+            "imza","mühür","muhur","kaşe","kase","stamp","seal",
+            "signature","tasdik","tescil","onay","noter","sayfa","page",
         ]
     BLK_SINGLE = set(_norm_ws(b).lower() for b in fuzzy_blacklist)
 
-    # Rol/kurum ve metrik STOP sözlüğü (geçiyorsa PERSON değildir)
     STOP_TOKENS = {
         # roller/kurumlar
-        "toplanti", "toplantı", "baskan", "başkan", "baskani", "başkanı", "divan",
-        "katip", "kâtip", "uyesi", "üyesi", "temsilcisi", "noter", "müdürü", "muduru",
-        "mudurlugu", "müdürlüğü", "müdürlük", "mudurluk", "ticaret", "sicil",
-        "şirketi", "sirketi", "limited", "anonim", "bankasi", "bankası", "merkezi",
+        "toplanti","toplantı","baskan","başkan","baskani","başkanı","divan",
+        "katip","kâtip","uyesi","üyesi","temsilcisi","noter","müdürü","muduru",
+        "mudurlugu","müdürlüğü","müdürlük","mudurluk","ticaret","sicil","şirketi","sirketi",
+        "limited","anonim","bankasi","bankası","merkezi",
         # metrik/başlıklar
-        "toplam", "pay", "adedi", "adet", "mevcut", "nisap", "nisabı", "nisabi",
-        "hesap", "hesabi", "hesabı", "tutar", "tutarı", "sayisi", "sayısı", "oran",
-        "yuzde", "yüzde",
+        "toplam","pay","adedi","adet","mevcut","nisap","nisabı","nisabi",
+        "hesap","hesabi","hesabı","tutar","tutarı","sayisi","sayısı","oran","yuzde","yüzde",
     }
 
+    # Hızlı ham-pattern (fold etmeden) – İ/ı varyantlarına duyarsız
+    ASLI_GIBIDIR_RAW = re.compile(r"\bA[SŞ]L[İIıi]\b.*\bG[İIıi]B[İIıi]D[İIıi]R\b", re.IGNORECASE)
+    ASLINA_UYGUNDUR_RAW = re.compile(r"\bA[SŞ]L[İIıi]NA\b.*\bUYGUNDUR\b", re.IGNORECASE)
+
     def _has_stop(text: str) -> bool:
-        """Rol/kurum/metrik kelimeleri veya 'Aslı Gibidir' ibaresi içeriyorsa True döner."""
+        # Ham metinde damga ibarelerini yakala
+        if ASLI_GIBIDIR_RAW.search(text or "") or ASLINA_UYGUNDUR_RAW.search(text or ""):
+            return True
+
         t_norm = _norm_ws(text)
         t_fold = _fold_tr(t_norm)
 
-        # Spesifik yasak ibareler — 'ASLI GİBİDİR', 'ASLINA UYGUNDUR'
-        if re.search(r"\basli\s+gibidir\b", t_fold):
-            return True
-        if re.search(r"\baslina\s+uygundur\b", t_fold):
+        # Fold edilmiş metinde de kontrol et (ek güvenlik)
+        if re.search(r"\basli\s+gibidir\b", t_fold) or re.search(r"\baslina\s+uygundur\b", t_fold):
             return True
 
-        # Token bazlı kontrol
         toks = t_fold.split()
         for tok in toks:
             if tok in STOP_TOKENS:
-                # Eğer kelime 'asli' ise ve 'gibidir' veya 'uygundur' izlemiyorsa AL
-                if tok == "asli" and not any(
-                    x in t_fold for x in ["asli gibidir", "asli uygundur", "aslı gibidir", "aslı uygundur"]
-                ):
+                # 'asli' tek başına isim olabilir; 'gibidir/uygundur' eşlik etmiyorsa eleme
+                if tok == "asli" and not any(x in t_fold for x in ["asli gibidir","asli uygundur"]):
                     continue
                 return True
         return False
@@ -104,21 +103,15 @@ def extract_name_boxes_ner_only_strong(
         return " ".join(out)
 
     def _name_like_by_rule(raw: str) -> bool:
-        """Kutu metnini isim gibi mi görür? (bbox birleşimi YOK)"""
         txt = _norm_ws(raw)
-        if not txt:
-            return False
-        if _has_stop(txt):
+        if not txt or _has_stop(txt):
             return False
 
         parts = txt.split()
-        # ALLCAPS mi?
         all_caps = all(re.fullmatch(r"[A-ZÇĞİÖŞÜ]+\.?", p) for p in parts) and len(parts) > 0
-        # TitleCase sayısı
         title_parts = _title_soft(txt).split()
         n_title = sum(1 for p in title_parts if re.fullmatch(r"[A-ZÇĞİÖŞÜ][a-zçğıöşüİ]+\.?", p))
 
-        # 2–4 kelime, rakam yok, tekil blacklist yok, sadece harf (TR) olmalı
         if not (min_tokens[0] <= len(parts) <= min_tokens[1]):
             return False
         if any(any(ch.isdigit() for ch in p) for p in parts):
@@ -128,10 +121,7 @@ def extract_name_boxes_ner_only_strong(
         if not all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts):
             return False
 
-        # Büyük harf deseni:
-        if all_caps:
-            return True
-        return n_title >= 2
+        return True if all_caps else (n_title >= 2)
 
     # ---------------- Ana döngü ----------------
     pages = _ensure_pages(pages_scaled)
@@ -145,9 +135,8 @@ def extract_name_boxes_ner_only_strong(
             raw = _norm_ws(it.get("text") or it.get("txt") or "")
             if not raw:
                 continue
-            if _has_stop(raw):  # erken eleme
-                if debug:
-                    print(f"[stop] {raw}")
+            if _has_stop(raw):
+                if debug: print(f"[stop] {raw}")
                 continue
 
             conf = it.get("confidence")
@@ -165,55 +154,48 @@ def extract_name_boxes_ner_only_strong(
                     cov = len(ent_txt.replace(" ", "")) / max(1, len(doc.text.replace(" ", "")))
                     if cov >= 0.8:
                         is_person = True
-                        matched_text = raw[ent.start_char:ent.end_char] if (
-                            0 <= ent.start_char < len(raw)
-                        ) else raw
+                        matched_text = raw[ent.start_char:ent.end_char] if (0 <= ent.start_char < len(raw)) else raw
                         break
             except Exception as ex:
-                if debug:
-                    print("spaCy error:", ex)
+                if debug: print("spaCy error:", ex)
 
-            # 2) Kural (yalnızca kutu metni; bbox değişmez)
+            # 2) Kural
             if not is_person and _name_like_by_rule(raw):
                 is_person = True
                 matched_text = raw
 
-            # 3) Conf filtresi (yalnız emin olamadıysak)
+            # 3) Conf filtresi (emin olamadıysak)
             if not is_person:
                 if isinstance(conf, (int, float)) and conf < ocr_conf_min:
-                    if debug:
-                        print(f"[skip-conf] {conf:.2f} -> {raw}")
+                    if debug: print(f"[skip-conf] {conf:.2f} -> {raw}")
                     continue
                 if not _name_like_by_rule(raw):
                     continue
                 is_person = True
                 matched_text = raw
 
-            results.append(
-                {
-                    "page_index": pi,
-                    "role": "PERSON",
-                    "name": _norm_ws(matched_text).upper(),
-                    "matched_text": matched_text,
-                    "name_span": None,
-                    "boxes": {
-                        "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
-                        "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
-                        "width": int(bbox.get("width", bbox.get("w", 0))),
-                        "height": int(bbox.get("height", bbox.get("h", 0))),
-                    },
-                    "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-                    "source": "box_ner" if matched_text != raw else "box_rule",
-                }
-            )
+            results.append({
+                "page_index": pi,
+                "role": "PERSON",
+                "name": _norm_ws(matched_text).upper(),
+                "matched_text": matched_text,
+                "name_span": None,
+                "boxes": {
+                    "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
+                    "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
+                    "width": int(bbox.get("width", bbox.get("w", 0))),
+                    "height": int(bbox.get("height", bbox.get("h", 0))),
+                },
+                "confidence": float(conf) if isinstance(conf, (int, float)) else None,
+                "source": "box_ner" if matched_text != raw else "box_rule",
+            })
 
     # ---------------- Dedup ----------------
     seen, uniq = set(), []
     for r in results:
         b = r["boxes"]
         k = (r["page_index"], r["name"], b["x_min"], b["y_min"], b["width"], b["height"])
-        if k in seen:
+        if k in seen: 
             continue
-        seen.add(k)
-        uniq.append(r)
+        seen.add(k); uniq.append(r)
     return uniq
