@@ -1,586 +1,198 @@
-# === Datathon "one-cell" training & inference ===
-import time, gc
-import numpy as np, pandas as pd
-from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import QuantileTransformer
-
-import xgboost as xgb
-from lightgbm import LGBMClassifier, early_stopping, log_evaluation
-from catboost import CatBoostClassifier, Pool
-
-import competition_metric as cm
-
-# ======================= Config =======================
-ID_COL, TARGET, CV, SEED = "cust_id", "churn", 5, 42
-
-USE_GPU               = False
-USE_ISOTONIC          = True
-USE_ADV_REWEIGHT      = True     # adversarial reweighting toward recent folds
-USE_TE_LGB_XGB        = True     # month-safe target encoding for LGB/XGB
-TE_MIN_SAMPLES        = 50
-
-PRUNE_CORR_995        = True
-ADD_MISSING_FLAGS     = True
-CLIP_NUMERICS_QTL     = (0.005, 0.995)   # winsorize
-
-N_ROUNDS              = 4000
-ES_ROUNDS_XGB         = 300
-ES_ROUNDS_LGB         = 300
-OD_WAIT_CAT           = 300
-SEEDS                 = [42, 1337, 2027]
-
-TOP_FOCUS_RECENT_K    = 2        # “deployment-like” folds for calibration and tuning
-RANK_BLEND_INIT       = 0.15     # starting point; we’ll re-optimize on OOF
-PIECEWISE_TAU_GRID    = np.arange(0.65, 0.93, 0.02)
-PIECEWISE_GLO_GRID    = np.linspace(1.0, 1.30, 7)
-PIECEWISE_GHI_GRID    = np.linspace(1.0, 3.0, 21)
-
-# ======================= Helpers =======================
-def _rank01(a): return pd.Series(a).rank(method="average", pct=True).astype("float32").values
-def _datathon(y_true, y_prob):
-    out = cm.ing_hubs_datathon_metric(y_true, y_prob)
-    if isinstance(out, (tuple, list, np.ndarray)): out = out[0]
-    return float(out)
-
-def _logit(p):
-    p = np.clip(p, 1e-6, 1-1e-6)
-    return np.log(p/(1-p))
-
-def _sigmoid(z): return 1.0/(1.0+np.exp(-z))
-
-def _ensure_ref_keys(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "ref_date" not in df.columns:
-        raise ValueError("ref_date column is required for time-aware CV")
-    df["ref_date_ts"]  = pd.to_datetime(df["ref_date"], errors="coerce")
-    df["ref_month_ts"] = df["ref_date_ts"].dt.to_period("M").dt.to_timestamp()
-    df["ref_month_str"]= df["ref_month_ts"].dt.strftime("%Y-%m")
-    return df
-
-def _piecewise_sharpen_grid(y_true, p_va, p_te, mask_eval=None,
-                            taus=PIECEWISE_TAU_GRID, g_los=PIECEWISE_GLO_GRID, g_his=PIECEWISE_GHI_GRID,
-                            use_iso=True):
-    if mask_eval is None: mask_eval = slice(None)
-    iso = None
-    if use_iso and (np.min(y_true)!=np.max(y_true)):
-        iso = IsotonicRegression(out_of_bounds="clip").fit(p_va, y_true)
-        p_va = iso.transform(p_va)
-        p_te = iso.transform(p_te) if p_te is not None else None
-    best = (1.0, 1.0, 0.75); best_s = -1.0
-    for t in taus:
-        lo_mask = p_va < t
-        p_lo_base = np.minimum(p_va, t)/t
-        p_hi_base = np.maximum(p_va - t, 0)/(1.0 - t + 1e-12)
-        for gl in g_los:
-            p_lo = np.power(p_lo_base, gl) * t
-            for gh in g_his:
-                p_hi = t + (1.0 - t) * np.power(p_hi_base, gh)
-                cand = np.where(lo_mask, p_lo, p_hi)
-                s = _datathon(y_true[mask_eval], cand[mask_eval])
-                if s > best_s:
-                    best_s, best = s, (gl, gh, t)
-    gl, gh, t = best
-    def _apply(p):
-        p_lo = np.power(np.minimum(p, t)/t, gl) * t
-        p_hi = t + (1.0 - t) * np.power(np.maximum(p - t, 0)/(1.0 - t + 1e-12), gh)
-        return np.where(p >= t, p_hi, p_lo)
-    return _apply(p_va), (None if p_te is None else _apply(p_te)), iso, best
-
-def _month_blocks(df_train, cv=5):
-    counts = df_train.groupby("ref_month_ts").size().sort_index()
-    months = counts.index.to_numpy()
-    target = int(np.ceil(len(df_train)/cv))
-    blocks, acc, start = [], 0, 0
-    for i in range(len(months)):
-        acc += counts.iloc[i]
-        if acc >= target and len(blocks) < cv-1:
-            blocks.append(months[start:i+1])
-            start, acc = i+1, 0
-    if start < len(months): blocks.append(months[start:])
-    blocks = [b for b in blocks if len(b)>0]
-    while len(blocks)>cv:
-        blocks[-2] = np.concatenate([blocks[-2], blocks[-1]]); blocks.pop()
-    while len(blocks)<cv:
-        k = np.argmax([len(b) for b in blocks])
-        mid = len(blocks[k])//2
-        b = blocks.pop(k)
-        blocks.insert(k, b[:mid]); blocks.insert(k+1, b[mid:])
-    splits = []
-    n = len(df_train)
-    for fm in blocks:
-        va_idx = np.where(df_train["ref_month_ts"].isin(fm).values)[0]
-        tr_idx = np.setdiff1d(np.arange(n), va_idx, assume_unique=True)
-        splits.append((tr_idx, va_idx))
-    return splits
-
-def _month_safe_target_encode(df_all, tr_idx, va_idx, cat_cols, target, month_col="ref_month_ts", min_samples=50, prior=None):
-    if not cat_cols: return {}, {}
-    if prior is None: prior = float(df_all.loc[df_all.index[tr_idx], target].mean())
-    months = np.sort(df_all.loc[df_all.index[tr_idx], month_col].unique())
-    te_maps = {c:{} for c in cat_cols}; csum={c:{} for c in cat_cols}; ccnt={c:{} for c in cat_cols}
-    for m in months:
-        idx_m = df_all.index[tr_idx][df_all.loc[df_all.index[tr_idx], month_col]==m]
-        y_m = df_all.loc[idx_m, target].values
-        for c in cat_cols:
-            keys = df_all.loc[idx_m, c].astype(str).values
-            for k, yv in zip(keys, y_m):
-                csum[c][k] = csum[c].get(k,0.0)+yv
-                ccnt[c][k] = ccnt[c].get(k,0)+1
-                te_maps[c][k] = (csum[c][k] + prior*min_samples)/(ccnt[c][k]+min_samples)
-    def _tx(idx):
-        out={}
-        for c in cat_cols:
-            m = te_maps[c]
-            out[c+"_te"] = df_all.loc[idx, c].astype(str).map(m).fillna(prior).astype("float32").values
-        return out
-    return _tx(df_all.index[tr_idx]), _tx(df_all.index[va_idx])
-
-def _winsorize_inplace(df, num_cols, qlow=0.005, qhi=0.995):
-    if not num_cols: return
-    q = df[num_cols].quantile([qlow, qhi])
-    lo, hi = q.loc[qlow], q.loc[qhi]
-    for c in num_cols:
-        df[c] = df[c].clip(lo[c], hi[c])
-
-# ======================= Data prep =======================
-t0_all = time.time()
-assert TARGET in train_test_df.columns, "Missing target column in train_test_df"
-df     = _ensure_ref_keys(train_test_df.copy())
-val_df = _ensure_ref_keys(validation_df_submission.copy())
-is_labeled = df[TARGET].isin([0,1])
-df_train = df.loc[is_labeled].copy().reset_index(drop=True)
-y = pd.to_numeric(df_train[TARGET], errors="coerce").astype(np.int32).values
-
-X  = df_train.drop(columns=[c for c in [ID_COL, TARGET] if c in df_train.columns]).copy()
-Xv = val_df.drop(columns=[c for c in [ID_COL, TARGET] if c in val_df.columns]).copy()
-X  = X.replace([np.inf,-np.inf], np.nan); Xv = Xv.replace([np.inf,-np.inf], np.nan)
-
-# Drop time keys from features
-TIME_KEY_COLS = [c for c in ["ref_date", "ref_date_ts", "ref_month_ts", "ref_month_str"] if c in X.columns]
-if TIME_KEY_COLS:
-    print(f"[cleanup] Dropping time-key cols from features: {TIME_KEY_COLS}")
-    X.drop(columns=TIME_KEY_COLS, inplace=True, errors="ignore")
-    Xv.drop(columns=[c for c in TIME_KEY_COLS if c in Xv.columns], inplace=True, errors="ignore")
-
-# Missing flags + winsorize
-num_cols = list(X.select_dtypes(include=[np.number]).columns)
-obj_cols = list(X.select_dtypes(include=["object","category"]).columns)
-if ADD_MISSING_FLAGS and num_cols:
-    for c in num_cols:
-        X[c+"_isnan"]  = X[c].isna().astype("int8")
-        Xv[c+"_isnan"] = Xv[c].isna().astype("int8")
-    # update list
-    num_cols = list(X.select_dtypes(include=[np.number]).columns)
-
-if CLIP_NUMERICS_QTL and num_cols:
-    _winsorize_inplace(X, num_cols, *CLIP_NUMERICS_QTL)
-
-# Pruning
-nun = X.nunique(dropna=False); empties = X.isna().all()
-const_cols = list(nun.index[(nun<=1)|empties])
-if const_cols:
-    print(f"[cleanup] Dropping {len(const_cols)} constant/empty cols")
-    X.drop(columns=const_cols, inplace=True, errors="ignore")
-    Xv.drop(columns=[c for c in const_cols if c in Xv.columns], inplace=True, errors="ignore")
-
-dup_mask = X.T.duplicated(keep="first")
-dup_cols = list(X.columns[dup_mask])
-if dup_cols:
-    print(f"[cleanup] Dropping {len(dup_cols)} duplicate cols")
-    X.drop(columns=dup_cols, inplace=True, errors="ignore")
-    Xv.drop(columns=[c for c in dup_cols if c in Xv.columns], inplace=True, errors="ignore")
-
-if PRUNE_CORR_995:
-    num_cols_tmp = list(X.select_dtypes(include=[np.number]).columns)
-    if len(num_cols_tmp)>1:
-        corr  = X[num_cols_tmp].corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-        to_drop_corr = [col for col in upper.columns if (upper[col] >= 0.995).any()]
-        if to_drop_corr:
-            print(f"[cleanup] Dropping {len(to_drop_corr)} ultra-high corr cols (≥0.995)")
-            X.drop(columns=to_drop_corr, inplace=True, errors="ignore")
-            Xv.drop(columns=[c for c in to_drop_corr if c in Xv.columns], inplace=True, errors="ignore")
-
-# Align columns
-for c in X.columns:
-    if c not in Xv.columns: Xv[c] = np.nan
-Xv = Xv[X.columns].copy()
-
-# Types
-num_cols = list(X.select_dtypes(include=[np.number]).columns)
-obj_cols = list(X.select_dtypes(include=["object","category"]).columns)
-if num_cols:
-    X[num_cols]  = X[num_cols].apply(pd.to_numeric, errors="coerce").astype("float32")
-    Xv[num_cols] = Xv[num_cols].apply(pd.to_numeric, errors="coerce").astype("float32")
-if obj_cols:
-    X[obj_cols]  = X[obj_cols].astype("category")
-    Xv[obj_cols] = Xv[obj_cols].astype("category")
-cat_idx = [X.columns.get_loc(c) for c in X.columns if str(X[c].dtype) in ("category","object")]
-
-# Class weight
-pos, neg = float((y==1).sum()), float((y==0).sum())
-spw = neg / max(pos, 1.0)
-print(f"[train] n={len(y)} | Pos={int(pos)} Neg={int(neg)} | features={X.shape[1]} | spw={spw:.3f}")
-
-# Model params (capacity nudged)
-xgb_params = {
-    "objective":"binary:logistic","eval_metric":"auc","eta":0.02,"max_depth":8,"min_child_weight":6,
-    "subsample":0.7,"colsample_bytree":0.7,"reg_lambda":8.0,"reg_alpha":0.1,"gamma":0.0,
-    "max_delta_step":1,"scale_pos_weight":spw,"seed":SEED,
-    "tree_method":"gpu_hist" if USE_GPU else "hist", **({"predictor":"gpu_predictor"} if USE_GPU else {})
-}
-lgb_params = dict(
-    n_estimators=N_ROUNDS*2, learning_rate=0.02, num_leaves=255, max_depth=-1,
-    subsample=0.75, colsample_bytree=0.70, feature_fraction_bynode=0.8,
-    reg_lambda=8.0, reg_alpha=0.0, min_child_samples=50, max_bin=511,
-    objective="binary", random_state=SEED, n_jobs=-1, **({"device_type":"gpu"} if USE_GPU else {}),
-)
-cat_params = dict(
-    iterations=N_ROUNDS, learning_rate=0.03, depth=8, loss_function="Logloss", eval_metric="AUC",
-    random_seed=SEED, verbose=False, od_type="Iter", od_wait=OD_WAIT_CAT,
-    l2_leaf_reg=6.0, class_weights=[1.0, spw], allow_writing_files=False, thread_count=-1,
-    bootstrap_type="Bernoulli", subsample=0.8, rsm=0.8, **({"task_type":"GPU"} if USE_GPU else {}),
-)
-
-# ======================= Chrono CV =======================
-splits = _month_blocks(df_train, CV)
-print("[cv] Using chronological month blocks (no shuffling).")
-def _fold_median_month(idx):
-    m = df_train.loc[idx, "ref_month_ts"]
-    return pd.to_datetime(pd.Series(m).median())
-fold_info = [(i, _fold_median_month(va)) for i,(_,va) in enumerate(splits,1)]
-fold_order = [f for f,_ in sorted(fold_info, key=lambda t: t[1], reverse=True)]
-
-# Recency weights: latest highest
-ramp = np.linspace(1.0, 3.0, num=CV)
-fold2weight = {f:w for f,w in zip(fold_order, ramp[::-1])}
-print("[cv] fold recency order (latest→oldest):", fold_order)
-print("[cv] weights:", fold2weight)
-
-print("\n[Fold month summary]")
-for fi, (_,va_idx) in enumerate(splits,1):
-    m_ts = df_train.loc[va_idx,"ref_month_ts"]
-    counts = m_ts.value_counts().sort_index()
-    months_list = [d.strftime("%Y-%m") for d in counts.index]
-    span_lo = counts.index.min().strftime("%Y-%m") if len(counts) else "NA"
-    span_hi = counts.index.max().strftime("%Y-%m") if len(counts) else "NA"
-    med = pd.Series(m_ts).median(); med_str = med.strftime("%Y-%m") if pd.notnull(med) else "NA"
-    pos_in_fold = int((y[va_idx]==1).sum()); rate = pos_in_fold/max(1,len(va_idx))
-    print(f"Fold {fi}: n={len(va_idx)} | pos={pos_in_fold} (rate={rate:.4f}) | months={months_list} | span={span_lo}→{span_hi} | median≈{med_str}")
-
-# ======================= CV Train =======================
-oof_xgb = np.zeros(len(y), dtype="float32")
-oof_lgb = np.zeros(len(y), dtype="float32")
-oof_cat = np.zeros(len(y), dtype="float32")
-fold_preds_val = {"xgb":[], "lgb":[], "cat":[], "w":[]}
-fold_masks = []
-fold_auc_meta, fold_dat_meta = [], []
-
-# Optional adversarial reweighting toward recent-like rows
-w_domain = np.ones(len(y), dtype="float32")
-if USE_ADV_REWEIGHT:
-    recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
-    domain_y = np.zeros(len(y), dtype=int)
-    for f,(tr,va) in enumerate(splits,1):
-        if f in recent_set:
-            domain_y[va] = 1
-    adv = LGBMClassifier(n_estimators=600, learning_rate=0.05, num_leaves=127, subsample=0.8, colsample_bytree=0.8)
-    adv.fit(X, domain_y)
-    p_domain = adv.predict_proba(X)[:,1]
-    w_domain = (0.5 + p_domain).astype("float32")   # ~[0.5,1.5]
-    del adv, p_domain; gc.collect()
-    print("[adv] adversarial reweighting enabled.")
-
-print("\n=========== CV training (time-aware, recency-weighted) ===========")
-t0 = time.time()
-for fold, (tr_idx, va_idx) in enumerate(splits, 1):
-    print(f"\n--- Fold {fold}/{CV} (w={fold2weight[fold]:.2f}) ---")
-    Xtr, Xva = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
-    ytr, yva = y[tr_idx], y[va_idx]
-
-    # TE for LGB/XGB (CatBoost keeps raw cats)
-    cat_for_te = [c for c in X.columns if str(X[c].dtype) in ("category","object")] if USE_TE_LGB_XGB else []
-    if USE_TE_LGB_XGB and len(cat_for_te):
-        df_all_for_te = pd.concat([df_train[[TARGET,"ref_month_ts"]], X[cat_for_te]], axis=1)
-        te_tr, te_va = _month_safe_target_encode(
-            df_all=df_all_for_te, tr_idx=tr_idx, va_idx=va_idx,
-            cat_cols=cat_for_te, target=TARGET, month_col="ref_month_ts", min_samples=TE_MIN_SAMPLES
-        )
-    # Build views per model
-    Xtr_lgb, Xva_lgb = Xtr.copy(), Xva.copy()
-    if USE_TE_LGB_XGB and len(cat_for_te):
-        for k,v in te_tr.items(): Xtr_lgb[k]=v
-        for k,v in te_va.items(): Xva_lgb[k]=v
-
-    # XGB
-    pxgb_list, pxgbv_list = [], []
-    for s in SEEDS:
-        xgb_params['seed'] = s
-        dtr = xgb.DMatrix(Xtr_lgb, label=ytr, weight=w_domain[tr_idx], enable_categorical=True)
-        dva = xgb.DMatrix(Xva_lgb, label=yva, enable_categorical=True)
-        dv  = xgb.DMatrix(Xv[Xtr_lgb.columns], enable_categorical=True)
-        bst = xgb.train(xgb_params, dtr, num_boost_round=N_ROUNDS,
-                        evals=[(dtr,"train"),(dva,"val")],
-                        early_stopping_rounds=ES_ROUNDS_XGB, verbose_eval=False)
-        pxgb_list.append(bst.predict(dva, iteration_range=(0, bst.best_iteration+1)))
-        pxgbv_list.append(bst.predict(dv,  iteration_range=(0, bst.best_iteration+1)))
-    pxgb_va = np.mean(pxgb_list, axis=0); pxgb_v = np.mean(pxgbv_list, axis=0)
-    del dtr, dva, dv, bst; gc.collect()
-
-    # LGB
-    plgb_list, plgbv_list = [], []
-    for s in SEEDS:
-        lgb_params['random_state'] = s
-        lgbm = LGBMClassifier(**lgb_params)
-        lgbm.fit(Xtr_lgb, ytr, eval_set=[(Xva_lgb, yva)], eval_metric="auc",
-                 callbacks=[early_stopping(ES_ROUNDS_LGB, verbose=False), log_evaluation(0)],
-                 sample_weight=w_domain[tr_idx])
-        plgb_list.append(lgbm.predict_proba(Xva_lgb)[:,1])
-        plgbv_list.append(lgbm.predict_proba(Xv[Xtr_lgb.columns])[:,1])
-    plgb_va = np.mean(plgb_list, axis=0); plgb_v = np.mean(plgbv_list, axis=0)
-    del lgbm; gc.collect()
-
-    # CAT
-    pcat_list, pcatv_list = [], []
-    for s in SEEDS:
-        cat_params['random_seed'] = s
-        train_pool = Pool(Xtr, label=ytr, cat_features=cat_idx if len(cat_idx) else None, weight=w_domain[tr_idx])
-        valid_pool = Pool(Xva, label=yva, cat_features=cat_idx if len(cat_idx) else None)
-        val_pool   = Pool(Xv,            cat_features=cat_idx if len(cat_idx) else None)
-        cat = CatBoostClassifier(**cat_params)
-        cat.fit(train_pool, eval_set=valid_pool, verbose=False, use_best_model=True)
-        pcat_list.append(cat.predict_proba(valid_pool)[:,1])
-        pcatv_list.append(cat.predict_proba(val_pool)[:,1])
-    pcat_va = np.mean(pcat_list, axis=0); pcat_v = np.mean(pcatv_list, axis=0)
-    del train_pool, valid_pool, val_pool, cat; gc.collect()
-
-    # Recent mask for tuning in this fold = global recent folds (not just this fold)
-    recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
-    recent_mask_oof = np.zeros_like(y, dtype=bool)
-    for f2,(tr2,va2) in enumerate(splits,1):
-        if f2 in recent_set: recent_mask_oof[va2] = True
-    # Piecewise sharpen per model using recent-only eval
-    pxgb_va, pxgb_v, _, _ = _piecewise_sharpen_grid(yva, pxgb_va, pxgb_v, mask_eval=None, use_iso=True)
-    plgb_va, plgb_v, _, _ = _piecewise_sharpen_grid(yva, plgb_va, plgb_v, mask_eval=None, use_iso=True)
-    pcat_va, pcat_v, _, _ = _piecewise_sharpen_grid(yva, pcat_va, pcat_v, mask_eval=None, use_iso=True)
-
-    # OOF
-    oof_xgb[va_idx] = pxgb_va; oof_lgb[va_idx] = plgb_va; oof_cat[va_idx] = pcat_va
-
-    fold_preds_val["xgb"].append(pxgb_v)
-    fold_preds_val["lgb"].append(plgb_v)
-    fold_preds_val["cat"].append(pcat_v)
-    fold_preds_val["w"].append(fold2weight[fold])
-
-    m = np.zeros(len(y), dtype=bool); m[va_idx]=True
-    fold_masks.append((fold, m))
-
-    # quick meta diag per-fold
-    mean3 = (pxgb_va + plgb_va + pcat_va)/3.0
-    std3  = np.std(np.column_stack([pxgb_va, plgb_va, pcat_va]), axis=1)
-    range3= np.maximum.reduce([pxgb_va, plgb_va, pcat_va]) - np.minimum.reduce([pxgb_va, plgb_va, pcat_va])
-    meta_X_va = np.column_stack([
-        pxgb_va, plgb_va, pcat_va,
-        _rank01(pxgb_va), _rank01(plgb_va), _rank01(pcat_va),
-        0.5*pxgb_va + 0.5*plgb_va,
-        np.maximum.reduce([pxgb_va, plgb_va, pcat_va]),
-        np.minimum.reduce([pxgb_va, plgb_va, pcat_va]),
-        mean3, std3, range3
-    ])
-    meta_lr = LogisticRegression(max_iter=2000, solver="lbfgs")
-    meta_lr.fit(meta_X_va, yva)
-    pmeta_va = meta_lr.predict_proba(meta_X_va)[:,1]
-    fold_auc_meta.append(roc_auc_score(yva, pmeta_va))
-    fold_dat_meta.append(_datathon(yva, pmeta_va))
-    print(f"Fold {fold}: AUC_meta={fold_auc_meta[-1]:.4f} | DAT_meta={fold_dat_meta[-1]:.5f}")
-
-print(f"\n[Fold meta diagnostics] Mean AUC={np.mean(fold_auc_meta):.4f} ± {np.std(fold_auc_meta):.4f} "
-      f"| Mean DAT={np.mean(fold_dat_meta):.5f}")
-print(f"[Total CV time] {time.time()-t0:.1f}s")
-
-# ======================= Recency-weighted blend on VAL streams =======================
-Wsum = np.sum(fold_preds_val["w"])
-predv_xgb = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["xgb"])], axis=0)/Wsum
-predv_lgb = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["lgb"])], axis=0)/Wsum
-predv_cat = np.sum([w*p for w,p in zip(fold_preds_val["w"], fold_preds_val["cat"])], axis=0)/Wsum
-
-# ======================= Weight search (OOF) =======================
-recent_set = set(fold_order[:TOP_FOCUS_RECENT_K])
-recent_mask = np.zeros(len(y), dtype=bool)
-for f, m in fold_masks:
-    if f in recent_set: recent_mask |= m
-
-def _weight_search(o1,o2,o3,y_true,mask,step):
-    grid = np.arange(0.0, 1.0+1e-9, step)
-    best_w, best_s = (1/3,1/3,1/3), -1.0
-    for wx in grid:
-        for wl in grid:
-            wc = 1.0 - wx - wl
-            if wc < -1e-12: continue
-            wc = max(0.0, wc)
-            s = _datathon(y_true[mask], (wx*o1 + wl*o2 + wc*o3)[mask])
-            if s > best_s: best_s, best_w = s, (wx, wl, wc)
-    return best_w, best_s
-
-best_w,_ = _weight_search(oof_xgb, oof_lgb, oof_cat, y, recent_mask, step=0.05)
-wx0, wl0, _ = best_w
-grid_wx = np.arange(max(0.0, wx0-0.05), min(1.0, wx0+0.05)+1e-9, 0.01)
-grid_wl = np.arange(max(0.0, wl0-0.05), min(1.0, wl0+0.05)+1e-9, 0.01)
-best_s_fine, best_w_fine = -1.0, best_w
-for wx in grid_wx:
-    for wl in grid_wl:
-        wc = 1.0 - wx - wl
-        if wc < -1e-12: continue
-        wc = max(0.0, wc)
-        s = _datathon(y, wx*oof_xgb + wl*oof_lgb + wc*oof_cat)
-        if s > best_s_fine: best_s_fine, best_w_fine = s, (wx, wl, wc)
-best_w = best_w_fine
-print(f"[Weight search] best=(xgb={best_w[0]:.3f}, lgb={best_w[1]:.3f}, cat={best_w[2]:.3f})")
-
-# ======================= Meta stacking (OOF) =======================
-mean3 = (oof_xgb + oof_lgb + oof_cat)/3.0
-std3  = np.std(np.column_stack([oof_xgb,oof_lgb,oof_cat]), axis=1)
-range3= np.maximum.reduce([oof_xgb,oof_lgb,oof_cat]) - np.minimum.reduce([oof_xgb,oof_lgb,oof_cat])
-
-stack_X_oof = np.column_stack([
-    oof_xgb, oof_lgb, oof_cat,
-    _rank01(oof_xgb), _rank01(oof_lgb), _rank01(oof_cat),
-    0.5*oof_xgb+0.5*oof_lgb,
-    np.maximum.reduce([oof_xgb,oof_lgb,oof_cat]),
-    np.minimum.reduce([oof_xgb,oof_lgb,oof_cat]),
-    mean3, std3, range3,
-    best_w[0]*oof_xgb + best_w[1]*oof_lgb + best_w[2]*oof_cat
-])
-sample_w = np.ones(len(y), dtype="float32")
-for f, m in fold_masks: sample_w[m] = float(fold2weight[f])
-
-# focus weights for top-decile emphasis
-oof_q = np.zeros_like(y, dtype="float32")
-months = df_train["ref_month_str"].values
-for m in np.unique(months):
-    mask_m = (months==m)
-    oof_q[mask_m] = pd.Series((best_w[0]*oof_xgb + best_w[1]*oof_lgb + best_w[2]*oof_cat)[mask_m]).rank(pct=True).values
-meta_w = sample_w * (1.0 + 9.0*(oof_q>=0.9))
-
-meta = LogisticRegression(max_iter=5000, solver="lbfgs")
-meta.fit(stack_X_oof, y, sample_weight=meta_w)
-oof_meta = meta.predict_proba(stack_X_oof)[:,1]
-
-# ===== Calibrate on recent folds only =====
-keep_recent = recent_mask
-if USE_ISOTONIC:
-    iso_global = IsotonicRegression(out_of_bounds="clip")
-    iso_global.fit(oof_meta[keep_recent], y[keep_recent], sample_weight=sample_w[keep_recent])
-    oof_meta_iso = iso_global.transform(oof_meta)
-else:
-    oof_meta_iso = oof_meta
-
-# ===== Prior correction with alpha shrink (tuned on recent) =====
-def _group_keys_for_prior(df_):
-    keys = []
-    for k in ["cohort_ym","behavioral_region","ref_month_str"]:
-        if k in df_.columns: keys.append(k)
-    return keys if keys else ["ref_month_str"]
-
-def _fit_prior_correction(df_ref, proba, keys):
-    tmp = df_ref.loc[:, keys].astype(str).copy()
-    tmp["z"] = _logit(proba); z_global = tmp["z"].mean()
-    tmp["g"] = tmp[keys].agg("||".join, axis=1)
-    delta = (tmp.groupby("g")["z"].mean() - z_global).to_dict()
-    return delta, z_global
-
-def _apply_prior_shrunk(df_ref, proba, keys, delta, alpha=0.5):
-    z = _logit(proba); g = df_ref[keys].astype(str).agg("||".join, axis=1)
-    shift = g.map(delta).fillna(0.0).values
-    return _sigmoid(z - alpha*shift)
-
-keys_prior = _group_keys_for_prior(df_train)
-delta_map, z0 = _fit_prior_correction(df_train, oof_meta_iso, keys_prior)
-best_alpha, best_s = 0.0, -1.0
-for a in np.linspace(0.0, 1.0, 11):
-    cand = _apply_prior_shrunk(df_train, oof_meta_iso, keys_prior, delta_map, alpha=a)
-    s = _datathon(y[keep_recent], cand[keep_recent])
-    if s>best_s: best_s, best_alpha = s, a
-oof_meta_corr = _apply_prior_shrunk(df_train, oof_meta_iso, keys_prior, delta_map, alpha=best_alpha)
-print(f"[prior] best alpha={best_alpha:.2f} (tuned on recent)")
-
-# ===== Rank-blend weight tuned on recent =====
-def _build_ecdf_map(months_vec, scores):
-    out={}
-    for m, s in pd.DataFrame({"m":months_vec, "s":scores}).groupby("m")["s"]:
-        out[m] = np.sort(s.values)
-    return out
-
-ecdf_map = _build_ecdf_map(df_train["ref_month_str"].values, oof_meta_corr)
-def _percentile(arr_sorted, x): 
-    idx = np.searchsorted(arr_sorted, x, side="right")
-    return idx / max(1, len(arr_sorted))
-
-best_rb, best_rb_s = RANK_BLEND_INIT, -1.0
-months_arr = df_train["ref_month_str"].values
-oof_pct = np.zeros_like(oof_meta_corr)
-for m in np.unique(months_arr):
-    arr = ecdf_map.get(m, np.sort(oof_meta_corr))
-    mask = (months_arr==m)
-    oof_pct[mask] = _percentile(arr, oof_meta_corr[mask])
-for rb in np.linspace(0.0, 0.5, 51):
-    cand = (1.0-rb)*oof_meta_corr + rb*oof_pct
-    s = _datathon(y[keep_recent], cand[keep_recent])
-    if s>best_rb_s: best_rb_s, best_rb = s, rb
-print(f"[rank-blend] best RANK_BLEND={best_rb:.3f} (tuned on recent)")
-
-# ===== OOF report =====
-def _report(tag, y_true, p):
-    auc = roc_auc_score(y_true, p)
-    gini = cm.convert_auc_to_gini(auc)
-    r10  = cm.recall_at_k(y_true, p, k=0.10)
-    l10  = cm.lift_at_k(y_true, p, k=0.10)
-    dat  = _datathon(y_true, p)
-    print(f"{tag} OOF AUC={auc:.4f} | Gini={gini:.4f} | Recall@10%={r10:.4f} | Lift@10%={l10:.4f} | Datathon={dat:.5f}")
-
-print("\n========== OOF (stacked) ==========")
-_report("Raw   ", y, oof_meta)
-_report("Iso   ", y, oof_meta_iso)
-_report("Prior ", y, oof_meta_corr)
-oof_meta_final = (1.0-best_rb)*oof_meta_corr + best_rb*oof_pct
-_report("Final ", y, oof_meta_final)
-
-# ======================= Validation inference =======================
-# Build stacking features for VAL (mirror OOF stack)
-mean3_v  = (predv_xgb + predv_lgb + predv_cat) / 3.0
-std3_v   = np.std(np.column_stack([predv_xgb, predv_lgb, predv_cat]), axis=1)
-range3_v = np.maximum.reduce([predv_xgb, predv_lgb, predv_cat]) - np.minimum.reduce([predv_xgb, predv_lgb, predv_cat])
-blend_v  = best_w[0]*predv_xgb + best_w[1]*predv_lgb + best_w[2]*predv_cat
-stack_X_val = np.column_stack([
-    predv_xgb, predv_lgb, predv_cat,
-    _rank01(predv_xgb), _rank01(predv_lgb), _rank01(predv_cat),
-    0.5*predv_xgb + 0.5*predv_lgb,
-    np.maximum.reduce([predv_xgb, predv_lgb, predv_cat]),
-    np.minimum.reduce([predv_xgb, predv_lgb, predv_cat]),
-    mean3_v, std3_v, range3_v,
-    blend_v
-])
-val_prob = meta.predict_proba(stack_X_val)[:,1].astype("float32")
-val_prob = iso_global.transform(val_prob) if USE_ISOTONIC else val_prob
-
-# apply prior shrunk
-val_prob_corr = _apply_prior_shrunk(val_df, val_prob, keys_prior, delta_map, alpha=best_alpha)
-
-# ECDF rank blend by month (from OOF)
-train_ecdf_by_month = _build_ecdf_map(df_train["ref_month_str"].values, oof_meta_corr)
-val_months = val_df["ref_month_str"].values
-val_rank_pct = np.zeros_like(val_prob_corr)
-for m in np.unique(val_months):
-    arr = train_ecdf_by_month.get(m, np.sort(oof_meta_corr))
-    mask = (val_months==m)
-    # vectorized percentile per block
-    val_rank_pct[mask] = np.searchsorted(arr, val_prob_corr[mask], side="right")/max(1,len(arr))
-
-final_val = (1.0-best_rb)*val_prob_corr + best_rb*val_rank_pct
-final_val = final_val.astype("float32")
-
-col_name = "pred_churn_prob" if "churn" in validation_df_submission.columns else "churn"
-validation_df_submission[col_name] = final_val
-print(f"\n[validation] wrote predictions to validation_df_submission['{col_name}'] | shape={final_val.shape} | time={time.time()-t0_all:.1f}s")
+import re
+from typing import List, Dict, Any, Optional, Tuple
+
+# RapidFuzz varsa kullan, yoksa sade eşleme ile devam
+try:
+    from rapidfuzz import fuzz
+    _HAS_RF = True
+except Exception:
+    _HAS_RF = False
+
+def extract_role_boxes(
+    pages_scaled: Any,
+    fuzzy_cutoff: int = 86,
+    use_fuzzy: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    pages_scaled içindeki rol metinlerini yakalar ve bbox bilgisiyle döner.
+
+    Dönüş: [
+      {
+        "page_index": int,
+        "role": str,                      # kanonik rol
+        "matched_text": str,              # OCR metninin orijinali
+        "bbox": {"x_min":..., "y_min":..., "width":..., "height":...},
+        "confidence": float|None,
+        "score": float,                   # eşleşme skoru (0-100)
+        "matched_variant": str            # eşleşen varyant (normalize)
+      },
+      ...
+    ]
+    """
+
+    # --- 1) Kanonik rol sözlüğü ve varyantları ---
+    ROLE_ALIASES_DEFAULT: Dict[str, List[str]] = {
+        "toplantı başkanı": [
+            "toplantı başkanı","toplanti baskani","top. baskani","topl. baskani","baskan",
+            "toplan ti bask ani","toplanıı bask anı","toplanti baska ni","toplanti bsk"
+        ],
+        "tutanak yazmanı": [
+            "tutanak yazmani","tutanak yazmanı","yazman","yazmani"
+        ],
+        "bakanlık temsilcisi": [
+            "bakanlik temsilcisi","ticaret bakanligi temsilcisi","ticaret bakanligi temsilcist",
+            "ticaret bakanligi temsIlcIsI","bakanlik temsIlcIsI"
+        ],
+        "yönetim kurulu başkanı": [
+            "yönetim kurulu başkanı","yonetim kurulu baskani","yk baskani","yk bsk","yk bsk."
+        ],
+        "yönetim kurulu üyesi": [
+            "yönetim kurulu üyesi","yonetim kurulu uyesi","yk uyesi","yk uye","yk. uyesi",
+            # sadece "yönetim kurulu" görüldüğünde bu role düşecek (kural aşağıda)
+            "yönetim kurulu","yonetim kurulu","yk"
+        ],
+        "katip": [
+            "katip","kâtıp","kâtip","ka tip"
+        ],
+        "divan başkanı": [
+            "divan başkanı","divan baskani","divan bsk"
+        ],
+        "oy toplama memuru": [
+            "oy toplama memuru","oy sayım memuru","oy sayim memuru","oy toplama gorevlisi"
+        ],
+        "noter": [
+            "noter","noterce","noter onaylı","noter onayli"
+        ],
+    }
+
+    # --- 2) Normalizasyon yardımcıları ---
+    def fold(s: str) -> str:
+        s = s.lower()
+        s = s.replace("ı","i").replace("İ","i").replace("ş","s").replace("Ş","s") \
+             .replace("ç","c").replace("Ç","c").replace("ö","o").replace("Ö","o") \
+             .replace("ğ","g").replace("Ğ","g").replace("ü","u").replace("Ü","u")
+        s = s.replace("|","l").replace("’","'").replace("“","\"").replace("”","\"")
+        s = re.sub(r"\s+", " ", s).strip()
+        # 3+ tekrar eden karakterleri yumuşat
+        s = re.sub(r"(.)\1{2,}", r"\1\1", s)
+        return s
+
+    # aliasları normalize edip uzun olanları önce deneyeceğiz
+    canon_by_variant: Dict[str, str] = {}
+    all_variants: List[Tuple[str, str]] = []  # (variant_norm, canon)
+    for canon, vals in ROLE_ALIASES_DEFAULT.items():
+        for v in vals:
+            vv = fold(v)
+            canon_by_variant[vv] = canon
+            all_variants.append((vv, canon))
+    # uzun varyantlar önce
+    all_variants.sort(key=lambda x: len(x[0]), reverse=True)
+
+    def ensure_pages(pages_obj: Any) -> List[List[Dict[str, Any]]]:
+        """Tek sayfa listesi de gelse [ [items...] ] şekline çevir."""
+        if not pages_obj:
+            return []
+        # sayfa düzeyi liste mi? (içindeki ilk eleman dictionary ise tek sayfa)
+        if isinstance(pages_obj, list) and pages_obj and isinstance(pages_obj[0], dict):
+            return [pages_obj]
+        return pages_obj  # zaten [ [dict,...], [dict,...] ]
+
+    pages = ensure_pages(pages_scaled)
+    out: List[Dict[str, Any]] = []
+
+    # --- 3) Eşleme ana akışı ---
+    for pi, items in enumerate(pages):
+        for it in items:
+            txt = it.get("text") or it.get("txt") or ""
+            if not txt:
+                continue
+            bbox = it.get("bbox") or {}
+            conf = it.get("confidence")
+
+            raw_norm = fold(txt)
+            raw_ns = raw_norm.replace(" ", "")
+
+            best: Optional[Tuple[str, str, float]] = None  # (canon, matched_variant, score)
+            matched_only_yk = False  # sadece "yönetim kurulu" kuralı için
+
+            # 3.a: özel kural – YK başkanı > üye, ayrımı
+            if ("yonetim kurulu baskan" in raw_norm) or ("yönetim kurulu başkan" in raw_norm) or ("yk bask" in raw_norm):
+                best = ("yönetim kurulu başkanı", "yonetim kurulu baskani", 100.0)
+            else:
+                # 3.b: varyantlara göre doğrudan içerme / nospace içerme
+                for variant, canon in all_variants:
+                    v_ns = variant.replace(" ", "")
+                    hit = False
+                    if variant in raw_norm or v_ns in raw_ns:
+                        hit = True
+                        score = 100.0
+                    elif use_fuzzy and _HAS_RF:
+                        # partial match, OCR artıkları için daha toleranslı
+                        score = max(
+                            fuzz.partial_ratio(variant, raw_norm),
+                            fuzz.partial_ratio(variant, raw_ns)
+                        )
+                        hit = score >= fuzzy_cutoff
+                    else:
+                        score = 0.0
+
+                    if hit:
+                        # "yönetim kurulu" tek başına ise üye kuralını uygula
+                        if canon == "yönetim kurulu üyesi" and (
+                            "yonetim kurulu baskan" in raw_norm or "yönetim kurulu başkan" in raw_norm or "yk bask" in raw_norm
+                        ):
+                            # başkan sinyali varsa üye yerine başkan olacak, bir üstte zaten yakalanırdı
+                            continue
+
+                        if best is None or score > best[2]:
+                            best = (canon, variant, float(score))
+
+                        if variant in ("yönetim kurulu","yonetim kurulu","yk"):
+                            matched_only_yk = True
+
+            if best:
+                canon, matched_variant, score = best
+
+                # “yalnızca yönetim kurulu” ⇒ üye
+                if matched_only_yk and canon != "yönetim kurulu başkanı":
+                    canon = "yönetim kurulu üyesi"
+
+                out.append({
+                    "page_index": pi,
+                    "role": canon,
+                    "matched_text": txt,
+                    "bbox": {
+                        "x_min": bbox.get("x_min"),
+                        "y_min": bbox.get("y_min"),
+                        "width": bbox.get("width"),
+                        "height": bbox.get("height"),
+                    },
+                    "confidence": conf if isinstance(conf, (int, float)) else None,
+                    "score": round(score, 1),
+                    "matched_variant": fold(matched_variant)
+                })
+
+    # Aynı kutu için birden fazla rol bulunursa, en yüksek skoru tut
+    def _key(r):
+        b = r["bbox"]
+        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
+    best_by_box: Dict[Any, Dict[str, Any]] = {}
+    for r in out:
+        k = _key(r)
+        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
+            best_by_box[k] = r
+    return list(best_by_box.values())
+
+# pages_scaled = [...]  # senin OCR çıktın
+role_boxes = extract_role_boxes(pages_scaled, fuzzy_cutoff=86)
+
+# Örnek çıktı elemanı:
+# {
+#   'page_index': 0,
+#   'role': 'toplantı başkanı',
+#   'matched_text': 'TOPLANTI BAŞKANI: CİHAN DEMİR',
+#   'bbox': {'x_min': 524, 'y_min': 188, 'width': 753, 'height': 95},
+#   'confidence': 0.938,
+#   'score': 100.0,
+#   'matched_variant': 'toplanti baskani'
+# }
