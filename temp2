@@ -1,208 +1,225 @@
-def extract_role_boxes(
-    pages_scaled,
-    fuzzy_cutoff: int = 86,
-    use_fuzzy: bool = True,
-):
+from typing import Any, Dict, List, Optional, Tuple, Union
+import re
+import math
+
+def extract_name_boxes(
+    pages_scaled: Union[List[Dict[str, Any]], Dict[str, Any]],
+    nlp,                              # spaCy model: tr_core_news_trf önerilir
+    ocr_conf_min: float = 0.70,       # düşük konf. kutuları atla
+    min_tokens: Tuple[int,int] = (2,3),  # ad-soyad veya ad-ikinciad-soyad
+    fuzzy_blacklist: Optional[List[str]] = None,  # single-token blacklist
+    line_merge_px: Optional[int] = None,      # satır birleştirme eşiği (px). None => otomatik
+    x_gap_max_px: Optional[int] = None,       # satır içinde kelime birleştirme max boşluk (px)
+    debug: bool = False,
+) -> List[Dict[str, Any]]:
     """
-    OCR metinlerinden rol yakalar ve bbox ile döner.
-    Çıktı: en yüksek skorlu tek kayıt/bbox.
+    Sadece PERSON (ad-soyad) kutularını NER ile çıkarır.
+    - Önce satır bazında OCR item'larını birleştirir,
+    - NER'i satır metni üzerinde çalıştırır,
+    - Span'a düşen kelime kutularının birleşik bbox'ını döndürür.
+
+    Dönüş: [{page_index, role:'PERSON', name, matched_text, name_span:(s,e), boxes:{...}, confidence:None, source}]
     """
-    # --- opsiyonel RapidFuzz ---
-    _HAS_RF = False
-    if use_fuzzy:
-        try:
-            from rapidfuzz import fuzz  # type: ignore
-            _HAS_RF = True
-        except Exception:
-            _HAS_RF = False
 
-    import re
-
-    # --- 1) Kanonik roller ve varyantları ---
-    ROLE_ALIASES_DEFAULT = {
-        "toplantı başkanı": [
-            "toplantı başkanı","toplanti baskani","topl bsk","topl bşk",
-            "toplanti bsk","topl bşkan","divan başkanı","divan baskani"
-        ],
-        "tutanak yazmanı": [
-            "tutanak yazmanı","tutanak yazmani","yazman","yazmanı"
-        ],
-        "bakanlık temsilcisi": [
-            "bakanlık temsilcisi","bakanlik temsilcisi",
-            "ticaret bakanligi temsilcisi","ticaret bakanlığı temsilcisi"
-        ],
-        "yönetim kurulu başkanı": [
-            "yönetim kurulu başkanı","yonetim kurulu baskani",
-            "yk başkanı","yk baskani","yk bşk","yk bsk"
-        ],
-        "yönetim kurulu üyesi": [
-            "yönetim kurulu üyesi","yonetim kurulu uyesi",
-            "yk üyesi","yk uyesi","yk üye","yk uye"
-        ],
-        "katip": ["katip","kâtip","ka tip"],
-        "divan başkanı": ["divan başkanı","divan baskani","divan bşk","divan bsk"],
-        "oy toplama memuru": [
-            "oy toplama memuru","oy sayım memuru","oy sayim memuru",
-            "oy toplama görevlisi","oy toplama gorevlisi"
-        ],
-        "noter": ["noter","noterce","noter onaylı","noter onayli"],
-    }
-
-    # --- 2) Normalize yardımcıları ---
-    def fold(s: str) -> str:
-        s = (s or "").lower()
-        s = (s.replace("â","a").replace("î","i").replace("û","u")
-               .replace("ş","s").replace("ç","c").replace("ğ","g")
-               .replace("ö","o").replace("ü","u").replace("ı","i"))
-        s = re.sub(r"[^a-z0-9\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def _tokens(s_norm: str):
-        return set(s_norm.split())
-
-    # tüm varyantları normalize + uzunları önce dene
-    all_variants = []  # [(variant_norm, canon)]
-    for canon, vars_ in ROLE_ALIASES_DEFAULT.items():
-        for v in vars_:
-            all_variants.append((fold(v), canon))
-    all_variants.sort(key=lambda t: len(t[0]), reverse=True)
-
-    # --- 3) Girdi normalizasyonu ---
-    def ensure_pages(obj):
+    # --- yardımcılar ---
+    def _ensure_pages(obj):
         if not obj:
             return []
         if isinstance(obj, dict):
             if "items" in obj and isinstance(obj["items"], list):
                 return [obj]
             return [{"items": obj if isinstance(obj, list) else []}]
-        pages = []
+        out = []
         for p in obj:
             if isinstance(p, dict) and "items" in p:
-                pages.append(p)
+                out.append(p)
             elif isinstance(p, list):
-                pages.append({"items": p})
-        return pages
+                out.append({"items": p})
+        return out
 
-    pages = ensure_pages(pages_scaled)
+    def _norm_ws(s: str) -> str:
+        s = (s or "").replace("|"," ").replace("•"," ").replace("—","-").replace("–","-")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    # --- 4) Anchor & Ambiguity kuralları ---
-    TOPLAM_RE   = re.compile(r"\btoplam[a-z]*\b")
-    OY_RE       = re.compile(r"\boy\b")
-    SAYIM_RE    = re.compile(r"\bsayi?m\b")       # sayım/sayim
-    TOPLANTI_RE = re.compile(r"\btoplanti\w*\b")
+    # tekil token blacklist temizliği (alt-dizini değil, sadece tek kelimeyi düş)
+    if fuzzy_blacklist is None:
+        fuzzy_blacklist = [
+            "imza","mühür","muhur","kaşe","kase","stamp","seal",
+            "signature","tasdik","tescil","onay","noter","sayfa","page"
+        ]
+    BLK = set([_norm_ws(b).lower() for b in fuzzy_blacklist])
 
-    def passes_anchor_rules(canon_norm: str, raw_norm: str) -> bool:
-        # 'toplam' tek başına -> yasak
-        toplam_alone = bool(TOPLAM_RE.search(raw_norm) and not OY_RE.search(raw_norm))
-        if canon_norm == "oy toplama memuru":
-            if toplam_alone:
-                return False
-            return bool(OY_RE.search(raw_norm) or SAYIM_RE.search(raw_norm))
-        if canon_norm == "toplanti baskani":
-            if toplam_alone:
-                return False
-            return bool(TOPLANTI_RE.search(raw_norm))
-        return True
+    def _is_blacklisted_token(tok: str) -> bool:
+        t = tok.lower()
+        return t in BLK
 
-    # --- 4b) Rol-özel zorunlu kelimeler (aynı item içinde bulunmalı) ---
-    ROLE_REQUIRED = {
-        "bakanlık temsilcisi": {"bakanlik", "temsilcisi"},
-        "oy toplama memuru": {"oy"},             # 'oy' şart, 'sayim' opsiyonel
-        "toplantı başkanı": {"toplanti"},
-    }
-    def passes_required_tokens(canon: str, raw_norm: str) -> bool:
-        need = ROLE_REQUIRED.get(canon, set())
-        if not need:
-            return True
-        have = _tokens(raw_norm)
-        return need.issubset(have)
+    def _looks_like_name(text: str) -> bool:
+        # rakam içermesin
+        if any(ch.isdigit() for ch in text):
+            return False
+        parts = [p for p in text.split() if p]
+        if not (min_tokens[0] <= len(parts) <= min_tokens[1]):
+            return False
+        # tekil token blacklist varsa eler
+        if any(_is_blacklisted_token(p) for p in parts):
+            return False
+        # her parça harflerden oluşsun (Türkçe harfler dahil)
+        return all(re.fullmatch(r"[A-Za-zÇĞİÖŞÜçğıöşüİ]+\.?", p) for p in parts)
 
-    # kısa metinlerde fuzzy'i kapat
-    MIN_RAW_LEN_FOR_FUZZY = 5
-    MIN_RAW_TOKENS_FOR_FUZZY = 2
-
-    # --- 5) Eşleme ---
-    out = []
-    for pi, page in enumerate(pages):
-        for it in page.get("items", []):
-            txt = it.get("text") or ""
-            if not txt.strip():
-                continue
-            bbox = it.get("bbox") or {}
-            conf = it.get("confidence")
-
-            raw_norm = fold(txt)
-            raw_ns   = raw_norm.replace(" ", "")
-            raw_toks = _tokens(raw_norm)
-
-            best = None  # (canon, matched_variant_norm, score)
-
-            # Özel sinyal: yönetim kurulu başkanı
-            if ("yonetimkurulubaskan" in raw_ns) or ("yönetimkurulubaskan" in raw_ns) or ("ykbask" in raw_ns):
-                best = ("yönetim kurulu başkanı", "yönetim kurulu başkanı", 100.0)
+    def _title_soft(s: str) -> str:
+        # ALLCAPS satırlarda isim tanımını kolaylaştırır
+        words = s.split()
+        out = []
+        for w in words:
+            if len(w) == 1:
+                out.append(w)  # tek harfe dokunma
+            elif re.fullmatch(r"[A-ZÇĞİÖŞÜ]+", w):
+                out.append(w.title())
             else:
-                for v_norm, canon in all_variants:
-                    hit = False
-                    score = 0.0
+                out.append(w)
+        return " ".join(out)
 
-                    if v_norm in raw_norm:
-                        hit = True
-                        score = 100.0
-                    else:
-                        use_local_fuzzy = (
-                            _HAS_RF and
-                            (len(raw_norm) >= MIN_RAW_LEN_FOR_FUZZY) and
-                            (len(raw_toks) >= MIN_RAW_TOKENS_FOR_FUZZY)
-                        )
-                        if use_local_fuzzy:
-                            # token_set_ratio kısa-uzun karma metinlerde daha güvenli
-                            score = float(fuzz.token_set_ratio(v_norm, raw_norm))
-                            hit = score >= float(fuzzy_cutoff)
+    def _union_bbox(bxs):
+        x1 = min(b["x_min"] for b in bxs)
+        y1 = min(b["y_min"] for b in bxs)
+        x2 = max(b["x_min"] + b["width"]  for b in bxs)
+        y2 = max(b["y_min"] + b["height"] for b in bxs)
+        return {"x_min": int(x1), "y_min": int(y1),
+                "width": int(x2 - x1), "height": int(y2 - y1)}
 
-                    if hit:
-                        canon_norm = fold(canon)               # 'toplanti baskani' vb.
-                        if not passes_anchor_rules(canon_norm, raw_norm):
-                            continue
-                        if not passes_required_tokens(canon, raw_norm):
-                            continue
-                        # uzun varyanta küçük bonus
-                        score += min(5.0, len(v_norm) * 0.2)
-                        if (best is None) or (score > best[2]):
-                            best = (canon, v_norm, score)
+    # --- sayfaları hazırla ---
+    pages = _ensure_pages(pages_scaled)
 
-            if best:
-                canon, matched_variant, score = best
+    results: List[Dict[str,Any]] = []
 
-                # üye vs başkan düzeltmesi
-                if canon == "yönetim kurulu üyesi":
-                    if ("yönetim kurulu baskan" in raw_norm) or ("yk bask" in raw_norm):
-                        canon = "yönetim kurulu başkanı"
+    for pi, page in enumerate(pages):
+        items = [it for it in page.get("items", []) if isinstance(it, dict)]
+        # düşük conf. ele
+        good = []
+        for it in items:
+            conf = it.get("confidence")
+            if isinstance(conf, (int,float)) and conf < ocr_conf_min:
+                if debug: print(f"[skip] low conf {conf:.2f}")
+                continue
+            txt = _norm_ws(it.get("text") or it.get("txt") or "")
+            if not txt:
+                continue
+            good.append({
+                "text": txt,
+                "bbox": it.get("bbox") or {},
+                "conf": conf
+            })
+        if not good:
+            continue
 
-                out.append({
+        # satır birleştirme (y merkezine göre)
+        # otomatik eşik: görüntü yüksekliğinin %2'si kadar veya 20px (hangisi büyükse)
+        # bbox yoksa varsayılan 20
+        if line_merge_px is None:
+            # en yaygın yükseklikten kaba bir H çıkar
+            ys = [g["bbox"].get("y_min",0) for g in good]
+            H_est = (max(ys) - min(ys) + 1000)  # güvenli varsayım
+            line_thr = max(20, int(H_est * 0.02))
+        else:
+            line_thr = int(line_merge_px)
+
+        # x arası boşluk eşiği
+        x_thr = int( x_gap_max_px if x_gap_max_px is not None else 80 )
+
+        # y merkezine göre sırala
+        def y_center(it): 
+            b = it["bbox"]; return b.get("y_min",0) + b.get("height",0)/2
+        good.sort(key=lambda it: (y_center(it), it["bbox"].get("x_min",0)))
+
+        lines = []
+        cur = []
+        last_y = None
+        for it in good:
+            yc = y_center(it)
+            if last_y is None or abs(yc - last_y) <= line_thr:
+                cur.append(it)
+                last_y = yc if last_y is None else (last_y*0.7 + yc*0.3)
+            else:
+                lines.append(cur); cur = [it]; last_y = yc
+        if cur:
+            lines.append(cur)
+
+        # her satır içinde sola göre sırala ve yakın kutuları metin sırasıyla birleştir
+        for line in lines:
+            line.sort(key=lambda it: it["bbox"].get("x_min",0))
+
+            # line metni ve segment char aralıklarını üret
+            segs = []  # [{text, bbox, start, end}]
+            cursor = 0
+            for j, it in enumerate(line):
+                t = _norm_ws(it["text"])
+                if not t:
+                    continue
+                # araya boşluk ekle
+                if segs:
+                    segs.append({"text":" ", "bbox":None, "start":cursor, "end":cursor+1})
+                    cursor += 1
+                segs.append({"text":t, "bbox":it["bbox"], "start":cursor, "end":cursor+len(t)})
+                cursor += len(t)
+
+            if not segs:
+                continue
+
+            raw_line = "".join(s["text"] for s in segs)
+            text_for_ner = _title_soft(raw_line)
+
+            # NER
+            try:
+                doc = nlp(text_for_ner)
+            except Exception as ex:
+                if debug: print("spaCy error:", ex)
+                continue
+
+            # span -> seg kapsama eşlemesi
+            for ent in doc.ents:
+                if str(ent.label_).upper() != "PERSON":
+                    continue
+                s, e = int(ent.start_char), int(ent.end_char)
+                cand_boxes = []
+                matched_text = raw_line[s:e]
+
+                # span ile kesişen segmentleri topla
+                for sg in segs:
+                    if sg["bbox"] is None:
+                        continue
+                    if not (e <= sg["start"] or s >= sg["end"]):
+                        cand_boxes.append(sg["bbox"])
+
+                if not cand_boxes:
+                    continue
+
+                name = _norm_ws(matched_text)
+                if not _looks_like_name(name):
+                    if debug: print(f"[skip] not name: '{name}'")
+                    continue
+
+                fused = _union_bbox(cand_boxes)
+                results.append({
                     "page_index": pi,
-                    "role": canon.upper(),
-                    "matched_text": txt,
-                    "bbox": {
-                        "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
-                        "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
-                        "width": int(bbox.get("width", bbox.get("w", 0))),
-                        "height": int(bbox.get("height", bbox.get("h", 0))),
-                    },
-                    "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-                    "score": float(score),
-                    "matched_variant": fold(matched_variant),
+                    "role": "PERSON",
+                    "name": name.upper(),
+                    "matched_text": matched_text,
+                    "name_span": (s, e),
+                    "boxes": fused,
+                    "confidence": None,
+                    "source": "line_ner"
                 })
 
-    # --- 6) Aynı bbox için en yüksek skoru tut ---
-    def _k(r):
-        b = r["bbox"]
-        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
+    # sayfa+isim+bbox ile dedup
+    seen = set()
+    uniq = []
+    for r in results:
+        b = r["boxes"]
+        k = (r["page_index"], r["name"], b["x_min"], b["y_min"], b["width"], b["height"])
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(r)
 
-    best_by_box = {}
-    for r in out:
-        k = _k(r)
-        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
-            best_by_box[k] = r
-
-    return list(best_by_box.values())
+    return uniq
