@@ -1,6 +1,195 @@
 import re
 from typing import List, Dict, Any, Optional, Tuple
 
+try:
+    from rapidfuzz import fuzz
+    _HAS_RF = True
+except Exception:
+    _HAS_RF = False
+
+def extract_role_boxes_clean(
+    pages_scaled: Any,
+    fuzzy_cutoff: int = 86,
+    use_fuzzy: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    pages_scaled içindeki rol metinlerini döner.
+    Kara listedeki kelimeleri (örn. İMZA, KAŞE) temizler.
+    """
+
+    # -----------------------------
+    # 1. Kara liste (blacklist)
+    # -----------------------------
+    BLACKLIST_WORDS = [
+        "imza", "i̇mza", "mühür", "kaşe", "stamp", "seal",
+        "onay", "tescil", "tasdik", "signature"
+    ]
+
+    # -----------------------------
+    # 2. Rol sözlüğü
+    # -----------------------------
+    ROLE_ALIASES_DEFAULT: Dict[str, List[str]] = {
+        "toplantı başkanı": [
+            "toplantı başkanı","toplanti baskani","top. baskani","topl. baskani","baskan",
+            "toplan ti bask ani","toplanıı bask anı","toplanti baska ni","toplanti bsk"
+        ],
+        "tutanak yazmanı": [
+            "tutanak yazmani","tutanak yazmanı","yazman","yazmani"
+        ],
+        "bakanlık temsilcisi": [
+            "bakanlik temsilcisi","ticaret bakanligi temsilcisi","ticaret bakanligi temsilcist",
+            "ticaret bakanligi temsIlcIsI","bakanlik temsIlcIsI"
+        ],
+        "yönetim kurulu başkanı": [
+            "yönetim kurulu başkanı","yonetim kurulu baskani","yk baskani","yk bsk","yk bsk."
+        ],
+        "yönetim kurulu üyesi": [
+            "yönetim kurulu üyesi","yonetim kurulu uyesi","yk uyesi","yk uye","yk. uyesi",
+            "yönetim kurulu","yonetim kurulu","yk"
+        ],
+        "katip": [
+            "katip","kâtıp","kâtip","ka tip"
+        ],
+        "divan başkanı": [
+            "divan başkanı","divan baskani","divan bsk"
+        ],
+        "oy toplama memuru": [
+            "oy toplama memuru","oy sayım memuru","oy sayim memuru","oy toplama gorevlisi"
+        ],
+        "noter": [
+            "noter","noterce","noter onaylı","noter onayli"
+        ],
+    }
+
+    def fold(s: str) -> str:
+        s = s.lower()
+        s = s.replace("ı","i").replace("İ","i").replace("ş","s").replace("Ş","s") \
+             .replace("ç","c").replace("Ç","c").replace("ö","o").replace("Ö","o") \
+             .replace("ğ","g").replace("Ğ","g").replace("ü","u").replace("Ü","u")
+        s = s.replace("|","l").replace("’","'").replace("“","\"").replace("”","\"")
+        s = re.sub(r"\s+", " ", s).strip()
+        s = re.sub(r"(.)\1{2,}", r"\1\1", s)
+        return s
+
+    # -----------------------------
+    # 3. Alias'ları normalize et
+    # -----------------------------
+    canon_by_variant: Dict[str, str] = {}
+    all_variants: List[Tuple[str, str]] = []
+    for canon, vals in ROLE_ALIASES_DEFAULT.items():
+        for v in vals:
+            vv = fold(v)
+            canon_by_variant[vv] = canon
+            all_variants.append((vv, canon))
+    all_variants.sort(key=lambda x: len(x[0]), reverse=True)
+
+    # -----------------------------
+    # 4. pages_scaled normalize
+    # -----------------------------
+    def ensure_pages(pages_obj: Any) -> List[List[Dict[str, Any]]]:
+        if not pages_obj:
+            return []
+        if isinstance(pages_obj, list) and pages_obj and isinstance(pages_obj[0], dict):
+            return [pages_obj]
+        return pages_obj
+
+    pages = ensure_pages(pages_scaled)
+    out: List[Dict[str, Any]] = []
+
+    # -----------------------------
+    # 5. Ana döngü
+    # -----------------------------
+    for pi, items in enumerate(pages):
+        for it in items:
+            raw_txt = it.get("text") or it.get("txt") or ""
+            if not raw_txt:
+                continue
+
+            # --- blacklist kelimeleri çıkar ---
+            cleaned_txt = raw_txt
+            for bad in BLACKLIST_WORDS:
+                cleaned_txt = re.sub(
+                    r"\b" + re.escape(bad) + r"\b", "", cleaned_txt, flags=re.IGNORECASE
+                )
+            cleaned_txt = re.sub(r"\s+", " ", cleaned_txt).strip()
+
+            if not cleaned_txt:
+                continue
+
+            bbox = it.get("bbox") or {}
+            conf = it.get("confidence")
+
+            ntext = fold(cleaned_txt)
+            ntext_ns = ntext.replace(" ", "")
+
+            best = None
+            matched_only_yk = False
+
+            if any(k in ntext for k in ["yonetim kurulu baskan", "yönetim kurulu başkan", "yk bask"]):
+                best = ("yönetim kurulu başkanı", "yonetim kurulu baskani", 100.0)
+            else:
+                for variant, canon in all_variants:
+                    v_ns = variant.replace(" ", "")
+                    hit = False
+                    if variant in ntext or v_ns in ntext_ns:
+                        hit = True
+                        score = 100.0
+                    elif use_fuzzy and _HAS_RF:
+                        score = max(
+                            fuzz.partial_ratio(variant, ntext),
+                            fuzz.partial_ratio(variant, ntext_ns)
+                        )
+                        hit = score >= fuzzy_cutoff
+                    else:
+                        score = 0.0
+
+                    if hit:
+                        if canon == "yönetim kurulu üyesi" and any(
+                            k in ntext for k in ["yonetim kurulu baskan", "yönetim kurulu başkan", "yk bask"]
+                        ):
+                            continue
+
+                        if best is None or score > best[2]:
+                            best = (canon, variant, float(score))
+                        if variant in ("yönetim kurulu", "yonetim kurulu", "yk"):
+                            matched_only_yk = True
+
+            if best:
+                canon, matched_variant, score = best
+                if matched_only_yk and canon != "yönetim kurulu başkanı":
+                    canon = "yönetim kurulu üyesi"
+
+                out.append({
+                    "page_index": pi,
+                    "role": canon,
+                    "matched_text": cleaned_txt,  # artık blacklist kelimeler silinmiş
+                    "bbox": {
+                        "x_min": bbox.get("x_min"),
+                        "y_min": bbox.get("y_min"),
+                        "width": bbox.get("width"),
+                        "height": bbox.get("height"),
+                    },
+                    "confidence": conf if isinstance(conf, (int, float)) else None,
+                    "score": round(score, 1),
+                    "matched_variant": fold(matched_variant)
+                })
+
+    # -----------------------------
+    # 6. Aynı kutudan en iyisini seç
+    # -----------------------------
+    def _key(r):
+        b = r["bbox"]
+        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
+    best_by_box: Dict[Any, Dict[str, Any]] = {}
+    for r in out:
+        k = _key(r)
+        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
+            best_by_box[k] = r
+    return list(best_by_box.values())
+
+import re
+from typing import List, Dict, Any, Optional, Tuple
+
 # RapidFuzz varsa kullan, yoksa sade eşleme ile devam
 try:
     from rapidfuzz import fuzz
