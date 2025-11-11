@@ -1,324 +1,228 @@
-import cv2
 import math
-import numpy as np
+from typing import List, Dict, Any, Tuple, Optional
+import cv2
 import matplotlib.pyplot as plt
-from collections import defaultdict
 
-def visualize_role_boxes(
-    final_lower_imgs,
-    role_boxes,
-    ocr_sizes=None,          # Optional: [(h,w) per page used during OCR]. If None, no scaling.
-    label_font_scale=0.6,
-    box_thickness=2,
-    label_bg=True,
-    return_images=False,     # If True, returns list of annotated images
-):
+def link_merge_visualize(
+    final_lower_imgs: List,                 # sayfa bazında numpy img (H,W,3)
+    role_boxes: List[Dict[str, Any]],
+    name_boxes: List[Dict[str, Any]],
+    sig_boxes:  List[Dict[str, Any]],
+    name_to_role_thresh_ratio: float = 0.20,
+    sig_to_name_thresh_ratio:  float = 0.20,
+    show_unmatched: bool = True,
+    save_dir: Optional[str] = None,
+    show_plots: bool = True
+) -> Tuple[Dict[str, Any], List]:
     """
-    Draw role boxes on each page image.
-
-    Parameters
-    ----------
-    final_lower_imgs : List[np.ndarray]
-        Page images (BGR or RGB).
-    role_boxes : List[Dict]
-        Output list from extract_role_boxes(). Must contain 'page_index' and 'bbox'.
-        bbox expected keys: x_min, y_min, width, height (in OCR coordinate space).
-    ocr_sizes : Optional[List[Tuple[int,int]]]
-        (height, width) for each page that produced the bboxes (e.g., 1048x1048).
-        If provided and differs from the current image shape, boxes are scaled.
-    return_images : bool
-        If True, returns the annotated images list.
-
-    Notes
-    -----
-    - If your OCR and images are same resolution, set ocr_sizes=None.
-    - If OCR used fixed size (e.g., 1048,1048) for all pages, pass
-      ocr_sizes=[(1048,1048)] * len(final_lower_imgs)
+    Tek fonksiyon: normalize -> eşleştir -> merge -> görselleştir
+    Girdi şemaları:
+      - role/name: {'page_index':int, 'boxes': {'x_min','y_min','width','height'}, ...}
+      - sig:      ya yukarıdaki gibi tekil, ya da sayfa kaydı içinde 'boxes' listesi (xyxy)
+                  {'page_index':int, 'boxes':[{'x_min','x_max','y_min','y_max',...}, ...]}
+    Çıktı:
+      (result_dict, canvases_list)
     """
-    # group detections by page
-    by_page = defaultdict(list)
-    for r in role_boxes:
-        by_page[int(r["page_index"])].append(r)
 
-    annotated = []
-    for pi, img in enumerate(final_lower_imgs):
-        if img is None:
-            annotated.append(None)
-            continue
+    # ---------- yardımcılar ----------
+    def _to_float(v): 
+        try: return float(v)
+        except: return 0.0
 
-        # ensure BGR for cv2 drawing
-        draw_img = img.copy()
-        if draw_img.ndim == 2:
-            draw_img = cv2.cvtColor(draw_img, cv2.COLOR_GRAY2BGR)
-        elif draw_img.shape[2] == 4:
-            draw_img = cv2.cvtColor(draw_img, cv2.COLOR_BGRA2BGR)
-
-        H, W = draw_img.shape[:2]
-
-        # scale factors if OCR size provided
-        if ocr_sizes is not None and len(ocr_sizes) > pi and ocr_sizes[pi] is not None:
-            oH, oW = ocr_sizes[pi]
-            sx = W / float(oW)
-            sy = H / float(oH)
-        else:
-            sx = sy = 1.0
-
-        for r in by_page.get(pi, []):
-            b = r["bbox"]
-            x1 = int(round(b.get("x_min", 0) * sx))
-            y1 = int(round(b.get("y_min", 0) * sy))
-            x2 = int(round((b.get("x_min", 0) + b.get("width", 0)) * sx))
-            y2 = int(round((b.get("y_min", 0) + b.get("height", 0)) * sy))
-
-            # clip to image
-            x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
-            y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
-
-            # draw rectangle
-            cv2.rectangle(draw_img, (x1, y1), (x2, y2), (0, 255, 0), box_thickness)
-
-            # label
-            role = r.get("role", "")
-            score = r.get("score", None)
-            label = role if score is None else f"{role} ({score:.0f})"
-            # compute label box
-            t_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, label_font_scale, 1)
-            tx2 = min(W - 1, x1 + t_size[0] + 8)
-            ty2 = max(0, y1 - t_size[1] - 8)
-            if label_bg:
-                cv2.rectangle(draw_img, (x1, y1 - t_size[1] - 10), (tx2, y1), (0, 255, 0), -1)
-                cv2.putText(draw_img, label, (x1 + 4, y1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, label_font_scale, (0, 0, 0), 1, cv2.LINE_AA)
+    def _normalize_flat_xywh(items):
+        out=[]
+        for it in items:
+            b = dict(it.get('boxes', {}))
+            if 'width' not in b or 'height' not in b:
+                x_min = _to_float(b.get('x_min', 0))
+                y_min = _to_float(b.get('y_min', 0))
+                x_max = _to_float(b.get('x_max', x_min))
+                y_max = _to_float(b.get('y_max', y_min))
+                b = {'x_min': x_min,'y_min': y_min,'width': max(0.0,x_max-x_min),'height': max(0.0,y_max-y_min)}
             else:
-                cv2.putText(draw_img, label, (x1, max(12, y1 - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, label_font_scale, (0, 255, 0), 2, cv2.LINE_AA)
+                b = {'x_min': _to_float(b.get('x_min',0)),'y_min': _to_float(b.get('y_min',0)),
+                     'width': _to_float(b.get('width',0)),'height': _to_float(b.get('height',0))}
+            new_it = dict(it)
+            new_it['boxes']=b
+            out.append(new_it)
+        return out
 
-        annotated.append(draw_img)
+    def _normalize_sig(items):
+        # sig, sayfa içinde list olabilir
+        flat=[]
+        for it in items:
+            if isinstance(it.get('boxes'), list):
+                pidx = int(it.get('page_index',0))
+                for bx in it['boxes']:
+                    x_min = _to_float(bx.get('x_min',0))
+                    y_min = _to_float(bx.get('y_min',0))
+                    x_max = _to_float(bx.get('x_max',x_min))
+                    y_max = _to_float(bx.get('y_max',y_min))
+                    flat.append({
+                        'page_index': pidx,
+                        'boxes': {'x_min': x_min, 'y_min': y_min, 'width': max(0.0,x_max-x_min), 'height': max(0.0,y_max-y_min)},
+                        'conf': _to_float(bx.get('conf', None)) if 'conf' in bx else None,
+                        'class_id': bx.get('class_id', None)
+                    })
+            else:
+                flat.append(it)
+        return _normalize_flat_xywh(flat)
 
-        # show per page with matplotlib (expects RGB)
-        plt.figure(figsize=(10, 10))
-        plt.title(f"Page {pi}")
-        plt.imshow(cv2.cvtColor(draw_img, cv2.COLOR_BGR2RGB))
-        plt.axis('off')
-        plt.show()
+    def _assign_ids(items, prefix):
+        out=[]
+        for i,it in enumerate(items):
+            c=dict(it)
+            c['_id']=f"{prefix}_{i}"
+            out.append(c)
+        return out
 
-    if return_images:
-        return annotated
+    def _xywh(item):
+        b=item['boxes']; return float(b['x_min']),float(b['y_min']),float(b['width']),float(b['height'])
+    def _xyxy(item):
+        x,y,w,h=_xywh(item); return x,y,x+w,y+h
+    def _center(item):
+        x,y,w,h=_xywh(item); return (x+w/2.0, y+h/2.0)
+    def _top_center(item):
+        x,y,w,h=_xywh(item); return (x+w/2.0, y)
+    def _euclid(p,q): return math.hypot(p[0]-q[0], p[1]-q[1])
+    def _union_xyxy(lst):
+        if not lst: return None
+        xs=[b[0] for b in lst]; ys=[b[1] for b in lst]; xe=[b[2] for b in lst]; ye=[b[3] for b in lst]
+        xmin, ymin, xmax, ymax = min(xs), min(ys), max(xe), max(ye)
+        return {'x_min': xmin, 'y_min': ymin, 'width': xmax-xmin, 'height': ymax-ymin}
 
-role_boxes = extract_role_boxes(pages_scaled)
-visualize_role_boxes(final_lower_imgs, role_boxes, ocr_sizes=None)
+    def _by_page(items):
+        d={}
+        for it in items: d.setdefault(it['page_index'], []).append(it)
+        return d
 
+    def _greedy_match(children, parents, page_h_map, ratio):
+        matches={}
+        pairs=[]
+        for c in children:
+            cp=_top_center(c)
+            for p in parents:
+                if c['page_index']!=p['page_index']: 
+                    continue
+                pp=_center(p)
+                pairs.append(( _euclid(cp,pp), c['_id'], p['_id'], c['page_index']))
+        pairs.sort(key=lambda x:x[0])
+        taken=set()
+        for dist, cid, pid, pidx in pairs:
+            if cid in taken: 
+                continue
+            if dist <= page_h_map.get(pidx,0)*ratio:
+                matches[cid]=pid
+                taken.add(cid)
+        return matches
 
+    def _xywh_to_xyxy(b):
+        x,y,w,h= b['x_min'],b['y_min'],b['width'],b['height']
+        return int(x),int(y),int(x+w),int(y+h)
 
-def extract_role_boxes(
-    pages_scaled,
-    fuzzy_cutoff: int = 86,
-    use_fuzzy: bool = True,
-):
-    """
-    OCR metinlerinden rol yakalar ve bbox ile döner.
+    def _draw(img, box, color, label=None, thick=2):
+        x1,y1,x2,y2=_xywh_to_xyxy(box)
+        cv2.rectangle(img,(x1,y1),(x2,y2),color,thick)
+        if label:
+            y = max(0, y1-5)
+            cv2.putText(img, label, (x1,y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-    Parameters
-    ----------
-    pages_scaled : List[Dict] | Dict
-        Her sayfa için OCR item listesi. Her item en azından:
-        {
-          "text": str,
-          "bbox": {"x_min": int, "y_min": int, "width": int, "height": int},
-          "confidence": float | int | None
-        }
-    fuzzy_cutoff : int
-        Fuzzy skor eşiği (0-100). RapidFuzz yoksa kullanılmaz.
-    use_fuzzy : bool
-        RapidFuzz mevcutsa partial_ratio ile eşleşmeye izin ver.
+    # ---------- normalize + id ----------
+    role_norm = _assign_ids(_normalize_flat_xywh(role_boxes), 'role')
+    name_norm = _assign_ids(_normalize_flat_xywh(name_boxes), 'name')
+    sig_norm  = _assign_ids(_normalize_sig(sig_boxes),          'sig')
 
-    Returns
-    -------
-    List[Dict]
-        [
-          {
-            "page_index": int,
-            "role": str,              # KANONIK (UPPER)
-            "matched_text": str,      # OCR ham metin
-            "bbox": {"x_min": int, "y_min": int, "width": int, "height": int},
-            "confidence": float | None,
-            "score": float,           # 0-100
-            "matched_variant": str    # normalize edilmiş eşleşen varyant
-          },
-          ...
-        ]
-    """
-    # --- opsiyonel RapidFuzz ---
-    _HAS_RF = False
-    if use_fuzzy:
-        try:
-            from rapidfuzz import fuzz  # type: ignore
-            _HAS_RF = True
-        except Exception:
-            _HAS_RF = False
+    # ---------- sayfa yükseklikleri ----------
+    page_h = {i:int(img.shape[0]) for i,img in enumerate(final_lower_imgs) if img is not None}
 
-    import re
+    # ---------- eşleştirme ----------
+    name_to_role = _greedy_match(name_norm, role_norm, page_h, name_to_role_thresh_ratio)
+    sig_to_name  = _greedy_match(sig_norm,  name_norm, page_h, sig_to_name_thresh_ratio)
 
-    # --- 1) Kanonik roller ve varyantları (geniş tut) ---
-    ROLE_ALIASES_DEFAULT = {
-        "toplantı başkanı": [
-            "toplantı başkanı", "toplanti baskani", "topl bsk", "topl bşk",
-            "toplanti bsk", "topl bşkan", "divan başkanı", "divan baskani"
-        ],
-        "tutanak yazmanı": [
-            "tutanak yazmanı", "tutanak yazmani", "yazman", "yazmanı"
-        ],
-        "bakanlık temsilcisi": [
-            "bakanlık temsilcisi", "bakanlik temsilcisi", "ticaret bakanligi temsilcisi",
-            "ticaret bakanlığı temsilcisi"
-        ],
-        "yönetim kurulu başkanı": [
-            "yönetim kurulu başkanı", "yonetim kurulu baskani", "yk başkanı", "yk baskani",
-            "yk bşk", "yk bsk"
-        ],
-        "yönetim kurulu üyesi": [
-            "yönetim kurulu üyesi", "yonetim kurulu uyesi", "yk üyesi", "yk uyesi",
-            "yk üye", "yk uye"
-        ],
-        "katip": ["katip", "kâtip", "ka tip"],
-        "divan başkanı": ["divan başkanı", "divan baskani", "divan bşk", "divan bsk"],
-        "oy toplama memuru": [
-            "oy toplama memuru", "oy sayım memuru", "oy sayim memuru",
-            "oy toplama görevlisi", "oy toplama gorevlisi"
-        ],
-        "noter": ["noter", "noterce", "noter onaylı", "noter onayli"],
+    # ---------- role merkezli gruplar ----------
+    role_idx = {r['_id']: r for r in role_norm}
+    name_idx = {n['_id']: n for n in name_norm}
+    sig_idx  = {s['_id']: s for s in sig_norm}
+
+    role_children_names={}
+    for n in name_norm:
+        rid=name_to_role.get(n['_id'])
+        if rid: role_children_names.setdefault(rid, []).append(n['_id'])
+
+    name_children_sigs={}
+    for s in sig_norm:
+        nid=sig_to_name.get(s['_id'])
+        if nid: name_children_sigs.setdefault(nid, []).append(s['_id'])
+
+    groups=[]
+    for rid, ritem in role_idx.items():
+        nids = role_children_names.get(rid, [])
+        sids = []
+        for nid in nids:
+            sids += name_children_sigs.get(nid, [])
+        all_xyxy=[_xyxy(ritem)] + [_xyxy(name_idx[n]) for n in nids] + [_xyxy(sig_idx[s]) for s in sids]
+        merged=_union_xyxy(all_xyxy)
+        groups.append({
+            'page_index': ritem['page_index'],
+            'role_id': rid,
+            'role_box': ritem,
+            'name_ids': nids,
+            'sig_ids': sids,
+            'merged_box': merged
+        })
+
+    unmatched = {
+        'names': [n['_id'] for n in name_norm if n['_id'] not in name_to_role],
+        'sigs' : [s['_id'] for s in sig_norm  if s['_id'] not in sig_to_name]
     }
 
-    # --- 2) Normalize yardımcıları ---
-    def fold(s: str) -> str:
-        s = (s or "").lower()
-        s = (s.replace("â", "a").replace("î", "i").replace("û", "u")
-                 .replace("ş", "s").replace("ç", "c").replace("ğ", "g")
-                 .replace("ö", "o").replace("ü", "u")
-                 .replace("ı", "i"))
-        s = re.sub(r"[^a-z0-9\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    result = {'links': {'name_to_role': name_to_role, 'sig_to_name': sig_to_name},
+              'groups': groups, 'unmatched': unmatched}
 
-    # tüm varyantları normalize + uzunları önce dene
-    all_variants = []  # [(variant_norm, canon)]
-    for canon, vars_ in ROLE_ALIASES_DEFAULT.items():
-        for v in vars_:
-            all_variants.append((fold(v), canon))
-    all_variants.sort(key=lambda t: len(t[0]), reverse=True)
+    # ---------- görselleştirme ----------
+    canvases = [img.copy() for img in final_lower_imgs]
+    C_ROLE, C_NAME, C_SIG, C_MERGED = (255,0,0), (0,200,0), (0,165,255), (0,0,255)
 
-    # --- 3) Girdi normalizasyonu ---
-    def ensure_pages(obj):
-        if not obj:
-            return []
-        # tek sayfa dict'i gelmiş olabilir -> listele
-        if isinstance(obj, dict):
-            # tek sayfa ise "items" bekler; değilse doğrudan item listesi
-            if "items" in obj and isinstance(obj["items"], list):
-                return [obj]
-            return [{"items": obj if isinstance(obj, list) else []}]
-        # zaten liste
-        pages = []
-        for p in obj:
-            if isinstance(p, dict) and "items" in p:
-                pages.append(p)
-            elif isinstance(p, list):
-                pages.append({"items": p})
-        return pages
+    for g in groups:
+        p=g['page_index']; canvas=canvases[p]
+        r=g['role_box']; _draw(canvas, r['boxes'], C_ROLE, label=f"ROLE:{r.get('role','')}", thick=2)
+        for nid in g['name_ids']:
+            n=name_idx[nid]; _draw(canvas, n['boxes'], C_NAME, label="NAME", thick=2)
+        for sid in g['sig_ids']:
+            s=sig_idx[sid]; _draw(canvas, s['boxes'], C_SIG,  label="SIG",  thick=2)
+        if g['merged_box'] is not None:
+            _draw(canvas, g['merged_box'], C_MERGED, label="MERGED", thick=3)
 
-    pages = ensure_pages(pages_scaled)
+    if show_unmatched:
+        for nid in unmatched['names']:
+            n=name_idx[nid]; _draw(canvases[n['page_index']], n['boxes'], (0,130,0), "NAME_unmatched", 1)
+        for sid in unmatched['sigs']:
+            s=sig_idx[sid]; _draw(canvases[s['page_index']], s['boxes'], (0,120,180), "SIG_unmatched", 1)
 
-    # --- 4) Anchor & Ambiguity kuralları ---
-    TOPLAM_RE = re.compile(r"\btoplam[a-z]*\b")
-    OY_RE = re.compile(r"\boy\b")
-    SAYIM_RE = re.compile(r"\bsayi?m\b")  # sayım/sayim
-    TOPLANTI_RE = re.compile(r"\btoplanti\w*\b")
+    if save_dir:
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        for p, canvas in enumerate(canvases):
+            cv2.imwrite(f"{save_dir}/annot_page_{p}.png", canvas)
 
-    def passes_anchor_rules(canon_norm: str, raw_norm: str) -> bool:
-        toplam_alone = bool(TOPLAM_RE.search(raw_norm) and not OY_RE.search(raw_norm))
-        if canon_norm == "oy toplama memuru":
-            if toplam_alone:
-                return False
-            return bool(OY_RE.search(raw_norm) or SAYIM_RE.search(raw_norm))
-        if canon_norm == "toplanti baskani" or canon_norm == "toplanti başkanı":
-            if toplam_alone:
-                return False
-            return bool(TOPLANTI_RE.search(raw_norm))
-        # diğer roller için kural yok
-        return True
+    if show_plots:
+        for p, canvas in enumerate(canvases):
+            plt.figure(figsize=(10,10))
+            plt.imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+            plt.title(f"Page {p} — role/name/sig & merged")
+            plt.axis('off')
+            plt.show()
 
-    # --- 5) Eşleme ---
-    out = []
-    for pi, page in enumerate(pages):
-        for it in page.get("items", []):
-            txt = it.get("text") or ""
-            if not txt.strip():
-                continue
-            bbox = it.get("bbox") or {}
-            conf = it.get("confidence")
+    return result, canvases
 
-            raw_norm = fold(txt)
-            raw_ns = raw_norm.replace(" ", "")
-
-            best = None  # (canon, matched_variant_norm, score)
-
-            # Özel durum: 'yönetim kurulu' sinyali
-            if ("yonetimkurulubaskan" in raw_ns) or ("yönetimkurulubaskan" in raw_ns) or ("ykbask" in raw_ns):
-                best = ("yönetim kurulu başkanı", "yönetim kurulu başkanı", 100.0)
-            else:
-                for v_norm, canon in all_variants:
-                    hit = False
-                    score = 0.0
-
-                    if v_norm in raw_norm:
-                        hit = True
-                        score = 100.0
-                    elif _HAS_RF:
-                        score = float(fuzz.partial_ratio(v_norm, raw_norm))
-                        hit = score >= float(fuzzy_cutoff)
-
-                    if hit:
-                        # anchor kuralları
-                        if not passes_anchor_rules(fold(canon), raw_norm):
-                            continue
-                        # skor iyileştirme: uzun eşleşmeye küçük bonus
-                        score += min(5.0, len(v_norm) * 0.2)
-                        if (best is None) or (score > best[2]):
-                            best = (canon, v_norm, score)
-
-            if best:
-                canon, matched_variant, score = best
-
-                # 'yönetim kurulu üyesi' vs 'başkanı' düzeltmesi:
-                if canon == "yönetim kurulu üyesi":
-                    if ("yönetim kurulu baskan" in raw_norm) or ("yk bask" in raw_norm):
-                        canon = "yönetim kurulu başkanı"
-
-                out.append({
-                    "page_index": pi,
-                    "role": canon.upper(),
-                    "matched_text": txt,
-                    "bbox": {
-                        "x_min": int(bbox.get("x_min", bbox.get("x", 0))),
-                        "y_min": int(bbox.get("y_min", bbox.get("y", 0))),
-                        "width": int(bbox.get("width", bbox.get("w", 0))),
-                        "height": int(bbox.get("height", bbox.get("h", 0))),
-                    },
-                    "confidence": float(conf) if isinstance(conf, (int, float)) else None,
-                    "score": float(score),
-                    "matched_variant": fold(matched_variant),
-                })
-
-    # --- 6) Aynı bbox için en yüksek skoru tut ---
-    def _k(r):
-        b = r["bbox"]
-        return (r["page_index"], b["x_min"], b["y_min"], b["width"], b["height"])
-
-    best_by_box = {}
-    for r in out:
-        k = _k(r)
-        if k not in best_by_box or r["score"] > best_by_box[k]["score"]:
-            best_by_box[k] = r
-
-    return list(best_by_box.values())
-
+result, canvases = link_merge_visualize(
+    final_lower_imgs,
+    role_boxes,      # ham role listesi
+    name_boxes,      # ham name listesi
+    sig_boxes,       # sayfa-kayıtlı veya tekil olabilir
+    name_to_role_thresh_ratio=0.20,
+    sig_to_name_thresh_ratio=0.20,
+    show_unmatched=True,
+    save_dir="annot_out",     # kaydetmek istemezsen None
+    show_plots=True
+)
