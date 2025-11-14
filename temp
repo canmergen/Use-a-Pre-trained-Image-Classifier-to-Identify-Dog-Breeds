@@ -1,117 +1,215 @@
-import cv2
-import numpy as np
-
-def binarize_and_enhance_table(table_img: np.ndarray,
-                               auto_percentile: int = 90,
-                               line_scale: int = 25) -> np.ndarray:
+def process_tables_with_line_fix(res, auto_percentile: int = 90):
     """
-    1) Tabloyu güvenli bir şekilde binarize eder.
-    2) Yatay ve dikey çizgileri morfoloji ile güçlendirir, kopuklukları birleştirir.
+    Hazırun tablolarını işler:
+      - Tablo bölgesini sık kırpar
+      - Arka planı beyaza, metin/çizgiyi siyaha çevirir (binarize)
+      - Dikey/yatay çizgiler için ayrı maske üretip kopuklukları doldurur, kalınlaştırır
+      - Çizgi maskesini metinle birleştirir (metin kalınlaşmaz)
 
-    line_scale: çizgi uzunluğuna göre kernel boyutunu belirler.
-                Daha küçük -> daha agresif çizgi yakalama.
+    Girdi
+    -----
+    res : list[dict]
+        Her dict içinde 'table_bw' veya 'table' anahtarı olmalı.
+
+    Çıktı
+    -----
+    binarized_tables : list[np.ndarray]
+        Her tablo için tek kanallı (uint8) siyah-beyaz görüntü.
     """
+    import cv2
+    import numpy as np
 
-    # --- Griye çevir ---
-    if table_img.ndim == 3:
-        gray = cv2.cvtColor(table_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = table_img.copy()
+    # ------------------------------------------------------------------
+    # 1) Yardımcı: sert binarizasyon (arka plan beyaz, metin+çizgi siyah)
+    # ------------------------------------------------------------------
+    def binarize_strict_white(img: np.ndarray, auto_percentile: int = 90) -> np.ndarray:
+        # BGR ise griye çevir
+        if img.ndim == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img.copy()
 
-    # --- Kontrastı normalize et (aşırı uçları kırp) ---
-    gmin, gmax = np.percentile(gray, [100-auto_percentile, auto_percentile])
-    if gmax - gmin < 1e-6:
-        norm = gray.astype(np.uint8)
-    else:
-        norm = np.clip((gray - gmin) * 255.0 / (gmax - gmin), 0, 255).astype(np.uint8)
+        # Kontrast normalizasyonu (gölge/gri arka planları açmak için)
+        gmin, gmax = float(gray.min()), float(gray.max())
+        if gmax - gmin < 1e-6:
+            gray_norm = gray.astype(np.uint8)
+        else:
+            gray_f = gray.astype(np.float32)
+            gray_norm = np.clip((gray_f - gmin) * (255.0 / (gmax - gmin)), 0, 255).astype(np.uint8)
 
-    # --- Otsu ile binarizasyon (arka plan beyaz, içerik siyah) ---
-    blur = cv2.GaussianBlur(norm, (3, 3), 0)
-    _, bin_img = cv2.threshold(blur, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Otomatik eşik için üst percentile değerini kullan
+        p_lo = np.percentile(gray_norm, 1)
+        p_hi = np.percentile(gray_norm, auto_percentile)
+        gray_stretch = np.clip((gray_norm - p_lo) * (255.0 / max(p_hi - p_lo, 1.0)), 0, 255).astype(np.uint8)
 
-    # --- Çizgi güçlendirme için içerik maskesini ters çevir (siyah->0, çizgi/yazı->255) ---
-    inv = cv2.bitwise_not(bin_img)
+        # Hafif blur + Otsu threshold (arka plan beyaz olacak)
+        blur = cv2.GaussianBlur(gray_stretch, (3, 3), 0)
+        _, bin_img = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    h, w = inv.shape[:2]
+        # Emin olmak için beyaz oranı kontrolü: çoğunluk beyaz değilse invert et
+        white_ratio = float((bin_img == 255).mean())
+        if white_ratio < 0.5:
+            bin_img = cv2.bitwise_not(bin_img)
 
-    # Kernel boyutlarını dinamik belirle
-    horiz_k = max(10, w // line_scale)
-    vert_k  = max(10, h // line_scale)
+        return bin_img
 
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_k, 1))
-    vert_kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_k))
+    # ------------------------------------------------------------------
+    # 2) Yardımcı: sadece tablo gövdesini sık kırp
+    # ------------------------------------------------------------------
+    def tight_table_crop(rectified_bgr: np.ndarray,
+                         min_area_ratio: float = 0.25,
+                         extra_margin_px: int = 4) -> tuple[np.ndarray, tuple[int,int,int,int]]:
+        """
+        Girdi:  tablo içeren görüntü (BGR veya gri)
+        Çıktı:  sadece tablo alanı (hafif margin ile) + (x0,y0,x1,y1)
+        """
+        if rectified_bgr.ndim == 3:
+            gray = cv2.cvtColor(rectified_bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = rectified_bgr.copy()
 
-    # --- Yatay ve dikey çizgileri doldur/güçlendir ---
-    horiz_lines = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, horiz_kernel, iterations=1)
-    vert_lines  = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, vert_kernel, iterations=1)
+        H, W = gray.shape[:2]
 
-    # Çizgileri birleştir
-    lines = cv2.max(horiz_lines, vert_lines)
+        # Çizgi/gövde için invert Otsu
+        _, bin_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Çizgileri orijinal içerik ile birleştir (yazıları kaybetmemek için)
-    merged_inv = cv2.max(inv, lines)
+        # Morfoloji ile grid’i biraz birleştir
+        kx = max(25, W // 30)
+        ky = max(25, H // 25)
+        hmask = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN,
+                                 cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)), iterations=1)
+        vmask = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN,
+                                 cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)), iterations=1)
 
-    # Geri çevir (arka plan beyaz kalsın)
-    enhanced = cv2.bitwise_not(merged_inv)
+        # Dış çerçeve = en büyük bileşen
+        grid = cv2.bitwise_or(hmask, vmask)
+        cnts, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    return enhanced
+        if not cnts:
+            # Fallback: tüm görüntü
+            x0, y0, x1, y1 = 0, 0, W, H
+        else:
+            c = max(cnts, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            if area < min_area_ratio * (H * W):
+                # Güvenlik: alan çok küçükse yine tüm görüntü
+                x0, y0, w, h = cv2.boundingRect(c)
+                x1, y1 = x0 + w, y0 + h
+            else:
+                x0, y0, w, h = cv2.boundingRect(c)
+                x1, y1 = x0 + w, y0 + h
 
-def tight_table_crop(img: np.ndarray, margin: int = 5):
-    if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img.copy()
+        # Küçük margin ekle ama görüntü sınırını aşma
+        x0 = max(0, x0 - extra_margin_px)
+        y0 = max(0, y0 - extra_margin_px)
+        x1 = min(W, x1 + extra_margin_px)
+        y1 = min(H, y1 + extra_margin_px)
 
-    _, bin_img = cv2.threshold(gray, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    non_white = cv2.bitwise_not(bin_img)
-    coords = cv2.findNonZero(non_white)
+        cropped = rectified_bgr[y0:y1, x0:x1].copy()
+        return cropped, (x0, y0, x1, y1)
 
-    if coords is None:
-        h, w = gray.shape[:2]
-        return img, (0, 0, w, h)
+    # ------------------------------------------------------------------
+    # 3) Yardımcı: dikey+yatay çizgi maskesi (kopuklukları doldurur, kalınlaştırır)
+    # ------------------------------------------------------------------
+    def add_borders(img: np.ndarray) -> np.ndarray:
+        img[ :2, :] = 255
+        img[-2:, :] = 255
+        img[:,  :2] = 255
+        img[:, -2:] = 255
+        return img
 
-    x, y, w, h = cv2.boundingRect(coords)
-    x = max(0, x - margin)
-    y = max(0, y - margin)
-    x2 = min(img.shape[1], x + w + margin)
-    y2 = min(img.shape[0], y + h + margin)
+    def return_binary_mask(table_gray: np.ndarray) -> np.ndarray:
+        """
+        Girdi:  gri veya binary tablo
+        Çıktı:  sadece çizgileri içeren maske (255=çizgi, 0=arka plan)
+        """
+        # Gri değilse griye çevir
+        if table_gray.ndim == 3:
+            gray = cv2.cvtColor(table_gray, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = table_gray.copy()
 
-    cropped = img[y:y2, x:x2].copy()
-    return cropped, (x, y, x2 - x, y2 - y)
+        # Yüksek eşik + invert: çizgiler/metin beyaz, arka plan siyah
+        _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        binary = add_borders(binary)
 
+        h, w = binary.shape[:2]
 
-def process_all_tables(res):
-    binarized_tables = []
+        # Dikey / yatay uzun kernel’ler
+        ver_kernels = (1, 100)
+        hor_kernels = (100, 1)
+
+        ver_erode_iter, ver_dilate_iter = 2, 20
+        hor_erode_iter, hor_dilate_iter = 2, 20
+
+        # Yatay çizgiler
+        kernel_hor = cv2.getStructuringElement(cv2.MORPH_RECT, hor_kernels)
+        binary_horizontal = cv2.erode(binary, kernel_hor, iterations=hor_erode_iter)
+        binary_horizontal = cv2.dilate(binary_horizontal, kernel_hor, iterations=hor_dilate_iter)
+
+        # Dikey çizgiler
+        kernel_ver = cv2.getStructuringElement(cv2.MORPH_RECT, ver_kernels)
+        binary_vertical = cv2.erode(binary, kernel_ver, iterations=ver_erode_iter)
+        binary_vertical = cv2.dilate(binary_vertical, kernel_ver, iterations=ver_dilate_iter)
+
+        # İstenirse sağ taraftaki “boş/yan kolon”u temizle
+        handle_inv = True
+        if handle_inv:
+            inv_x_range = 0
+            for x in range(binary_vertical.shape[1]):
+                mean_val = np.mean(binary_vertical[:, x])
+                if mean_val == 0:
+                    inv_x_range = x
+                    break
+            if inv_x_range > binary_vertical.shape[1] * 0.15:
+                binary_vertical[:, 2:inv_x_range-2] = 0
+
+        # Dikey + yatayı birleştir
+        binary_lines = cv2.addWeighted(binary_vertical, 0.5, binary_horizontal, 0.5, 0.0)
+
+        # Çizgileri hafif kalınlaştır
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        binary_lines = cv2.dilate(binary_lines, kernel, iterations=1)
+
+        return binary_lines  # 255 = çizgi
+
+    # ------------------------------------------------------------------
+    # 4) Ana akış: tüm tabloları işle
+    # ------------------------------------------------------------------
+    binarized_tables: list[np.ndarray] = []
+
     for r in res:
         table = r.get("table_bw") or r.get("table")
         if table is None:
             continue
 
         try:
-            # 1) Tabloyu sıkı kırp
+            # a) Tabloyu sık kırp
             table_cropped, _ = tight_table_crop(table)
 
-            # 2) Binarize + çizgi güçlendirme
-            table_bin = binarize_and_enhance_table(
-                table_cropped,
-                auto_percentile=90,
-                line_scale=25,   # istersen 20–30 arasıyla oynayabilirsin
-            )
+            # b) Sert binarizasyon (arka plan beyaz, metin+çizgi siyah)
+            table_bin = binarize_strict_white(table_cropped, auto_percentile=auto_percentile)
 
-            binarized_tables.append(table_bin)
+            # c) Sadece çizgileri çıkar, kopuklukları doldur ve kalınlaştır
+            line_mask = return_binary_mask(table_bin)
+
+            # d) Metni koru, çizgi maskesi olan yerleri siyah yap
+            table_final = table_bin.copy()
+            table_final[line_mask > 0] = 0
+
+            binarized_tables.append(table_final)
+
         except Exception as e:
             print(f"Sayfa {r.get('image_index')} hata: {e}")
             continue
 
     return binarized_tables
 
-binarized_tables = process_all_tables(res)
+binarized_tables = process_tables_with_line_fix(res)
 
 for i, img in enumerate(binarized_tables):
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(10, 4))
     plt.title(f"Table {i}")
-    plt.imshow(img, cmap="gray")  # artık tek kanal
+    plt.imshow(img, cmap="gray")
     plt.axis("off")
     plt.show()
