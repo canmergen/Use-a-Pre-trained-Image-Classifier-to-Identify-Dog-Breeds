@@ -1,303 +1,130 @@
-import re
-import pandas as pd
+import re, unicodedata
+from typing import Any, List, Tuple
 from rapidfuzz import fuzz
-from typing import Any, Dict, List, Optional, Tuple
 
-def extract_and_merge_sermaye(
-    pages_scaled: List[List[Dict[str, Any]]],
-    bottom_temp_df1: Optional[pd.DataFrame] = None,
-    fuzzy_threshold: int = 80,
-    line_tol: float = 0.4,
-    max_dx: int = 1600,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+_TR_MAP = str.maketrans({
+    "İ": "I", "I": "I", "ı": "i",
+    "Ş": "S", "ş": "s",
+    "Ğ": "G", "ğ": "g",
+    "Ü": "U", "ü": "u",
+    "Ö": "O", "ö": "o",
+    "Ç": "C", "ç": "c",
+})
+
+def _norm(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.translate(_TR_MAP)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^A-Za-z0-9]+", "", s).lower()
+    return s
+
+def _get_text(x: Any) -> str:
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        for k in ("text", "extractedText", "extracted_text", "full_text"):
+            v = x.get(k)
+            if isinstance(v, str):
+                return v
+    return ""
+
+def _build_norm_stream_with_map(src: str) -> Tuple[str, List[int]]:
+    norm_chars: List[str] = []
+    norm2orig: List[int] = []
+    for i, ch in enumerate(src):
+        ch_tr = ch.translate(_TR_MAP)
+        ch_dec = unicodedata.normalize("NFKD", ch_tr)
+        base = "".join(c for c in ch_dec if not unicodedata.combining(c))
+        base = re.sub(r"[^A-Za-z0-9]+", "", base)
+        for _ in base.lower():
+            norm_chars.append(_)
+            norm2orig.append(i)
+    return "".join(norm_chars), norm2orig
+
+def _has_number(s: str) -> bool:
+    return bool(re.search(r"\d", s))
+
+def align_region_texts_by_substring_fuzzy_v2(
+    paddle_ocr_texts: Any,
+    paddle_ocr_regions: Any,
+    fuzzy_threshold: int = 90,
+    length_tolerance: int = 2,
+):
     """
-    pages_scaled: her sayfa için PaddleOCR benzeri çıktı listesi
-        [
-          [ {"text": "...", "bbox": {"x_min":..,"y_min":..,"x_max":..,"y_max":..}}, ... ],
-          [ ... ],
-          ...
-        ]
-
-    bottom_temp_df1: daha önce oluşturduğun bottom_df (image_index kolonlu)
-
-    Dönenler:
-        sermaye_df : tüm tespitler (label + value + bbox + numeric)
-        merged     : bottom_temp_df1 + en iyi sermaye_value + sermaye_bbox
+    paddle_ocr_texts : sayfa düzeyinde full text (str veya list[str])
+    paddle_ocr_regions : region listesi veya sayfa listesi
+    Sadece region["text"] alanını, full text içindeki daha düzgün karşılığıyla değiştirir.
     """
 
-    # ---------------- number parsing helpers ----------------
-    DIGIT_RX       = re.compile(r"\d[\d\s\.,]*")
-    RX_COMMA_DEC   = re.compile(r"^\s*\d{1,3}(\.\d{3})*,\d{1,2}\s*$")   # 1.234,56
-    RX_DOT_DEC     = re.compile(r"^\s*\d{1,3}(,\d{3})*\.\d{1,2}\s*$")   # 1,234.56
-    RX_DOTS_THOUS  = re.compile(r"^\s*\d{1,3}(\.\d{3})+\s*$")           # 12.050.000
-    RX_COMMA_THOUS = re.compile(r"^\s*\d{1,3}(,\d{3})+\s*$")            # 12,050,000
-    RX_INTEGER     = re.compile(r"^\s*\d+\s*$")                         # 12000000
+    # Çok sayfalı mı tek sayfa mı?
+    is_multi = (
+        isinstance(paddle_ocr_regions, list)
+        and len(paddle_ocr_regions) > 0
+        and isinstance(paddle_ocr_regions[0], list)
+    )
+    pages = paddle_ocr_regions if is_multi else [paddle_ocr_regions]
+    page_texts = (
+        paddle_ocr_texts
+        if isinstance(paddle_ocr_texts, list)
+        else [paddle_ocr_texts]
+    )
 
-    def _extract_number_str(s: str) -> Optional[str]:
-        if not s:
-            return None
-        cands = [m.group(0).strip() for m in DIGIT_RX.finditer(s)]
-        return max(cands, key=len) if cands else None
+    out_pages = []
 
-    def _parse_tr_number(num_str: Optional[str]) -> Optional[float]:
-        if not num_str:
-            return None
+    for p_i, regs in enumerate(pages):
+        page_text_raw = _get_text(page_texts[p_i]) if p_i < len(page_texts) else ""
+        norm_stream, norm2orig = _build_norm_stream_with_map(page_text_raw)
 
-        s = num_str.strip()
+        page_out = []
+        for r in regs:
+            r_txt_raw = _get_text(r)
+            r_norm = _norm(r_txt_raw)
+            if not r_norm:
+                page_out.append(r)
+                continue
 
-        # para birimi ve gereksiz ekleri temizle
-        for tok in ["TL", "Tl", "tl", "₺", "TRY", "try", "Try"]:
-            s = s.replace(tok, "")
-        s = re.sub(r"[^\d\.,]", "", s)
+            L = len(r_norm)
 
-        # bilinen formatlar
-        if RX_COMMA_DEC.match(s):
-            # 1.234,56 -> 1234.56
-            s = s.replace(".", "").replace(",", ".")
-        elif RX_DOT_DEC.match(s):
-            # 1,234.56 -> 1234.56
-            s = s.replace(",", "")
-        elif RX_DOTS_THOUS.match(s):
-            # 12.050.000 -> 12050000
-            s = s.replace(".", "")
-        elif RX_COMMA_THOUS.match(s):
-            # 12,050,000 -> 12050000
-            s = s.replace(",", "")
-        elif RX_INTEGER.match(s):
-            # zaten saf integer
-            pass
-        else:
-            # fallback heuristic: son nokta/virgülü decimal gibi kabul et
-            last_dot = s.rfind(".")
-            last_com = s.rfind(",")
-            last_pos = max(last_dot, last_com)
-
-            if last_pos > -1 and last_pos >= len(s) - 3:
-                # decimal var: önce thousand separator'ları sil
-                s = s.replace(".", "").replace(",", "")
+            # --- NUMARALI SATIRLAR İÇİN ESNEK EŞİK ---
+            if _has_number(r_txt_raw):
+                local_threshold = min(fuzzy_threshold, 80)   # sayılar için 80 civarı
+                local_len_tol = max(length_tolerance, 4)     # 1–2 karakter farkı tolere et
             else:
-                # tamamen thousand separator olarak düşün, hepsini sil
-                s = s.replace(".", "").replace(",", "")
+                local_threshold = fuzzy_threshold
+                local_len_tol = length_tolerance
 
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    # ---------------- geometry helpers ----------------
-    def _h(b: Dict[str, float]) -> float:
-        return b.get("height", b["y_max"] - b["y_min"])
-
-    def _center_y(b: Dict[str, float]) -> float:
-        return (b["y_min"] + b["y_max"]) / 2.0
-
-    def _same_line(a: Dict[str, float], b: Dict[str, float], tol: float) -> bool:
-        ha = _h(a)
-        ya = _center_y(a)
-        yb = _center_y(b)
-        return abs(ya - yb) <= tol * max(ha, 1.0)
-
-    def _reading_order(items: List[Dict[str, Any]]) -> List[int]:
-        return sorted(
-            range(len(items)),
-            key=lambda i: (items[i]["bbox"]["y_min"], items[i]["bbox"]["x_min"]),
-        )
-
-    def _nearest_value_on_right(
-        items: List[Dict[str, Any]],
-        idx_label: int,
-        max_dx: int,
-        line_tol: float,
-    ) -> Optional[int]:
-        """
-        1) Önce aynı satırda, sağda ve max_dx içinde en yakın (en küçük dx) kutuyu arar.
-        2) Bulamazsa fallback:
-           - label bbox'un merkez Y'sine en yakın,
-           - x_min'i label'dan büyük (sağda),
-           - max_dx içinde,
-           - text'inde rakam olan
-           kutuyu seçer.
-        Dönen: index veya None
-        """
-        A = items[idx_label]["bbox"]
-        cYA = _center_y(A)
-
-        best_idx = None
-        best_dx = None
-
-        # 1) Aynı satırda en yakın sağdaki sayı kutusu
-        for j, it in enumerate(items):
-            if j == idx_label:
-                continue
-            B = it["bbox"]
-
-            if B["x_min"] <= A["x_min"]:
+            # 1) Doğrudan norm alt dizi eşleşmesi
+            j = norm_stream.find(r_norm)
+            if j != -1:
+                s_o = norm2orig[j]
+                e_o = norm2orig[j + L - 1]
+                r["text"] = page_text_raw[s_o:e_o + 1]
+                page_out.append(r)
                 continue
 
-            dx = B["x_min"] - A["x_min"]
-            if dx > max_dx:
-                continue
+            # 2) Fuzzy: norm akışında pencere arama
+            best_score, best_s, best_len = -1, None, None
+            min_len = max(1, L - local_len_tol)
+            max_len = min(len(norm_stream), L + local_len_tol)
 
-            if not _same_line(A, B, line_tol):
-                continue
-
-            if not DIGIT_RX.search(it.get("text", "")):
-                continue
-
-            if best_dx is None or dx < best_dx:
-                best_dx = dx
-                best_idx = j
-
-        # 2) Fallback: y-ortalaması en yakın sağdaki sayı kutusu
-        if best_idx is None:
-            best_score = None  # (dy, dx)
-            for j, it in enumerate(items):
-                if j == idx_label:
+            for win_len in range(min_len, max_len + 1):
+                if win_len > len(norm_stream):
                     continue
-                B = it["bbox"]
-                txt = it.get("text", "")
+                for start in range(0, len(norm_stream) - win_len + 1):
+                    cand = norm_stream[start:start + win_len]
+                    score = fuzz.ratio(cand, r_norm)
+                    if score > best_score:
+                        best_score, best_s, best_len = score, start, win_len
 
-                if B["x_min"] <= A["x_min"]:
-                    continue
+            if best_score is not None and best_score >= local_threshold:
+                s_o = norm2orig[best_s]
+                e_o = norm2orig[best_s + best_len - 1]
+                r["text"] = page_text_raw[s_o:e_o + 1]
 
-                dx = B["x_min"] - A["x_min"]
-                if dx > max_dx:
-                    continue
+            page_out.append(r)
 
-                if not DIGIT_RX.search(txt):
-                    continue
+        out_pages.append(page_out)
 
-                cYB = _center_y(B)
-                dy = abs(cYB - cYA)
-                score = (dy, dx)
-
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_idx = j
-
-        return best_idx
-
-    # ---------------- extract sermaye per page ----------------
-    rows: List[Dict[str, Any]] = []
-
-    n_pages = len(pages_scaled or [])
-    for pidx, items in enumerate(pages_scaled or []):
-        if not items:
-            continue
-
-        order = _reading_order(items)
-        pos = {k: i for i, k in enumerate(order)}
-
-        for i, it in enumerate(items):
-            text = (it.get("text") or "").casefold()
-
-            score = max(
-                fuzz.partial_ratio(text, "şirketin sermaye"),
-                fuzz.partial_ratio(text, "şirketin sermayesi"),
-            )
-            if score < fuzzy_threshold:
-                continue
-
-            label_bbox = it["bbox"]
-            value_txt: Optional[str] = None
-            value_bbox: Optional[Dict[str, float]] = None
-
-            # 1) Önce label kutusunun kendi içinden sayı çek
-            value_str = _extract_number_str(it.get("text", ""))
-            value_num = _parse_tr_number(value_str) if value_str else None
-
-            # 2) Eğer yoksa, sağdaki en yakın kutudan dene (advanced nearest)
-            if value_num is None:
-                cand = _nearest_value_on_right(items, i, max_dx=max_dx, line_tol=line_tol)
-                if cand is not None:
-                    value_txt = items[cand].get("text", "")
-                    value_bbox = items[cand]["bbox"]
-                    value_str = _extract_number_str(value_txt)
-                    value_num = _parse_tr_number(value_str) if value_str else None
-
-            # 3) Hâlâ None ise, reading order'da sağa doğru ilk sayı içeren kutuya bak
-            if value_num is None:
-                k = pos[i]
-                for j in order[k + 1 :] if k + 1 < len(order) else []:
-                    txt_j = items[j].get("text", "")
-                    if not DIGIT_RX.search(txt_j):
-                        continue
-                    value_txt = txt_j
-                    value_bbox = items[j]["bbox"]
-                    value_str = _extract_number_str(value_txt)
-                    value_num = _parse_tr_number(value_str) if value_str else None
-                    if value_num is not None:
-                        break
-
-            # label içinde sayı yok ama sağda sayı varsa,
-            # "value_txt is None ve value_str is not None" durumunda label_text'i value_txt yap
-            if value_txt is None and value_str is not None:
-                value_txt = it.get("text", "")
-                value_bbox = label_bbox
-
-            rows.append(
-                {
-                    "image_index": pidx,
-                    "label_text": it.get("text", ""),
-                    "label_bbox": label_bbox,
-                    "value_text": value_txt,
-                    "value_bbox": value_bbox,
-                    "value_str": value_str,
-                    "value_num": value_num,
-                }
-            )
-
-    sermaye_df = pd.DataFrame(rows)
-
-    # ---------------- robust merge into bottom_temp_df1 ----------------
-    # sayfa başına tek bir en iyi sermaye değeri seç
-    if not sermaye_df.empty:
-        # numeric'e göre sıralayıp en büyük değeri al (value_num yoksa value_str üzerinden de gidebiliriz)
-        df_non_null = sermaye_df.dropna(subset=["value_num"])
-        if not df_non_null.empty:
-            best = (
-                df_non_null.sort_values(["image_index", "value_num"], ascending=[True, False])
-                .groupby("image_index", as_index=False)
-                .first()[["image_index", "value_num", "value_bbox"]]
-                .rename(columns={"value_num": "sermaye_value", "value_bbox": "sermaye_bbox"})
-            )
-        else:
-            # numeric yoksa string bazlı seçim
-            best = (
-                sermaye_df.dropna(subset=["value_str"])
-                .sort_values(["image_index", "value_str"], ascending=[True, False])
-                .groupby("image_index", as_index=False)
-                .first()[["image_index", "value_str", "value_bbox"]]
-                .rename(columns={"value_str": "sermaye_value", "value_bbox": "sermaye_bbox"})
-            )
-    else:
-        best = pd.DataFrame(columns=["image_index", "sermaye_value", "sermaye_bbox"])
-
-    # sermaye_value'yu integer'a çevir (scientific notation olmadan)
-    if "sermaye_value" in best.columns and not best["sermaye_value"].isna().all():
-        try:
-            best["sermaye_value"] = best["sermaye_value"].astype("float64").astype("int64")
-        except Exception:
-            # bazı satırlar float değilse sessizce geç
-            pass
-
-    # bottom_temp_df1 ile merge
-    if bottom_temp_df1 is None or not isinstance(bottom_temp_df1, pd.DataFrame) or bottom_temp_df1.empty:
-        skeleton = pd.DataFrame({"image_index": list(range(n_pages))})
-        merged = skeleton.merge(best, on="image_index", how="left")
-    else:
-        bd = bottom_temp_df1.copy()
-        if "image_index" not in bd.columns:
-            # satır sayısı sayfa sayısına eşitse indeksleri image_index olarak kullan
-            if len(bd) == n_pages:
-                bd = bd.reset_index(drop=True)
-                bd["image_index"] = range(n_pages)
-            else:
-                bd["image_index"] = bd.get("image_index", range(len(bd)))
-        merged = bd.merge(best, on="image_index", how="left")
-
-    return sermaye_df, merged
-
-sermaye_df, bottom_temp_df1 = extract_and_merge_sermaye(pages_scaled, bottom_temp_df1)
-display(sermaye_df.head())
-display(bottom_temp_df1.head())
+    return out_pages if is_multi else out_pages[0]
