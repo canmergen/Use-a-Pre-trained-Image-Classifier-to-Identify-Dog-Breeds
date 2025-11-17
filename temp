@@ -1,102 +1,128 @@
+import numpy as np
 import pandas as pd
-from collections import defaultdict
-from typing import List, Dict, Any, Tuple
+from difflib import SequenceMatcher
 
-def build_tables_from_pages(
-    pages_scaled: List[List[Dict[str, Any]]],
-    page_cells_all: List[List[Dict[str, Any]]],
-    header_row: int = 0,
-    min_conf: float = 0.0,
-) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
+def add_signature_flags_all_pages(
+    table_dfs,
+    page_cells_all,
+    sig_boxes,
+    signature_header_target="IMZA",   # veya "İMZA"
+    iou_threshold=0.05,
+    fuzzy_min_score=0.7,
+):
     """
-    pages_scaled[p]      : OCR kutuları listesi (dict: 'text', 'bbox', 'confidence' ...)
-    page_cells_all[p]    : Hücre listesi (dict: 'page','row','col','x','y','w','h')
-    header_row           : Her sayfada kolon isimlerinin olduğu satır index'i
-    min_conf             : OCR kutuları için minimum confidence filtresi
-
-    Dönüş:
-      dfs_per_page : her sayfa için ayrı DataFrame listesi
-      full_df      : tüm sayfaların concat hali, 'page_index' kolonu ile
+    table_dfs          : list[pd.DataFrame]  -> her sayfanın tablosu
+    page_cells_all     : list[list[dict]]    -> her sayfa için hücreler
+                         her hücre: {'page':p,'row':r,'col':c,'x':..,'y':..,'w':..,'h':..}
+    sig_boxes          : YOLO imza çıktısı listesi
+                         her eleman: {'image_index':p,'boxes':[{'xyxy':[x1,y1,x2,y2],...},...]}
+    signature_header_target : 'IMZA' başlığını fuzzy ile bulmak için hedef string
     """
 
-    def _build_table_for_page(p_index: int) -> pd.DataFrame:
-        ocr_boxes = pages_scaled[p_index]
-        cells     = page_cells_all[p_index]
+    # 1) Sig kutularını normalize et
+    norm_sigs = []
+    for sb in sig_boxes:
+        img_idx = sb.get("image_index", 0)
+        for b in sb.get("boxes", []):
+            xyxy = b.get("xyxy") or b.get("bbox") or b
+            x1, y1, x2, y2 = map(float, xyxy)
+            norm_sigs.append(
+                {
+                    "image_index": img_idx,
+                    "x_min": x1,
+                    "y_min": y1,
+                    "x_max": x2,
+                    "y_max": y2,
+                }
+            )
 
-        # (row, col) -> hücre bbox
-        cell_rects = {(c["row"], c["col"]): c for c in cells}
+    def iou_cell_sig(cell, sig):
+        xA = max(cell["x"], sig["x_min"])
+        yA = max(cell["y"], sig["y_min"])
+        xB = min(cell["x"] + cell["w"], sig["x_max"])
+        yB = min(cell["y"] + cell["h"], sig["y_max"])
 
-        # (row, col) -> metin listesi
-        texts_by_cell = defaultdict(list)
+        inter_w = max(0.0, xB - xA)
+        inter_h = max(0.0, yB - yA)
+        inter = inter_w * inter_h
+        if inter <= 0:
+            return 0.0
 
-        # OCR kutularını ilgili hücrelere ata
-        for box in ocr_boxes:
-            if "bbox" not in box:
-                continue
-            if ("confidence" in box) and (box["confidence"] < min_conf):
-                continue
+        area_cell = float(cell["w"] * cell["h"])
+        area_sig = float((sig["x_max"] - sig["x_min"]) * (sig["y_max"] - sig["y_min"]))
+        return inter / (area_cell + area_sig - inter)
 
-            bb = box["bbox"]
-            x0 = bb.get("x_min", bb.get("left", 0))
-            y0 = bb.get("y_min", bb.get("top", 0))
-            x1 = bb.get("x_max", x0 + bb.get("width", 0))
-            y1 = bb.get("y_max", y0 + bb.get("height", 0))
+    def fuzzy_best_col(columns, target):
+        best_col = None
+        best_score = 0.0
+        t = target.upper()
+        for col in columns:
+            s = SequenceMatcher(None, str(col).upper(), t).ratio()
+            if s > best_score:
+                best_score = s
+                best_col = col
+        return best_col, best_score
 
-            cx = 0.5 * (x0 + x1)
-            cy = 0.5 * (y0 + y1)
+    # 2) Sayfa bazlı imza flag yaz
+    result_dfs = []
 
-            for (r, c), cell in cell_rects.items():
-                x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
-                if (x <= cx < x + w) and (y <= cy < y + h):
-                    texts_by_cell[(r, c)].append(box.get("text", ""))
-                    break
+    for page_index, df in enumerate(table_dfs):
+        if df is None or df.empty:
+            result_dfs.append(df)
+            continue
 
-        # grid boyutları
-        max_row = max(c["row"] for c in cells)
-        max_col = max(c["col"] for c in cells)
+        # imza_flag kolonunu ekle (varsa dokunma)
+        if "imza_flag" not in df.columns:
+            df["imza_flag"] = 0
 
-        # 2D tabloyu doldur
-        table = []
-        for r in range(max_row + 1):
-            row_vals = []
-            for c in range(max_col + 1):
-                toks = texts_by_cell.get((r, c), [])
-                txt  = " ".join(toks).strip()
-                row_vals.append(txt)
-            table.append(row_vals)
+        # page_index kolonu varsa, değerleri sabit; ama burada kullanmamıza gerek yok
+        data_cols = [c for c in df.columns if c != "page_index" and c != "imza_flag"]
+        if not data_cols:
+            result_dfs.append(df)
+            continue
 
-        # header + data
-        header    = table[header_row]
-        data_rows = table[header_row + 1:]
+        # İMZA kolonunu fuzzy ile bul
+        sig_col_name, score = fuzzy_best_col(data_cols, signature_header_target)
+        if sig_col_name is None or score < fuzzy_min_score:
+            # İmza kolonu bulunamadı → direkt geç
+            result_dfs.append(df)
+            continue
 
-        df = pd.DataFrame(data_rows, columns=header)
-        df.insert(0, "page_index", p_index)  # her satıra page_index ekle
-        return df
+        sig_col_pos = data_cols.index(sig_col_name)
 
-    # Tüm sayfalar için çalıştır
-    n_pages = min(len(pages_scaled), len(page_cells_all))
-    dfs_per_page: List[pd.DataFrame] = []
+        # Bu sayfanın hücreleri ve imza kutuları
+        cells = page_cells_all[page_index]
+        page_sigs = [s for s in norm_sigs if s["image_index"] == page_index]
 
-    for p in range(n_pages):
-        df_p = _build_table_for_page(p)
-        dfs_per_page.append(df_p)
+        if not cells or not page_sigs:
+            result_dfs.append(df)
+            continue
 
-    # Hepsini tek DF'de birleştir
-    if dfs_per_page:
-        full_df = pd.concat(dfs_per_page, ignore_index=True)
-    else:
-        full_df = pd.DataFrame()
+        # Her imza kutusunu ilgili hücrelerle eşleştir
+        for sig in page_sigs:
+            for cell in cells:
+                if cell["col"] != sig_col_pos:
+                    continue
+                ov = iou_cell_sig(cell, sig)
+                if ov > iou_threshold:
+                    row_idx = cell["row"]
+                    # df'in indeksinin satır sırası ile aynı olduğunu varsayıyoruz
+                    if row_idx in df.index:
+                        df.at[row_idx, "imza_flag"] = 1
 
-    return dfs_per_page, full_df
+        result_dfs.append(df)
 
-dfs_per_page, full_df = build_tables_from_pages(
-    pages_scaled=pages_scaled,
+    return result_dfs
+
+# table_df_list: build_tables_from_pages çıkışı (sayfa bazlı df listesi)
+table_df_with_flags = add_signature_flags_all_pages(
+    table_dfs=table_df,
     page_cells_all=page_cells_all,
-    header_row=0,
-    min_conf=0.0,
+    sig_boxes=sig_boxes,
+    signature_header_target="İMZA",   # başlıkta nasıl yazıyorsa ona göre
+    iou_threshold=0.05,
+    fuzzy_min_score=0.7,
 )
 
-# Örneğin:
-df_page0 = dfs_per_page[0]
-df_page1 = dfs_per_page[1]
-df_page2 = dfs_per_page[2]
+for df in table_df_with_flags:
+    display(df)
