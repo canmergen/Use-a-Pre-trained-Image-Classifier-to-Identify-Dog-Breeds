@@ -1,238 +1,116 @@
-def process_all_tables(
-    res,
-    auto_percentile: int = 90,
-    use_tight_crop: bool = True,
-    min_area_ratio: float = 0.25,
-    extra_margin_px: int = 4,
-    ver_kernel_ratio: float = 0.35,
-    hor_kernel_ratio: float = 0.15,
-    ver_erode_iter: int = 2,
-    ver_dilate_iter: int = 20,
-    hor_erode_iter: int = 1,
+import cv2
+import numpy as np
+
+def return_binary_mask(
+    table: np.ndarray,
+    ver_kernels=(1, 250),
+    hor_kernels=(250, 1),
+    hor_erode_iter: int = 2,
     hor_dilate_iter: int = 20,
-    thin_dilate_size: int = 3,
-    thin_dilate_iter: int = 3,
+    ver_erode_iter: int = 1,
+    ver_dilate_iter: int = 20,
+    handle_inv: bool = True,
+    # imza / blob temizliği için parametreler
+    remove_blobs: bool = True,
+    blob_min_area: int = 150,       # çok küçük gürültüyü dikkate alma
+    blob_min_thickness: int = 5,    # min(kısa_kenar) bundan büyükse "kalın" say
+    blob_max_aspect_ratio: float = 8.0  # max(w,h)/min(w,h) < bu ise line değildir
 ):
     """
-    res: 
-        - [{ 'table_bw': img, ... }, ...]  veya 
-        - [img1, img2, ...]  (np.ndarray listesi)
+    1) Tablo görselini binary-inv'e çevirir.
+    2) İmza benzeri kalın, kompakt blobları siler (isteğe bağlı).
+    3) Horizontal ve vertical line mask'leri üretir.
+    4) Bu iki mask'i birleştirerek 'binary_lines' döndürür.
 
-    Çıktı:
-        - binarized_tables: [np.ndarray, ...] -> arka plan beyaz, çizgiler kalın siyah
+    Dönüş:
+        binary_lines, binary_horizontal, binary_vertical
     """
-    import cv2
-    import numpy as np
 
-    # ----------------------- #
-    #  STRICT BINARIZATION
-    # ----------------------- #
-    def _binarize_strict_white(img: np.ndarray, auto_percentile: int = 90) -> np.ndarray:
-        if img.ndim == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img.copy()
+    def add_borders(img: np.ndarray) -> np.ndarray:
+        img = img.copy()
+        img[0, :] = 255
+        img[-1, :] = 255
+        img[:, 0] = 255
+        img[:, -1] = 255
+        return img
 
-        gmin, gmax = float(gray.min()), float(gray.max())
-        if gmax - gmin < 1e-6:
-            return np.full_like(gray, 255, dtype=np.uint8)
-
-        # Normalize dinamik aralık
-        gray = np.clip((gray - gmin) * (255.0 / (gmax - gmin)), 0, 255).astype(np.uint8)
-
-        p1 = np.percentile(gray, 1)
-        p2 = np.percentile(gray, auto_percentile)
-        if p2 - p1 < 1:
-            p2 = p1 + 1
-
-        gray = np.clip((gray - p1) * (255.0 / (p2 - p1)), 0, 255).astype(np.uint8)
-
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, bin_img = cv2.threshold(
-            blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        return bin_img
-
-    # ----------------------- #
-    #  SIKI TABLO KIRPMA
-    # ----------------------- #
-    def _tight_table_crop(
-        rectified_bgr: np.ndarray,
-        min_area_ratio: float = 0.25,
-        extra_margin_px: int = 4,
-    ):
-        H, W = rectified_bgr.shape[:2]
-
-        if rectified_bgr.ndim == 3:
-            gray = cv2.cvtColor(rectified_bgr, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = rectified_bgr.copy()
-
-        # Zemin normalize + median + otsu (ızgarayı belirginleştir)
-        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        gray = cv2.medianBlur(gray, 3)
-        _, bin_inv = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-
-        # Grid için dikey/yatay maskeler
-        ky = max(25, H // 30)
-        kx = max(25, W // 25)
-        vmask = cv2.morphologyEx(
-            bin_inv,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)),
-            iterations=1,
-        )
-        hmask = cv2.morphologyEx(
-            bin_inv,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)),
-            iterations=1,
-        )
-        grid = cv2.bitwise_or(vmask, hmask)
-        grid = cv2.morphologyEx(
-            grid,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
-            iterations=2,
-        )
-
-        cnts, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            return rectified_bgr, (0, 0, W, H)
-
-        c = max(cnts, key=cv2.contourArea)
-        if cv2.contourArea(c) < (min_area_ratio * W * H):
-            return rectified_bgr, (0, 0, W, H)
-
-        x, y, w, h = cv2.boundingRect(c)
-
-        x0 = max(0, x - extra_margin_px)
-        y0 = max(0, y - extra_margin_px)
-        x1 = min(W, x + w + extra_margin_px)
-        y1 = min(H, y + h + extra_margin_px)
-
-        cropped = rectified_bgr[y0:y1, x0:x1].copy()
-        return cropped, (x0, y0, x1, y1)
-
-    # ----------------------- #
-    #  UZUN ÇİZGİ MASKESİ
-    # ----------------------- #
-    def _long_line_mask(bin_img: np.ndarray) -> np.ndarray:
-        # bin_img: arka plan beyaz (255), metin+çizgi siyah (0)
-        inv = cv2.bitwise_not(bin_img)  # 255 = foreground (metin+çizgi)
-
-        h, w = inv.shape
-        ver_len = max(20, int(h * ver_kernel_ratio))
-        hor_len = max(20, int(w * hor_kernel_ratio))
-
-        kernel_ver = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ver_len))
-        kernel_hor = cv2.getStructuringElement(cv2.MORPH_RECT, (hor_len, 1))
-
-        # Dikey
-        v = cv2.erode(inv, kernel_ver, iterations=ver_erode_iter)
-        v = cv2.dilate(v, kernel_ver, iterations=ver_dilate_iter)
-
-        # Yatay
-        hmask = cv2.erode(inv, kernel_hor, iterations=hor_erode_iter)
-        hmask = cv2.dilate(hmask, kernel_hor, iterations=hor_dilate_iter)
-
-        merged = cv2.addWeighted(v, 0.5, hmask, 0.5, 0)
-
-        # Uzun çizgiler için maske: 0 = çizgi, 255 = zemin
-        long_mask = cv2.bitwise_not(merged)
-        return long_mask
-
-    # ----------------------- #
-    #  KISA / İNCE ÇİZGİ MASKESİ
-    # ----------------------- #
-    def _thin_line_mask(
-        bin_img: np.ndarray, size: int = 3, iterations: int = 3
-    ) -> np.ndarray:
-        # ximgproc varsa thinning kullan, yoksa fallback
-        try:
-            thin = cv2.ximgproc.thinning(bin_img)
-        except Exception:
-            thin = cv2.erode(bin_img, np.ones((3, 3), np.uint8), iterations=2)
-
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
-        thick = cv2.dilate(thin, k, iterations=iterations)
-
-        short_mask = cv2.bitwise_not(thick)  # 0 = çizgi, 255 = zemin
-        return short_mask
-
-    # ----------------------- #
-    #  ANA DÖNGÜ
-    # ----------------------- #
-    binarized_tables = []
-
-    # res dict list mi, direkt img list mi?
-    if isinstance(res, (list, tuple)):
-        iterable = res
+    # 0) Griye çevir
+    if table.ndim == 3:
+        gray = cv2.cvtColor(table, cv2.COLOR_BGR2GRAY)
     else:
-        iterable = [res]
+        gray = table.copy()
 
-    for r in iterable:
-        if isinstance(r, dict):
-            table = (
-                r.get("table_bw")
-                or r.get("table")
-                or r.get("image")
-                or r.get("img")
-            )
-        else:
-            table = r
+    # 1) Binary-inv: çizgiler / yazılar = 255, arka plan = 0
+    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    binary = add_borders(binary)
 
-        if table is None:
-            continue
-
-        # 1) İsteğe bağlı sıkı kırpma
-        if use_tight_crop:
-            table, _ = _tight_table_crop(
-                table,
-                min_area_ratio=min_area_ratio,
-                extra_margin_px=extra_margin_px,
-            )
-
-        # 2) Sert binarizasyon (arka plan beyaz, içerik siyah)
-        bin_img = _binarize_strict_white(table, auto_percentile=auto_percentile)
-
-        # 3) Uzun çizgi maskesi
-        long_mask = _long_line_mask(bin_img)
-
-        # 4) Kısa / ince çizgi maskesi
-        short_mask = _thin_line_mask(
-            bin_img, size=thin_dilate_size, iterations=thin_dilate_iter
+    # 2) İmza / kompakt blob temizliği
+    if remove_blobs:
+        # Connected components
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
         )
 
-        # 5) Maskeleri birleştir (çizgi = 0, zemin = 255)
-        combined_mask = cv2.bitwise_and(long_mask, short_mask)
+        for label in range(1, num_labels):  # 0 = arka plan
+            x, y, w, h, area = stats[label]
 
-        # 6) Maske sadece çizgilere dokunsun, metne dokunma:
-        final = bin_img.copy()
-        # Çizgi olması gereken yerde siyah zorla
-        final[combined_mask == 0] = 0
+            # Çok küçük objeleri boş ver (zaten gürültü olabilir)
+            if area < blob_min_area:
+                continue
 
-        binarized_tables.append(final)
+            short_side = min(w, h)
+            long_side = max(w, h)
+            aspect_ratio = long_side / max(1, short_side)
 
-    return binarized_tables
+            # İnce uzun çizgiler: genelde short_side çok küçük, aspect_ratio büyük
+            is_thin_line = (short_side <= blob_min_thickness) and (aspect_ratio >= blob_max_aspect_ratio)
 
+            if is_thin_line:
+                # Gerçek line; dokunma
+                continue
 
-binarized_tables = process_all_tables(
-    res,
-    ver_kernel_ratio=0.4,
-    hor_kernel_ratio=0.2,
-    ver_dilate_iter=25,
-    hor_dilate_iter=25,
-    thin_dilate_size=3,
-    thin_dilate_iter=4,
-)
+            # Buraya düşenler: kalın ve kompakt bloblar (imza, text vb.)
+            # Bunları siliyoruz (0'a çekiyoruz)
+            binary[labels == label] = 0
+
+    # 3) Horizontal / vertical line mask'leri
+    kernel_hor = cv2.getStructuringElement(cv2.MORPH_RECT, hor_kernels)
+    kernel_ver = cv2.getStructuringElement(cv2.MORPH_RECT, ver_kernels)
+
+    # Horizontal
+    binary_horizontal = cv2.erode(binary, kernel_hor, iterations=hor_erode_iter)
+    binary_horizontal = cv2.dilate(binary_horizontal, kernel_hor, iterations=hor_dilate_iter)
+
+    # Vertical
+    binary_vertical = cv2.erode(binary, kernel_ver, iterations=ver_erode_iter)
+    binary_vertical = cv2.dilate(binary_vertical, kernel_ver, iterations=ver_dilate_iter)
+
+    # 4) Eğer sağdaki imza kolonunu komple ignore etmek istersen
+    if handle_inv:
+        inv_x_range = 0
+        for x in range(binary_vertical.shape[1]):
+            mean_y = np.mean(binary_vertical[:, x])
+            if mean_y == 0:
+                inv_x_range = x
+                break
+
+        if inv_x_range >= binary_vertical.shape[1] * 0.15:
+            # Bu kısım senin mevcut mantığın; istersen burayı da ayrıca
+            # imza kolonuna göre maskeleyecek şekilde oynayabilirsin.
+            binary_vertical[:, 2 * inv_x_range:-2] = 0
+
+    # 5) Horizontal + vertical birleşimi (line mask)
+    binary_lines = cv2.addWeighted(binary_vertical, 0.5,
+                                   binary_horizontal, 0.5, 0.0)
+
+    return binary_lines, binary_horizontal, binary_vertical
+
+binarized_tables = process_tables_with_line_fix(res)
 
 for i, img in enumerate(binarized_tables):
-    plt.figure(figsize=(10, 4))
-    plt.title(f"Table {i}")
-    plt.imshow(img, cmap="gray")
-    plt.axis("off")
+    binary_lines, horiz, vert = return_binary_mask(img)
+    plt.figure(figsize=(16, 4))
+    plt.subplot(1, 3, 1); plt.title(f"lines {i}"); plt.imshow(binary_lines, cmap="gray"); plt.axis("off")
+    plt.subplot(1, 3, 2); plt.title("horiz"); plt.imshow(horiz, cmap="gray"); plt.axis("off")
+    plt.subplot(1, 3, 3); plt.title("vert");  plt.imshow(vert, cmap="gray");  plt.axis("off")
     plt.show()
-
