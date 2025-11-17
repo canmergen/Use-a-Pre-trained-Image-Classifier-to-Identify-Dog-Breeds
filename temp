@@ -1,247 +1,102 @@
-import cv2
-import numpy as np
+import pandas as pd
 from collections import defaultdict
-import matplotlib.pyplot as plt
+from typing import List, Dict, Any, Tuple
 
-def prune_empty_rows_and_cols_for_all_pages(
-    binarized_tables,
-    grid_info,
-    all_cells,
-    signature_col=-1,
-    ink_thr_cell=0.002,
-    min_cc_area_frac=1/6000.0,
-    inset_px=4,
-    inset_frac=0.02,
-    debug=False,
-    plot=False,          # final sonucu çiz
-    plot_cells_flag=True # hücre dikdörtgenlerini de çiz
-):
+def build_tables_from_pages(
+    pages_scaled: List[List[Dict[str, Any]]],
+    page_cells_all: List[List[Dict[str, Any]]],
+    header_row: int = 0,
+    min_conf: float = 0.0,
+) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
     """
-    Tüm sayfalar için:
-      - tamamen boş satır ve sütunları düşer,
-      - hücre listesini yeni indekslere göre günceller,
-      - istenirse sonucu orijinal tablo üzerinde plot eder.
+    pages_scaled[p]      : OCR kutuları listesi (dict: 'text', 'bbox', 'confidence' ...)
+    page_cells_all[p]    : Hücre listesi (dict: 'page','row','col','x','y','w','h')
+    header_row           : Her sayfada kolon isimlerinin olduğu satır index'i
+    min_conf             : OCR kutuları için minimum confidence filtresi
 
-    all_cells: [{'page':i,'row':r,'col':c,'x':x,'y':y,'w':w,'h':h}, ...]
-    Dönen:
-      pruned_all = [
-        {
-          "page_index": i,
-          "cells": cells_pruned,
-          "rows_y": rows_y_pruned,
-          "cols_x": cols_x_pruned,
-          "n_rows": n_rows,
-          "n_cols": n_cols,
-        },
-        ...
-      ]
+    Dönüş:
+      dfs_per_page : her sayfa için ayrı DataFrame listesi
+      full_df      : tüm sayfaların concat hali, 'page_index' kolonu ile
     """
 
-    # -------------------- helper'lar -------------------- #
-    def _content_mask_no_lines(img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        binv = cv2.adaptiveThreshold(
-            blur, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV,
-            31, 10
-        )
-        H, W = binv.shape
-        lx = max(25, W // 60)
-        ly = max(25, H // 60)
+    def _build_table_for_page(p_index: int) -> pd.DataFrame:
+        ocr_boxes = pages_scaled[p_index]
+        cells     = page_cells_all[p_index]
 
-        horiz = cv2.morphologyEx(
-            binv, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (lx, 1)),
-            1
-        )
-        vert = cv2.morphologyEx(
-            binv, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, ly)),
-            1
-        )
-        lines = cv2.bitwise_or(horiz, vert)
+        # (row, col) -> hücre bbox
+        cell_rects = {(c["row"], c["col"]): c for c in cells}
 
-        grow = max(1, min(H, W) // 350)
-        lines = cv2.dilate(
-            lines,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (2 * grow, 2 * grow)),
-            1
-        )
+        # (row, col) -> metin listesi
+        texts_by_cell = defaultdict(list)
 
-        content = cv2.bitwise_and(binv, cv2.bitwise_not(lines))
-        return content
-
-    def _inner_box(cell, inset_px, inset_frac):
-        x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
-        dx = max(inset_px, int(w * inset_frac))
-        dy = max(inset_px, int(h * inset_frac))
-        x0 = x + dx
-        y0 = y + dy
-        x1 = x + w - dx
-        y1 = y + h - dy
-        if x1 <= x0 or y1 <= y0:
-            return x, y, w, h
-        return x0, y0, x1 - x0, y1 - y0
-
-    def _is_textlike(roi, min_area, min_cc_area):
-        if roi.size == 0:
-            return False
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(roi, connectivity=8)
-        if n <= 1:
-            return False
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        max_area = areas.max()
-        if max_area < min_area:
-            return False
-        if max_area < min_cc_area:
-            return False
-        return True
-
-    def _plot_page(table_img, rows_y, cols_x, cells_page, page_idx, title_suffix=""):
-        """Son grid ve hücreleri orijinal tablo üzerinde göster."""
-        if table_img.ndim == 2:
-            img_rgb = cv2.cvtColor(table_img, cv2.COLOR_GRAY2RGB)
-        else:
-            img_rgb = cv2.cvtColor(table_img, cv2.COLOR_BGR2RGB)
-
-        H, W = img_rgb.shape[:2]
-        fig, ax = plt.subplots(figsize=(12, 9))
-        ax.imshow(img_rgb, alpha=0.9)
-        ax.set_title(f"Page {page_idx} final grid {title_suffix}")
-
-        # satır çizgileri (yatay)
-        for y in rows_y:
-            ax.axhline(y=y, linewidth=1.2)
-
-        # sütun çizgileri (dikey)
-        for x in cols_x:
-            ax.axvline(x=x, linewidth=1.2)
-
-        if plot_cells_flag:
-            for c in cells_page:
-                x, y, w, h = c["x"], c["y"], c["w"], c["h"]
-                rect = plt.Rectangle(
-                    (x, y), w, h,
-                    fill=False, linewidth=1.2
-                )
-                ax.add_patch(rect)
-        ax.axis("off")
-        plt.tight_layout()
-        plt.show()
-
-    def _prune_single_page(table_img, rows_y, cols_x, cells_page):
-        if not cells_page:
-            return [], rows_y, cols_x, 0, 0
-
-        content = _content_mask_no_lines(table_img)
-        H, W = content.shape
-        min_cc_area = max(12, int(H * W * min_cc_area_frac))
-
-        row_nonempty = defaultdict(bool)
-        col_nonempty = defaultdict(bool)
-
-        for cell in cells_page:
-            x0, y0, w0, h0 = _inner_box(cell, inset_px, inset_frac)
-            roi = content[max(0, y0):max(0, y0) + h0, max(0, x0):max(0, x0) + w0]
-            if roi.size == 0:
+        # OCR kutularını ilgili hücrelere ata
+        for box in ocr_boxes:
+            if "bbox" not in box:
+                continue
+            if ("confidence" in box) and (box["confidence"] < min_conf):
                 continue
 
-            ink_cnt = int(np.count_nonzero(roi))
-            ink_ratio = ink_cnt / float(roi.size)
-            if ink_ratio < ink_thr_cell:
-                continue
+            bb = box["bbox"]
+            x0 = bb.get("x_min", bb.get("left", 0))
+            y0 = bb.get("y_min", bb.get("top", 0))
+            x1 = bb.get("x_max", x0 + bb.get("width", 0))
+            y1 = bb.get("y_max", y0 + bb.get("height", 0))
 
-            if not _is_textlike(roi, min_area=12, min_cc_area=min_cc_area):
-                continue
+            cx = 0.5 * (x0 + x1)
+            cy = 0.5 * (y0 + y1)
 
-            r = int(cell["row"])
-            c = int(cell["col"])
-            row_nonempty[r] = True
-            if signature_col == -1 or c != signature_col:
-                col_nonempty[c] = True
+            for (r, c), cell in cell_rects.items():
+                x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
+                if (x <= cx < x + w) and (y <= cy < y + h):
+                    texts_by_cell[(r, c)].append(box.get("text", ""))
+                    break
 
-        max_row = max(c["row"] for c in cells_page) if cells_page else -1
-        max_col = max(c["col"] for c in cells_page) if cells_page else -1
+        # grid boyutları
+        max_row = max(c["row"] for c in cells)
+        max_col = max(c["col"] for c in cells)
 
-        rows_keep = [r for r in range(max_row + 1) if row_nonempty.get(r, False)]
-        cols_keep = [c for c in range(max_col + 1) if col_nonempty.get(c, False)]
+        # 2D tabloyu doldur
+        table = []
+        for r in range(max_row + 1):
+            row_vals = []
+            for c in range(max_col + 1):
+                toks = texts_by_cell.get((r, c), [])
+                txt  = " ".join(toks).strip()
+                row_vals.append(txt)
+            table.append(row_vals)
 
-        if not rows_keep or not cols_keep:
-            rows_keep = list(range(max_row + 1))
-            cols_keep = list(range(max_col + 1))
+        # header + data
+        header    = table[header_row]
+        data_rows = table[header_row + 1:]
 
-        rmap = {old_r: new_r for new_r, old_r in enumerate(sorted(rows_keep))}
-        cmap = {old_c: new_c for new_c, old_c in enumerate(sorted(cols_keep))}
+        df = pd.DataFrame(data_rows, columns=header)
+        df.insert(0, "page_index", p_index)  # her satıra page_index ekle
+        return df
 
-        rows_y_pruned = [rows_y[0]]
-        for old_r in sorted(rows_keep):
-            rows_y_pruned.append(rows_y[old_r + 1])
+    # Tüm sayfalar için çalıştır
+    n_pages = min(len(pages_scaled), len(page_cells_all))
+    dfs_per_page: List[pd.DataFrame] = []
 
-        cols_x_pruned = [cols_x[0]]
-        for old_c in sorted(cols_keep):
-            cols_x_pruned.append(cols_x[old_c + 1])
+    for p in range(n_pages):
+        df_p = _build_table_for_page(p)
+        dfs_per_page.append(df_p)
 
-        cells_pruned = []
-        for cell in cells_page:
-            r_old = int(cell["row"])
-            c_old = int(cell["col"])
-            if r_old not in rmap or c_old not in cmap:
-                continue
-            new_cell = dict(cell)
-            new_cell["row"] = rmap[r_old]
-            new_cell["col"] = cmap[c_old]
-            cells_pruned.append(new_cell)
+    # Hepsini tek DF'de birleştir
+    if dfs_per_page:
+        full_df = pd.concat(dfs_per_page, ignore_index=True)
+    else:
+        full_df = pd.DataFrame()
 
-        n_rows = len(rows_y_pruned) - 1
-        n_cols = len(cols_x_pruned) - 1
+    return dfs_per_page, full_df
 
-        if debug:
-            print(f"  -> pruned rows={n_rows}, cols={n_cols}")
-
-        return cells_pruned, np.array(rows_y_pruned), np.array(cols_x_pruned), n_rows, n_cols
-
-    # -------------------- ana akış -------------------- #
-    pruned_all = []
-
-    for page_dict in grid_info:
-        p = int(page_dict["page_index"])
-        rows_y = np.array(page_dict["rows_y"])
-        cols_x = np.array(page_dict["cols_x"])
-
-        cells_page = [c for c in all_cells if int(c["page"]) == p]
-        table_img = binarized_tables[p]
-
-        if debug:
-            print(f"Page {p}: incoming rows={len(rows_y)-1}, cols={len(cols_x)-1}, cells={len(cells_page)}")
-
-        cells_pruned, r_pruned, c_pruned, n_rows, n_cols = _prune_single_page(
-            table_img, rows_y, cols_x, cells_page
-        )
-
-        if plot:
-            _plot_page(table_img, r_pruned, c_pruned, cells_pruned, p, title_suffix=f"(rows={n_rows}, cols={n_cols})")
-
-        pruned_all.append(
-            {
-                "page_index": p,
-                "cells": cells_pruned,
-                "rows_y": r_pruned,
-                "cols_x": c_pruned,
-                "n_rows": n_rows,
-                "n_cols": n_cols,
-            }
-        )
-
-    return pruned_all
-
-pruned_all = prune_empty_rows_and_cols_for_all_pages(
-    binarized_tables=binarized_tables,
-    grid_info=grid_info,
-    all_cells=all_cells,
-    signature_col=-1,
-    debug=True,
-    plot=True,          # her sayfa için final sonucu çiz
-    plot_cells_flag=True
+dfs_per_page, full_df = build_tables_from_pages(
+    pages_scaled=pages_scaled,
+    page_cells_all=page_cells_all,
+    header_row=0,
+    min_conf=0.0,
 )
+
+# Örneğin:
+df_page0 = dfs_per_page[0]
+df_page1 = dfs_per_page[1]
+df_page2 = dfs_per_page[2]
