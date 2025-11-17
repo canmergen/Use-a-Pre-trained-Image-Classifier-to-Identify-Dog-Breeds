@@ -1,290 +1,168 @@
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import Tuple, Optional
+from collections import defaultdict
 
-def return_binary_mask(
-    table: np.ndarray,
-    ver_kernels: Optional[Tuple[int, int]] = None,
-    hor_kernels: Optional[Tuple[int, int]] = None,
-    hor_erode_iter: int = 2,
-    ver_erode_iter: int = 1,
-    handle_inv: bool = True,
-    min_cov_h: float = 0.4,
-    min_cov_v: float = 0.4,
-    min_gap_frac: float = 0.015,
-    compact_ratio: float = 0.5,
-    v_proj_top_frac: float = 0.7,   # dikey projeksiyon için üst band
-    debug: bool = False,
+def _reindex_compact(cells):
+    """
+    rows/cols'u sıkıştırır; (n_rows, n_cols) döner.
+    cells: list of dict, her biri {row, col, x, y, w, h, ...}
+    """
+    if not cells:
+        return 0, 0
+
+    rkeep = sorted({c["row"] for c in cells})
+    ckeep = sorted({c["col"] for c in cells})
+
+    rmap = {r: i for i, r in enumerate(rkeep)}
+    cmap = {c: i for i, c in enumerate(ckeep)}
+
+    for cell in cells:
+        cell["row"] = rmap[cell["row"]]
+        cell["col"] = cmap[cell["col"]]
+
+    return len(rkeep), len(ckeep)
+
+
+def _prune_rows_y_from_cells(rows_y, cells):
+    """
+    rows_y'yi, elde kalan hücrelere göre yeniden oluştur.
+    rows_y: 1D array/list (grid eksenleri)
+    cells : list of dict
+    """
+    if not cells:
+        return rows_y
+
+    kept_rows = sorted({c["row"] for c in cells})
+
+    out = [rows_y[kept_rows[0]]]  # üst kenar
+    for r in kept_rows:
+        out.append(rows_y[r + 1])  # ilgili bandın alt kenarı
+
+    # rows_y np.array ise np.array döndür
+    import numpy as np
+    return np.array(out) if hasattr(rows_y, "dtype") else out
+
+def prune_rows_and_cols_fully_empty(
+    table_img,
+    rows_y,
+    cols_x,
+    cells,
+    signature_col=-1,          # imza hep son sütun ise -1
+    ink_thr_cell=0.002,        # %0.2 alan
+    min_cc=2,
+    min_cc_area_frac=1/6000,   # ROI oranı
+    inset_px=4,
+    inset_frac=0.02,
+    debug=False,
 ):
     """
-    Çıktı:
-      binary_lines      : yatay+dikey çizgi maskesi
-      binary_horizontal : yatay çizgi maskesi
-      binary_vertical   : dikey çizgi maskesi
-      rows_y            : grid yatay eksenleri (üst+ara+alt)
-      cols_x            : grid dikey eksenleri (sol+ara+sağ)
+    Dönüş:
+        cells_pruned, rows_y_pruned, cols_x_pruned (aynı),
+        n_rows, n_cols
     """
+    if not cells:
+        return cells, rows_y, cols_x, 0, 0
 
-    # ----------------- yardımcılar -----------------
+    # 1) Çizgileri silip sadece içerik maskesi üret
+    content = _content_mask_no_lines(table_img)
+    H, W = content.shape
 
-    def add_borders(img: np.ndarray, border: int = 2) -> np.ndarray:
-        img[:border, :] = 255
-        img[-border:, :] = 255
-        img[:, :border] = 255
-        img[:, -border:] = 255
-        return img
+    # 2) Orijinal sütun sayısı + imza sütunu index'i
+    n_cols_orig = max(c["col"] for c in cells) + 1
+    sig_c = (n_cols_orig - 1) if signature_col == -1 else signature_col
 
-    def extract_axes_from_mask(mask: np.ndarray,
-                               axis: str,
-                               min_coverage: float,
-                               min_gap_px: int,
-                               title: str = "",
-                               dbg: bool = False) -> np.ndarray:
-        """
-        1D projeksiyon ile eksen merkezlerini bulur.
-        axis = 'h' -> satır eksenleri (y)
-        axis = 'v' -> sütun eksenleri (x)
-        """
-        H, W = mask.shape
+    # 3) Satır/sütun bazlı doluluk istatistikleri
+    row_nonempty = defaultdict(int)
+    col_nonempty = defaultdict(int)
+    cell_is_text = {}
 
-        if axis == "h":
-            proj = mask.sum(axis=1) / (255.0 * max(1, W))
-            length = H
+    for cell in cells:
+        x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
+
+        x0, y0, w0, h0 = _inner_box(x, y, w, h, inset_px, inset_frac)
+        roi = content[max(0, y0): y0 + h0, max(0, x0): x0 + w0]
+
+        if roi.size == 0:
+            ir = 0.0
+            is_text = False
         else:
-            proj = mask.sum(axis=0) / (255.0 * max(1, H))
-            length = W
+            cnt = int(np.count_nonzero(roi))
+            ir = cnt / float(roi.size)
+            min_area = max(12, int(roi.size * min_cc_area_frac))
+            is_text = (ir > ink_thr_cell) and _is_textlike(roi, min_area, min_cc=min_cc)
 
-        is_line = proj > min_coverage
+        r, c = cell["row"], cell["col"]
+        cell_is_text[(r, c)] = is_text
 
-        centers = []
-        i = 0
-        while i < length:
-            if not is_line[i]:
-                i += 1
-                continue
-            j = i + 1
-            while j < length and is_line[j]:
-                j += 1
-            c = (i + j - 1) // 2
-            centers.append(c)
-            i = j
+        # imza sütununu doluluk hesabına katma
+        if c != sig_c and is_text:
+            row_nonempty[r] += 1
+            col_nonempty[c] += 1
 
-        merged = []
-        for c in centers:
-            if not merged or c - merged[-1] >= min_gap_px:
-                merged.append(c)
-            else:
-                merged[-1] = int((merged[-1] + c) / 2)
+        if debug:
+            print(f"cell ({r},{c}) ink_ratio={ir:.4f} textlike={is_text}")
 
-        merged = np.array(merged, dtype=int)
+    # 4) Tamamen boş satır/sütun listeleri
+    max_row = max(c["row"] for c in cells)
+    max_col = max(c["col"] for c in cells)
 
-        if dbg:
-            xs = np.arange(length)
-            plt.figure(figsize=(10, 3))
-            plt.plot(xs, proj, label="projection")
-            if len(merged) > 0:
-                plt.scatter(merged, proj[merged], c="red", s=30, label="axes")
-            plt.title(title)
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
+    rows_to_drop = [r for r in range(max_row + 1) if row_nonempty.get(r, 0) == 0]
+    cols_to_drop = [c for c in range(max_col + 1) if col_nonempty.get(c, 0) == 0]
 
-        return merged
+    # 5) Özel kural: r0 c0 ve r0 clast ikisi de boş ise r0 row'u düşme (başlık satırı)
+    last_col = max_col
+    first_cell_ok = cell_is_text.get((0, 0), False)
+    last_cell_ok = cell_is_text.get((0, last_col), False)
 
-    def merge_dense_axes(axes: np.ndarray,
-                         ratio: float,
-                         full_length: int) -> np.ndarray:
-        """
-        Çok yakın eksenleri gap dağılımına + mutlak eşiğe göre birleştirir.
-        Ayrıca sağ taraftaki imza bölgesinde en fazla 2 eksen bırakır.
-        """
-        if axes is None or len(axes) <= 2:
-            return axes
-
-        gaps = np.diff(axes).astype(float)
-        valid = gaps[gaps > 0]
-        if len(valid) == 0:
-            return axes
-
-        q1 = np.percentile(valid, 25)
-        median = np.median(valid)
-
-        # sayfa genişliğinin %2'si: sadece çok dar aralıklara izin
-        abs_thresh = 0.02 * full_length
-        thresh = min(q1, median * ratio, abs_thresh)
-
-        merged = [axes[0]]
-        for dx, x in zip(gaps, axes[1:]):
-            if dx < thresh:
-                merged[-1] = int((merged[-1] + x) / 2)
-            else:
-                merged.append(x)
-        merged = np.array(merged, dtype=int)
-
-        # --- sağ uç için ek kontrol (imza sütunu alanı) ---
-        # sağ bölge: genişliğin son %18'i
-        right_start = int(0.82 * full_length)
-        right_idx = np.where(merged >= right_start)[0]
-        if len(right_idx) > 2:
-            left_sig = merged[right_idx[0]]
-            right_sig = merged[right_idx[-1]]
-            keep_mask = merged < right_start
-            merged = np.concatenate([merged[keep_mask],
-                                     np.array([left_sig, right_sig])])
-            merged = np.sort(merged)
-
-        return np.array(merged, dtype=int)
-
-    # ----------------- 1) gri + threshold -----------------
-
-    if table.ndim == 3:
-        gray = cv2.cvtColor(table, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = table.copy()
-
-    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-    binary = add_borders(binary)
-
-    H, W = binary.shape[:2]
-
-    # ----------------- 2) kernel boyutları -----------------
-
-    if hor_kernels is None:
-        kw = max(25, W // 20)
-        hor_kernels = (kw, 1)
-
-    if ver_kernels is None:
-        kh = max(25, H // 20)
-        ver_kernels = (1, kh)
-
-    kernel_hor = cv2.getStructuringElement(cv2.MORPH_RECT, hor_kernels)
-    kernel_ver = cv2.getStructuringElement(cv2.MORPH_RECT, ver_kernels)
-
-    # ----------------- 3) yatay / dikey çizgiler -----------------
-
-    binary_horizontal = cv2.erode(binary, kernel_hor, iterations=hor_erode_iter)
-    binary_horizontal = cv2.dilate(binary_horizontal, kernel_hor, iterations=20)
-
-    binary_vertical = cv2.erode(binary, kernel_ver, iterations=ver_erode_iter)
-    binary_vertical = cv2.dilate(binary_vertical, kernel_ver, iterations=20)
-
-    # ----------------- 4) sağ taraftaki anomalik kolon kırpma -----------------
-
-    if handle_inv:
-        inv_x_range = 0
-        for x in range(W):
-            if np.mean(binary_vertical[:, x]) == 0:
-                inv_x_range = x
-                break
-
-        if inv_x_range >= W * 0.15:
-            binary_vertical[:, :max(0, 2 * inv_x_range - 2)] = 0
-
-    # ----------------- 5) birleşik maske -----------------
-
-    binary_lines = cv2.addWeighted(binary_vertical, 0.5,
-                                   binary_horizontal, 0.5, 0.0)
-
-    # ----------------- 6) grid eksenleri -----------------
-
-    min_gap_h = max(3, int(H * min_gap_frac))
-    min_gap_v = max(3, int(W * min_gap_frac))
-
-    rows_y = extract_axes_from_mask(
-        binary_horizontal,
-        axis="h",
-        min_coverage=min_cov_h,
-        min_gap_px=min_gap_h,
-        title="Row projection",
-        dbg=debug,
-    )
-
-    # Dikey projeksiyon için üst bandı kullan (imzayı baskılamak için)
-    top_h = int(H * v_proj_top_frac)
-    vert_for_proj = binary_vertical[:top_h, :]
-
-    cols_x_raw = extract_axes_from_mask(
-        vert_for_proj,
-        axis="v",
-        min_coverage=min_cov_v,
-        min_gap_px=min_gap_v,
-        title="Column projection (raw, top band)",
-        dbg=debug,
-    )
-
-    cols_x = merge_dense_axes(cols_x_raw, ratio=compact_ratio, full_length=W)
-
-    # ----------------- 7) DEBUG görselleştirme -----------------
+    if (not first_cell_ok) and (not last_cell_ok):
+        # sadece header row kalsın
+        if 0 in rows_to_drop:
+            rows_to_drop.remove(0)
 
     if debug:
-        print(f"rows_y (len={len(rows_y)}): {rows_y}")
-        print(f"cols_x_raw (len={len(cols_x_raw)}): {cols_x_raw}")
-        print(f"cols_x_merged (len={len(cols_x)}): {cols_x}")
+        print(f"rows_to_drop: {rows_to_drop}  cols_to_drop: {cols_to_drop}")
 
-        # arka planı silik yapmak için griyi biraz aç
-        bg = cv2.normalize(gray, None, 200, 255, cv2.NORM_MINMAX)
-        vis = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    # 6) Hücreleri filtrele
+    kept_cells = [
+        dict(cell)  # kopya
+        for cell in cells
+        if (cell["row"] not in rows_to_drop) and (cell["col"] not in cols_to_drop)
+    ]
 
-        # satırlar: yeşil, kalın
-        for y in rows_y:
-            cv2.line(vis, (0, y), (W - 1, y), (0, 255, 0), 4)
+    # 7) row/col indexlerini sıkıştır
+    n_rows, n_cols = _reindex_compact(kept_cells)
 
-        # sütunlar: kırmızı, kalın
-        for x in cols_x:
-            cv2.line(vis, (x, 0), (x, H - 1), (255, 0, 0), 4)
+    # 8) rows_y güncelle (istenirse cols_x de ayrı sıkıştırılabilir;
+    #    senin orijinal kodunda cols_x genelde aynen bırakılıyordu)
+    rows_y_pruned = _prune_rows_y_from_cells(rows_y, kept_cells)
+    cols_x_pruned = cols_x
 
-        plt.figure(figsize=(8, 8))
-        plt.title("Detected grid axes (over original)")
-        plt.imshow(vis[:, :, ::-1])
-        plt.axis('off')
-        plt.tight_layout()
-        plt.show()
+    if debug:
+        print(f"Final grid: (n_rows={n_rows} x n_cols={n_cols})")
 
-    return binary_lines, binary_horizontal, binary_vertical, rows_y, cols_x
+    return kept_cells, rows_y_pruned, cols_x_pruned, n_rows, n_cols
 
-bin_lines, hmask, vmask, rows_y, cols_x = return_binary_mask(
-    binarized_tables[i],
-    debug=True
-)
-n_rows = len(rows_y) - 1
-n_cols = len(cols_x) - 1
-print(f"Page {i}: rows={n_rows}, cols={n_cols}")
+pruned_all = []
 
+for p, page in enumerate(grid_info):
+    rows_y = page["rows_y"]
+    cols_x = page["cols_x"]
 
-# === sonuçları tutmak için listeler ===
-all_bin_lines = []
-all_hmask     = []
-all_vmask     = []
-all_rows_y    = []
-all_cols_x    = []
-grid_info     = []
+    # all_cells[p] mutlaka "list of dict" olsun
+    cells = all_cells[p]          # veya list(all_cells[p].values()) eğer dict ise
 
-# === tüm sayfaları işle ===
-for i in range(len(binarized_tables)):
-
-    bin_lines, hmask, vmask, rows_y, cols_x = return_binary_mask(
-        binarized_tables[i],
-        debug=True,
-        more_debug=False
+    cells_pruned, r_pruned, c_pruned, n_rows, n_cols = prune_rows_and_cols_fully_empty(
+        table_img      = binarized_tables[p],  # o sayfanın tablo imajı
+        rows_y         = rows_y,
+        cols_x         = cols_x,
+        cells          = cells,
+        signature_col  = -1,
+        debug          = False
     )
 
-    n_rows = len(rows_y) - 1
-    n_cols = len(cols_x) - 1
-    print(f"Page {i}: rows={n_rows}, cols={n_cols}")
-
-    # maskeleri sakla
-    all_bin_lines.append(bin_lines)
-    all_hmask.append(hmask)
-    all_vmask.append(vmask)
-    all_rows_y.append(rows_y)
-    all_cols_x.append(cols_x)
-
-    # özet bilgileri sakla
-    grid_info.append({
-        "page_index": i,
-        "rows_y": rows_y,
-        "cols_x": cols_x,
+    pruned_all.append({
+        "page_index": p,
+        "cells":  cells_pruned,
+        "rows_y": r_pruned,
+        "cols_x": c_pruned,
         "n_rows": n_rows,
-        "n_cols": n_cols
+        "n_cols": n_cols,
     })
