@@ -1,100 +1,211 @@
-def prune_rows_and_cols_fully_empty(
-    table_img, rows_y, cols_x, cells,
+import cv2
+import numpy as np
+from collections import defaultdict
+
+def prune_empty_rows_and_cols_for_all_pages(
+    binarized_tables,
+    grid_info,
+    all_cells,
     signature_col=-1,
     ink_thr_cell=0.002,
-    min_cc=2,
-    min_cc_area_frac=1/6000,
-    inset_px=4, inset_frac=0.02,
-    debug=False
+    min_cc_area_frac=1/6000.0,
+    inset_px=4,
+    inset_frac=0.02,
+    debug=False,
 ):
+    """
+    Tüm sayfalar için:
+      - tamamen boş satır ve sütunları düşer,
+      - hücre listesini yeni indekslere göre günceller.
 
-    if not cells:
-        return cells, rows_y, cols_x, 0, 0
+    all_cells: [{'page':i,'row':r,'col':c,'x':x,'y':y,'w':w,'h':h}, ...]
+    """
 
-    content = _content_mask_no_lines(table_img)
-    H, W = content.shape
+    # -------------------- helper'lar -------------------- #
+    def _content_mask_no_lines(img):
+        """Tablo içeriği (yazı) için, grid çizgilerini silen maske."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        binv = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            31, 10
+        )
+        H, W = binv.shape
+        lx = max(25, W // 60)
+        ly = max(25, H // 60)
 
-    # --- DIKKAT: Hücreler artık dict, bu yüzden dict yapısını kullanıyoruz ---
-    n_cols_orig = max(c["col"] for c in cells) + 1
-    sig_c = (n_cols_orig - 1) if signature_col == -1 else signature_col
+        horiz = cv2.morphologyEx(
+            binv, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (lx, 1)),
+            1
+        )
+        vert = cv2.morphologyEx(
+            binv, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, ly)),
+            1
+        )
+        lines = cv2.bitwise_or(horiz, vert)
 
-    row_nonempty = defaultdict(int)
-    col_nonempty = defaultdict(int)
-    cell_is_text = {}
+        grow = max(1, min(H, W) // 350)
+        lines = cv2.dilate(
+            lines,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2 * grow, 2 * grow)),
+            1
+        )
 
-    # --- her hücre için metin/boş kontrolü ---
-    for c in cells:
-        xi, yi = c["x"], c["y"]
-        wi, hi = c["w"], c["h"]
+        content = cv2.bitwise_and(binv, cv2.bitwise_not(lines))
+        return content
 
-        x0 = max(0, xi + inset_px)
-        y0 = max(0, yi + inset_px)
-        x1 = min(W, xi + wi - inset_px)
-        y1 = min(H, yi + hi - inset_px)
+    def _inner_box(cell, inset_px, inset_frac):
+        """Hücrenin kenarlarından içeri girilmiş ROI (kenar çizgilerini dışarıda bırakmak için)."""
+        x, y, w, h = cell["x"], cell["y"], cell["w"], cell["h"]
+        dx = max(inset_px, int(w * inset_frac))
+        dy = max(inset_px, int(h * inset_frac))
+        x0 = x + dx
+        y0 = y + dy
+        x1 = x + w - dx
+        y1 = y + h - dy
+        if x1 <= x0 or y1 <= y0:
+            return x, y, w, h   # fallback
+        return x0, y0, x1 - x0, y1 - y0
 
-        roi = content[y0:y1, x0:x1]
-
+    def _is_textlike(roi, min_area, min_cc_area, debug=False):
+        """ROI içinde anlamlı büyüklükte connected component var mı?"""
         if roi.size == 0:
-            is_text = False
-        else:
-            cnt = int(np.count_nonzero(roi))
-            ir = cnt / float(roi.size)
-            min_area = max(12, int(roi.size * min_cc_area_frac))
-            is_text = (ir >= ink_thr_cell) and _is_textlike(roi, min_area, min_cc=min_cc)
+            return False
+        # roi 0/255 ikili maske varsayıyoruz; 255 = ink
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(roi, connectivity=8)
+        if n <= 1:
+            return False
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = areas.max()
+        if max_area < min_area:
+            return False
+        if max_area < min_cc_area:
+            return False
+        return True
 
-        cell_is_text[(c["row"], c["col"])] = is_text
+    def _prune_single_page(table_img, rows_y, cols_x, cells_page):
+        """
+        Tek sayfa için boş satır/sütunları düşer.
+        cells_page: sadece o sayfaya ait hücre dict listesi.
+        """
+        if not cells_page:
+            return [], rows_y, cols_x, 0, 0
 
-        if c["col"] != sig_c and is_text:
-            col_nonempty[c["col"]] += 1
-            row_nonempty[c["row"]] += 1
+        content = _content_mask_no_lines(table_img)
+        H, W = content.shape
+
+        # min alan threshold
+        min_cc_area = max(12, int(H * W * min_cc_area_frac))
+
+        row_nonempty = defaultdict(bool)
+        col_nonempty = defaultdict(bool)
+
+        # Hücre bazında ink oranı + textlike kontrolü
+        for cell in cells_page:
+            x0, y0, w0, h0 = _inner_box(cell, inset_px, inset_frac)
+            roi = content[max(0, y0):max(0, y0) + h0, max(0, x0):max(0, x0) + w0]
+            if roi.size == 0:
+                continue
+
+            ink_cnt = int(np.count_nonzero(roi))
+            ink_ratio = ink_cnt / float(roi.size)
+
+            if ink_ratio < ink_thr_cell:
+                continue
+
+            if not _is_textlike(roi, min_area=12, min_cc_area=min_cc_area):
+                continue
+
+            r = int(cell["row"])
+            c = int(cell["col"])
+            row_nonempty[r] = True
+            # imza sütunu boş olsa bile tutmak isteyebilirsiniz; signature_col ile kontrol
+            if signature_col == -1 or c != signature_col:
+                col_nonempty[c] = True
+
+        # Hangi satır/sütunlar kalsın?
+        max_row = max(c["row"] for c in cells_page) if cells_page else -1
+        max_col = max(c["col"] for c in cells_page) if cells_page else -1
+
+        rows_keep = [r for r in range(max_row + 1) if row_nonempty.get(r, False)]
+        cols_keep = [c for c in range(max_col + 1) if col_nonempty.get(c, False)]
+
+        if not rows_keep or not cols_keep:
+            # her şey boş görünüyorsa, hiç prune etme
+            rows_keep = list(range(max_row + 1))
+            cols_keep = list(range(max_col + 1))
+
+        # Eski -> yeni indeks haritaları
+        rmap = {old_r: new_r for new_r, old_r in enumerate(sorted(rows_keep))}
+        cmap = {old_c: new_c for new_c, old_c in enumerate(sorted(cols_keep))}
+
+        # Satır/sütun kenar koordinatlarını yeniden oluştur
+        rows_y_pruned = [rows_y[0]]
+        for old_r in sorted(rows_keep):
+            rows_y_pruned.append(rows_y[old_r + 1])
+
+        cols_x_pruned = [cols_x[0]]
+        for old_c in sorted(cols_keep):
+            cols_x_pruned.append(cols_x[old_c + 1])
+
+        # Hücreleri filtrele ve yeni indekslerle dön
+        cells_pruned = []
+        for cell in cells_page:
+            r_old = int(cell["row"])
+            c_old = int(cell["col"])
+            if r_old not in rmap or c_old not in cmap:
+                continue
+            new_cell = dict(cell)  # shallow copy
+            new_cell["row"] = rmap[r_old]
+            new_cell["col"] = cmap[c_old]
+            cells_pruned.append(new_cell)
+
+        n_rows = len(rows_y_pruned) - 1
+        n_cols = len(cols_x_pruned) - 1
 
         if debug:
-            print(f"{c['row']},{c['col']}  ink_ratio={ir:.4f}  text={is_text}")
+            print(f"Pruned page: rows {n_rows}, cols {n_cols}")
 
-    # --- tam boş satır ve sütunları belirle ---
-    rows_to_drop = [
-        r for r in range(max(c["row"] for c in cells) + 1)
-        if row_nonempty.get(r, 0) == 0
-    ]
+        return cells_pruned, np.array(rows_y_pruned), np.array(cols_x_pruned), n_rows, n_cols
 
-    cols_to_drop = [
-        c for c in range(max(c["col"] for c in cells) + 1)
-        if col_nonempty.get(c, 0) == 0
-    ]
+    # -------------------- ana akış -------------------- #
+    pruned_all = []
 
-    # --- ilk/son satır korunmalı mı kontrol ---
-    first_cell_ok = cell_is_text.get((0, 0), False)
-    last_row = max(c["row"] for c in cells)
-    last_col = max(c["col"] for c in cells)
-    last_cell_ok = cell_is_text.get((last_row, last_col), False)
+    for page_dict in grid_info:
+        p = int(page_dict["page_index"])
+        rows_y = np.array(page_dict["rows_y"])
+        cols_x = np.array(page_dict["cols_x"])
 
-    if (not first_cell_ok) and (not last_cell_ok):
-        rows_to_drop = []
+        # Bu sayfaya ait hücreleri seç
+        cells_page = [c for c in all_cells if int(c["page"]) == p]
 
-    kept = [
-        c for c in cells
-        if c["row"] not in rows_to_drop and c["col"] not in cols_to_drop
-    ]
+        table_img = binarized_tables[p]
 
-    # --- satır/sütun ekseni güncelle ---
-    n_rows, n_cols = _reindex_compact(kept)
+        cells_pruned, r_pruned, c_pruned, n_rows, n_cols = _prune_single_page(
+            table_img, rows_y, cols_x, cells_page
+        )
 
-    rows_y_pruned = _prune_rows_y_from_cells(rows_y, kept)
-    cols_x_pruned = cols_x
+        pruned_all.append(
+            {
+                "page_index": p,
+                "cells": cells_pruned,
+                "rows_y": r_pruned,
+                "cols_x": c_pruned,
+                "n_rows": n_rows,
+                "n_cols": n_cols,
+            }
+        )
 
-    if debug:
-        print(f"Dropped rows: {rows_to_drop}, dropped cols: {cols_to_drop}")
-        print(f"Final grid: ({n_rows} x {n_cols})")
+    return pruned_all
 
-    return kept, rows_y_pruned, cols_x_pruned, n_rows, n_cols
-
-cells = list(all_cells[p].values())
-
-cells_pruned, r_pruned, c_pruned, n_rows, n_cols = prune_rows_and_cols_fully_empty(
-    table_img=binarized_tables[p],
-    rows_y=rows_y,
-    cols_x=cols_x,
-    cells=cells,
-    signature_col=-1,
-    debug=False
+pruned_all = prune_empty_rows_and_cols_for_all_pages(
+    binarized_tables=binarized_tables,
+    grid_info=grid_info,
+    all_cells=all_cells,
+    signature_col=-1,      # en sağ imza sütununu özel ele almak istersen burayı değiştirirsin
+    debug=False,
 )
