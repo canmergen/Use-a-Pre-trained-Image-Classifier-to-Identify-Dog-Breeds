@@ -1,25 +1,31 @@
 import re
 import unicodedata
-from difflib import SequenceMatcher
-from typing import List, Dict, Iterable, Optional
+from typing import List, Dict, Iterable, Optional, Tuple, Any, Set
+
+import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
-def standardize_table_headers_with_fuzzy(
+def standardize_table_headers_with_jaccard_tfidf(
     table_dfs_marked: List[pd.DataFrame],
     min_score: float = 0.55,
     debug: bool = False,
+    w_jaccard: float = 0.4,
+    w_tfidf: float = 0.6,
 ) -> List[pd.DataFrame]:
     """
     OCR'den gelen sayfa bazlı DataFrame listesini standart şemaya map eder.
 
-    Öncelikler:
-    1) TCKN kolonunun doğru bulunması ve doldurulması
-    2) pay_sahibinin_adi_soyadi_unvani kolonunun dolu olması
-    3) paylarin_toplam_itibari_degeri(tl): 25.000 -> 25000.0 gibi doğru parse edilmesi
+    Fuzzy / SequenceMatcher YOK.
+    - İsim benzerliği: kelime bazlı Jaccard
+    - Karakter bazlı benzerlik: TF-IDF (char n-gram) + cosine
+    - Nihai skor: w_jaccard * jaccard + w_tfidf * cosine
     """
 
-    # -------------------- helper'lar --------------------
+    # ---------------- helper'lar ----------------
+
     def _normalize_name(s: str) -> str:
         if s is None:
             return ""
@@ -27,15 +33,59 @@ def standardize_table_headers_with_fuzzy(
         tr_map = str.maketrans("çğıöşü", "cgiosu")
         s = s.translate(tr_map)
         s = unicodedata.normalize("NFKD", s)
-        s = re.sub(r"[^0-9a-z]+", " ", s)
+        s = re.sub(r"[^a-z0-9\s]+", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def _sim(a: str, b: str) -> float:
-        return SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
+    def _jaccard_word(a: str, b: str) -> float:
+        a_norm = _normalize_name(a)
+        b_norm = _normalize_name(b)
+        sa = set(a_norm.split())
+        sb = set(b_norm.split())
+        if not sa and not sb:
+            return 1.0
+        if not sa or not sb:
+            return 0.0
+        inter = len(sa & sb)
+        union = len(sa | sb)
+        return inter / union if union > 0 else 0.0
+
+    def _build_tfidf_matrix(cols: List[str]):
+        norm_cols = [_normalize_name(c) for c in cols]
+        vect = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 4),
+            min_df=1
+        )
+        X = vect.fit_transform(norm_cols)
+        return vect, X
+
+    def _similarity_scores(
+        target: str,
+        source_cols: List[str],
+        tfidf_vect: TfidfVectorizer,
+        tfidf_mat
+    ) -> np.ndarray:
+        """
+        Bütün source_cols için combined similarity döner.
+        """
+        # 1) Jaccard (word-level)
+        jacc_scores = np.array(
+            [_jaccard_word(target, c) for c in source_cols],
+            dtype=float,
+        )
+
+        # 2) TF-IDF cosine (char-level)
+        t_norm = _normalize_name(target)
+        t_vec = tfidf_vect.transform([t_norm])
+        cos_scores = cosine_similarity(t_vec, tfidf_mat)[0]  # shape: (n_cols,)
+
+        # 3) Weighted combination
+        scores = w_jaccard * jacc_scores + w_tfidf * cos_scores
+        return scores
 
     def _safe_series(obj) -> pd.Series:
-        """DataFrame gelirse ilk kolonu alır; her durumda Series döner."""
+        """DataFrame gelirse ilk kolonu al; her durumda Series döner."""
         if isinstance(obj, pd.Series):
             return obj
         if isinstance(obj, pd.DataFrame):
@@ -50,47 +100,58 @@ def standardize_table_headers_with_fuzzy(
         return s_norm.isin(["", "nan", "none"]).mean() > 0.8
 
     def _col_profile(s: pd.Series) -> Dict[str, float]:
+        """
+        Kolon tipi / pattern profili (TCID oranı, numeric oranı vb.)
+        """
         s = _safe_series(s)
-        if s.empty:
+        if _is_empty_series(s):
             return dict(
                 tcid_ratio=0.0,
-                numeric_ratio=0.0,
                 short_int_ratio=0.0,
+                numeric_ratio=0.0,
                 text_ratio=0.0,
-                has_asal_vek=False,
+                has_asal_yetk=False,
                 has_tem_tur=False,
             )
+
         s_str = s.astype(str).str.strip().str.lower()
 
         tcid_mask = s_str.str.fullmatch(r"\d{10,11}")
-        numeric_mask = s_str.str.fullmatch(r"\d+(\.\d+|\,\d+)?")
-        short_int_mask = s_str.str.fullmatch(r"\d{1,3}")
-        text_mask = s_str.str.contains(r"[a-zçğıöşü]", regex=True)
+        short_int_mask = s_str.str.fullmatch(r"\d{1,4}")
+        numeric_mask = s_str.str.fullmatch(r"\d+([\.,]\d+)*", na=False)
+
+        text_mask = ~(tcid_mask | short_int_mask | numeric_mask)
 
         return dict(
             tcid_ratio=float(tcid_mask.mean()),
-            numeric_ratio=float(numeric_mask.mean()),
             short_int_ratio=float(short_int_mask.mean()),
+            numeric_ratio=float(numeric_mask.mean()),
             text_ratio=float(text_mask.mean()),
-            has_asal_vek=bool(
-                s_str.str.contains("asaleten").any() or s_str.str.contains("vekaleten").any()
+            has_asal_yetk=bool(
+                s_str.str.contains("asaleten").any()
+                or s_str.str.contains("vekaleten").any()
             ),
-            has_tem_tur=bool(s_str.str.contains("temsilci tur").any()),
+            has_tem_tur=bool(
+                s_str.str.contains("temsilci tur", regex=False).any()
+            ),
         )
 
     def parse_turkish_amount(val) -> Optional[float]:
         """
-        '20.237.333,33', '20,237,333.33', '1.50', '25.000', '25' gibi değerleri float'a çevirir.
-        Özellikle '25.000' -> 25000.0 olacak şekilde binlik / ondalık ayrımını ele alır.
+        '20.237.333,33', '20,237,333.33', '1.50', '25.000', '25' gibi
+        stringleri float'a çevirir.
+        Özellikle '25.000' -> 25000.0 olacak şekilde binlik/ondalık ayırımı yapar.
         """
         if val is None:
             return None
+
         s = str(val).strip()
         if s == "":
             return None
 
-        s = s.replace("TL", "").replace("tl", "")
-        s = re.sub(r"[^\d\.,]", "", s)
+        s = s.replace(" TL", "").replace("tl", "")
+        s = re.sub(r"[^\d,\.]", "", s)
+
         if s == "":
             return None
 
@@ -99,23 +160,21 @@ def standardize_table_headers_with_fuzzy(
 
         # nokta + virgül: noktalar binlik, virgül ondalık
         if has_dot and has_comma:
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
 
-        # sadece virgül
+        # sadece virgül: ondalık
         if has_comma and not has_dot:
-            s_norm = s.replace(".", "")
-            s_norm = s_norm.replace(",", ".")
+            s_norm = s.replace(",", ".")
             try:
                 return float(s_norm)
             except ValueError:
                 return None
 
-        # sadece nokta
+        # sadece nokta: binlik veya ondalık olabilir
         if has_dot and not has_comma:
             parts = s.split(".")
             # '25.000' gibi: son grup 3 haneli ve tüm gruplar rakamsa -> binlik
@@ -137,7 +196,8 @@ def standardize_table_headers_with_fuzzy(
         except ValueError:
             return None
 
-    TARGET_ORDER = [
+    # Hedef kolon şeması
+    TARGET_ORDER: List[str] = [
         "page_index",
         "pay_sahibinin_adi_soyadi_unvani",
         "tckn",
@@ -151,24 +211,19 @@ def standardize_table_headers_with_fuzzy(
         "tablo_imza_var_mi",
     ]
 
+    # Kolon isimleri için synonym listeleri
     SYNONYMS: Dict[str, Iterable[str]] = {
         "pay_sahibinin_adi_soyadi_unvani": [
             "pay sahibinin adi soyadi unvani",
             "pay sahibinin adi soyadi/unvani",
             "pay sahibinin ad soyad unvan",
-            "pay sahibinin adi soyadi",
-            "pay sahibinin adi soyadi / unvani",
         ],
         "tckn": [
-            "tckn",
             "tc kimlik no",
             "tc kimlik numarasi",
-            "tc kimlik numarası",
-            "turkiye cumhuriyeti kimlik numarasi",
+            "tckn",
             "kimlik / vergi kimlik / mersis numarasi",
             "kimlik vergi kimlik mersis numarasi",
-            "kimlik vergi kimlik mersis numarası",
-            "kimlik/vergi kimlik/mersis numarası",
             "kimlik vergi kimlik mersis no",
         ],
         "uyrugu": [
@@ -181,9 +236,8 @@ def standardize_table_headers_with_fuzzy(
         ],
         "paylarin_toplam_itibari_degeri(tl)": [
             "paylarin toplam itibari degeri tl",
-            "paylarin toplam itibari degeri (tl)",
             "paylarin toplam itibari degeri",
-            "paylarin toplam itibari degeri tl)",
+            "paylarin toplam itibari degeri (tl)",
         ],
         "paylarin_edilmis_sekli_tarihi": [
             "paylarin edinim sekli ve tarihi",
@@ -192,17 +246,13 @@ def standardize_table_headers_with_fuzzy(
         "katilim_sekli": [
             "katilim sekli",
             "katilim sekli (asaleten vekaleten)",
-            "katilim sekli (asaleten/vekaleten)",
         ],
         "temsilci_adi_soyadi_unvani": [
             "temsilcinin adi soyadi unvani",
-            "temsilcinin adi soyadi/unvani",
-            "temsilci adi soyadi unvani",
+            "temsilcinin ad soyad unvani",
         ],
         "temsilci_tckn": [
-            "temsilcinin t c no su",
             "temsilcinin tc kimlik no su",
-            "temsilcinin t c kimlik nosu",
             "temsilcinin tckn",
         ],
         "tablo_imza_var_mi": [
@@ -213,80 +263,92 @@ def standardize_table_headers_with_fuzzy(
 
     def _choose_best_source(
         col_target: str,
-        source_cols: Iterable[str],
-        used: set,
+        source_cols: List[str],
+        used: Set[str],
         min_score_loc: float,
-    ) -> (Optional[str], float):
-        best_col = None
-        best_score = 0.0
+        tfidf_vect: TfidfVectorizer,
+        tfidf_mat,
+    ) -> Tuple[Optional[str], float]:
+        """
+        1) Synonym listesi üzerinden tam/çok yakın match varsa onları kullan,
+        2) Yoksa Jaccard + TF-IDF cosine ile en yüksek skorlu kolonu seç.
+        """
+        best_col: Optional[str] = None
+        best_score: float = 0.0
 
-        syn_list = SYNONYMS.get(col_target, [])
-        syn_norm = {_normalize_name(s) for s in syn_list}
+        syn_list = list(SYNONYMS.get(col_target, []))
+        syn_norm = [_normalize_name(s) for s in syn_list]
 
-        # 1) tam synonym
-        for c in source_cols:
-            if c in used:
+        # 1) Tam synonym match (normalize edilmiş)
+        if syn_norm:
+            norm_sources = {_normalize_name(c): c for c in source_cols}
+            for sn in syn_norm:
+                if sn in norm_sources and norm_sources[sn] not in used:
+                    # Tam match bulduk, maksimum skor ver
+                    return norm_sources[sn], 1.0
+
+        # 2) Jaccard + TF-IDF tabanlı similarity
+        scores = _similarity_scores(col_target, source_cols, tfidf_vect, tfidf_mat)
+
+        for col_name, score in zip(source_cols, scores):
+            if col_name in used:
                 continue
-            n = _normalize_name(c)
-            if n in syn_norm and n != "":
-                return c, 1.0
-
-        # 2) fuzzy hedef kolon adıyla
-        norm_target = _normalize_name(col_target)
-        for c in source_cols:
-            if c in used:
-                continue
-            score = _sim(norm_target, c)
             if score > best_score:
                 best_score = score
-                best_col = c
+                best_col = col_name
 
         if best_col is None or best_score < min_score_loc:
             return None, 0.0
         return best_col, best_score
 
-    # -------------------- ana döngü --------------------
     standardized_pages: List[pd.DataFrame] = []
 
+    # ---------------- ana döngü ----------------
     for df in table_dfs_marked:
         if df is None or df.empty:
             standardized_pages.append(pd.DataFrame(columns=TARGET_ORDER))
             continue
 
-        src_cols = list(df.columns)
+        src_cols: List[str] = list(df.columns)
 
-        # page_index kolonu
-        page_index_col = None
-        for c in src_cols:
-            if _normalize_name(c) == "page index":
-                page_index_col = c
-                break
+        # TF-IDF yapısını sadece bir kez kur
+        tfidf_vect, tfidf_mat = _build_tfidf_matrix(src_cols)
 
-        profiles: Dict[str, Dict[str, float]] = {c: _col_profile(df[c]) for c in src_cols}
-        used_cols: set = set()
+        profiles: Dict[str, Dict[str, float]] = {
+            c: _col_profile(df[c]) for c in src_cols
+        }
+        used_cols: Set[str] = set()
         col_map: Dict[str, Optional[str]] = {}
 
-        # 1) fuzzy mapping
+        # 1) fuzzy yerine Jaccard+TF-IDF ile kolon mapping
         for tgt in TARGET_ORDER:
             if tgt == "page_index":
                 continue
-            src, score = _choose_best_source(tgt, src_cols, used_cols, min_score)
+            src, score = _choose_best_source(
+                tgt,
+                src_cols,
+                used_cols,
+                min_score,
+                tfidf_vect,
+                tfidf_mat,
+            )
             if src is not None:
                 col_map[tgt] = src
                 used_cols.add(src)
                 if debug:
-                    print(f"[MAP] {tgt} <- '{src}' (score={score:.2f})")
+                    print(f"[MAP] {tgt} <- {src}  (score={score:.3f})")
             else:
                 col_map[tgt] = None
                 if debug:
-                    print(f"[WARN] {tgt} için fuzzy eşleşme bulunamadı.")
+                    print(f"[WARN] {tgt} için uygun kolon bulunamadı.")
 
         # 2) TCKN – içerik tabanlı düzeltme
         if col_map.get("tckn") is None:
             best_tckn_col = None
             best_ratio = 0.0
-            for c in src_cols:
-                p = profiles[c]
+            for c, p in profiles.items():
+                if c in used_cols:
+                    continue
                 if p["tcid_ratio"] > best_ratio:
                     best_ratio = p["tcid_ratio"]
                     best_tckn_col = c
@@ -294,20 +356,17 @@ def standardize_table_headers_with_fuzzy(
                 col_map["tckn"] = best_tckn_col
                 used_cols.add(best_tckn_col)
                 if debug:
-                    print(
-                        f"[INFO] tckn içerik tabanlı bulundu -> '{best_tckn_col}' "
-                        f"(tcid_ratio={best_ratio:.2f})"
-                    )
+                    print(f"[INFO] TCKN içerik tabanlı bulundu -> {best_tckn_col} "
+                          f"(tcid_ratio={best_ratio:.2f})")
 
-        # 3) temsilci TCKN – ana tckn'den farklı ikinci tcid kolonu
+        # 3) temsilci_tckn – ana tckn'den farklı ikinci tcid kolonu
         if col_map.get("temsilci_tckn") is None:
             best_tem_col = None
             best_ratio = 0.0
             main_tckn_col = col_map.get("tckn")
-            for c in src_cols:
-                if c == main_tckn_col:
+            for c, p in profiles.items():
+                if c in used_cols or c == main_tckn_col:
                     continue
-                p = profiles[c]
                 if p["tcid_ratio"] > best_ratio:
                     best_ratio = p["tcid_ratio"]
                     best_tem_col = c
@@ -315,50 +374,48 @@ def standardize_table_headers_with_fuzzy(
                 col_map["temsilci_tckn"] = best_tem_col
                 used_cols.add(best_tem_col)
                 if debug:
-                    print(
-                        f"[INFO] temsilci_tckn içerik tabanlı -> '{best_tem_col}' "
-                        f"(tcid_ratio={best_ratio:.2f})"
-                    )
+                    print(f"[INFO] temsilci_tckn içerik tabanlı -> {best_tem_col} "
+                          f"(tcid_ratio={best_ratio:.2f})")
 
-        # 4) PAY TUTARI – içerik tabanlı override (büyük sayıları yakalamak için)
-        best_amt_col = None
-        best_med = -1.0
-        for c in src_cols:
-            p = profiles[c]
-            # sayısal ağırlıklı olmalı
-            if p["numeric_ratio"] < 0.5:
-                continue
-            # TCKN benzeri kolonları ele
-            if p["tcid_ratio"] > 0.2:
-                continue
-            name_norm = _normalize_name(c)
-            if any(k in name_norm for k in ["tckn", "kimlik", "mersis", "vergi"]):
-                continue
-
-            vals = _safe_series(df[c]).apply(parse_turkish_amount)
-            med = vals.median(skipna=True)
-            if pd.isna(med):
-                continue
-            if med > best_med:
-                best_med = med
-                best_amt_col = c
-
-        if best_amt_col is not None:
-            col_map["paylarin_toplam_itibari_degeri(tl)"] = best_amt_col
-            used_cols.add(best_amt_col)
-            if debug:
-                print(
-                    f"[INFO] paylarin_toplam_itibari_degeri(tl) içerik tabanlı -> "
-                    f"'{best_amt_col}' (median={best_med})"
-                )
+        # 4) PAY TUTARI – numeric oranına bakarak override
+        if col_map.get("paylarin_toplam_itibari_degeri(tl)") is None:
+            best_amt_col = None
+            best_med = -1.0
+            for c in src_cols:
+                if c in used_cols:
+                    continue
+                p = profiles[c]
+                if p["numeric_ratio"] < 0.5:
+                    continue
+                # TCKN benzeri kolonları ele
+                if p["tcid_ratio"] > 0.2:
+                    continue
+                vals = _safe_series(df[c]).apply(parse_turkish_amount)
+                med = vals.median(skipna=True)
+                if pd.isna(med):
+                    continue
+                if med > best_med:
+                    best_med = med
+                    best_amt_col = c
+            if best_amt_col is not None:
+                col_map["paylarin_toplam_itibari_degeri(tl)"] = best_amt_col
+                used_cols.add(best_amt_col)
+                if debug:
+                    print(f"[INFO] paylarin_toplam_itibari_degeri(tl) içerik tabanlı -> "
+                          f"{best_amt_col} (median={best_med})")
 
         if debug:
-            print("Column mapping:", col_map)
+            print("Column mappings:", col_map)
 
         # 5) Yeni DF
         new_df = pd.DataFrame(columns=TARGET_ORDER)
 
         # page_index
+        page_index_col = None
+        for c in src_cols:
+            if _normalize_name(c) == "page index":
+                page_index_col = c
+                break
         if page_index_col is not None:
             new_df["page_index"] = _safe_series(df[page_index_col]).values
         else:
@@ -366,33 +423,27 @@ def standardize_table_headers_with_fuzzy(
 
         # map edilen kolonlar
         for tgt, src in col_map.items():
+            if tgt == "page_index":
+                continue
             if tgt == "paylarin_toplam_itibari_degeri(tl)":
                 if src is not None:
                     series_src = _safe_series(df[src])
-                    new_df[tgt] = series_src.apply(parse_turkish_amount)
+                    new_df[tgt] = series_src.apply(parse_turkish_amount).values
                 else:
                     new_df[tgt] = None
             elif tgt == "tablo_imza_var_mi":
                 if src is not None:
                     s = _safe_series(df[src]).astype(str).str.strip()
                     imza_int = (s != "").astype(int)
-                    new_df[tgt] = imza_int
+                    new_df[tgt] = imza_int.values
                 else:
                     new_df[tgt] = 0
-            elif tgt == "tckn":
+            elif tgt in ("tckn", "temsilci_tckn"):
                 if src is not None:
                     s = _safe_series(df[src]).astype(str).str.strip()
                     s_digits = s.str.replace(r"\D", "", regex=True)
                     mask_len = s_digits.str.len().between(10, 11)
-                    new_df[tgt] = s_digits.where(mask_len, None)
-                else:
-                    new_df[tgt] = None
-            elif tgt == "temsilci_tckn":
-                if src is not None:
-                    s = _safe_series(df[src]).astype(str).str.strip()
-                    s_digits = s.str.replace(r"\D", "", regex=True)
-                    mask_len = s_digits.str.len().between(10, 11)
-                    new_df[tgt] = s_digits.where(mask_len, None)
+                    new_df[tgt] = s_digits.where(mask_len, None).values
                 else:
                     new_df[tgt] = None
             elif tgt == "uyrugu":
@@ -415,32 +466,36 @@ def standardize_table_headers_with_fuzzy(
             s = s_raw.astype(str).str.strip()
             upper = s.str.upper()
 
-            # Uyruk: bu kolondaki her satırda "T.C" / "TC" / "T C" varsa
-            tc_text_mask = (
-                upper.str.contains(r"\bT\.?C\b", regex=True)
-                | upper.eq("TC")
-                | upper.eq("T C")
-            )
+            # Uyruk: satırda "T.C" / "TC" / "T C" geçiyorsa -> T.C
+            tc_text_mask = upper.str.contains(r"\bT\.?C\b", regex=True)
             if "uyrugu" in new_df.columns:
                 empty_mask = new_df["uyrugu"].astype(str).str.strip().isin(["", "nan", "none"])
                 fill_mask = empty_mask & tc_text_mask
                 if fill_mask.any():
-                    new_df.loc[fill_mask, "uyrugu"] = "TC"
                     if debug:
-                        print(f"[INFO] '{col}' kolonu uyrugu için kullanıldı (satır bazında TC).")
+                        print(f"[INFO] {col} kolonu uyrugu için kullanıldı (satır bazında T.C).")
+                    new_df.loc[fill_mask, "uyrugu"] = "TC"
 
-            # TCKN: 10–11 haneli rakam
+            # TCKN: 10-11 haneli sayı
             if "tckn" in new_df.columns:
                 digits = s.str.replace(r"\D", "", regex=True)
                 tcid_mask = digits.str.len().between(10, 11)
-                empty_tckn = new_df["tckn"].astype(str).str.strip().isin(["", "nan", "none"])
-                fill_mask = empty_tckn & tcid_mask
+                empty_mask = new_df["tckn"].astype(str).str.strip().isin(["", "nan", "none"])
+                fill_mask = empty_mask & tcid_mask
                 if fill_mask.any():
-                    new_df.loc[fill_mask, "tckn"] = digits[fill_mask]
                     if debug:
-                        print(f"[INFO] '{col}' kolonu tckn için kullanıldı (10–11 haneli sayı).")
+                        print(f"[INFO] {col} kolonu tckn için kullanıldı (10-11 haneli sayı).")
+                    new_df.loc[fill_mask, "tckn"] = digits[fill_mask]
 
         new_df = new_df[TARGET_ORDER]
         standardized_pages.append(new_df)
 
     return standardized_pages
+
+table_dfs_final = standardize_table_headers_with_jaccard_tfidf(
+    table_dfs_cleaned,
+    min_score=0.39,
+    debug=False,
+    w_jaccard=0.4,
+    w_tfidf=0.6,
+)
