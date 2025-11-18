@@ -1,165 +1,263 @@
-import pandas as pd
 import re
+import unicodedata
 from difflib import SequenceMatcher
-from typing import List
+import pandas as pd
+from typing import List, Dict, Iterable
 
-def standardize_hazirun_tables_fuzzy(
+def _normalize_name(s: str) -> str:
+    """Header isimlerini fuzzy'e uygun hale getir."""
+    if s is None:
+        return ""
+    # lower + trim
+    s = str(s).strip().lower()
+    # türkçe karakterleri sadeleştir
+    tr_map = str.maketrans({"ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u"})
+    s = s.translate(tr_map)
+    # unicode normalizasyon
+    s = unicodedata.normalize("NFKD", s)
+    # harf ve rakam dışı her şeyi boşluk yap
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    # fazla boşlukları tekle
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _sim(a: str, b: str) -> float:
+    """0–1 arası benzerlik skoru."""
+    return SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
+
+def standardize_table_headers_with_fuzzy(
     table_dfs_marked: List[pd.DataFrame],
-    page_col: str = "page_index",
-    imza_keywords=("imza", "inza"),
-    min_score: float = 0.65,
+    min_score: float = 0.55,
+    debug: bool = False,
 ) -> List[pd.DataFrame]:
     """
-    table_dfs_marked içindeki her DF'in kolonlarını, fuzzy + keyword kullanarak
-    standart hazırun şemasına map eder ve tamamen boş satırları siler.
+    Her sayfa DF'ini aşağıdaki hedef şemaya map eder.
+    Orijinal kolon isimlerinden en iyi eşleşeni seçer (1–1 mapping).
 
-    Dönüş: List[pd.DataFrame]
-        Her DF şu kolonları içerir:
-        [page_index,
-         pay_sahibinin_adi_soyadi_unvani,
-         tckn,
-         uyrugu,
-         adresi,
-         paylarin_toplam_itibari_degeri,
-         paylarin_edinim_sekli_tarihi,
-         katilim_sekli,
-         temsilci_turu,
-         temsilci_adi_soyadi_unvani,
-         temsilci_tckn,
-         tablo_imza_var_mi]
+    Hedef şema:
+      - pay_sahibinin_adi_soyadi_unvani
+      - tckn
+      - uyrugu
+      - adres
+      - paylarin_toplam_itibari_degeri(tl)
+      - paylarin_edilmin_sekli_tarihi
+      - katilim_sekli
+      - temsilci_turu
+      - temsilci_adi_soyadi_unvani
+      - temsilci_tckn
+      - tablo_imza_var_mi
+      - IMZA  (satir bazli 0/1; varsa korunur)
+      - page_index (dokunulmaz)
     """
 
-    # Hedef feature adları ve bunlara karşılık gelen "ideal" header metinleri
-    target_headers = {
-        "pay_sahibinin_adi_soyadi_unvani": "pay sahibinin adi soyadi unvani",
-        "tckn":                            "t c v k no tc kimlik no",
-        "uyrugu":                          "uyrugu uyruk",
-        "adresi":                          "adres",
-        "paylarin_toplam_itibari_degeri":  "paylarin toplam itibari degeri tl nominal",
-        "paylarin_edinim_sekli_tarihi":    "paylarin edinim sekli ve tarihi",
-        "katilim_sekli":                   "katilim sekli asaleten vekaleten",
-        "temsilci_turu":                   "temsilci turu katilim sekli temsilci turu",
-        "temsilci_adi_soyadi_unvani":      "temsilcinin adi soyadi unvani",
-        "temsilci_tckn":                   "temsilcinin t c kimlik vergi no",
-        "tablo_imza_var_mi":               "imza",
-    }
-
-    # Hedef kolon sırası
+    # Senin boş şeman:
     target_order = [
+        "page_index",
         "pay_sahibinin_adi_soyadi_unvani",
         "tckn",
         "uyrugu",
-        "adresi",
-        "paylarin_toplam_itibari_degeri",
-        "paylarin_edinim_sekli_tarihi",
+        "adres",
+        "paylarin_toplam_itibari_degeri(tl)",
+        "paylarin_edilmin_sekli_tarihi",
         "katilim_sekli",
         "temsilci_turu",
         "temsilci_adi_soyadi_unvani",
         "temsilci_tckn",
-        "tablo_imza_var_mi",
+        "IMZA",              # satır bazlı
+        "tablo_imza_var_mi", # 0/1 – tablonun genel imza var mı
     ]
 
-    def _norm(s: str) -> str:
-        s = str(s or "").lower().strip()
-        tr_map = str.maketrans("çğıöşüı", "cgiosui")
-        s = s.translate(tr_map)
-        s = re.sub(r"[^a-z0-9]+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    # Her hedef kolon için manuel synonym listesi
+    synonyms: Dict[str, Iterable[str]] = {
+        "pay_sahibinin_adi_soyadi_unvani": [
+            "pay sahibinin adi soyadi unvani",
+            "pay sahibinin adi soyadi/unvani",
+            "pay sahibinin adi soyadi / unvani",
+            "pay sahibinin adi soyadı/unvani",
+        ],
+        "tckn": [
+            "t c v k no",
+            "t.c./v.k.no",
+            "t c / v k no",
+            "t c no",
+            "tckn",
+            "tc kimlik no",
+            "t c kimlik numarasi",
+        ],
+        "uyrugu": [
+            "uyrugu",
+            "uyruk",
+            "uyrugU",
+        ],
+        "adres": [
+            "adres",
+            "ikamet adresi",
+        ],
+        "paylarin_toplam_itibari_degeri(tl)": [
+            "paylarin toplam itibari degeri tl",
+            "paylarin toplam itibari degeri",
+            "paylarin toplam itibari degeri (tl)",
+        ],
+        "paylarin_edilmin_sekli_tarihi": [
+            "paylarin edinim sekli ve tarihi",
+            "paylarin edinim sekli ve tarihi",
+            "paylarin edinim sekli ve tarıhı",
+        ],
+        "katilim_sekli": [
+            "katilim sekli",
+            "katilim sekli (asaleten vekaleten)",
+            "katilim sekli (asaleten/vekaleten)",
+        ],
+        "temsilci_turu": [
+            "temsilci turu",
+            "temsilcinin turu",
+            "temsil sekli temsilci turu",
+        ],
+        "temsilci_adi_soyadi_unvani": [
+            "temsilcinin adi soyadi unvani",
+            "temsilcinin adi soyadi/unvani",
+            "temsilcinin adi soyadi",
+        ],
+        "temsilci_tckn": [
+            "temsilcinin t c no su",
+            "temsilcinin t c no su",
+            "temsilcinin t c k n o su",
+            "temsilcinin t c kimlik no su",
+        ],
+        "IMZA": [
+            "imza",
+            "inza",
+        ],
+        "tablo_imza_var_mi": [
+            "imza",   # başlıkta IMZA / INZA yazıyor olacak
+            "inza",
+        ],
+    }
 
-    def _similar(a: str, b: str) -> float:
-        return SequenceMatcher(None, a, b).ratio()
+    def choose_best_source(col_target: str, source_cols: Iterable[str], used: set):
+        """Bir hedef için en iyi kaynak kolonu seç."""
+        norm_target = _normalize_name(col_target)
+        best_col = None
+        best_score = 0.0
 
-    std_dfs: List[pd.DataFrame] = []
+        # Önce hard synonym listesi üzerinden hızlı kontrol
+        syn_list = synonyms.get(col_target, [])
+        syn_norm = {_normalize_name(s) for s in syn_list}
+
+        for c in source_cols:
+            if c in used:
+                continue
+            n = _normalize_name(c)
+            if n in syn_norm:
+                # Direkt güçlü eşleşme – 1.0 say
+                return c, 1.0
+
+        # Hard eşleşme yoksa fuzzy
+        for c in source_cols:
+            if c in used:
+                continue
+            score = _sim(norm_target, c)
+            if score > best_score:
+                best_score = score
+                best_col = c
+
+        if best_col is None or best_score < min_score:
+            return None, 0.0
+        return best_col, best_score
+
+    standardized_pages: List[pd.DataFrame] = []
 
     for df in table_dfs_marked:
-        df = df.copy()
+        if df is None or df.empty:
+            # Boş sayfa
+            standardized_pages.append(
+                pd.DataFrame(columns=target_order)
+            )
+            continue
 
-        # Kaynak kolonlar (page_index hariç)
-        src_cols = [c for c in df.columns if c != page_col]
-        src_norm = {c: _norm(c) for c in src_cols}
+        src_cols = list(df.columns)
 
-        used_src = set()
-        mapping = {}  # target_name -> src_col or None
-
-        # Önce IMZA kolonunu özel olarak bul
-        imza_src = None
+        # page_index varsa aynen bırak
+        page_index_col = None
         for c in src_cols:
-            n = src_norm[c]
-            if any(k in n for k in imza_keywords):
-                imza_src = c
-                used_src.add(c)
+            if _normalize_name(c) == "page index":
+                page_index_col = c
                 break
-        mapping["tablo_imza_var_mi"] = imza_src  # şimdilik; None olabilir
 
-        # Diğer target kolonlar için fuzzy eşleme
+        used_cols = set()
+        col_map: Dict[str, str] = {}   # target -> source
+
+        # Önce page_index dışındakiler için mapping
         for tgt in target_order:
-            if tgt == "tablo_imza_var_mi":
-                continue  # IMZA'yı yukarıda yaptık
+            if tgt in ("page_index", "tablo_imza_var_mi"):  # tablo_imza_var_mi'yı veri sonrası hesaplayacağız
+                continue
+            if tgt == "IMZA":
+                # IMZA kolonu zaten daha önce eklenmiş olabilir; yine de mapping yapalım
+                pass
 
-            tgt_pattern = _norm(target_headers[tgt])
-            best_col = None
-            best_score = 0.0
+            src, score = choose_best_source(tgt, src_cols, used_cols)
+            if src is not None:
+                col_map[tgt] = src
+                used_cols.add(src)
+            elif debug:
+                print(f"[WARN] '{tgt}' için uygun kolon bulunamadı (best_score<{min_score})")
 
-            for c in src_cols:
-                if c in used_src:
-                    continue
-                score = _similar(src_norm[c], tgt_pattern)
-                if score > best_score:
-                    best_score = score
-                    best_col = c
+        if debug:
+            print("Column mapping:", col_map)
 
-            # Yeterli benzerlik varsa ata, yoksa None bırak
-            if best_col is not None and best_score >= min_score:
-                mapping[tgt] = best_col
-                used_src.add(best_col)
+        # Yeni DF'yi oluştur
+        new_df = pd.DataFrame(columns=target_order)
+
+        # page_index
+        if page_index_col is not None:
+            new_df["page_index"] = df[page_index_col].values
+        else:
+            # yoksa 0..n-1 atayalım
+            new_df["page_index"] = df.index.to_series().fillna(0).astype(int).values
+
+        # Diğer mapped kolonlar
+        for tgt, src in col_map.items():
+            if tgt == "IMZA":
+                # IMZA 0/1 olarak normalize et
+                col_vals = df[src]
+                new_df["IMZA"] = (
+                    col_vals.fillna(0)
+                    .astype(str)
+                    .str.replace(r"[^\d]", "", regex=True)
+                    .replace("", "0")
+                    .astype(int)
+                )
             else:
-                mapping[tgt] = None
+                new_df[tgt] = df[src].values
 
-        # tablodaki IMZA kolonunu hâlâ bulamadıysak, en yüksek "imza" benzerliğine göre ara
-        if mapping["tablo_imza_var_mi"] is None:
-            tgt_pattern = _norm(target_headers["tablo_imza_var_mi"])
-            best_col, best_score = None, 0.0
-            for c in src_cols:
-                if c in used_src:
-                    continue
-                score = _similar(src_norm[c], tgt_pattern)
-                if score > best_score:
-                    best_score, best_col = score, c
-            if best_col is not None and best_score >= min_score:
-                mapping["tablo_imza_var_mi"] = best_col
-                used_src.add(best_col)
-
-        # --- Yeni standart DF'i oluştur ---
-        std = pd.DataFrame()
-        std[page_col] = df[page_col].values
-
-        for tgt in target_order:
-            src = mapping.get(tgt)
-            if src is not None and src in df.columns:
-                std[tgt] = df[src].values
+        # Var olmayan hedef kolonlar NaN kalır
+        # tablo_imza_var_mi: IMZA kolonu varsa herhangi satırda 1 var mı?
+        if "IMZA" in new_df.columns:
+            has_sig = int(new_df["IMZA"].fillna(0).astype(int).max() > 0)
+        else:
+            # IMZA kolonunu bulamadıysa başlıklara göre bak
+            sig_source, _ = choose_best_source("tablo_imza_var_mi", src_cols, used_cols=set())
+            if sig_source is not None and df[sig_source].notna().any():
+                has_sig = 1
             else:
-                std[tgt] = pd.NA
+                has_sig = 0
+        new_df["tablo_imza_var_mi"] = has_sig
 
-        # --- Tamamen boş satırları sil (page_index + tablo_imza_var_mi hariç) ---
-        cols_to_check = [c for c in std.columns
-                         if c not in (page_col, "tablo_imza_var_mi")]
+        # Kolon sırasını garanti et
+        new_df = new_df[target_order]
 
-        if cols_to_check:
-            tmp = std[cols_to_check].astype(str)
+        standardized_pages.append(new_df)
 
-            # whitespace + "nan"/"None" temizliği
-            tmp = (tmp.apply(lambda s: s.str.replace(r"\s+", "", regex=True))
-                     .replace({"nan": "", "None": ""}))
+    return standardized_pages
 
-            mask_not_empty = ~tmp.eq("").all(axis=1)
-            std = std.loc[mask_not_empty].reset_index(drop=True)
+# OCR sonrası oluşturduğun mevcut DF listesi:
+# table_dfs_marked = [...]
 
-        std_dfs.append(std)
+table_dfs_final = standardize_table_headers_with_fuzzy(
+    table_dfs_cleaned,
+    min_score=0.55,
+    debug=True,  # mapping'i görmek istersen
+)
 
-    return std_dfs
-
-tables_df = standardize_hazirun_tables_fuzzy(table_dfs_marked)
-
-for t in tables_df:
-    display(t)
+for df in table_dfs_final:
+    display(df)
