@@ -14,7 +14,8 @@ def standardize_table_headers_with_fuzzy(
     OCR'den gelen sayfa bazlı DataFrame listesini standart şemaya map eder.
     - Kolon isimlerini fuzzy + içerik tipine göre eşler.
     - Boş kalan kolonlardan TC / TCKN bilgisi varsa uygun yere taşır.
-    - IMZA kolonundan tablo_imza_var_mi oluşturur.
+    - IMZA/INZA kolonundan sadece tablo_imza_var_mi (0/1) üretir.
+    - paylarin_toplam_itibari_degeri(tl) kolonunu float'a çevirir (Türk sayı formatı).
     """
 
     # ------------- helpers ------------- #
@@ -41,7 +42,6 @@ def standardize_table_headers_with_fuzzy(
             if obj.shape[1] == 0:
                 return pd.Series([], dtype=object)
             return obj.iloc[:, 0]
-        # tek değer veya başka tip
         return pd.Series(obj)
 
     def _is_empty_series(s: pd.Series) -> bool:
@@ -52,15 +52,6 @@ def standardize_table_headers_with_fuzzy(
         return s_norm.isin(["", "nan", "none"]).mean() > 0.8
 
     def _col_profile(s: pd.Series) -> Dict[str, float]:
-        """
-        Kolon içeriği için basit istatistikler:
-        - tcid_ratio: 10–11 haneli sayı oranı
-        - numeric_ratio: tamamen sayı olan hücre oranı
-        - short_int_ratio: 1–3 haneli küçük int oranı (SIRA NO gibi)
-        - text_ratio: içinde harf geçen hücre oranı
-        - has_asal_vek: 'asaleten' / 'vekaleten' var mı
-        - has_tem_tur: 'temsilci' veya 'turu' kelimeleri var mı
-        """
         s = _safe_series(s)
         if s.empty:
             return dict(
@@ -90,6 +81,60 @@ def standardize_table_headers_with_fuzzy(
             has_tem_tur=bool(s_norm.str.contains("temsilci|turu").any()),
         )
 
+    def _parse_turkish_amount(val) -> float | None:
+        """
+        '20.237.333,33', '20.237.333.33', '1.50', '.33' gibi değerleri float'a çevirir.
+        Varsayım:
+          - Son '.' veya ',' ondalık ayracı
+          - Önceki tüm '.' ',' binlik ayırıcı
+        """
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s == "":
+            return None
+
+        # sadece rakam + ayraçlar hariç her şeyi at
+        s = re.sub(r"[^0-9\.,]", "", s)
+        if s == "":
+            return None
+
+        # '.33' -> '0.33'
+        if s.startswith(".") or s.startswith(","):
+            s = "0" + s
+
+        last_dot = s.rfind(".")
+        last_comma = s.rfind(",")
+
+        # hiç ayrac yoksa direkt parse
+        if last_dot == -1 and last_comma == -1:
+            try:
+                return float(s)
+            except ValueError:
+                return None
+
+        # son ayracı ondalık kabul et
+        if last_comma > last_dot:
+            dec_pos = last_comma
+            decimal_sep = ","
+        else:
+            dec_pos = last_dot
+            decimal_sep = "."
+
+        int_part = re.sub(r"[^\d]", "", s[:dec_pos])  # tüm ayraçları kaldır
+        frac_part = re.sub(r"[^\d]", "", s[dec_pos + 1 :])
+
+        if int_part == "" and frac_part == "":
+            return None
+        if int_part == "":
+            int_part = "0"
+
+        norm = int_part + "." + frac_part if frac_part != "" else int_part
+        try:
+            return float(norm)
+        except ValueError:
+            return None
+
     # ------------- hedef şema ve sinonimler ------------- #
     target_order = [
         "page_index",
@@ -103,7 +148,6 @@ def standardize_table_headers_with_fuzzy(
         "temsilci_turu",
         "temsilci_adi_soyadi_unvani",
         "temsilci_tckn",
-        "IMZA",
         "tablo_imza_var_mi",
     ]
 
@@ -160,14 +204,7 @@ def standardize_table_headers_with_fuzzy(
             "temsilcinin t c kimlik no su",
             "temsilcinin t c kimlik nosu",
         ],
-        "IMZA": [
-            "imza",
-            "inza",
-        ],
-        "tablo_imza_var_mi": [
-            "imza",
-            "inza",
-        ],
+        # IMZA başlığını sadece tablo_imza_var_mi için kullanacağız
     }
 
     def choose_best_source(col_target: str, source_cols: Iterable[str], used: set) -> (str, float):
@@ -178,7 +215,6 @@ def standardize_table_headers_with_fuzzy(
         syn_list = synonyms.get(col_target, [])
         syn_norm = {_normalize_name(s) for s in syn_list}
 
-        # 1) hard eşleşme
         for c in source_cols:
             if c in used:
                 continue
@@ -186,7 +222,6 @@ def standardize_table_headers_with_fuzzy(
             if n in syn_norm:
                 return c, 1.0
 
-        # 2) fuzzy
         for c in source_cols:
             if c in used:
                 continue
@@ -216,13 +251,11 @@ def standardize_table_headers_with_fuzzy(
                 page_index_col = c
                 break
 
-        # her kolon için profil hazırla
         profiles = {c: _col_profile(df[c]) for c in src_cols}
-
         used_cols = set()
         col_map: Dict[str, str] = {}
 
-        # 1) ilk fuzzy mapping
+        # 1) ilk fuzzy mapping (IMZA hariç; sadece tablo_imza_var_mi'de kullanacağız)
         for tgt in target_order:
             if tgt in ("page_index", "tablo_imza_var_mi"):
                 continue
@@ -234,7 +267,6 @@ def standardize_table_headers_with_fuzzy(
                 print(f"[WARN] '{tgt}' için fuzzy ile uygun kolon bulunamadı (best_score<{min_score})")
 
         # 2) temsilci_tckn için içerik tabanlı override
-        #    10–11 haneli sayı oranı en yüksek olan kolon
         best_tckn_col = None
         best_tcid_ratio = 0.0
         for c in src_cols:
@@ -244,7 +276,6 @@ def standardize_table_headers_with_fuzzy(
                 best_tckn_col = c
 
         if best_tckn_col is not None and best_tcid_ratio >= 0.5:
-            # eğer mevcut map yanlışsa değiştir
             if "temsilci_tckn" not in col_map or col_map["temsilci_tckn"] != best_tckn_col:
                 if debug:
                     print(f"[INFO] temsilci_tckn override -> '{best_tckn_col}' (tcid_ratio={best_tcid_ratio:.2f})")
@@ -252,7 +283,6 @@ def standardize_table_headers_with_fuzzy(
             used_cols.add(best_tckn_col)
 
         # 3) temsilci_turu için içerik tabanlı kontrol
-        #    metin ağırlıklı, numeric_ratio düşük ve 'asaleten/vekaleten/temsilci/turu' anahtar kelimeleri olan kolon
         def is_good_turu(cname: str) -> bool:
             p = profiles[cname]
             return (
@@ -261,7 +291,6 @@ def standardize_table_headers_with_fuzzy(
                 and (p["has_asal_vek"] or p["has_tem_tur"])
             )
 
-        # mevcut kolon uygunsa bırak, değilse başka ara
         cur_turu = col_map.get("temsilci_turu")
         if cur_turu is None or not is_good_turu(cur_turu):
             best_turu_col = None
@@ -293,15 +322,9 @@ def standardize_table_headers_with_fuzzy(
 
         # map edilen kolonlar
         for tgt, src in col_map.items():
-            if tgt == "IMZA":
-                col_vals = _safe_series(df[src])
-                new_df["IMZA"] = (
-                    col_vals.fillna(0)
-                    .astype(str)
-                    .str.replace(r"[^\d]", "", regex=True)
-                    .replace("", "0")
-                    .astype(int)
-                )
+            if tgt == "paylarin_toplam_itibari_degeri(tl)":
+                s_vals = _safe_series(df[src])
+                new_df[tgt] = s_vals.apply(_parse_turkish_amount)
             else:
                 new_df[tgt] = _safe_series(df[src]).values
 
@@ -332,7 +355,7 @@ def standardize_table_headers_with_fuzzy(
                     print(f"[INFO] '{col}' kolonu uyrugu için kullanıldı (TC).")
                 continue
 
-            # TCKN (pay sahibi TCKN) – temsilci_tckn'den farklı ama kural aynı
+            # Pay sahibi TCKN
             if "tckn" in new_df.columns and prof["tcid_ratio"] > 0.5:
                 empty_mask = new_df["tckn"].astype(str).str.strip().isin(["", "nan", "none"]) | new_df["tckn"].isna()
                 new_df.loc[empty_mask, "tckn"] = digits[empty_mask]
@@ -341,17 +364,34 @@ def standardize_table_headers_with_fuzzy(
                 continue
 
         # -------- tablo_imza_var_mi -------- #
-        if "IMZA" in new_df.columns:
-            has_sig = int(new_df["IMZA"].fillna(0).astype(int).max() > 0)
-        else:
-            sig_source, _ = choose_best_source("tablo_imza_var_mi", src_cols, used=set())
-            if sig_source is not None and df[sig_source].notna().any():
-                has_sig = 1
-            else:
-                has_sig = 0
-        new_df["tablo_imza_var_mi"] = has_sig
+        # IMZA/INZA başlığını bul ve sadece sayfa bazında flag üret
+        imza_source = None
+        for c in src_cols:
+            n = _normalize_name(c)
+            if n in {_normalize_name("imza"), _normalize_name("inza")}:
+                imza_source = c
+                break
 
+        if imza_source is not None:
+            s_imza = _safe_series(df[imza_source])
+            try:
+                img_flag = int(
+                    s_imza.fillna(0)
+                    .astype(str)
+                    .str.replace(r"[^\d]", "", regex=True)
+                    .replace("", "0")
+                    .astype(int)
+                    .max()
+                    > 0
+                )
+            except Exception:
+                img_flag = 1 if s_imza.notna().any() else 0
+        else:
+            img_flag = 0
+
+        new_df["tablo_imza_var_mi"] = img_flag
         new_df = new_df[target_order]
+
         standardized_pages.append(new_df)
 
     return standardized_pages
