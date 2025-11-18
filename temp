@@ -1,115 +1,165 @@
-import numpy as np
 import pandas as pd
+import re
 from difflib import SequenceMatcher
+from typing import List
 
-def mark_signatures_on_imza_column(
-    table_dfs,
-    page_cells_all,
-    sig_boxes,
-    signature_header_target="IMZA",   # veya "İMZA"
-    iou_threshold=0.05,
-    fuzzy_min_score=0.7,
-):
+def standardize_hazirun_tables_fuzzy(
+    table_dfs_marked: List[pd.DataFrame],
+    page_col: str = "page_index",
+    imza_keywords=("imza", "inza"),
+    min_score: float = 0.65,
+) -> List[pd.DataFrame]:
     """
-    table_dfs      : list[pd.DataFrame]  -> her sayfanın tablosu
-    page_cells_all : list[list[dict]]    -> her sayfa için hücreler
-    sig_boxes      : YOLO imza çıktısı listesi
+    table_dfs_marked içindeki her DF'in kolonlarını, fuzzy + keyword kullanarak
+    standart hazırun şemasına map eder ve tamamen boş satırları siler.
+
+    Dönüş: List[pd.DataFrame]
+        Her DF şu kolonları içerir:
+        [page_index,
+         pay_sahibinin_adi_soyadi_unvani,
+         tckn,
+         uyrugu,
+         adresi,
+         paylarin_toplam_itibari_degeri,
+         paylarin_edinim_sekli_tarihi,
+         katilim_sekli,
+         temsilci_turu,
+         temsilci_adi_soyadi_unvani,
+         temsilci_tckn,
+         tablo_imza_var_mi]
     """
 
-    # 1) Sig kutularını normalize et
-    norm_sigs = []
-    for sb in sig_boxes:
-        img_idx = sb.get("image_index", 0)
-        for b in sb.get("boxes", []):
-            xyxy = b.get("xyxy") or b.get("bbox") or b
-            x1, y1, x2, y2 = map(float, xyxy)
-            norm_sigs.append(
-                {
-                    "image_index": img_idx,
-                    "x_min": x1,
-                    "y_min": y1,
-                    "x_max": x2,
-                    "y_max": y2,
-                }
-            )
+    # Hedef feature adları ve bunlara karşılık gelen "ideal" header metinleri
+    target_headers = {
+        "pay_sahibinin_adi_soyadi_unvani": "pay sahibinin adi soyadi unvani",
+        "tckn":                            "t c v k no tc kimlik no",
+        "uyrugu":                          "uyrugu uyruk",
+        "adresi":                          "adres",
+        "paylarin_toplam_itibari_degeri":  "paylarin toplam itibari degeri tl nominal",
+        "paylarin_edinim_sekli_tarihi":    "paylarin edinim sekli ve tarihi",
+        "katilim_sekli":                   "katilim sekli asaleten vekaleten",
+        "temsilci_turu":                   "temsilci turu katilim sekli temsilci turu",
+        "temsilci_adi_soyadi_unvani":      "temsilcinin adi soyadi unvani",
+        "temsilci_tckn":                   "temsilcinin t c kimlik vergi no",
+        "tablo_imza_var_mi":               "imza",
+    }
 
-    def iou_cell_sig(cell, sig):
-        xA = max(cell["x"], sig["x_min"])
-        yA = max(cell["y"], sig["y_min"])
-        xB = min(cell["x"] + cell["w"], sig["x_max"])
-        yB = min(cell["y"] + cell["h"], sig["y_max"])
+    # Hedef kolon sırası
+    target_order = [
+        "pay_sahibinin_adi_soyadi_unvani",
+        "tckn",
+        "uyrugu",
+        "adresi",
+        "paylarin_toplam_itibari_degeri",
+        "paylarin_edinim_sekli_tarihi",
+        "katilim_sekli",
+        "temsilci_turu",
+        "temsilci_adi_soyadi_unvani",
+        "temsilci_tckn",
+        "tablo_imza_var_mi",
+    ]
 
-        inter_w = max(0.0, xB - xA)
-        inter_h = max(0.0, yB - yA)
-        inter = inter_w * inter_h
-        if inter <= 0:
-            return 0.0
+    def _norm(s: str) -> str:
+        s = str(s or "").lower().strip()
+        tr_map = str.maketrans("çğıöşüı", "cgiosui")
+        s = s.translate(tr_map)
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-        area_cell = float(cell["w"] * cell["h"])
-        area_sig = float((sig["x_max"] - sig["x_min"]) * (sig["y_max"] - sig["y_min"]))
-        return inter / (area_cell + area_sig - inter)
+    def _similar(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio()
 
-    def fuzzy_best_col(columns, target):
-        best_col = None
-        best_score = 0.0
-        t = target.upper()
-        for col in columns:
-            s = SequenceMatcher(None, str(col).upper(), t).ratio()
-            if s > best_score:
-                best_score = s
-                best_col = col
-        return best_col, best_score
+    std_dfs: List[pd.DataFrame] = []
 
-    result_dfs = []
+    for df in table_dfs_marked:
+        df = df.copy()
 
-    for page_index, df in enumerate(table_dfs):
-        if df is None or df.empty:
-            result_dfs.append(df)
-            continue
+        # Kaynak kolonlar (page_index hariç)
+        src_cols = [c for c in df.columns if c != page_col]
+        src_norm = {c: _norm(c) for c in src_cols}
 
-        # imza kolonunu fuzzy ile bul (page_index hariç)
-        data_cols = [c for c in df.columns if c != "page_index"]
-        sig_col_name, score = fuzzy_best_col(data_cols, signature_header_target)
-        if sig_col_name is None or score < fuzzy_min_score:
-            # imza başlığı bulunamadı → aynen bırak
-            result_dfs.append(df)
-            continue
+        used_src = set()
+        mapping = {}  # target_name -> src_col or None
 
-        sig_col_pos = data_cols.index(sig_col_name)
+        # Önce IMZA kolonunu özel olarak bul
+        imza_src = None
+        for c in src_cols:
+            n = src_norm[c]
+            if any(k in n for k in imza_keywords):
+                imza_src = c
+                used_src.add(c)
+                break
+        mapping["tablo_imza_var_mi"] = imza_src  # şimdilik; None olabilir
 
-        # İMZA kolonunu 0/1'e çevirmeye hazırlık
-        df[sig_col_name] = 0
+        # Diğer target kolonlar için fuzzy eşleme
+        for tgt in target_order:
+            if tgt == "tablo_imza_var_mi":
+                continue  # IMZA'yı yukarıda yaptık
 
-        cells = page_cells_all[page_index]
-        page_sigs = [s for s in norm_sigs if s["image_index"] == page_index]
+            tgt_pattern = _norm(target_headers[tgt])
+            best_col = None
+            best_score = 0.0
 
-        if not cells or not page_sigs:
-            result_dfs.append(df)
-            continue
-
-        # sadece imza kolonundaki hücrelere bak
-        for sig in page_sigs:
-            for cell in cells:
-                if cell["col"] != sig_col_pos:
+            for c in src_cols:
+                if c in used_src:
                     continue
-                ov = iou_cell_sig(cell, sig)
-                if ov > iou_threshold:
-                    row_idx = cell["row"]
-                    if row_idx in df.index:
-                        df.at[row_idx, sig_col_name] = 1
+                score = _similar(src_norm[c], tgt_pattern)
+                if score > best_score:
+                    best_score = score
+                    best_col = c
 
-        result_dfs.append(df)
+            # Yeterli benzerlik varsa ata, yoksa None bırak
+            if best_col is not None and best_score >= min_score:
+                mapping[tgt] = best_col
+                used_src.add(best_col)
+            else:
+                mapping[tgt] = None
 
-    return result_dfs
+        # tablodaki IMZA kolonunu hâlâ bulamadıysak, en yüksek "imza" benzerliğine göre ara
+        if mapping["tablo_imza_var_mi"] is None:
+            tgt_pattern = _norm(target_headers["tablo_imza_var_mi"])
+            best_col, best_score = None, 0.0
+            for c in src_cols:
+                if c in used_src:
+                    continue
+                score = _similar(src_norm[c], tgt_pattern)
+                if score > best_score:
+                    best_score, best_col = score, c
+            if best_col is not None and best_score >= min_score:
+                mapping["tablo_imza_var_mi"] = best_col
+                used_src.add(best_col)
 
-table_dfs_marked = mark_signatures_on_imza_column(
-    table_dfs=table_df,          # build_tables_from_pages çıktısı (list of df)
-    page_cells_all=page_cells_all,
-    sig_boxes=sig_boxes,
-    signature_header_target="İMZA",  # başlıkta nasılsa
-    iou_threshold=0.05,
-    fuzzy_min_score=0.7,
-)
+        # --- Yeni standart DF'i oluştur ---
+        std = pd.DataFrame()
+        std[page_col] = df[page_col].values
 
-for df in table_dfs_marked:
-    display(df)
+        for tgt in target_order:
+            src = mapping.get(tgt)
+            if src is not None and src in df.columns:
+                std[tgt] = df[src].values
+            else:
+                std[tgt] = pd.NA
+
+        # --- Tamamen boş satırları sil (page_index + tablo_imza_var_mi hariç) ---
+        cols_to_check = [c for c in std.columns
+                         if c not in (page_col, "tablo_imza_var_mi")]
+
+        if cols_to_check:
+            tmp = std[cols_to_check].astype(str)
+
+            # whitespace + "nan"/"None" temizliği
+            tmp = (tmp.apply(lambda s: s.str.replace(r"\s+", "", regex=True))
+                     .replace({"nan": "", "None": ""}))
+
+            mask_not_empty = ~tmp.eq("").all(axis=1)
+            std = std.loc[mask_not_empty].reset_index(drop=True)
+
+        std_dfs.append(std)
+
+    return std_dfs
+
+tables_df = standardize_hazirun_tables_fuzzy(table_dfs_marked)
+
+for t in tables_df:
+    display(t)
