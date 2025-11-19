@@ -1,26 +1,34 @@
-def map_df(df: pd.DataFrame) -> pd.DataFrame:
-
-    # --- 0) Duplicate column fix ---
-    # Eğer aynı header birden fazla kez geldiyse .1, .2 gibi suffix ekleyerek düzelt
-    df = df.copy()
-    df.columns = pd.io.parsers.ParserBase({'names': df.columns})._maybe_dedup_names(df.columns)
-
-    # Normalization
-    norm_cols = {c: norm(c) for c in df.columns}
-    best: Dict[str, Tuple[str, float]] = {}
-
 import re
 import unicodedata
-import pandas as pd
-from rapidfuzz import fuzz
 from typing import List, Dict, Tuple
 
+import pandas as pd
+from rapidfuzz import fuzz
 
-def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
-                                 match_threshold: float = 65.0
-                                ) -> List[pd.DataFrame]:
 
-    # ---------------- Normalizasyon yardımcıları ----------------
+def standardize_table_columns(
+    table_dfs_cleaned: List[pd.DataFrame],
+    match_threshold: float = 65.0,
+) -> List[pd.DataFrame]:
+    """
+    Hazırun tablolarındaki kolon adlarını normalize edip ortak şemaya çevirir.
+
+    Ortak şema:
+        page_index
+        pay_sahibinin_adi_soyadi_unvani
+        pay_sahibi_tckn
+        pay_sahibi_uyrugu
+        pay_sahibi_adresi
+        pay_adedi
+        paylarin_toplam_itibari_degeri
+        paylarin_edinin_sekli_tarihi
+        katilim_sekli
+        temsilci_adi_soyadi_unvani
+        temsilci_tckn
+        tablo_imza_var_mi
+    """
+
+    # ---------------- 1) Normalizasyon yardımcıları ----------------
     TR_MAP = str.maketrans({
         "İ": "I", "I": "I", "ı": "i", "i": "i",
         "Ş": "S", "ş": "s",
@@ -42,13 +50,13 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
-    def jaccard(a, b):
+    def jaccard(a: str, b: str) -> float:
         a_set, b_set = set(a.split()), set(b.split())
         if not a_set or not b_set:
             return 0.0
         return len(a_set & b_set) / len(a_set | b_set)
 
-    # ---------------- Canonical şema ----------------
+    # ---------------- 2) Canonical şema ----------------
     canonical_schema = [
         ("page_index", "page index sayfa no sira"),
         ("pay_sahibinin_adi_soyadi_unvani",
@@ -74,8 +82,14 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
     ]
     canonical_names = [c[0] for c in canonical_schema]
 
-    # ---------------- Değer dönüştürme helperları ----------------
+    # ---------------- 3) Değer dönüştürme helperları ----------------
     def parse_tl_value(x):
+        """
+        '11.000.000,15'   -> 11000000.15
+        '11.000.000'      -> 11000000.00
+        '20,5'            -> 20.50
+        '20.5'            -> 20.50 (fallback)
+        """
         if pd.isna(x):
             return pd.NA
         if isinstance(x, (int, float)):
@@ -86,10 +100,11 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
             return pd.NA
         s = s.replace(" ", "")
 
+        # TR stili: virgül ondalık
         if "," in s:
             idx = s.rfind(",")
             int_part = re.sub(r"\D", "", s[:idx]) or "0"
-            frac_raw = re.sub(r"\D", "", s[idx+1:])
+            frac_raw = re.sub(r"\D", "", s[idx + 1:])
             if frac_raw == "":
                 frac = "00"
             elif len(frac_raw) == 1:
@@ -98,15 +113,19 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
                 frac = frac_raw[:2]
             return float(int(int_part)) + int(frac) / 100.0
 
+        # Nokta var mı?
         if "." in s:
             parts = s.split(".")
             if len(parts) > 2:
+                # çok noktalı -> binlik ayraç kabul et
                 digits = re.sub(r"\D", "", s)
                 return float(int(digits)) if digits else pd.NA
             before, after = parts
+            # 1.308.980 gibi durum: 3 haneli ve uzun integer -> binlik
             if len(after) == 3 and len(before) > 3 and after.isdigit():
                 digits = re.sub(r"\D", "", s)
                 return float(int(digits)) if digits else pd.NA
+            # yoksa '.' ondalık
             int_part = re.sub(r"\D", "", before) or "0"
             frac_raw = re.sub(r"\D", "", after)
             if frac_raw == "":
@@ -117,10 +136,12 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
                 frac = frac_raw[:2]
             return float(int(int_part)) + int(frac) / 100.0
 
+        # Ne . ne , yok
         digits = re.sub(r"\D", "", s)
         return float(int(digits)) if digits else pd.NA
 
     def format_pay_adedi_str(x):
+        """Pay adedini '11.000.000' formatında stringe çevir."""
         if pd.isna(x):
             return pd.NA
         s = str(x).strip()
@@ -130,13 +151,14 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
         num = int(digits)
         return format(num, ",").replace(",", ".")
 
-    # ---------------- İçerik bazlı tckn/uyruk heuristikleri ----------------
+    # ---------------- 4) Seri bazlı TCKN / uyruk heuristikleri ----------------
     def looks_like_tckn_series(s: pd.Series) -> bool:
         vals = s.astype(str).str.replace(r"\D", "", regex=True)
         non_empty = vals != ""
         if non_empty.mean() < 0.7:
             return False
         lengths = vals[non_empty].str.len()
+        # çoğunlukla 10–11 haneli numeric
         return (lengths.between(10, 11).mean() > 0.7)
 
     def looks_like_uyruk_series(s: pd.Series) -> bool:
@@ -148,17 +170,32 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
         # kısa stringler
         if (vals.str.len() <= 5).mean() < 0.7:
             return False
-        # harf ağırlıklı veya TC benzeri
-        letters_ratio = vals.str.replace(r"[^A-Za-z]", "", regex=True).str.len() / vals.str.len()
-        tc_like = vals.str.replace(".", "", regex=False).str.upper().isin(["TC", "T C", "TÜRKIYE", "TURKIYE"])
-        return (letters_ratio.mean() > 0.5) or (tc_like.mean() > 0.3)
+        letters = vals.str.replace(r"[^A-Za-z]", "", regex=True).str.len()
+        letters_ratio = (letters / vals.str.len()).mean()
+        tc_like = vals.str.replace(".", "", regex=False).str.upper().isin(
+            ["TC", "T C", "TURKIYE", "TÜRKIYE"]
+        )
+        return (letters_ratio > 0.5) or (tc_like.mean() > 0.3)
 
-    # ---------------- Tek DF kolon eşleme ----------------
+    # ---------------- 5) Tek DF kolon eşleme ----------------
     def map_df(df: pd.DataFrame) -> pd.DataFrame:
+        # 5.0 Duplicate column isimlerini tekilleştir
+        df = df.copy()
+        new_cols = []
+        seen: Dict[str, int] = {}
+        for col in df.columns:
+            if col not in seen:
+                seen[col] = 0
+                new_cols.append(col)
+            else:
+                seen[col] += 1
+                new_cols.append(f"{col}.{seen[col]}")
+        df.columns = new_cols
+
         norm_cols = {c: norm(c) for c in df.columns}
         best: Dict[str, Tuple[str, float]] = {}
 
-        # 1) Kural tabanlı
+        # 5.1 Header tabanlı kurallar
         for c, n in norm_cols.items():
 
             # İmza
@@ -177,7 +214,7 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
             if "temsilci" not in n and any(k in n for k in ["tc", "tck", "kimlik", "vkn"]):
                 best["pay_sahibi_tckn"] = (c, 100.0)
 
-            # Pay sahibi uyrugu (header)
+            # Pay sahibi uyrugu (header’da uyruk geçiyorsa)
             if "uyruk" in n or "uyrugu" in n:
                 best["pay_sahibi_uyrugu"] = (c, 100.0)
 
@@ -185,7 +222,7 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
             if "pay" in n and any(k in n for k in ["adet", "adedi", "sayisi", "lot"]):
                 best["pay_adedi"] = (c, 100.0)
 
-            # PAY SAHİBİNİN ADI SOYADI ÜNVAN
+            # PAY SAHİBİNİN ADI SOYADI ÜNVAN (header tam match)
             if (
                 "pay" in n and "sahib" in n and
                 "adi" in n and ("soyadi" in n or "soyad" in n) and
@@ -195,13 +232,13 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
 
         tckn_col = best.get("pay_sahibi_tckn", (None, None))[0]
 
-        # 2) Fuzzy + jaccard
+        # 5.2 Fuzzy + jaccard
         for c, n_c in norm_cols.items():
             for canon_name, canon_desc in canonical_schema:
                 if canon_name in best and best[canon_name][1] >= 100:
                     continue
 
-                # uyruk için tckn tipli kolonları aday yapma
+                # uyruk için: tckn tipli kolonları aday yapma
                 if canon_name == "pay_sahibi_uyrugu":
                     if c == tckn_col:
                         continue
@@ -219,7 +256,7 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
                     if canon_name not in best or score > best[canon_name][1]:
                         best[canon_name] = (c, score)
 
-        # 3) Uyruk kısa-TC fallback (header yoksa)
+        # 5.3 Uyruk kısa-TC fallback (header yoksa)
         if "pay_sahibi_uyrugu" not in best:
             for c in df.columns:
                 if c == tckn_col:
@@ -234,31 +271,30 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
                             best["pay_sahibi_uyrugu"] = (c, 95.0)
                             break
 
-        # 4) İçerik bazlı düzeltme (duplicate header case)
-        #    - tckn kolonunu değerlerden tespit et
-        #    - uyruk kolonunu kısa/harf ağırlıklı değerlerden tespit et
+        # 5.4 İçerik bazlı düzeltme (duplicate header / karışık case)
         tckn_guess = None
         uyruk_guess = None
         for c in df.columns:
             s = df[c]
+            if not isinstance(s, pd.Series):
+                continue
             if looks_like_tckn_series(s):
-                tckn_guess = c if tckn_guess is None else tckn_guess
+                if tckn_guess is None:
+                    tckn_guess = c
             if looks_like_uyruk_series(s):
                 if uyruk_guess is None:
                     uyruk_guess = c
 
         if tckn_guess is not None:
-            # eğer tckn map edilmemişse ya da yanlışsa, düzelt
             if ("pay_sahibi_tckn" not in best) or (best["pay_sahibi_tckn"][0] != tckn_guess):
                 best["pay_sahibi_tckn"] = (tckn_guess, 99.0)
             tckn_col = tckn_guess
 
         if uyruk_guess is not None and uyruk_guess != tckn_col:
-            # eğer uyruk yoksa ya da tckn kolonuna eşitlenmişse, düzelt
             if ("pay_sahibi_uyrugu" not in best) or (best["pay_sahibi_uyrugu"][0] == tckn_col):
                 best["pay_sahibi_uyrugu"] = (uyruk_guess, 98.0)
 
-        # 5) Yeni DF
+        # 5.5 Yeni DF'yi ortak şemaya göre kur
         new_df = pd.DataFrame()
         for canon in canonical_names:
             if canon in best:
@@ -266,7 +302,7 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
             else:
                 new_df[canon] = pd.NA
 
-        # 6) Değer dönüşümleri
+        # 5.6 Değer dönüşümleri
         if "paylarin_toplam_itibari_degeri" in new_df.columns:
             new_df["paylarin_toplam_itibari_degeri"] = \
                 new_df["paylarin_toplam_itibari_degeri"].apply(parse_tl_value)
@@ -276,5 +312,6 @@ def standardize_table_columns_v8(table_dfs_cleaned: List[pd.DataFrame],
 
         return new_df
 
-    # 7) Tüm df listesine uygula
-    return [map_df(df) for df in table_dfs_cleaned]
+    # ---------------- 6) Tüm DF listesine uygula ----------------
+    standardized = [map_df(df) for df in table_dfs_cleaned]
+    return standardized
