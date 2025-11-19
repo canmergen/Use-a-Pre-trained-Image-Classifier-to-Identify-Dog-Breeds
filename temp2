@@ -4,30 +4,27 @@ from typing import List, Dict, Tuple
 import pandas as pd
 from rapidfuzz import fuzz
 
-def standardize_table_columns(table_dfs_cleaned: List[pd.DataFrame],
-                              match_threshold: float = 70.0
-                              ) -> List[pd.DataFrame]:
+def standardize_table_columns_v2(table_dfs_cleaned: List[pd.DataFrame],
+                                 match_threshold: float = 65.0
+                                 ) -> List[pd.DataFrame]:
     """
     table_dfs_cleaned içindeki df'lerin kolon adlarını tek şemaya çevirir.
 
-    Dönüş: Aynı uzunlukta liste, her df'te kolonlar:
-        [
-            "page_index",
-            "pay_sahibinin_adi_soyadi_unvani",
-            "pay_sahibi_tckn",
-            "pay_sahibi_uyrugu",
-            "pay_sahibi_adresi",
-            "paylarin_toplam_itibari_degeri",
-            "paylarin_edinin_sekli_tarihi",
-            "katilim_sekli",
-            "temsilci_adi_soyadi_unvani",
-            "temsilci_tckn",
-            "tablo_imza_var_mi",
-        ]
-    Olmayan kolonlar NaN ile doldurulur.
+    Hedef kolonlar:
+        page_index
+        pay_sahibinin_adi_soyadi_unvani
+        pay_sahibi_tckn
+        pay_sahibi_uyrugu
+        pay_sahibi_adresi
+        paylarin_toplam_itibari_degeri
+        paylarin_edinin_sekli_tarihi
+        katilim_sekli
+        temsilci_adi_soyadi_unvani
+        temsilci_tckn
+        tablo_imza_var_mi
     """
 
-    # ---- 1) Türkçe normalizasyon & token çıkarma ----
+    # --- 1) Normalizasyon yardımcıları ---
     TR_MAP = str.maketrans({
         "İ": "I", "I": "I", "ı": "i", "i": "i",
         "Ş": "S", "ş": "s",
@@ -37,38 +34,34 @@ def standardize_table_columns(table_dfs_cleaned: List[pd.DataFrame],
         "Ç": "C", "ç": "c",
     })
 
-    def normalize(s: str) -> str:
+    def norm_col(s: str) -> str:
         if not isinstance(s, str):
             return ""
         s = s.translate(TR_MAP)
         s = unicodedata.normalize("NFKD", s)
         s = "".join(ch for ch in s if not unicodedata.combining(ch))
         s = s.lower()
-        # harf, rakam ve boşluk dışını at
+        s = s.replace("t.c.", "tc").replace("t.c", "tc")
         s = re.sub(r"[^a-z0-9\s]+", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
     def token_set(s: str) -> set:
-        return set(normalize(s).split())
+        return set(norm_col(s).split())
 
     def jaccard(a: str, b: str) -> float:
         ta, tb = token_set(a), token_set(b)
         if not ta or not tb:
             return 0.0
-        inter = len(ta & tb)
-        union = len(ta | tb)
-        return inter / union
+        return len(ta & tb) / len(ta | tb)
 
-    # ---- 2) Hedef şema & hedef açıklamaları ----
-    # Açıklamaları geniş tuttum ki fuzzy + jaccard iyi yakalasın
+    # --- 2) Hedef şema tanımı ---
     canonical_schema: List[Tuple[str, str]] = [
-        ("page_index",
-         "page index sayfa no sira"),
+        ("page_index", "page index sayfa no sira"),
         ("pay_sahibinin_adi_soyadi_unvani",
          "pay sahibinin adi soyadi unvani isim pay sahibi ad soyad"),
         ("pay_sahibi_tckn",
-         "pay sahibi tckn tc kimlik vergi kimlik numarasi t c vkn"),
+         "pay sahibi tc kimlik tckn vergi kimlik vkn no pay sahibi"),
         ("pay_sahibi_uyrugu",
          "pay sahibi uyrugu uyruk nationality"),
         ("pay_sahibi_adresi",
@@ -80,64 +73,95 @@ def standardize_table_columns(table_dfs_cleaned: List[pd.DataFrame],
         ("katilim_sekli",
          "katilim sekli katilma sekli"),
         ("temsilci_adi_soyadi_unvani",
-         "temsilci adi soyadi unvani vekil ad soyad"),
+         "temsilci temsilcinin adi soyadi unvani vekil ad soyad"),
         ("temsilci_tckn",
-         "temsilci tckn tc kimlik vergi kimlik numarasi vekil t c vkn"),
+         "temsilci temsilcinin tc kimlik tckn vergi kimlik vkn no vekil"),
         ("tablo_imza_var_mi",
          "imza tablo imza var mi signature"),
     ]
-
     canonical_names = [c[0] for c in canonical_schema]
 
-    # ---- 3) Tek kolon için en iyi hedefi bul ----
-    def best_match(col_name: str) -> Tuple[str, float]:
-        best_canon = None
-        best_score = -1.0
-        norm_col = normalize(col_name)
+    # --- 3) Tek df için kolon eşleme ---
+    def map_columns(df: pd.DataFrame) -> pd.DataFrame:
+        src_cols = list(df.columns)
+        norm_map = {c: norm_col(c) for c in src_cols}
 
-        for canon_name, canon_desc in canonical_schema:
-            norm_canon = normalize(canon_desc)
-            # fuzzy + jaccard birleştir
-            fuzzy_score = fuzz.token_set_ratio(norm_col, norm_canon)  # 0–100
-            j_score = jaccard(norm_col, norm_canon) * 100.0           # 0–100
-            score = 0.6 * fuzzy_score + 0.4 * j_score
-            if score > best_score:
-                best_score = score
-                best_canon = canon_name
-        return best_canon, best_score
+        # canonical -> (best_src_col, best_score)
+        best_for_canon: Dict[str, Tuple[str, float]] = {}
 
-    standardized_dfs: List[pd.DataFrame] = []
+        # 3.1 KURAL TABANLI EŞLEŞME (kritik kolonlar)
+        for c in src_cols:
+            n = norm_map[c]
 
-    # ---- 4) Her df için kolonları map et ----
-    for df in table_dfs_cleaned:
-        col_map: Dict[str, str] = {}  # src_col -> canonical_name
+            # İMZA
+            if "imza" in n:
+                _update_best(best_for_canon, "tablo_imza_var_mi", c, 100.0)
 
-        for src_col in df.columns:
-            canon, score = best_match(src_col)
-            if score >= match_threshold:
-                # Aynı canonical'a iki kolon map olursa, en yüksek skorluya öncelik verilebilir.
-                # Basitçe ilk geleni koruyoruz; istersen skor bazlı seçim de ekleyebilirsin.
-                if canon not in col_map.values():
-                    col_map[src_col] = canon
+            # TEMSİLCİ TCKN
+            if "temsilci" in n and any(t in n for t in ["tc", "tck", "vkn", "vergi", "kimlik"]):
+                _update_best(best_for_canon, "temsilci_tckn", c, 100.0)
 
-        # Yeni df'yi hedef şemaya göre kur
+            # TEMSİLCİ AD SOYAD
+            if "temsilci" in n and any(t in n for t in ["adi", "ad", "soyadi", "soyad", "unvani", "unvan"]):
+                _update_best(best_for_canon, "temsilci_adi_soyadi_unvani", c, 100.0)
+
+            # PAY SAHİBİ TCKN (temsilci geçmiyorsa)
+            if "temsilci" not in n and any(t in n for t in ["tc", "tck", "vkn", "vergi", "kimlik"]):
+                _update_best(best_for_canon, "pay_sahibi_tckn", c, 100.0)
+
+            # PAY SAHİBİ UYRUGU
+            if any(t in n for t in ["uyruk", "uyrugu"]):
+                _update_best(best_for_canon, "pay_sahibi_uyrugu", c, 100.0)
+
+        # 3.2 Fuzzy + Jaccard (kalan canonicallar için)
+        for c in src_cols:
+            n_col = norm_map[c]
+            if not n_col:
+                continue
+
+            for canon_name, canon_desc in canonical_schema:
+                # eğer bu canonical zaten kural tabanlı 100 puanla doldurulduysa,
+                # skor çok düşükse zorlamaya gerek yok
+                prev = best_for_canon.get(canon_name)
+                if prev is not None and prev[1] >= 100.0:
+                    continue
+
+                n_canon = norm_col(canon_desc)
+                fuzzy_score = fuzz.token_set_ratio(n_col, n_canon)  # 0–100
+                j_score = jaccard(n_col, n_canon) * 100.0
+                score = 0.6 * fuzzy_score + 0.4 * j_score
+
+                if score >= match_threshold:
+                    _update_best(best_for_canon, canon_name, c, score)
+
+        # 3.3 Yeni df'yi kur
         new_df = pd.DataFrame()
-
         for canon_name in canonical_names:
-            # bu canonical için bir kaynak kolon bulunmuş mu?
-            src_candidates = [s for s, c in col_map.items() if c == canon_name]
-            if src_candidates:
-                src = src_candidates[0]
+            src, _ = best_for_canon.get(canon_name, (None, None))
+            if src is not None and src in df.columns:
                 new_df[canon_name] = df[src]
             else:
-                # yoksa boş kolon
                 new_df[canon_name] = pd.NA
 
-        standardized_dfs.append(new_df)
+        return new_df
 
-    return standardized_dfs
+    # küçük yardımcı: her canonical için en yüksek skoru sakla
+    def _update_best(best_dict: Dict[str, Tuple[str, float]],
+                     canon_name: str,
+                     src_col: str,
+                     score: float):
+        prev = best_dict.get(canon_name)
+        if (prev is None) or (score > prev[1]):
+            best_dict[canon_name] = (src_col, score)
 
-std_table_dfs = standardize_table_columns(table_dfs_cleaned, match_threshold=70)
+    # fonksiyon içinden erişebilmesi için yeniden tanımlama
+    def _wrap_update(*args, **kwargs):
+        return _update_best(*args, **kwargs)
 
-# Örnek: ilk tabloyu gör
-display(std_table_dfs[0].head())
+    # closure hilesi: map_columns içinde kullanacağız
+    global _update_best
+    _update_best = _wrap_update
+
+    # --- 4) Tüm df listesine uygula ---
+    standardized = [map_columns(df) for df in table_dfs_cleaned]
+    return standardized
