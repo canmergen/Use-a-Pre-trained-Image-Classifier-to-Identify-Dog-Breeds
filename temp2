@@ -5,26 +5,14 @@ from rapidfuzz import fuzz
 from typing import List, Dict, Tuple
 
 
-def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
+def standardize_table_columns_v6(table_dfs_cleaned: List[pd.DataFrame],
                                  match_threshold: float = 65.0
                                 ) -> List[pd.DataFrame]:
     """
     Hazırun tablo dataframe'lerinin kolon adlarını normalize eder ve
-    ortak şemaya map eder.
-
-    Hedef kolonlar:
-        page_index
-        pay_sahibinin_adi_soyadi_unvani
-        pay_sahibi_tckn
-        pay_sahibi_uyrugu
-        pay_sahibi_adresi
-        pay_adedi
-        paylarin_toplam_itibari_degeri
-        paylarin_edinin_sekli_tarihi
-        katilim_sekli
-        temsilci_adi_soyadi_unvani
-        temsilci_tckn
-        tablo_imza_var_mi
+    ortak şemaya map eder. Ayrıca:
+      - paylarin_toplam_itibari_degeri: float (TL, 2 hane kuruş)
+      - pay_adedi: string, binlik ayraçlı '11.000.000' formatında
     """
 
     # -------------------------------------------------------
@@ -86,7 +74,78 @@ def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
     canonical_names = [c[0] for c in canonical_schema]
 
     # -------------------------------------------------------
-    # 3) Tek DF kolon eşleme
+    # 3) Değer dönüştürme helperları
+    # -------------------------------------------------------
+    def parse_tl_value(x):
+        """
+        '11.000.000,15'   -> 11000000.15
+        '11.000.000'      -> 11000000.00
+        '20,5'            -> 20.50
+        '20.5'            -> 20.50 (fallback)
+        """
+        if pd.isna(x):
+            return pd.NA
+        if isinstance(x, (int, float)):
+            return float(x)
+
+        s = str(x).strip()
+        if s == "":
+            return pd.NA
+        s = s.replace(" ", "")
+
+        # TR stili: virgül varsa son virgül ondalık diye düşün
+        if "," in s:
+            idx = s.rfind(",")
+            int_part = re.sub(r"\D", "", s[:idx]) or "0"
+            frac_raw = re.sub(r"\D", "", s[idx+1:])
+            if frac_raw == "":
+                frac = "00"
+            elif len(frac_raw) == 1:
+                frac = frac_raw + "0"
+            else:
+                frac = frac_raw[:2]
+            return float(int(int_part)) + int(frac) / 100.0
+
+        # Virgül yok; nokta var mı?
+        if "." in s:
+            parts = s.split(".")
+            if len(parts) > 2:
+                # birden çok nokta -> binlik ayraç gibi, ondalık yok
+                digits = re.sub(r"\D", "", s)
+                return float(int(digits)) if digits else pd.NA
+            before, after = parts
+            # '11.000' gibi (3 haneli ve uzun integer) -> binlik ayraç
+            if len(after) == 3 and len(before) > 3 and after.isdigit():
+                digits = re.sub(r"\D", "", s)
+                return float(int(digits)) if digits else pd.NA
+            # yoksa '.' ondalık kabul
+            int_part = re.sub(r"\D", "", before) or "0"
+            frac_raw = re.sub(r"\D", "", after)
+            if frac_raw == "":
+                frac = "00"
+            elif len(frac_raw) == 1:
+                frac = frac_raw + "0"
+            else:
+                frac = frac_raw[:2]
+            return float(int(int_part)) + int(frac) / 100.0
+
+        # ne . ne , yok -> sade integer
+        digits = re.sub(r"\D", "", s)
+        return float(int(digits)) if digits else pd.NA
+
+    def format_pay_adedi_str(x):
+        if pd.isna(x):
+            return pd.NA
+        s = str(x).strip()
+        digits = re.sub(r"\D", "", s)
+        if digits == "":
+            return s  # olduğu gibi bırak
+        num = int(digits)
+        # 11,000,000 -> 11.000.000
+        return format(num, ",").replace(",", ".")
+
+    # -------------------------------------------------------
+    # 4) Tek DF kolon eşleme
     # -------------------------------------------------------
     def map_df(df: pd.DataFrame) -> pd.DataFrame:
         norm_cols = {c: norm(c) for c in df.columns}
@@ -94,7 +153,7 @@ def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
         # canonical -> (best_src, best_score)
         best: Dict[str, Tuple[str, float]] = {}
 
-        # --- Kural tabanlı eşleşme ---
+        # 4.1 Kural tabanlı eşleşme
         for c, n in norm_cols.items():
 
             # İmza
@@ -106,22 +165,22 @@ def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
                 best["temsilci_tckn"] = (c, 100.0)
 
             # Temsilci isim
-            if "temsilci" in n and any(k in n for k in ["adi", "ad", "soyadi", "unvani"]):
+            if "temsilci" in n and any(k in n for k in ["ad", "soyad", "unvani"]):
                 best["temsilci_adi_soyadi_unvani"] = (c, 100.0)
 
             # Pay sahibi TCKN (temsilci olmayan)
             if "temsilci" not in n and any(k in n for k in ["tc", "tck", "kimlik", "vkn"]):
                 best["pay_sahibi_tckn"] = (c, 100.0)
 
-            # Pay sahibi uyrugu
+            # Pay sahibi uyrugu (header'da uyruk geçiyorsa)
             if "uyruk" in n or "uyrugu" in n:
                 best["pay_sahibi_uyrugu"] = (c, 100.0)
 
-            # Pay adedi – "pay" + "adet / sayisi / adedi / lot"
-            if "pay" in n and any(k in n for k in ["adet", "sayisi", "adedi", "lot"]):
+            # Pay adedi
+            if "pay" in n and any(k in n for k in ["adet", "adedi", "sayisi", "lot"]):
                 best["pay_adedi"] = (c, 100.0)
 
-        # --- Fuzzy + Jaccard ile kalanların doldurulması ---
+        # 4.2 Fuzzy + jaccard eşleşmeleri
         for c, n_c in norm_cols.items():
             for canon_name, canon_desc in canonical_schema:
                 if canon_name in best and best[canon_name][1] >= 100:
@@ -129,15 +188,29 @@ def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
 
                 n_d = norm(canon_desc)
 
-                fuzzy_score = fuzz.token_set_ratio(n_c, n_d)  # 0–100
+                fuzzy_score = fuzz.token_set_ratio(n_c, n_d)
                 j_score = jaccard(n_c, n_d) * 100
-                score = 0.6 * fuzzy_score + 0.4 * j_score
+                score = 0.6*fuzzy_score + 0.4*j_score
 
                 if score >= match_threshold:
                     if canon_name not in best or score > best[canon_name][1]:
                         best[canon_name] = (c, score)
 
-        # --- Yeni DF oluştur ---
+        # 4.3 UYRUK Fallback (kısa TC tipi değerler)
+        if "pay_sahibi_uyrugu" not in best:
+            for c in df.columns:
+                col_norm = norm_cols[c]
+                if len(col_norm) <= 5:
+                    series_values = df[c].astype(str).str.lower().str.strip()
+
+                    if series_values.apply(lambda x: len(x) <= 5).all():
+                        if series_values.apply(
+                            lambda x: x.replace(".", "").replace(" ", "") in ["tc", "tcc", "t", "tcno"]
+                        ).any():
+                            best["pay_sahibi_uyrugu"] = (c, 95.0)
+                            break
+
+        # 4.4 Yeni DF oluşturma
         new_df = pd.DataFrame()
         for canon in canonical_names:
             if canon in best:
@@ -145,9 +218,18 @@ def standardize_table_columns_v4(table_dfs_cleaned: List[pd.DataFrame],
             else:
                 new_df[canon] = pd.NA
 
+        # 4.5 Değer dönüşümleri
+        if "paylarin_toplam_itibari_degeri" in new_df.columns:
+            new_df["paylarin_toplam_itibari_degeri"] = \
+                new_df["paylarin_toplam_itibari_degeri"].apply(parse_tl_value)
+
+        if "pay_adedi" in new_df.columns:
+            new_df["pay_adedi"] = new_df["pay_adedi"].apply(format_pay_adedi_str)
+
         return new_df
 
     # -------------------------------------------------------
-    # 4) Tüm listeye uygula
+    # 5) Tüm DF listesine uygula
     # -------------------------------------------------------
     return [map_df(df) for df in table_dfs_cleaned]
+
