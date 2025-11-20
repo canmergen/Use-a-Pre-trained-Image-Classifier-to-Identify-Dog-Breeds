@@ -1,271 +1,398 @@
-import re
-import unicodedata
-from typing import List, Dict, Tuple, Any
-import pandas as pd
-import numpy as np
-from rapidfuzz import fuzz
+def standardize_hazirun_tables(
+    table_dfs: List[pd.DataFrame],
+    match_threshold: float = 65.0,
+) -> List[pd.DataFrame]:
+    """
+    OCR sonrası elde edilen ham hazirun tabloları (table_dfs) alır ve:
+      - Boş satırları temizler (page_index / tablo_imza_var_mi hariç full-empty ise drop),
+      - Kolonları canonical şemaya map eder,
+      - pay_sahibi_tckn, pay_adedi, paylarin_toplam_itibari_degeri, katilim_sekli,
+        temsilci alanlarını normalize eder.
+    Çıktı: standardize edilmiş tablo listesi.
+    """
 
+    import re
+    import unicodedata
+    from typing import Any, List, Dict, Tuple
+    import numpy as np
+    import pandas as pd
+    from rapidfuzz import fuzz
 
-# ============================================================
-# Normalizasyon yardımcıları
-# ============================================================
+    # -----------------------------
+    # 0) Boş satır temizleme
+    # -----------------------------
+    def drop_empty_rows_except_index_and_signature(
+        df: pd.DataFrame,
+        index_col: str = "page_index",
+        signature_col: str = "tablo_imza_var_mi",
+    ) -> pd.DataFrame:
+        cols_to_check = [c for c in df.columns if c not in [index_col, signature_col]]
+        tmp = df[cols_to_check].copy()
+        tmp = tmp.replace(r"^\s*$", pd.NA, regex=True)
+        tmp = tmp.replace(["<NA>", "None"], pd.NA)
+        mask_all_empty = tmp.isna().all(axis=1)
+        cleaned_df = df[~mask_all_empty].reset_index(drop=True)
+        return cleaned_df
 
-TR_MAP = str.maketrans({
-    "İ": "i", "I": "i", "ı": "i",
-    "Ş": "s", "ş": "s",
-    "Ğ": "g", "ğ": "g",
-    "Ü": "u", "ü": "u",
-    "Ö": "o", "ö": "o",
-    "Ç": "c", "ç": "c",
-})
+    # -----------------------------
+    # 1) Normalizasyon yardımcıları
+    # -----------------------------
+    TR_MAP = str.maketrans({
+        "İ": "i", "I": "i", "ı": "i",
+        "Ş": "s", "ş": "s",
+        "Ğ": "g", "ğ": "g",
+        "Ü": "u", "ü": "u",
+        "Ö": "o", "ö": "o",
+        "Ç": "c", "ç": "c",
+    })
 
-def norm(s: Any) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.translate(TR_MAP)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    def norm(s: Any) -> str:
+        if not isinstance(s, str):
+            return ""
+        s = s.translate(TR_MAP)
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        s = s.lower()
+        s = s.replace("t.c.", "tc").replace("t.c ", "tc")
+        s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
+    def jaccard(a: str, b: str) -> float:
+        a_set, b_set = set(a.split()), set(b.split())
+        if not a_set or not b_set:
+            return 0.0
+        return len(a_set & b_set) / len(a_set | b_set)
 
-def jaccard(a: str, b: str) -> float:
-    A, B = set(a.split()), set(b.split())
-    return len(A & B) / len(A | B) if A and B else 0.0
+    # -----------------------------
+    # 2) TL parse
+    # -----------------------------
+    def parse_tl_value(x: Any) -> Any:
+        if pd.isna(x):
+            return pd.NA
 
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            return float(x)
 
-# ============================================================
-# TL değer dönüştürme
-# ============================================================
+        s = str(x).strip()
+        if s == "":
+            return pd.NA
 
-def parse_tl_value(x):
-    if pd.isna(x):
-        return pd.NA
-    if isinstance(x, (int, float, np.number)):
-        return float(x)
+        # içindeki "TL" vb harfleri at, sadece rakam/ayraç bırak
+        if re.search(r"[a-zA-Z]", s):
+            s_clean_tmp = re.sub(r"[^\d,\.]", "", s)
+            if s_clean_tmp == "":
+                return pd.NA
+            s = s_clean_tmp
 
-    s = str(x).strip()
-    s = s.replace(" ", "")
-    if s == "":
-        return pd.NA
+        s = s.replace(" ", "")
 
-    # OCR: 20.527.333.33 → 20527333.33
-    if "," not in s and s.count(".") >= 2:
+        # OCR vakası: sadece nokta, 2+ nokta, virgül yok → son 2 hane kuruş
+        if "," not in s and s.count(".") >= 2:
+            digits = re.sub(r"[^\d]", "", s)
+            if len(digits) <= 2:
+                return pd.NA
+            int_part = digits[:-2]
+            frac_part = digits[-2:]
+            try:
+                return float(int_part) + float(frac_part) / 100.0
+            except ValueError:
+                return pd.NA
+
+        # hem nokta hem virgül
+        if "," in s and "." in s:
+            s_clean = s.replace(".", "")
+            s_clean = s_clean.replace(",", ".")
+            try:
+                return float(s_clean)
+            except ValueError:
+                pass
+
+        # sadece virgül
+        if "," in s and "." not in s:
+            parts = s.split(",")
+            if len(parts[-1]) in (1, 2):
+                s_clean = s.replace(".", "")
+                s_clean = s_clean.replace(",", ".")
+                try:
+                    return float(s_clean)
+                except ValueError:
+                    pass
+            digits = re.sub(r"[^\d]", "", s)
+            if digits == "":
+                return pd.NA
+            try:
+                return float(digits)
+            except ValueError:
+                return pd.NA
+
+        # sadece nokta
+        if "." in s and "," not in s:
+            parts = s.split(".")
+            if len(parts[-1]) in (1, 2):
+                int_raw = "".join(parts[:-1])
+                frac_raw = parts[-1]
+                int_digits = re.sub(r"\D", "", int_raw)
+                frac_digits = re.sub(r"\D", "", frac_raw)
+                if int_digits == "":
+                    int_digits = "0"
+                if frac_digits == "":
+                    frac_digits = "0"
+                try:
+                    return float(f"{int_digits}.{frac_digits}")
+                except ValueError:
+                    return pd.NA
+            digits = re.sub(r"[^\d]", "", s)
+            if digits == "":
+                return pd.NA
+            try:
+                return float(digits)
+            except ValueError:
+                return pd.NA
+
+        # saf integer
         digits = re.sub(r"[^\d]", "", s)
-        if len(digits) > 2:
-            return float(digits[:-2]) + float(digits[-2:]) / 100
-        return pd.NA
-
-    # 11.000.000,15
-    if "." in s and "," in s:
-        s = s.replace(".", "").replace(",", ".")
+        if digits == "":
+            return pd.NA
         try:
-            return float(s)
-        except:
+            return float(digits)
+        except ValueError:
             return pd.NA
 
-    # 20,5
-    if "," in s:
-        s = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except:
+    def format_pay_adedi_str(x: Any) -> Any:
+        if pd.isna(x):
             return pd.NA
-
-    # 20.5
-    if "." in s:
-        try:
-            return float(s.replace(",", ""))
-        except:
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            n = int(x)
+            return f"{n:,}".replace(",", ".")
+        s = str(x).strip()
+        if s == "":
             return pd.NA
+        digits = re.sub(r"[^\d]", "", s)
+        if digits == "":
+            return pd.NA
+        n = int(digits)
+        return f"{n:,}".replace(",", ".")
 
-    digits = re.sub(r"[^\d]", "", s)
-    if digits != "":
-        return float(digits)
+    # -----------------------------
+    # 3) TCKN heuristik
+    # -----------------------------
+    def looks_like_tckn_series(s: pd.Series) -> bool:
+        vals = s.astype(str).str.replace(r"\D", "", regex=True)
+        non_empty = vals != ""
+        if non_empty.mean() < 0.7:
+            return False
+        lengths = vals[non_empty].str.len()
+        return lengths.between(10, 11).mean() >= 0.7
 
-    return pd.NA
+    # -----------------------------
+    # 4) Katılım normalizasyon
+    # -----------------------------
+    def normalize_katilim_value(v: Any) -> Any:
+        if pd.isna(v):
+            return pd.NA
+        s = norm(str(v))
+        if "asalet" in s:
+            return "ASALETEN"
+        if "vekalet" in s:
+            return "VEKALETEN"
+        if "kayyum" in s:
+            return "KAYYUM"
+        raw = str(v).strip()
+        return raw if raw != "" else pd.NA
 
+    # -----------------------------
+    # 5) Canonical şema (adres/uyruk yok, temsilci_turu var)
+    # -----------------------------
+    canonical_schema: List[Tuple[str, str]] = [
+        ("page_index", "page index sayfa no sira"),
+        ("pay_sahibinin_adi_soyadi_unvani",
+         "pay sahibinin adi soyadi unvani pay sahibinin adi soyad unvan"),
+        ("pay_sahibi_tckn",
+         "pay sahibi tckn tc kimlik tckn vkn vergi kimlik"),
+        ("pay_adedi",
+         "pay adedi pay sayisi hisse adedi lot"),
+        (
+            "paylarin_toplam_itibari_degeri",
+            "paylarin toplam itibari degeri toplam nominal deger toplam sermaye tutari sermaye miktari tl nominal tutar pay nominal deger sermaye bedeli"
+        ),
+        (
+            "paylarin_edilme_sekli_tarihi",
+            "paylarin edinim sekli tarihi edinim tarihi satin alma tarihi devir tarihi"
+        ),
+        (
+            "katilim_sekli",
+            "katilim sekli katilma sekli katilim bicimi katilim sekli asaleten vekaleten kayyum"
+        ),
+        (
+            "temsilci_adi_soyadi_unvani",
+            "temsilci adi soyadi unvani vekil ad soyad vekalet eden temsilcinin adi soyadi"
+        ),
+        (
+            "temsilci_tckn",
+            "temsilci tc kimlik tckn vekil tckn vekalet tckn vergi kimlik"
+        ),
+        (
+            "temsilci_turu",
+            "temsilci turu katilim turu asaleten vekaleten kayyum"
+        ),
+        (
+            "tablo_imza_var_mi",
+            "imza signature imzali imza var mi imza kolonu"
+        ),
+    ]
+    canonical_names = [c[0] for c in canonical_schema]
 
-def normalize_katilim_value(v):
-    if pd.isna(v):
-        return pd.NA
-    s = norm(str(v))
-    if "asalet" in s: return "ASALETEN"
-    if "vekalet" in s: return "VEKALETEN"
-    if "kayyum"  in s: return "KAYYUM"
-    raw = str(v).strip()
-    return raw if raw else pd.NA
+    # -----------------------------
+    # 6) Tek DF map fonksiyonu
+    # -----------------------------
+    def map_df(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame({c: pd.Series(dtype="object") for c in canonical_names})
 
+        # duplicate kolon isimlerini tektipleştir
+        new_cols: List[str] = []
+        seen: Dict[str, int] = {}
+        for col in df.columns:
+            c = str(col)
+            if c not in seen:
+                seen[c] = 0
+                new_cols.append(c)
+            else:
+                seen[c] += 1
+                new_cols.append(f"{c}__{seen[c]}")
+        df_local = df.copy()
+        df_local.columns = new_cols
 
-# ============================================================
-# Canonical şema ***ADRES + UYRUK YOK***
-# ============================================================
+        norm_cols: Dict[str, str] = {col: norm(col) for col in df_local.columns}
+        best: Dict[str, Tuple[str, float]] = {}
 
-canonical_schema = [
-    ("page_index", ""),
-    ("pay_sahibinin_adi_soyadi_unvani", "pay sahibinin adi soyadi unvani ad soyad unvan"),
-    ("pay_sahibi_tckn", "tckn tc kimlik kimlik vergi"),
-    ("pay_adedi", "pay adedi hisse adedi sayisi lot"),
-    ("paylarin_toplam_itibari_degeri",
-     "toplam itibari degeri sermaye nominal tutar miktar tl"),
-    ("katilim_sekli", "katilim sekli bicim asaleten vekaleten kayyum"),
-    ("temsilci_adi_soyadi_unvani", "temsilci vekil adi soyadi"),
-    ("temsilci_tckn", "temsilci tc kimlik tckn vergi"),
-    ("tablo_imza_var_mi", "imza signature")
-]
+        # Sert kurallar
+        for col, n in norm_cols.items():
+            # imza
+            if "imza" in n or "signature" in n:
+                best["tablo_imza_var_mi"] = (col, 100.0)
 
-canonical_names = [c[0] for c in canonical_schema]
+            # temsilci tckn
+            if "temsilci" in n and any(k in n for k in ["tc", "tck", "kimlik", "vkn"]):
+                best["temsilci_tckn"] = (col, 100.0)
 
+            # temsilci isim
+            if "temsilci" in n and any(k in n for k in ["ad", "soyad", "unvan"]):
+                best["temsilci_adi_soyadi_unvani"] = (col, 100.0)
 
-# ============================================================
-# Ana tek DF map fonksiyonu
-# ============================================================
+            # temsilci türü
+            if "temsilci" in n and "tur" in n:
+                best["temsilci_turu"] = (col, 100.0)
 
-def map_single_df(df: pd.DataFrame, match_threshold: float = 65.0) -> pd.DataFrame:
+            # pay sahibi tckn
+            if "temsilci" not in n and any(k in n for k in ["tc", "tck", "kimlik", "vkn"]):
+                best["pay_sahibi_tckn"] = (col, 100.0)
 
-    if df is None or df.empty:
-        return pd.DataFrame({c: pd.Series(dtype="object") for c in canonical_names})
+            # pay adedi
+            if "pay" in n and any(k in n for k in ["adet", "adedi", "sayisi", "lot"]):
+                best["pay_adedi"] = (col, 100.0)
 
-    df = df.copy()
+            # pay sahibi adı
+            if ("pay" in n and "sahib" in n and
+                    any(k in n for k in ["ad", "soyad", "unvan"])):
+                best["pay_sahibinin_adi_soyadi_unvani"] = (col, 100.0)
 
-    # --------------------------------------------------------
-    # Header normalizasyonu
-    # --------------------------------------------------------
-    new_cols = []
-    seen = {}
-    for c in df.columns:
-        if c not in seen:
-            seen[c] = 0
-            new_cols.append(c)
-        else:
-            seen[c] += 1
-            new_cols.append(f"{c}__{seen[c]}")
-    df.columns = new_cols
+            # sermaye
+            if (
+                any(k in n for k in ["sermaye", "nominal", "miktar", "tutar", "deger"]) and
+                any(k in n for k in ["tl", "tutar", "deger", "nominal", "sermaye"]) and
+                not any(k in n for k in ["adet", "adedi", "sayisi", "lot"])
+            ):
+                best["paylarin_toplam_itibari_degeri"] = (col, 100.0)
 
-    norm_cols = {c: norm(c) for c in df.columns}
-    best = {}
+            # katilim sekli
+            if "katilim" in n and any(k in n for k in ["sekli", "sekil", "bicim"]):
+                best["katilim_sekli"] = (col, 100.0)
 
-    # --------------------------------------------------------
-    # 1) Sert header kuralları
-    # --------------------------------------------------------
-    for col, n in norm_cols.items():
-
-        # İmza
-        if "imza" in n or "signature" in n:
-            best["tablo_imza_var_mi"] = (col, 100)
-
-        # Temsilci TCKN
-        if "temsilci" in n and any(k in n for k in ["tc", "tck", "kimlik", "vkn"]):
-            best["temsilci_tckn"] = (col, 100)
-
-        # Temsilci ad soyad
-        if "temsilci" in n and any(k in n for k in ["ad", "soyad", "unvan"]):
-            best["temsilci_adi_soyadi_unvani"] = (col, 100)
-
-        # Pay sahibi TCKN (temsilci içermeyen)
-        if "temsilci" not in n and any(k in n for k in ["tc","tck","kimlik","vkn"]):
-            best["pay_sahibi_tckn"] = (col, 100)
-
-        # Pay adedi
-        if "pay" in n and any(k in n for k in ["adet","adedi","sayisi","lot"]):
-            best["pay_adedi"] = (col, 100)
-
-        # Pay sahibi adı
-        if ("pay" in n and "sahib" in n and 
-            any(k in n for k in ["ad","soyad","unvan"])):
-            best["pay_sahibinin_adi_soyadi_unvani"] = (col, 100)
-
-        # Sermaye (adet geçmeyecek)
-        if any(k in n for k in ["sermaye","nominal","tutar","miktar","deger"]) \
-           and any(k in n for k in ["tl","nominal","tutar","deger"]) \
-           and not any(k in n for k in ["adet","sayisi","lot"]):
-            best["paylarin_toplam_itibari_degeri"] = (col, 100)
-
-        # Katılım şekli
-        if "katilim" in n:
-            best["katilim_sekli"] = (col, 100)
-
-    # --------------------------------------------------------
-    # 2) Fuzzy eşleşme
-    # --------------------------------------------------------
-    for col, n in norm_cols.items():
-        for canon, desc in canonical_schema:
-            if canon in best and best[canon][1] >= 100:
-                continue
-
-            # Sermaye kolonunda adet içeren header yok
-            if canon == "paylarin_toplam_itibari_degeri":
-                if any(k in n for k in ["adet","adedi","sayisi","lot"]):
+        # Fuzzy eşleşmeler
+        for col, n in norm_cols.items():
+            for canon_name, canon_desc in canonical_schema:
+                if canon_name in best and best[canon_name][1] >= 100:
                     continue
 
-            fuzzy_score = fuzz.token_set_ratio(n, desc)
-            jac = jaccard(n, desc) * 100
-            score = 0.6 * fuzzy_score + 0.4 * jac
+                if canon_name == "paylarin_toplam_itibari_degeri":
+                    if any(k in n for k in ["adet", "adedi", "sayisi", "lot"]):
+                        continue
 
-            if score >= match_threshold:
-                if canon not in best or score > best[canon][1]:
-                    best[canon] = (col, score)
+                fuzzy_score = fuzz.token_set_ratio(n, canon_desc)
+                j_score = jaccard(n, canon_desc) * 100
+                local_threshold = match_threshold
 
-    # --------------------------------------------------------
-    # 3) DF oluştur
-    # --------------------------------------------------------
-    out = pd.DataFrame()
-    for canon in canonical_names:
-        if canon in best:
-            out[canon] = df[best[canon][0]]
-        else:
-            out[canon] = pd.NA
+                if canon_name in ["paylarin_toplam_itibari_degeri", "katilim_sekli", "temsilci_turu"]:
+                    score = 0.7 * fuzzy_score + 0.3 * j_score
+                    local_threshold = match_threshold - 5
+                else:
+                    score = 0.6 * fuzzy_score + 0.4 * j_score
 
-    # --------------------------------------------------------
-    # 4) TCKN fallback — pay_sahibinin adı içinde 10–11 haneli sayı varsa al
-    # --------------------------------------------------------
-    if out["pay_sahibi_tckn"].isna().all():
-        for i, val in out["pay_sahibinin_adi_soyadi_unvani"].items():
-            if isinstance(val, str):
-                digits = re.findall(r"\b\d{10,11}\b", val)
-                if len(digits) > 0:
-                    out.loc[i, "pay_sahibi_tckn"] = digits[0]
+                if score >= local_threshold:
+                    if canon_name not in best or score > best[canon_name][1]:
+                        best[canon_name] = (col, score)
 
-    # --------------------------------------------------------
-    # 5) Katılım şekli + temsilci türü birleştirme
-    # --------------------------------------------------------
-    if "katilim_sekli" not in out.columns:
-        out["katilim_sekli"] = pd.NA
-
-    out["katilim_sekli"] = out["katilim_sekli"].apply(normalize_katilim_value)
-
-    # Eğer boşsa → temsilci adından/kolonundan çek
-    temsil_cols = ["temsilci_adi_soyadi_unvani", "temsilci_tckn"]
-    for i in range(len(out)):
-        if pd.isna(out.at[i, "katilim_sekli"]):
-            for c in temsil_cols:
-                v = out.at[i, c]
-                nn = normalize_katilim_value(v)
-                if not pd.isna(nn):
-                    out.at[i, "katilim_sekli"] = nn
+        # TCKN içerik bazlı
+        if "pay_sahibi_tckn" not in best:
+            for col in df_local.columns:
+                s = df_local[col]
+                if isinstance(s, pd.Series) and looks_like_tckn_series(s):
+                    best["pay_sahibi_tckn"] = (col, 99.0)
                     break
 
-    # --------------------------------------------------------
-    # 6) Sermaye numeric çevir
-    # --------------------------------------------------------
-    out["paylarin_toplam_itibari_degeri"] = out["paylarin_toplam_itibari_degeri"].apply(parse_tl_value)
+        # Canonical DF oluştur
+        new_df = pd.DataFrame()
+        for canon in canonical_names:
+            if canon in best:
+                new_df[canon] = df_local[best[canon][0]]
+            else:
+                new_df[canon] = pd.NA
 
-    return out
+        # pay_sahibi_tckn fallback: ad/soyad içindeki 10–11 haneli sayı
+        if new_df["pay_sahibi_tckn"].isna().all():
+            col_nm = "pay_sahibinin_adi_soyadi_unvani"
+            if col_nm in new_df.columns:
+                for i, val in new_df[col_nm].items():
+                    if isinstance(val, str):
+                        matches = re.findall(r"\b\d{10,11}\b", val)
+                        if matches:
+                            new_df.at[i, "pay_sahibi_tckn"] = matches[0]
 
+        # Değer dönüşümleri
+        if "paylarin_toplam_itibari_degeri" in new_df.columns:
+            new_df["paylarin_toplam_itibari_degeri"] = \
+                new_df["paylarin_toplam_itibari_degeri"].apply(parse_tl_value)
 
-# ============================================================
-# 7) Tüm tabloları tek fonksiyonla işleyen ANA PIPELINE
-# ============================================================
+        if "pay_adedi" in new_df.columns:
+            new_df["pay_adedi"] = new_df["pay_adedi"].apply(format_pay_adedi_str)
 
-def standardize_all_tables(table_dfs: List[pd.DataFrame]) -> List[pd.DataFrame]:
-    std = []
-    for t in table_dfs:
-        std.append(map_single_df(t))
-    return std
+        # Katılım + temsilci_turu birleşimi
+        if "katilim_sekli" in new_df.columns:
+            new_df["katilim_sekli"] = new_df["katilim_sekli"].apply(normalize_katilim_value)
+        if "temsilci_turu" in new_df.columns:
+            new_df["temsilci_turu"] = new_df["temsilci_turu"].apply(normalize_katilim_value)
 
-std_tables = standardize_all_tables(table_dfs_marked)
+        if "katilim_sekli" in new_df.columns and "temsilci_turu" in new_df.columns:
+            mask = new_df["katilim_sekli"].isna() & new_df["temsilci_turu"].notna()
+            new_df.loc[mask, "katilim_sekli"] = new_df.loc[mask, "temsilci_turu"]
 
-for df in std_tables:
-    display(df)
+        return new_df
+
+    # -----------------------------
+    # 7) Tüm tabloları işle
+    # -----------------------------
+    standardized: List[pd.DataFrame] = []
+    for df in table_dfs:
+        if df is None or df.empty:
+            continue
+        df_clean = drop_empty_rows_except_index_and_signature(df)
+        std_df = map_df(df_clean)
+        standardized.append(std_df)
+
+    return standardized
+
+std_table_dfs = standardize_hazirun_tables(table_dfs_marked, match_threshold=70)
+for t in std_table_dfs:
+    display(t)
