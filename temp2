@@ -1,17 +1,34 @@
-def prune_sig_boxes_by_nt_coverage(
-    sig_boxes,
-    nt_boxes,
-    cover_threshold=0.4
-):
-    """
-    nt kutularının %X'inden fazlasını kapsayan signature kutularını siler.
-    """
-    from collections import defaultdict
+from typing import List, Dict, Any
+from collections import defaultdict
 
-    #--- Yardımcı fonksiyonlar ---
+def prune_sig_boxes_by_nt_coverage(
+    sig_boxes: List[Dict[str, Any]],
+    nt_boxes: List[Dict[str, Any]],
+    cover_nt_threshold: float = 0.4,   # nt kutusunun en az %40'ı kapsanmalı
+    cover_sig_threshold: float = 0.3,  # imza kutusunun en az %30'u kapsanmalı
+    max_nt_rel_area: float = 0.5       # nt kutusu sayfanın %50'sinden büyükse bozuk say, kullanma
+) -> List[Dict[str, Any]]:
+    """
+    nt kutularının belirli bir oranından fazlasını kapsayan imza kutularını siler.
+    Hem nt alanı hem imza alanı tarafında eşik uygular.
+
+    Beklenen format (predict_on_memory_images çıktısı):
+        [
+          {
+            "image_index": int,
+            "orig_shape": (h, w),
+            "boxes": [
+              {"xyxy": [x1, y1, x2, y2], "conf": float, "class_id": int},
+              ...
+            ]
+          },
+          ...
+        ]
+    """
+
     def area(b):
         x1, y1, x2, y2 = b
-        return max(0, x2 - x1) * max(0, y2 - y1)
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
     def intersection(a, b):
         ax1, ay1, ax2, ay2 = a
@@ -21,61 +38,90 @@ def prune_sig_boxes_by_nt_coverage(
         x2 = min(ax2, bx2)
         y2 = min(ay2, by2)
         if x2 <= x1 or y2 <= y1:
-            return 0
+            return 0.0
         return (x2 - x1) * (y2 - y1)
 
-    #--- NT kutularını sayfa bazında grupla ---
-    nt_map = defaultdict(list)
+    # --- 1) Noter kutularını sayfa bazında grupla ---
+    nt_map: Dict[int, Dict[str, Any]] = defaultdict(lambda: {"xyxy": [], "img_area": None})
     for page in nt_boxes:
-        idx = page["image_index"]
+        idx = page.get("image_index", 0)
+        h, w = page.get("orig_shape", (None, None))
+        img_area = None
+        if h is not None and w is not None:
+            img_area = float(h) * float(w)
+
         for b in page.get("boxes", []):
             xyxy = b.get("xyxy")
-            if xyxy and len(xyxy) == 4:
-                nt_map[idx].append(xyxy)
+            if not xyxy or len(xyxy) != 4:
+                continue
+            nt_map[idx]["xyxy"].append(xyxy)
+            nt_map[idx]["img_area"] = img_area
 
-    #--- Şimdi signature kutularını prune et ---
-    pruned = []
+    # --- 2) İmza kutularını prune et ---
+    pruned_sig_boxes: List[Dict[str, Any]] = []
+
     for page in sig_boxes:
-        idx = page["image_index"]
-        page_nt_boxes = nt_map.get(idx, [])
+        idx = page.get("image_index", 0)
+        nt_info = nt_map.get(idx, None)
 
-        if not page_nt_boxes:
-            pruned.append(page)
+        # Bu sayfada noter kutusu yoksa direkt ekle
+        if nt_info is None or not nt_info["xyxy"]:
+            pruned_sig_boxes.append(page)
             continue
 
-        kept = []
+        nt_xyxy_list = nt_info["xyxy"]
+        img_area = nt_info["img_area"]
+
+        kept_boxes = []
         for b in page.get("boxes", []):
-            sb = b.get("xyxy")
-            if not sb or len(sb) != 4:
+            s_xyxy = b.get("xyxy")
+            if not s_xyxy or len(s_xyxy) != 4:
                 continue
 
-            s_area = area(sb)
+            s_area = area(s_xyxy)
+            if s_area <= 0:
+                kept_boxes.append(b)
+                continue
+
             remove = False
+            for nt_xyxy in nt_xyxy_list:
+                n_area = area(nt_xyxy)
+                if n_area <= 0:
+                    continue
 
-            for nt in page_nt_boxes:
-                nt_area = area(nt)
-                inter = intersection(sb, nt)
+                # Çok büyük (sayfanın %X'inden büyük) nt kutularını bozuk say, kullanma
+                if img_area is not None and img_area > 0:
+                    rel_nt_area = n_area / img_area
+                    if rel_nt_area > max_nt_rel_area:
+                        continue
 
-                # signature'ın NT kutusunu kapsama oranı
-                cover_nt = inter / nt_area if nt_area > 0 else 0
+                inter = intersection(s_xyxy, nt_xyxy)
+                if inter <= 0:
+                    continue
 
-                if cover_nt >= cover_threshold:
+                cover_nt = inter / n_area          # nt'nin ne kadarı imza içinde
+                cover_sig = inter / s_area         # imzanın ne kadarı nt ile çakışıyor
+
+                # Hem nt tarafında, hem imza tarafında anlamlı bir örtüşme varsa sil
+                if cover_nt >= cover_nt_threshold and cover_sig >= cover_sig_threshold:
                     remove = True
                     break
 
             if not remove:
-                kept.append(b)
+                kept_boxes.append(b)
 
         new_page = dict(page)
-        new_page["boxes"] = kept
-        pruned.append(new_page)
+        new_page["boxes"] = kept_boxes
+        pruned_sig_boxes.append(new_page)
 
-    return pruned
+    return pruned_sig_boxes
 
 sig_boxes = prune_sig_boxes_by_nt_coverage(
     sig_boxes,
     nt_boxes,
-    cover_threshold=0.40
+    cover_nt_threshold=0.4,   # istersen 0.5 yapabilirsin
+    cover_sig_threshold=0.3,  # gerekirse 0.2–0.4 arası oynarsın
+    max_nt_rel_area=0.5       # nt kutusu sayfanın yarısından büyükse ignore et
 )
 
 visualize_filtered_boxes(sig_boxes, lower_imgs_binarized)
