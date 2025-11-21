@@ -1,127 +1,151 @@
-from typing import List, Dict, Any
-from collections import defaultdict
+from typing import List, Tuple, Optional, Union
+import numpy as np
+import cv2
 
-def prune_sig_boxes_by_nt_coverage(
-    sig_boxes: List[Dict[str, Any]],
-    nt_boxes: List[Dict[str, Any]],
-    cover_nt_threshold: float = 0.4,   # nt kutusunun en az %40'ı kapsanmalı
-    cover_sig_threshold: float = 0.3,  # imza kutusunun en az %30'u kapsanmalı
-    max_nt_rel_area: float = 0.5       # nt kutusu sayfanın %50'sinden büyükse bozuk say, kullanma
-) -> List[Dict[str, Any]]:
+
+def crop_all_tables_from_doc_images(
+    doc_images: List[np.ndarray],
+    margin: int = 5,
+    strict: bool = False,
+    debug: bool = False,
+    include_bboxes: bool = True,
+) -> Union[
+    List[np.ndarray],
+    Tuple[List[np.ndarray], List[Optional[Tuple[int, int, int, int]]]],
+]:
     """
-    nt kutularının belirli bir oranından fazlasını kapsayan imza kutularını siler.
-    Hem nt alanı hem imza alanı tarafında eşik uygular.
+    Her sayfa için tablo bbox'ını tespit edip sadece tabloyu crop eder.
 
-    Beklenen format (predict_on_memory_images çıktısı):
-        [
-          {
-            "image_index": int,
-            "orig_shape": (h, w),
-            "boxes": [
-              {"xyxy": [x1, y1, x2, y2], "conf": float, "class_id": int},
-              ...
-            ]
-          },
-          ...
-        ]
+    Parameters
+    ----------
+    doc_images : List[np.ndarray]
+        Sayfa görüntüleri listesi (BGR, GRAY veya BGRA olabilir).
+    margin : int, optional
+        Tablo etrafına eklenecek boşluk (px), by default 5.
+    strict : bool, optional
+        True ise herhangi bir hata durumunda exception fırlatır, by default False.
+    debug : bool, optional
+        Ara adımları ve uyarıları yazdırmak için, by default False.
+    include_bboxes : bool, optional
+        True ise (table_imgs, bboxes) döner, aksi halde sadece table_imgs.
+
+    Returns
+    -------
+    List[np.ndarray] veya (List[np.ndarray], List[Optional[Tuple[int,int,int,int]]])
+        Tablonun crop edilmiş görüntüleri ve isteğe bağlı bbox listesi.
     """
 
-    def area(b):
-        x1, y1, x2, y2 = b
-        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    # ----------------------------------------------------------------------
+    # 1) Yardımcı: tablo benzeri en büyük dikdörtgen alanı bul (bbox)
+    # ----------------------------------------------------------------------
+    def detect_table_bbox_from_mask(
+        img: np.ndarray, debug: bool = False
+    ) -> Optional[Tuple[int, int, int, int]]:
+        # Griye çevir
+        if img.ndim == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img.copy()
 
-    def intersection(a, b):
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        x1 = max(ax1, bx1)
-        y1 = max(ay1, by1)
-        x2 = min(ax2, bx2)
-        y2 = min(ay2, by2)
-        if x2 <= x1 or y2 <= y1:
-            return 0.0
-        return (x2 - x1) * (y2 - y1)
+        # Hafif blur
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # --- 1) Noter kutularını sayfa bazında grupla ---
-    nt_map: Dict[int, Dict[str, Any]] = defaultdict(lambda: {"xyxy": [], "img_area": None})
-    for page in nt_boxes:
-        idx = page.get("image_index", 0)
-        h, w = page.get("orig_shape", (None, None))
-        img_area = None
-        if h is not None and w is not None:
-            img_area = float(h) * float(w)
+        # Binary + invert (çizgileri beyaz yapmak için)
+        _, bin_img = cv2.threshold(
+            blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        bin_inv = cv2.bitwise_not(bin_img)
 
-        for b in page.get("boxes", []):
-            xyxy = b.get("xyxy")
-            if not xyxy or len(xyxy) != 4:
-                continue
-            nt_map[idx]["xyxy"].append(xyxy)
-            nt_map[idx]["img_area"] = img_area
+        h, w = bin_inv.shape
 
-    # --- 2) İmza kutularını prune et ---
-    pruned_sig_boxes: List[Dict[str, Any]] = []
+        # Yatay + dikey çizgi tespiti
+        hx, hy = max(1, w // 100), max(1, h // 100)
 
-    for page in sig_boxes:
-        idx = page.get("image_index", 0)
-        nt_info = nt_map.get(idx, None)
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hx, 1))
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, hy))
 
-        # Bu sayfada noter kutusu yoksa direkt ekle
-        if nt_info is None or not nt_info["xyxy"]:
-            pruned_sig_boxes.append(page)
-            continue
+        horiz = cv2.morphologyEx(
+            bin_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=2
+        )
+        vert = cv2.morphologyEx(
+            bin_inv, cv2.MORPH_OPEN, vert_kernel, iterations=2
+        )
 
-        nt_xyxy_list = nt_info["xyxy"]
-        img_area = nt_info["img_area"]
+        table_mask = cv2.addWeighted(horiz, 0.5, vert, 0.5, 0.0)
 
-        kept_boxes = []
-        for b in page.get("boxes", []):
-            s_xyxy = b.get("xyxy")
-            if not s_xyxy or len(s_xyxy) != 4:
-                continue
+        # Kontur bul
+        cnts, _ = cv2.findContours(
+            table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not cnts:
+            if debug:
+                print("[WARN] no_table_found")
+            return None
 
-            s_area = area(s_xyxy)
-            if s_area <= 0:
-                kept_boxes.append(b)
-                continue
+        # En büyük alanlı konturu al
+        cnt = max(cnts, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(cnt)
 
-            remove = False
-            for nt_xyxy in nt_xyxy_list:
-                n_area = area(nt_xyxy)
-                if n_area <= 0:
-                    continue
+        if debug:
+            vis = img.copy()
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.imshow("table_bbox", vis)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
-                # Çok büyük (sayfanın %X'inden büyük) nt kutularını bozuk say, kullanma
-                if img_area is not None and img_area > 0:
-                    rel_nt_area = n_area / img_area
-                    if rel_nt_area > max_nt_rel_area:
-                        continue
+        return x, y, w, h
 
-                inter = intersection(s_xyxy, nt_xyxy)
-                if inter <= 0:
-                    continue
+    # ----------------------------------------------------------------------
+    # 2) Yardımcı: her görüntüyü BGR formatına çevir
+    # ----------------------------------------------------------------------
+    def _to_bgr(img: np.ndarray) -> np.ndarray:
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.ndim == 3 and img.shape[2] == 3:
+            return img.copy()
+        if img.ndim == 3 and img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        raise ValueError(f"Unsupported image shape: {img.shape}")
 
-                cover_nt = inter / n_area          # nt'nin ne kadarı imza içinde
-                cover_sig = inter / s_area         # imzanın ne kadarı nt ile çakışıyor
+    # ----------------------------------------------------------------------
+    # 3) Ana döngü: tüm sayfalarda tabloyu crop et
+    # ----------------------------------------------------------------------
+    table_imgs: List[np.ndarray] = []
+    bboxes: List[Optional[Tuple[int, int, int, int]]] = []
 
-                # Hem nt tarafında, hem imza tarafında anlamlı bir örtüşme varsa sil
-                if cover_nt >= cover_nt_threshold and cover_sig >= cover_sig_threshold:
-                    remove = True
-                    break
+    for i, page in enumerate(doc_images):
+        try:
+            bgr = _to_bgr(page)
 
-            if not remove:
-                kept_boxes.append(b)
+            bbox = detect_table_bbox_from_mask(bgr, debug=debug)
+            if bbox is None:
+                raise RuntimeError(f"No table detected on page {i}")
 
-        new_page = dict(page)
-        new_page["boxes"] = kept_boxes
-        pruned_sig_boxes.append(new_page)
+            x, y, w, h = bbox
 
-    return pruned_sig_boxes
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(bgr.shape[1], x + w + margin)
+            y2 = min(bgr.shape[0], y + h + margin)
 
-sig_boxes = prune_sig_boxes_by_nt_coverage(
-    sig_boxes,
-    nt_boxes,
-    cover_nt_threshold=0.4,   # istersen 0.5 yapabilirsin
-    cover_sig_threshold=0.3,  # gerekirse 0.2–0.4 arası oynarsın
-    max_nt_rel_area=0.5       # nt kutusu sayfanın yarısından büyükse ignore et
-)
+            table_img = bgr[y1:y2, x1:x2]
 
-visualize_filtered_boxes(sig_boxes, lower_imgs_binarized)
+            table_imgs.append(table_img)
+            bboxes.append(bbox)
+
+            if debug:
+                print(f"[page {i}] table crop shape: {table_img.shape}")
+
+        except Exception as e:
+            if debug:
+                print(f"[page {i}] failed: {e}")
+            if strict:
+                raise
+            table_imgs.append(None)
+            bboxes.append(None)
+
+    if include_bboxes:
+        return table_imgs, bboxes
+    return table_imgs
+
+table_imgs = crop_all_tables_from_doc_images(doc_images)
