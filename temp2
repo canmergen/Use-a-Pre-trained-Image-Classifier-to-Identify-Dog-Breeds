@@ -1,268 +1,127 @@
-from difflib import SequenceMatcher
-from typing import List, Dict, Any, Tuple
+import cv2
 import numpy as np
+import pandas as pd
 
 
-def mark_signatures_on_imza_column(
-    table_dfs: List["pd.DataFrame"],
-    page_cells_all: List[List[Dict[str, Any]]],
-    sig_boxes: List[Dict[str, Any]],
-    signature_header_target: str = "IMZA",   # veya "İMZA"
-    fuzzy_min_score: float = 0.7,
-    sig_cover_threshold: float = 0.15,       # imzanın en az %15'i hücre içinde
-    cell_cover_threshold: float = 0.08,      # hücrenin en az %8'i imza ile kaplı
-    center_pad_factor_top: float = 0.4,      # hücre üstüne h*0.4 tolerans
-    center_pad_factor_bottom: float = 0.4,   # hücre altına h*0.4 tolerans
-    cell_padding_px: int = 4,                # overlap hesabında hücreyi büyüt
-    debug: bool = False,
-):
+def _detect_table_on_page(
+    img: np.ndarray,
+    min_h_lines: int = 1,
+    min_v_lines: int = 1,
+    min_intersections: int = 1,
+    min_area_ratio: float = 0.02,
+    debug: bool = False
+) -> bool:
     """
-    İmza kolonunu 0/1'e çevirir.
+    Tek bir sayfada tablo var mı yok mu döner (True/False).
 
-    Mantık:
-      - YOLO imza bbox'larını normalize et.
-      - Her sayfa için:
-          * İMZA kolonundaki hücreleri al.
-          * Hücrelerin row değerlerini df.index ile hizalayan row_map oluştur:
-              - Hücre satır sayısı DF satır sayısından 1 fazlaysa, en küçük row'u
-                header kabul edip at.
-          * Her hücre için:
-              1) İmza bbox merkez Y değeri, hücrenin genişletilmiş dikey bandına
-                 düşüyorsa satırı 1 yap.
-              2) Aksi halde imza-hücre alan kesişimi oranlarına bak; eşikler
-                 aşılıyorsa yine 1 yap.
+    Sadece dikdörtgen görüp tablo dememek için:
+      - Yatay çizgi sayısı
+      - Dikey çizgi sayısı
+      - Çizgi kesişim sayısı
+      - Tablo bbox alan oranı
+    filtreleri kullanılır.
     """
 
-    # ------------------------------------------------------------------ #
-    # 1) YOLO çıktısını normalize et: (image_index, x_min, y_min, x_max, y_max)
-    # ------------------------------------------------------------------ #
-    norm_sigs: List[Dict[str, Any]] = []
+    # 1) Gri + binary
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img.copy()
 
-    for sb in sig_boxes:
-        img_idx = sb.get("image_index", 0)
-        boxes = sb.get("boxes", [])
+    # OTSU + invert
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        for b in boxes:
-            # b: {"xyxy":[x1,y1,x2,y2], ...} benzeri yapı
-            xyxy = (
-                b.get("xyxy")
-                or b.get("bbox")
-                or b.get("xxyy")
-                or b
-            )
-            if xyxy is None or len(xyxy) != 4:
-                continue
+    h, w = bw.shape
 
-            x1, y1, x2, y2 = map(float, xyxy)
+    # 2) Yatay ve dikey çizgi maskeleri
+    # kernel boyutları sayfa boyutuna göre
+    horizontal_size = max(20, w // 60)
+    vertical_size = max(20, h // 40)
 
-            norm_sigs.append(
-                {
-                    "image_index": int(img_idx),
-                    "x_min": x1,
-                    "y_min": y1,
-                    "x_max": x2,
-                    "y_max": y2,
-                }
-            )
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_size, 1))
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_size))
 
-    # ------------------------------------------------------------------ #
-    # 2) Overlap ölçüleri (padding ile)
-    # ------------------------------------------------------------------ #
-    def overlap_measures(cell: Dict[str, Any], sig: Dict[str, Any]) -> Tuple[float, float, float]:
-        """
-        return (intersection_area, frac_sig, frac_cell)
-          intersection_area: kesişim alanı
-          frac_sig         : imza alanının yüzde kaçı hücre içinde
-          frac_cell        : hücre alanının yüzde kaçı imza ile kaplı
-        """
+    # Yatay çizgiler
+    horizontal_lines = cv2.erode(bw, horiz_kernel, iterations=1)
+    horizontal_lines = cv2.dilate(horizontal_lines, horiz_kernel, iterations=1)
 
-        cx = float(cell["x"])
-        cy = float(cell["y"])
-        cw = float(cell["w"])
-        ch = float(cell["h"])
+    # Dikey çizgiler
+    vertical_lines = cv2.erode(bw, vert_kernel, iterations=1)
+    vertical_lines = cv2.dilate(vertical_lines, vert_kernel, iterations=1)
 
-        # Hücreyi px bazında büyüt
-        x1c = cx - cell_padding_px
-        y1c = cy - cell_padding_px
-        x2c = cx + cw + cell_padding_px
-        y2c = cy + ch + cell_padding_px
+    # 3) Çizgi sayısını tahmin et
+    cnts_h, _ = cv2.findContours(horizontal_lines, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cnts_v, _ = cv2.findContours(vertical_lines, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        xA = max(x1c, sig["x_min"])
-        yA = max(y1c, sig["y_min"])
-        xB = min(x2c, sig["x_max"])
-        yB = min(y2c, sig["y_max"])
+    num_h = len(cnts_h)
+    num_v = len(cnts_v)
 
-        inter_w = max(0.0, xB - xA)
-        inter_h = max(0.0, yB - yA)
-        inter_area = inter_w * inter_h
+    # 4) Yatay & dikey çizgi kesişimlerini bul
+    intersections = cv2.bitwise_and(horizontal_lines, vertical_lines)
+    cnts_i, _ = cv2.findContours(intersections, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    num_i = len(cnts_i)
 
-        if inter_area <= 0:
-            return 0.0, 0.0, 0.0
+    # 5) Yatay + dikey maskeleri birleştir, en büyük contour'u al
+    table_mask = cv2.bitwise_or(horizontal_lines, vertical_lines)
+    cnts_t, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        area_cell = (x2c - x1c) * (y2c - y1c)
-        area_sig = (sig["x_max"] - sig["x_min"]) * (sig["y_max"] - sig["y_min"])
-
-        frac_sig = inter_area / area_sig if area_sig > 0 else 0.0
-        frac_cell = inter_area / area_cell if area_cell > 0 else 0.0
-
-        return inter_area, frac_sig, frac_cell
-
-    # ------------------------------------------------------------------ #
-    # 3) Kolon adını fuzzy ile bul
-    # ------------------------------------------------------------------ #
-    def fuzzy_best_col(columns, target: str):
-        best_col = None
-        best_score = 0.0
-        t = target.upper()
-
-        for col in columns:
-            s = SequenceMatcher(None, str(col).upper(), t).ratio()
-            if s > best_score:
-                best_score = s
-                best_col = col
-        return best_col, best_score
-
-    # ------------------------------------------------------------------ #
-    # 4) Her sayfa için imza kolonunu 0/1 olarak doldur
-    # ------------------------------------------------------------------ #
-    result_dfs: List["pd.DataFrame"] = []
-
-    for page_index, df in enumerate(table_dfs):
-        if df is None or df.empty:
-            result_dfs.append(df)
-            continue
-
-        # "page_index" hariç kolonlar
-        data_cols = [c for c in df.columns if c != "page_index"]
-
-        sig_col_name, score = fuzzy_best_col(data_cols, signature_header_target)
-
-        # imza başlığı yoksa olduğu gibi bırak
-        if sig_col_name is None or score < fuzzy_min_score:
-            result_dfs.append(df)
-            continue
-
-        sig_col_pos = data_cols.index(sig_col_name)
-
-        # İMZA kolonunu 0 ile başlat
-        df[sig_col_name] = 0
-
-        # Sayfanın hücreleri ve imzaları
-        cells = page_cells_all[page_index]
-        page_sigs = [s for s in norm_sigs if s["image_index"] == page_index]
-
-        if not cells or not page_sigs:
-            result_dfs.append(df)
-            continue
-
-        # Sadece imza kolonundaki hücreler
-        imza_cells = [c for c in cells if c["col"] == sig_col_pos]
-        if not imza_cells:
-            result_dfs.append(df)
-            continue
-
-        # row değerlerini DataFrame index'lerine map et
-        unique_rows = sorted({int(c["row"]) for c in imza_cells})
-        df_rows = list(df.index)
-
-        # Hücre row sayısı DF satır sayısından 1 fazlaysa: header'ı at
-        if len(unique_rows) == len(df_rows) + 1:
-            if 0 in unique_rows:
-                rows_for_map = [r for r in unique_rows if r != 0]  # 0'ı header say
-            else:
-                rows_for_map = unique_rows[1:]  # en üstü header say
-        elif len(unique_rows) >= len(df_rows):
-            rows_for_map = unique_rows[: len(df_rows)]
-        else:
-            rows_for_map = unique_rows  # daha az hücre varsa kalan satırlar 0 kalır
-
-        row_map: Dict[int, int] = {}
-        for i, r in enumerate(rows_for_map):
-            if i < len(df_rows):
-                row_map[r] = df_rows[i]
-
+    if not cnts_t:
         if debug:
-            print(
-                f"\n[DEBUG] page {page_index}: {len(imza_cells)} imza hücresi,"
-                f" {len(page_sigs)} imza bbox'u, row_map={row_map}"
-            )
+            print("[DEBUG] no table-like contour found")
+        return False
 
-        # Her hücre için kontrol
-        for ci, cell in enumerate(imza_cells):
-            raw_row = int(cell["row"])
-            if raw_row not in row_map:
-                if debug:
-                    print(f"[DEBUG] page {page_index} cell#{ci} raw_row={raw_row} not in row_map")
-                continue
+    max_cnt = max(cnts_t, key=cv2.contourArea)
+    x, y, w_box, h_box = cv2.boundingRect(max_cnt)
+    area_ratio = (w_box * h_box) / float(w * h)
 
-            row_idx = row_map[raw_row]
+    if debug:
+        print(
+            f"[DEBUG] h_lines={num_h}, v_lines={num_v}, "
+            f"intersections={num_i}, area_ratio={area_ratio:.3f}"
+        )
 
-            cy = float(cell["y"])
-            ch = float(cell["h"])
+    # 6) Eşik kontrolleri
+    if num_h < min_h_lines:
+        if debug:
+            print("[DEBUG] failed: not enough horizontal lines")
+        return False
 
-            # Merkez-eşik aralığı
-            top_pad = center_pad_factor_top * ch
-            bottom_pad = center_pad_factor_bottom * ch
-            center_min = cy - top_pad
-            center_max = cy + ch + bottom_pad
+    if num_v < min_v_lines:
+        if debug:
+            print("[DEBUG] failed: not enough vertical lines")
+        return False
 
-            marked = False
-            best_frac_sig = 0.0
-            best_frac_cell = 0.0
+    if num_i < min_intersections:
+        if debug:
+            print("[DEBUG] failed: not enough intersections")
+        return False
 
-            for si, sig in enumerate(page_sigs):
-                sy_center = 0.5 * (sig["y_min"] + sig["y_max"])
+    if area_ratio < min_area_ratio:
+        if debug:
+            print("[DEBUG] failed: table area too small")
+        return False
 
-                # 1) Merkez bu satır aralığı içinde mi?
-                if center_min <= sy_center <= center_max:
-                    marked = True
-                    if debug:
-                        print(
-                            f"[DEBUG] page {page_index} cell#{ci} raw_row={raw_row} "
-                            f"-> row_idx={row_idx} CENTER hit by sig#{si}"
-                        )
-                    break
+    if debug:
+        print("[DEBUG] table detected")
 
-                # 2) Aksi halde overlap oranlarına bak
-                inter_area, frac_sig, frac_cell = overlap_measures(cell, sig)
-                if inter_area > 0:
-                    if frac_sig > best_frac_sig:
-                        best_frac_sig = frac_sig
-                    if frac_cell > best_frac_cell:
-                        best_frac_cell = frac_cell
+    return True
 
-            # Eğer merkez ile işaretlenmediyse, oranlara göre işaretle
-            if not marked:
-                if (best_frac_sig >= sig_cover_threshold) or (best_frac_cell >= cell_cover_threshold):
-                    marked = True
-                    if debug:
-                        print(
-                            f"[DEBUG] page {page_index} cell#{ci} raw_row={raw_row} "
-                            f"-> row_idx={row_idx} OVERLAP hit "
-                            f"(frac_sig={best_frac_sig:.3f}, "
-                            f"frac_cell={best_frac_cell:.3f})"
-                        )
 
-            if marked:
-                df.at[row_idx, sig_col_name] = 1
+def build_table_control_df(doc_images, debug: bool = False):
+    """
+    doc_images: her elemanı bir sayfa görüntüsü (np.ndarray) olan liste.
+    Dönen: page_index ve tablo_var_mi (1/0) içeren DataFrame.
+    """
+    rows = []
+    for page_index, img in enumerate(doc_images):
+        has_table = _detect_table_on_page(img, debug=debug)
+        rows.append({
+            "page_index": page_index,
+            "tablo_var_mi": 1 if has_table else 0
+        })
 
-        result_dfs.append(df)
+    table_control_df = pd.DataFrame(rows)
+    return table_control_df
 
-    return result_dfs
-
-table_dfs_marked = mark_signatures_on_imza_column(
-    table_dfs=table_df,
-    page_cells_all=page_cells_all,
-    sig_boxes=sig_boxes,
-    signature_header_target="İMZA",
-    fuzzy_min_score=0.7,
-    sig_cover_threshold=0.15,
-    cell_cover_threshold=0.08,
-    center_pad_factor_top=0.4,
-    center_pad_factor_bottom=0.4,
-    cell_padding_px=4,
-    debug=True,
-)
-
-for df in table_dfs_marked:
-    display(df)
+table_control_df = build_table_control_df(doc_images, debug=True)
+display(table_control_df)
