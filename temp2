@@ -1,5 +1,5 @@
 from difflib import SequenceMatcher
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import numpy as np
 
 
@@ -9,17 +9,18 @@ def mark_signatures_on_imza_column(
     sig_boxes: List[Dict[str, Any]],
     signature_header_target: str = "IMZA",   # veya "İMZA"
     fuzzy_min_score: float = 0.7,
-    max_vertical_factor: float = 1.0,        # ister 0.75'e tekrar çekebilirsin
+    sig_cover_threshold: float = 0.25,       # imzanın en az %25'i hücre içinde
+    cell_cover_threshold: float = 0.15,      # hücrenin en az %15'i imza ile kaplı
 ):
     """
-    table_dfs      : list[pd.DataFrame] -> her sayfanın tablo DataFrame'i
-    page_cells_all : list[list[dict]]   -> her sayfa için hücreler (row, col, x, y, w, h)
-    sig_boxes      : YOLO imza çıkışları (predict_on_memory_images -> all_boxes listesi)
-
     Mantık:
-    - Her sayfada imza kolonundaki hücreleri yukarıdan aşağıya sırala.
-    - Aynı sayfadaki imza bbox'larını dikey merkezine göre sırala.
-    - Sırayla eşleştir: k. imza -> k. hücre.
+    - Her sayfa için, her İMZA hücresi bazında bak:
+        * Bu hücreye giren tüm imza kutularının overlap alanını hesapla.
+        * Eğer bu overlap, imza alanının belirli oranından (sig_cover_threshold)
+          veya hücre alanının belirli oranından (cell_cover_threshold) fazlaysa
+          o satırı 1 yap.
+    - Aynı YOLO kutusu birden fazla hücreyi yeterince kaplıyorsa, o satırların
+      hepsi 1 olur (tek kutuda iki imza sorunu çözülür).
     """
 
     # 1) YOLO çıktısını normalize et: (image_index, x_min, y_min, x_max, y_max)
@@ -52,7 +53,35 @@ def mark_signatures_on_imza_column(
                 }
             )
 
-    # 2) Kolon adını fuzzy ile bul
+    # 2) Overlap ölçüleri
+    def overlap_measures(cell: Dict[str, Any], sig: Dict[str, Any]) -> Tuple[float, float, float]:
+        """
+        return (intersection_area, frac_sig, frac_cell)
+            intersection_area: kesişim alanı
+            frac_sig         : imza alanının yüzde kaçı hücre içinde
+            frac_cell        : hücre alanının yüzde kaçı imza ile kaplı
+        """
+        xA = max(float(cell["x"]), sig["x_min"])
+        yA = max(float(cell["y"]), sig["y_min"])
+        xB = min(float(cell["x"]) + float(cell["w"]), sig["x_max"])
+        yB = min(float(cell["y"]) + float(cell["h"]), sig["y_max"])
+
+        inter_w = max(0.0, xB - xA)
+        inter_h = max(0.0, yB - yA)
+        inter_area = inter_w * inter_h
+
+        if inter_area <= 0:
+            return 0.0, 0.0, 0.0
+
+        area_cell = float(cell["w"]) * float(cell["h"])
+        area_sig = (sig["x_max"] - sig["x_min"]) * (sig["y_max"] - sig["y_min"])
+
+        frac_sig = inter_area / area_sig if area_sig > 0 else 0.0
+        frac_cell = inter_area / area_cell if area_cell > 0 else 0.0
+
+        return inter_area, frac_sig, frac_cell
+
+    # 3) Kolon adını fuzzy ile bul
     def fuzzy_best_col(columns, target: str):
         best_col = None
         best_score = 0.0
@@ -65,7 +94,7 @@ def mark_signatures_on_imza_column(
                 best_col = col
         return best_col, best_score
 
-    # 3) Her sayfa için imza kolonunu 0/1 olarak doldur
+    # 4) Her sayfa için imza kolonunu 0/1 olarak doldur
     result_dfs: List["pd.DataFrame"] = []
 
     for page_index, df in enumerate(table_dfs):
@@ -78,7 +107,7 @@ def mark_signatures_on_imza_column(
 
         sig_col_name, score = fuzzy_best_col(data_cols, signature_header_target)
 
-        # imza başlığı yoksa dokunma
+        # imza başlığı yoksa olduğu gibi bırak
         if sig_col_name is None or score < fuzzy_min_score:
             result_dfs.append(df)
             continue
@@ -102,41 +131,26 @@ def mark_signatures_on_imza_column(
             result_dfs.append(df)
             continue
 
-        # 3.1 Hücreleri yukarıdan aşağıya sırala (center_y)
-        for c in imza_cells:
-            c["_center_y"] = float(c["y"]) + 0.5 * float(c["h"])
-        imza_cells_sorted = sorted(imza_cells, key=lambda c: c["_center_y"])
+        # Her hücre için en iyi overlap'i bul
+        for cell in imza_cells:
+            best_frac_sig = 0.0
+            best_frac_cell = 0.0
 
-        # 3.2 İmzaları yukarıdan aşağıya sırala (center_y)
-        for s in page_sigs:
-            s["_center_y"] = 0.5 * (s["y_min"] + s["y_max"])
-        page_sigs_sorted = sorted(page_sigs, key=lambda s: s["_center_y"])
+            for sig in page_sigs:
+                inter_area, frac_sig, frac_cell = overlap_measures(cell, sig)
+                if inter_area <= 0:
+                    continue
 
-        # 3.3 Kaç imza varsa o kadar satıra 1 ver
-        n_pairs = min(len(imza_cells_sorted), len(page_sigs_sorted))
+                if frac_sig > best_frac_sig:
+                    best_frac_sig = frac_sig
+                if frac_cell > best_frac_cell:
+                    best_frac_cell = frac_cell
 
-        for k in range(n_pairs):
-            cell = imza_cells_sorted[k]
-            sig = page_sigs_sorted[k]
-
-            cy = cell["_center_y"]
-            sy = sig["_center_y"]
-            ch = float(cell["h"])
-
-            # Güvenlik: dikey uzaklık çok absürt olmasın
-            if abs(sy - cy) > max_vertical_factor * ch:
-                # çok uzaktaysa bu eşlemeyi atla
-                continue
-
-            row_idx = cell["row"]
-            if row_idx in df.index:
-                df.at[row_idx, sig_col_name] = 1
-
-        # temizlik
-        for c in imza_cells:
-            c.pop("_center_y", None)
-        for s in page_sigs:
-            s.pop("_center_y", None)
+            # Herhangi bir imza bu hücreyi "yeterince" kaplıyorsa 1 yap
+            if (best_frac_sig >= sig_cover_threshold) or (best_frac_cell >= cell_cover_threshold):
+                row_idx = cell["row"]
+                if row_idx in df.index:
+                    df.at[row_idx, sig_col_name] = 1
 
         result_dfs.append(df)
 
@@ -148,7 +162,8 @@ table_dfs_marked = mark_signatures_on_imza_column(
     sig_boxes=sig_boxes,
     signature_header_target="İMZA",
     fuzzy_min_score=0.7,
-    max_vertical_factor=1.0,
+    sig_cover_threshold=0.25,     # istersen 0.2 yap
+    cell_cover_threshold=0.15,    # istersen 0.1–0.2 aralığında oynayabilirsin
 )
 
 for df in table_dfs_marked:
