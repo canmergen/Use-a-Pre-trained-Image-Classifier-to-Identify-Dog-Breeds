@@ -9,20 +9,29 @@ def mark_signatures_on_imza_column(
     sig_boxes: List[Dict[str, Any]],
     signature_header_target: str = "IMZA",   # veya "İMZA"
     fuzzy_min_score: float = 0.7,
-    sig_cover_threshold: float = 0.25,       # imzanın en az %25'i hücre içinde
-    cell_cover_threshold: float = 0.15,      # hücrenin en az %15'i imza ile kaplı
-    cell_padding_px: int = 6,                # hücreyi hesaplamada her yöne +6 px büyüt
+    sig_cover_threshold: float = 0.15,       # imzanın en az %15'i hücre içinde
+    cell_cover_threshold: float = 0.08,      # hücrenin en az %8'i imza ile kaplı
+    center_pad_factor_top: float = 0.3,      # hücrenin üstüne ekstra pay (h * 0.3)
+    center_pad_factor_bottom: float = 0.3,   # altına ekstra pay (h * 0.3)
+    cell_padding_px: int = 4,                # overlap hesabında hücreyi px bazında büyüt
+    debug: bool = False,
 ):
     """
+    Satır-merkezli imza işaretleme.
+
     Mantık:
-    - Her sayfa için, her İMZA hücresi bazında bak:
-        * Hücreyi hesaplamada cell_padding_px kadar büyüt.
-        * Bu hücreye giren tüm imza kutularının overlap alanını hesapla.
-        * Eğer bu overlap, imza alanının belirli oranından (sig_cover_threshold)
-          veya hücre alanının belirli oranından (cell_cover_threshold) fazlaysa
-          o satırı 1 yap.
-    - Aynı YOLO kutusu birden fazla hücreyi yeterince kaplıyorsa, o satırların
-      hepsi 1 olur (tek kutuda iki imza sorunu çözülür).
+      - Her sayfa ve her İMZA hücresi için:
+          1) Her imza bbox'unun merkez Y koordinatına bak.
+             Merkez, hücrenin [y - top_pad, y + h + bottom_pad] aralığındaysa bu satırı 1 yap.
+          2) Hala işaretlenmediyse, alan kesişimine bak:
+             intersection / area_sig >= sig_cover_threshold
+             veya
+             intersection / area_cell >= cell_cover_threshold
+             ise yine 1 yap.
+
+    Böylece:
+      - Küçük kaymalar, çizgi hizası problemleri, çok dar overlap durumları tolere edilir.
+      - Tek bir YOLO kutusu iki satırı da anlamlı kaplıyorsa ikisi de 1 olabilir.
     """
 
     # 1) YOLO çıktısını normalize et: (image_index, x_min, y_min, x_max, y_max)
@@ -33,7 +42,7 @@ def mark_signatures_on_imza_column(
         boxes = sb.get("boxes", [])
 
         for b in boxes:
-            # b: {"xyxy":[x1,y1,x2,y2], ...} vb.
+            # b: {"xyxy":[x1,y1,x2,y2], ...} benzeri
             xyxy = (
                 b.get("xyxy")
                 or b.get("bbox")
@@ -59,17 +68,17 @@ def mark_signatures_on_imza_column(
     def overlap_measures(cell: Dict[str, Any], sig: Dict[str, Any]) -> Tuple[float, float, float]:
         """
         return (intersection_area, frac_sig, frac_cell)
-            intersection_area: kesişim alanı
-            frac_sig         : imza alanının yüzde kaçı hücre içinde
-            frac_cell        : hücre alanının yüzde kaçı imza ile kaplı
+          intersection_area: kesişim alanı
+          frac_sig         : imza alanının yüzde kaçı hücre içinde
+          frac_cell        : hücre alanının yüzde kaçı imza ile kaplı
         """
 
-        # Hücreyi padding ile genişlet
         cx = float(cell["x"])
         cy = float(cell["y"])
         cw = float(cell["w"])
         ch = float(cell["h"])
 
+        # Hücreyi px bazında büyüt
         x1c = cx - cell_padding_px
         y1c = cy - cell_padding_px
         x2c = cx + cw + cell_padding_px
@@ -145,23 +154,54 @@ def mark_signatures_on_imza_column(
             result_dfs.append(df)
             continue
 
-        # Her hücre için en iyi overlap'i bul
-        for cell in imza_cells:
+        if debug:
+            print(f"\n[DEBUG] page {page_index}: {len(imza_cells)} imza hücresi, {len(page_sigs)} imza bbox'u")
+
+        # Her hücre için kontrol
+        for ci, cell in enumerate(imza_cells):
+            cy = float(cell["y"])
+            ch = float(cell["h"])
+
+            # Merkez-eşik aralığı
+            top_pad = center_pad_factor_top * ch
+            bottom_pad = center_pad_factor_bottom * ch
+            center_min = cy - top_pad
+            center_max = cy + ch + bottom_pad
+
+            marked = False
             best_frac_sig = 0.0
             best_frac_cell = 0.0
 
-            for sig in page_sigs:
+            for si, sig in enumerate(page_sigs):
+                sy_center = 0.5 * (sig["y_min"] + sig["y_max"])
+
+                # 1) Merkez bu satır aralığı içinde mi?
+                if center_min <= sy_center <= center_max:
+                    marked = True
+                    if debug:
+                        print(f"[DEBUG] page {page_index} cell#{ci} row={cell['row']} -> CENTER hit by sig#{si}")
+                    break
+
+                # 2) Aksi halde overlap oranlarına bak
                 inter_area, frac_sig, frac_cell = overlap_measures(cell, sig)
-                if inter_area <= 0:
-                    continue
+                if inter_area > 0:
+                    if frac_sig > best_frac_sig:
+                        best_frac_sig = frac_sig
+                    if frac_cell > best_frac_cell:
+                        best_frac_cell = frac_cell
 
-                if frac_sig > best_frac_sig:
-                    best_frac_sig = frac_sig
-                if frac_cell > best_frac_cell:
-                    best_frac_cell = frac_cell
+            # Eğer merkez ile işaretlenmediyse, oranlara göre işaretle
+            if not marked:
+                if (best_frac_sig >= sig_cover_threshold) or (best_frac_cell >= cell_cover_threshold):
+                    marked = True
+                    if debug:
+                        print(
+                            f"[DEBUG] page {page_index} cell#{ci} row={cell['row']} "
+                            f"-> OVERLAP hit (frac_sig={best_frac_sig:.3f}, "
+                            f"frac_cell={best_frac_cell:.3f})"
+                        )
 
-            # Herhangi bir imza bu hücreyi "yeterince" kaplıyorsa 1 yap
-            if (best_frac_sig >= sig_cover_threshold) or (best_frac_cell >= cell_cover_threshold):
+            if marked:
                 row_idx = cell["row"]
                 if row_idx in df.index:
                     df.at[row_idx, sig_col_name] = 1
@@ -176,7 +216,13 @@ table_dfs_marked = mark_signatures_on_imza_column(
     sig_boxes=sig_boxes,
     signature_header_target="İMZA",
     fuzzy_min_score=0.7,
-    sig_cover_threshold=0.20,      # istersen 0.15–0.25 arası dene
-    cell_cover_threshold=0.10,     # özellikle ilk satır için 0.10–0.15 iyi çalışır
-    cell_padding_px=6,             # yetmezse 8–10 deneyebilirsin
+    sig_cover_threshold=0.15,
+    cell_cover_threshold=0.08,
+    center_pad_factor_top=0.3,
+    center_pad_factor_bottom=0.3,
+    cell_padding_px=4,
+    debug=True,   # ilk denemede açık bırak
 )
+
+for df in table_dfs_marked:
+    display(df)
