@@ -1,3 +1,238 @@
+from typing import List
+import numpy as np
+import pandas as pd
+import re
+
+
+def fix_empty_column_names_in_list(table_dfs_cleaned: List[pd.DataFrame],
+                                   upper_tr: bool = False) -> List[pd.DataFrame]:
+    """
+    Boş / dummy kolon adlarını, alt satırdaki ilk dolu header değeriyle doldurur.
+    - 'col_0', 'col_1', 'Unnamed: 0', None, '' vb. başlıkları düzeltir.
+    - Header kullanılan hücreyi NaN yapar.
+    - Tüm hücreleri boş olan satırları drop eder.
+    - Sadece page_index dolu, diğer tüm kolonlar boş ise o satır da drop edilir.
+    """
+    fixed_list: List[pd.DataFrame] = []
+    col_pattern = re.compile(r"col_\d+$", re.IGNORECASE)
+
+    for df in table_dfs_cleaned:
+        if not isinstance(df, pd.DataFrame):
+            fixed_list.append(df)
+            continue
+
+        df2 = df.copy()
+        new_cols = list(df2.columns)
+
+        # 1) Boş kolon adlarını düzelt
+        for j, col in enumerate(df2.columns):
+            col_str = "" if col is None else str(col)
+            col_norm = col_str.strip().lower()
+
+            is_empty_name = col_norm in ("", "nan", "none") or bool(col_pattern.match(col_norm))
+            is_dummy = col_norm.startswith("unnamed")
+
+            if not (is_empty_name or is_dummy):
+                continue
+
+            # Bu kolon için header olarak kullanılacak ilk dolu hücreyi bul
+            series = df2.iloc[:, j]
+            first_valid = (
+                series
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            first_valid = first_valid[first_valid != ""]
+
+            if first_valid.empty:
+                continue
+
+            new_name = first_valid.iloc[0]
+            if upper_tr:
+                # Türkçe upper fix
+                new_name = (
+                    new_name.upper()
+                    .replace("İ", "I")
+                    .replace("ı", "I")
+                )
+
+            new_cols[j] = new_name
+            row_idx = first_valid.index[0]
+            # Header satırındaki hücreyi boşalt
+            df2.iloc[row_idx, j] = np.nan
+
+        df2.columns = new_cols
+
+        # 2) Satır temizliği
+        def should_drop(row: pd.Series) -> bool:
+            # Tamamen boş satır mı? (NaN veya boş string)
+            all_empty = True
+            for v in row:
+                if pd.isna(v):
+                    continue
+                if isinstance(v, str) and v.strip() == "":
+                    continue
+                all_empty = False
+                break
+            if all_empty:
+                return True
+
+            # Sadece page_index dolu, diğer kolonlar boş mu?
+            page_cols = [c for c in df2.columns if "page_index" in str(c).lower()]
+            if len(page_cols) == 1:
+                page_col = page_cols[0]
+                page_val = row[page_col]
+
+                other = row.drop(page_col)
+                others_empty = True
+                for v in other:
+                    if pd.isna(v):
+                        continue
+                    if isinstance(v, str) and v.strip() == "":
+                        continue
+                    others_empty = False
+                    break
+
+                if (not pd.isna(page_val)) and str(page_val).strip() != "" and others_empty:
+                    return True
+
+            return False
+
+        mask = df2.apply(should_drop, axis=1)
+        df2 = df2.loc[~mask].reset_index(drop=True)
+
+        fixed_list.append(df2)
+
+    return fixed_list
+
+
+def remove_TL_and_convert_to_float(table_dfs_cleaned: List[pd.DataFrame]) -> List[pd.DataFrame]:
+    """
+    1) Tüm hücrelerden 'TL', 'Tl', 'tl' vb. kaldırılır.
+    2) TL temizliğinden sonra sayısal hale gelebilen hücreler float'a çevrilir.
+       Özellikle '39.517.500.00 TL' → 39_517_500.00 olacak şekilde özel mantık içerir.
+    3) Numerik olmayan kolonlara dokunulmaz (string olarak kalır).
+    """
+    cleaned_list: List[pd.DataFrame] = []
+
+    def strip_tl(v):
+        if isinstance(v, str):
+            return (
+                v.replace("TL", "")
+                 .replace("Tl", "")
+                 .replace("tl", "")
+                 .replace("TRY", "")
+                 .replace("try", "")
+                 .strip()
+            )
+        return v
+
+    def to_float_candidate(v):
+        # Boş / NaN
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return np.nan
+
+        # Zaten sayısal
+        if isinstance(v, (int, float, np.number)):
+            return float(v)
+
+        txt = str(v).strip()
+        if txt == "" or not any(c.isdigit() for c in txt):
+            return np.nan
+
+        # Para birimi ibarelerini temizle
+        txt = re.sub(r"(?i)\b(tl|try)\b", "", txt)
+        txt = txt.strip()
+
+        # Hem nokta hem virgül varsa → TR formatı: 39.517.500,00
+        if "." in txt and "," in txt:
+            tmp = re.sub(r"[^\d\.,]", "", txt)
+            # binlik ayraçlar: nokta, ondalık: virgül
+            tmp = tmp.replace(".", "").replace(",", ".")
+            try:
+                return float(tmp)
+            except ValueError:
+                pass
+
+        # Sadece virgül varsa → virgül ondalık
+        if "," in txt and "." not in txt:
+            tmp = re.sub(r"[^\d,]", "", txt)
+            tmp = tmp.replace(".", "").replace(",", ".")
+            try:
+                return float(tmp)
+            except ValueError:
+                pass
+
+        # Sadece nokta varsa → binlik / OCR kası: 39.517.500.00
+        if "." in txt and "," not in txt:
+            clean = re.sub(r"[^\d\.]", "", txt)
+            parts = clean.split(".")
+
+            # 4 parça ve üzeri ise (39.517.500.00 gibi)
+            if len(parts) >= 4:
+                digits = "".join(parts)
+                # Son '00' kuruş değil, fazla sıfır → kırp
+                if digits.endswith("00"):
+                    digits = digits[:-2]
+                try:
+                    return float(digits)
+                except ValueError:
+                    pass
+
+            # Aksi halde nokta -> binlik ayraç kabul et
+            digits = "".join(parts)
+            if digits != "":
+                try:
+                    return float(digits)
+                except ValueError:
+                    pass
+
+        # Genel fallback: sadece rakamları al
+        digits = re.sub(r"[^\d]", "", txt)
+        if digits == "":
+            return np.nan
+        try:
+            return float(digits)
+        except ValueError:
+            return np.nan
+
+    for df in table_dfs_cleaned:
+        if not isinstance(df, pd.DataFrame):
+            cleaned_list.append(df)
+            continue
+
+        df2 = df.copy()
+        n_rows, n_cols = df2.shape
+
+        for j in range(n_cols):
+            s = df2.iloc[:, j]
+
+            # TL temizliği (string hücrelerde)
+            s_clean = s.map(strip_tl)
+
+            # Numerik kolona dönüştürme denemesi
+            s_float = s_clean.map(to_float_candidate)
+
+            # Eğer kolonda anlamlı sayısal içerik varsa float'a çevir
+            if s_float.notna().sum() > 0:
+                df2.iloc[:, j] = s_float
+            else:
+                # sayı dönmediyse en azından TL’siz string kalsın
+                df2.iloc[:, j] = s_clean
+
+        cleaned_list.append(df2)
+
+    return cleaned_list
+
+# 1) Header ve boş satır düzeltme
+table_dfs_fixed = fix_empty_column_names_in_list(table_dfs_cleaned, upper_tr=True)
+
+# 2) TL temizliği + float’a çevirme
+table_dfs_cleaned2 = remove_TL_and_convert_to_float(table_dfs_fixed)
+
+display(table_dfs_cleaned2[0])
+
 def standardize_hazirun_tables(
     table_dfs: List[pd.DataFrame],
     match_threshold: float = 55.0
