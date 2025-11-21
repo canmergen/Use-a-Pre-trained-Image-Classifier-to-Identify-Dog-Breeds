@@ -1,3 +1,161 @@
+from difflib import SequenceMatcher
+from typing import List, Dict, Any, Tuple
+import numpy as np
+
+
+def mark_signatures_on_imza_column(
+    table_dfs: List["pd.DataFrame"],
+    page_cells_all: List[List[Dict[str, Any]]],
+    sig_boxes: List[Dict[str, Any]],
+    signature_header_target: str = "IMZA",   # veya "İMZA"
+    sig_cover_threshold: float = 0.4,        # imzanın en az %40'ı hücre içinde olsun
+    iou_threshold: float = 0.01,             # çok düşük bırakıyorum, yedek koşul
+    fuzzy_min_score: float = 0.7,
+):
+    """
+    table_dfs      : list[pd.DataFrame] -> her sayfanın tablo DataFrame'i
+    page_cells_all : list[list[dict]]   -> her sayfa için hücreler (row, col, x, y, w, h)
+    sig_boxes      : YOLO imza çıkışları listesi (all_boxes)
+    """
+
+    # 1) YOLO çıktısını normalize et: her imza için (page, x_min, y_min, x_max, y_max)
+    norm_sigs: List[Dict[str, Any]] = []
+
+    for sb in sig_boxes:
+        img_idx = sb.get("image_index", 0)
+        boxes = sb.get("boxes", [])
+
+        for b in boxes:
+            # b yapısı: {"xyxy":[x1,y1,x2,y2], "conf":..., "class_id":...}
+            xyxy = (
+                b.get("xyxy")
+                or b.get("bbox")
+                or b.get("xxyy")
+                or b
+            )
+            if xyxy is None or len(xyxy) != 4:
+                continue
+
+            x1, y1, x2, y2 = map(float, xyxy)
+
+            norm_sigs.append(
+                {
+                    "image_index": int(img_idx),
+                    "x_min": x1,
+                    "y_min": y1,
+                    "x_max": x2,
+                    "y_max": y2,
+                }
+            )
+
+    # 2) Overlap ölçüleri: IoU + imzanın hücre içinde kalan oranı
+    def overlap_measures(cell: Dict[str, Any], sig: Dict[str, Any]) -> Tuple[float, float, float]:
+        """
+        return: (iou, frac_sig, frac_cell)
+            iou      : klasik IoU
+            frac_sig : imza alanının yüzde kaçı hücre içinde (intersection / area_sig)
+            frac_cell: hücre alanının yüzde kaçı overlap (intersection / area_cell)
+        """
+        xA = max(float(cell["x"]), sig["x_min"])
+        yA = max(float(cell["y"]), sig["y_min"])
+        xB = min(float(cell["x"]) + float(cell["w"]), sig["x_max"])
+        yB = min(float(cell["y"]) + float(cell["h"]), sig["y_max"])
+
+        inter_w = max(0.0, xB - xA)
+        inter_h = max(0.0, yB - yA)
+        inter_area = inter_w * inter_h
+
+        if inter_area <= 0:
+            return 0.0, 0.0, 0.0
+
+        area_cell = float(cell["w"]) * float(cell["h"])
+        area_sig = (sig["x_max"] - sig["x_min"]) * (sig["y_max"] - sig["y_min"])
+        union_area = area_cell + area_sig - inter_area
+
+        iou = inter_area / union_area if union_area > 0 else 0.0
+        frac_sig = inter_area / area_sig if area_sig > 0 else 0.0
+        frac_cell = inter_area / area_cell if area_cell > 0 else 0.0
+
+        return iou, frac_sig, frac_cell
+
+    # 3) Kolon adını fuzzy ile bul
+    def fuzzy_best_col(columns, target: str):
+        best_col = None
+        best_score = 0.0
+        t = target.upper()
+
+        for col in columns:
+            s = SequenceMatcher(None, str(col).upper(), t).ratio()
+            if s > best_score:
+                best_score = s
+                best_col = col
+        return best_col, best_score
+
+    # 4) Her sayfa için imza kolonunu 0/1 olarak doldur
+    result_dfs: List["pd.DataFrame"] = []
+
+    for page_index, df in enumerate(table_dfs):
+        if df is None or df.empty:
+            result_dfs.append(df)
+            continue
+
+        # "page_index" hariç kolonlar
+        data_cols = [c for c in df.columns if c != "page_index"]
+
+        sig_col_name, score = fuzzy_best_col(data_cols, signature_header_target)
+
+        # imza başlığı bulunamadı -> dokunma
+        if sig_col_name is None or score < fuzzy_min_score:
+            result_dfs.append(df)
+            continue
+
+        sig_col_pos = data_cols.index(sig_col_name)
+
+        # İMZA kolonunu 0'la başlat
+        df[sig_col_name] = 0
+
+        # İlgili sayfanın hücreleri ve imzaları
+        cells = page_cells_all[page_index]
+        page_sigs = [s for s in norm_sigs if s["image_index"] == page_index]
+
+        if not cells or not page_sigs:
+            result_dfs.append(df)
+            continue
+
+        # Sadece imza kolonundaki hücrelere bak
+        for cell in cells:
+            if cell["col"] != sig_col_pos:
+                continue
+
+            # Bu hücre için herhangi bir imza yeterince içeride mi?
+            for sig in page_sigs:
+                iou, frac_sig, frac_cell = overlap_measures(cell, sig)
+
+                # imzanın belli oranı hücre içinde ise veya IoU yeterliyse işaretle
+                if (frac_sig >= sig_cover_threshold) or (iou >= iou_threshold):
+                    row_idx = cell["row"]
+                    if row_idx in df.index:
+                        df.at[row_idx, sig_col_name] = 1
+                    break  # aynı hücre için başka imzaya bakmaya gerek yok
+
+        result_dfs.append(df)
+
+    return result_dfs
+
+table_dfs_marked = mark_signatures_on_imza_column(
+    table_dfs=table_df,
+    page_cells_all=page_cells_all,
+    sig_boxes=sig_boxes,
+    signature_header_target="İMZA",
+    sig_cover_threshold=0.4,   # istersen 0.3–0.5 arasında oynayabilirsin
+    iou_threshold=0.01,
+    fuzzy_min_score=0.7,
+)
+
+for df in table_dfs_marked:
+    display(df)
+
+
 from typing import List, Tuple, Optional
 import numpy as np
 import cv2
