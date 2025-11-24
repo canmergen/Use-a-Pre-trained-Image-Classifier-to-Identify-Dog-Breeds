@@ -1,59 +1,147 @@
 import cv2
 import numpy as np
+from typing import List, Dict, Any, Optional
 
-def auto_fix_table_lines(table_bin: np.ndarray, line_thickness: int = 3):
+def extract_tables_bw(
+    pages: List[np.ndarray],
+    min_area_ratio: float = 0.005,
+    margin_px: int = 6,
+    debug: bool = False
+) -> List[Dict[str, Any]]:
     """
-    Tablo içindeki yatay ve dikey çizgileri otomatik tespit eder,
-    sadece bu çizgileri kalınlaştırır ve kopuklukları kapatır.
-    Parametre gerektirmez. Çizgiler Hough transform ile bulunur.
+    Sayfalardaki tabloları tespit edip, çizgi yapısını BOZMADAN
+    ikili (0/255) tablo görüntüsü döndürür.
+
+    Çıktı:
+        [
+          {
+            "image_index": i,
+            "status": "ok" | "fallback" | "error",
+            "bbox": (x0, y0, x1, y1) or None,
+            "table_bw": np.ndarray (H,W)  # çizgiler korunmuş
+            "debug": {...} or None
+          },
+          ...
+        ]
     """
+    results: List[Dict[str, Any]] = []
 
-    # --- 1) Tek kanal garanti ---
-    if len(table_bin.shape) == 3:
-        gray = cv2.cvtColor(table_bin, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = table_bin.copy()
+    for idx, img in enumerate(pages):
+        try:
+            # --- 1) Griye çevir ---
+            if img.ndim == 2:
+                gray = img.copy()
+            elif img.ndim == 3 and img.shape[2] == 3:
+                # BGR/RGB fark etmiyor, griye indiriyoruz
+                try:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                except Exception:
+                    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            else:
+                raise ValueError("Unsupported image shape")
 
-    # --- 2) Kesin binary formata getir ---
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            H, W = gray.shape[:2]
 
-    # Çizgileri beyaz yap (morfoloji kolaylığı)
-    inv = 255 - bw
+            # --- 2) Sadece MASKE için ikili görüntü üret (tablo sınırını bulmak için) ---
+            # Bu bw_mask sadece kontur bulmak için; ÇİZGİ YAPISINA DOKUNACAĞIMIZ yer burası değil.
+            _, bw_mask = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
 
-    # --- 3) Kenarları belirle ---
-    edges = cv2.Canny(inv, 50, 150, apertureSize=3)
+            # --- 3) Siyah içeriği maske haline getir (yazı+çizgiler) ---
+            ink = cv2.subtract(255, bw_mask)      # siyah içerik -> beyaz
+            ink = cv2.medianBlur(ink, 3)          # hafif gürültü bastırma (sadece maske)
 
-    # --- 4) Hough Lines (çizgi tespiti TAM OTOMATİK) ---
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi/180,
-        threshold=80,
-        minLineLength=50,     # otomatik davranır
-        maxLineGap=20         # kopuklukların kapanması için
-    )
+            # --- 4) Büyük tek bileşen haline getirmek için closing ---
+            kx = max(15, W // 60)
+            ky = max(15, H // 60)
+            ker = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+            mask = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, ker, iterations=1)
 
-    # Yeni boş bir maske
-    line_mask = np.zeros_like(inv)
+            # Kenarları biraz kalınlaştır (daha stabil kontur için)
+            ker2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            mask = cv2.dilate(mask, ker2, iterations=1)
 
-    # --- 5) Bulunan çizgileri kalınlaştırarak çiz ---
-    if lines is not None:
-        for (x1, y1, x2, y2) in lines[:, 0]:
-            cv2.line(line_mask, (x1, y1), (x2, y2), 255, line_thickness)
+            # --- 5) En büyük dış konturu seç (tablo) ---
+            cnts, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
 
-    # --- 6) İnvert et ve 0–255 formatında döndür ---
-    line_mask = np.clip(line_mask, 0, 255).astype(np.uint8)
-    return line_mask
+            table_bbox: Optional[tuple[int, int, int, int]] = None
+            status = "fallback"
 
-fixed_tables = [
-    auto_fix_table_lines(img, line_thickness=3)
-    for img in binarized_tables
-]
+            if cnts:
+                area_img = H * W
+                cand = []
+                for c in cnts:
+                    a = cv2.contourArea(c)
+                    if a >= min_area_ratio * area_img:
+                        cand.append((a, c))
 
-# Görmek için
-for i, img in enumerate(fixed_tables):
-    plt.figure(figsize=(6,8))
-    plt.title(f"Table {i} – auto line fix")
-    plt.imshow(img, cmap="gray")
-    plt.axis("off")
-    plt.show()
+                if cand:
+                    cand.sort(key=lambda x: x[0], reverse=True)
+                    _, best = cand[0]
+                    x, y, w, h = cv2.boundingRect(best)
+
+                    # küçük güvenlik marjı
+                    x0 = max(0, x - margin_px)
+                    y0 = max(0, y - margin_px)
+                    x1 = min(W, x + w + margin_px)
+                    y1 = min(H, y + h + margin_px)
+
+                    table_bbox = (x0, y0, x1, y1)
+                    status = "ok"
+
+            # --- 6) Tablo kırp: ÖNEMLİ NOKTA -> ORİJİNAL GRAY'DEN KIRP ---
+            if table_bbox is None:
+                # tablo bulunamazsa tüm sayfayı kullan (fallback)
+                x0, y0, x1, y1 = 0, 0, W, H
+                status = "fallback"
+            else:
+                x0, y0, x1, y1 = table_bbox
+
+            table_gray = gray[y0:y1, x0:x1].copy()
+
+            # --- 7) Çizgileri bozmadan ikili hale getir ---
+            # Burada herhangi bir blur / close / open YOK, sadece threshold.
+            _, table_bw = cv2.threshold(
+                table_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+
+            out: Dict[str, Any] = {
+                "image_index": idx,
+                "status": status,
+                "bbox": (x0, y0, x1, y1),
+                "table_bw": table_bw,
+                "debug": None,
+            }
+
+            if debug:
+                dbg = {
+                    "bw_mask": bw_mask,   # sadece sınır bulmak için kullandığımız maske
+                    "ink": ink,
+                    "mask": mask,
+                    "kernel": (kx, ky),
+                    "gray": gray,
+                }
+                out["debug"] = dbg
+
+            results.append(out)
+
+        except Exception as e:
+            results.append(
+                {
+                    "image_index": idx,
+                    "status": "error",
+                    "error": str(e),
+                    "bbox": None,
+                    "table_bw": None,
+                    "debug": None,
+                }
+            )
+
+    return results
+
+res = extract_tables_bw(table_imgs, min_area_ratio=0.005, margin_px=6, debug=False)
+
+show_tables(res)  # senin mevcut fonksiyonunla
