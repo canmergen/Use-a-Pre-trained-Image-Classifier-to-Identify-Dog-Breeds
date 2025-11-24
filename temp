@@ -1,147 +1,41 @@
 import cv2
 import numpy as np
-from typing import List, Dict, Any, Optional
 
-def extract_tables_bw(
-    pages: List[np.ndarray],
-    min_area_ratio: float = 0.005,
-    margin_px: int = 6,
-    debug: bool = False
-) -> List[Dict[str, Any]]:
+def binarize_preserve_lines(gray: np.ndarray) -> np.ndarray:
     """
-    Sayfalardaki tabloları tespit edip, çizgi yapısını BOZMADAN
-    ikili (0/255) tablo görüntüsü döndürür.
-
-    Çıktı:
-        [
-          {
-            "image_index": i,
-            "status": "ok" | "fallback" | "error",
-            "bbox": (x0, y0, x1, y1) or None,
-            "table_bw": np.ndarray (H,W)  # çizgiler korunmuş
-            "debug": {...} or None
-          },
-          ...
-        ]
+    Global threshold yerine K-means (K=2) kullanarak,
+    koyu kümeyi mürekkep (siyah), açık kümeyi arka plan (beyaz) yapar.
+    İnce gri çizgiler Otsu'nun attığı durumları toparlar.
+    Girdi:  gray (H,W) uint8
+    Çıktı:  bw (H,W) uint8, 0=ink, 255=background
     """
-    results: List[Dict[str, Any]] = []
 
-    for idx, img in enumerate(pages):
-        try:
-            # --- 1) Griye çevir ---
-            if img.ndim == 2:
-                gray = img.copy()
-            elif img.ndim == 3 and img.shape[2] == 3:
-                # BGR/RGB fark etmiyor, griye indiriyoruz
-                try:
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                except Exception:
-                    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            else:
-                raise ValueError("Unsupported image shape")
+    # 1) Kontrastı hafif normalize et (K-means için daha net ayrım)
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-            H, W = gray.shape[:2]
+    # 2) K-means için vektörleştir
+    Z = norm.reshape(-1, 1).astype(np.float32)
 
-            # --- 2) Sadece MASKE için ikili görüntü üret (tablo sınırını bulmak için) ---
-            # Bu bw_mask sadece kontur bulmak için; ÇİZGİ YAPISINA DOKUNACAĞIMIZ yer burası değil.
-            _, bw_mask = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
+    # 3) K=2 cluster (arka plan / mürekkep)
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        10,
+        1.0
+    )
+    K = 2
+    _, labels, centers = cv2.kmeans(
+        Z, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+    )
 
-            # --- 3) Siyah içeriği maske haline getir (yazı+çizgiler) ---
-            ink = cv2.subtract(255, bw_mask)      # siyah içerik -> beyaz
-            ink = cv2.medianBlur(ink, 3)          # hafif gürültü bastırma (sadece maske)
+    labels = labels.reshape(norm.shape)
+    centers = centers.reshape(-1)  # 2 eleman: [c0, c1]
 
-            # --- 4) Büyük tek bileşen haline getirmek için closing ---
-            kx = max(15, W // 60)
-            ky = max(15, H // 60)
-            ker = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
-            mask = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, ker, iterations=1)
+    # 4) En koyu merkez = mürekkep kümesi
+    ink_cluster = int(np.argmin(centers))
 
-            # Kenarları biraz kalınlaştır (daha stabil kontur için)
-            ker2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            mask = cv2.dilate(mask, ker2, iterations=1)
+    # 5) Kümeleri 0/255'e map et
+    bw = np.where(labels == ink_cluster, 0, 255).astype(np.uint8)
 
-            # --- 5) En büyük dış konturu seç (tablo) ---
-            cnts, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
+    return bw
 
-            table_bbox: Optional[tuple[int, int, int, int]] = None
-            status = "fallback"
-
-            if cnts:
-                area_img = H * W
-                cand = []
-                for c in cnts:
-                    a = cv2.contourArea(c)
-                    if a >= min_area_ratio * area_img:
-                        cand.append((a, c))
-
-                if cand:
-                    cand.sort(key=lambda x: x[0], reverse=True)
-                    _, best = cand[0]
-                    x, y, w, h = cv2.boundingRect(best)
-
-                    # küçük güvenlik marjı
-                    x0 = max(0, x - margin_px)
-                    y0 = max(0, y - margin_px)
-                    x1 = min(W, x + w + margin_px)
-                    y1 = min(H, y + h + margin_px)
-
-                    table_bbox = (x0, y0, x1, y1)
-                    status = "ok"
-
-            # --- 6) Tablo kırp: ÖNEMLİ NOKTA -> ORİJİNAL GRAY'DEN KIRP ---
-            if table_bbox is None:
-                # tablo bulunamazsa tüm sayfayı kullan (fallback)
-                x0, y0, x1, y1 = 0, 0, W, H
-                status = "fallback"
-            else:
-                x0, y0, x1, y1 = table_bbox
-
-            table_gray = gray[y0:y1, x0:x1].copy()
-
-            # --- 7) Çizgileri bozmadan ikili hale getir ---
-            # Burada herhangi bir blur / close / open YOK, sadece threshold.
-            _, table_bw = cv2.threshold(
-                table_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-
-            out: Dict[str, Any] = {
-                "image_index": idx,
-                "status": status,
-                "bbox": (x0, y0, x1, y1),
-                "table_bw": table_bw,
-                "debug": None,
-            }
-
-            if debug:
-                dbg = {
-                    "bw_mask": bw_mask,   # sadece sınır bulmak için kullandığımız maske
-                    "ink": ink,
-                    "mask": mask,
-                    "kernel": (kx, ky),
-                    "gray": gray,
-                }
-                out["debug"] = dbg
-
-            results.append(out)
-
-        except Exception as e:
-            results.append(
-                {
-                    "image_index": idx,
-                    "status": "error",
-                    "error": str(e),
-                    "bbox": None,
-                    "table_bw": None,
-                    "debug": None,
-                }
-            )
-
-    return results
-
-res = extract_tables_bw(table_imgs, min_area_ratio=0.005, margin_px=6, debug=False)
-
-show_tables(res)  # senin mevcut fonksiyonunla
+table_bw = binarize_preserve_lines(table_gray)
