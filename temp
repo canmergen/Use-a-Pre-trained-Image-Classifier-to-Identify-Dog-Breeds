@@ -3,29 +3,25 @@ import numpy as np
 from typing import List, Dict, Any, Optional
 
 # ---------------------------------------------------------------------
-# 1) İnce çizgileri koruyan binarizasyon (K=2 K-means)
+# 1) İnce çizgileri koruyan lokal binarizasyon (K=2 K-means)
 # ---------------------------------------------------------------------
 def binarize_preserve_lines(gray: np.ndarray) -> np.ndarray:
     """
-    Global threshold (Otsu) yerine K-means (K=2) kullanarak,
-    koyu kümeyi mürekkep (siyah), açık kümeyi arka plan (beyaz) yapar.
-    İnce gri çizgilerin beyaza kaybolduğu durumları toparlamak için kullanılır.
+    Tablo bölgesini, global threshold yerine K-means (K=2) ile
+    binarize eder. Koyu cluster mürekkep (0), açık cluster arka plan (255).
 
     Girdi:
-        gray : (H, W) uint8 gri seviye tablo görüntüsü
+        gray : (H, W) uint8
     Çıktı:
-        bw   : (H, W) uint8 ikili görüntü (0=ink, 255=background)
+        bw   : (H, W) uint8, 0=ink, 255=background
     """
-    # Her ihtimale karşı tek kanal
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
 
-    # K-means öncesi hafif normalizasyon
+    # K-means öncesi normalize
     norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-
     Z = norm.reshape(-1, 1).astype(np.float32)
 
-    # K=2 cluster: arka plan / mürekkep
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
                 10, 1.0)
     K = 2
@@ -34,39 +30,38 @@ def binarize_preserve_lines(gray: np.ndarray) -> np.ndarray:
             Z, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
         )
         labels = labels.reshape(norm.shape)
-        centers = centers.reshape(-1)  # [c0, c1]
-        ink_cluster = int(np.argmin(centers))          # en koyu merkez
+        centers = centers.reshape(-1)       # [c0, c1]
+        ink_cluster = int(np.argmin(centers))
         bw = np.where(labels == ink_cluster, 0, 255).astype(np.uint8)
     except Exception:
-        # K-means bir sebeple çökerse, güvenli fallback: Otsu
+        # Güvenli fallback
         _, bw = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
 
     return bw
 
+
 # ---------------------------------------------------------------------
-# 2) Sayfalardan tablo tespiti + çizgileri bozmadan binarize etme
+# 2) Sayfalardan tablo tespiti + binarizasyon (kopukluk yok)
 # ---------------------------------------------------------------------
 def extract_tables_bw(
     pages: List[np.ndarray],
-    min_area_ratio: float = 0.005,  # tablo en az %0.5 alan kaplasın
-    margin_px: int = 6,             # kırpıma küçük pay
+    min_area_ratio: float = 0.005,   # tablo en az %0.5 alan kaplasın
+    margin_px: int = 6,              # bbox'a küçük pay
     debug: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Her sayfada (page) tabloyu bulur, bbox içinde gri tabloyu kırpar ve
-    çizgi yapısını bozmadan ikili tablo görüntüsü (table_bw) olarak döndürür.
+    Her sayfada tabloyu bulur, gri tabloyu kırpar ve çizgileri
+    bozmadan ikili (0/255) tablo görüntüsü döndürür.
 
-    Girdi:
-        pages : list of np.ndarray, her biri (H,W,3) veya (H,W) uint8
-    Çıktı (list of dict):
+    Dönen her eleman:
         {
             "image_index": int,
             "status": "ok" | "fallback" | "error",
-            "bbox": (x0, y0, x1, y1) veya None,
-            "table_bw": np.ndarray (H,W) veya None,
-            "debug": {...} veya None
+            "bbox": (x0, y0, x1, y1) | None,
+            "table_bw": np.ndarray(H,W) | None,
+            "debug": {...} | None
         }
     """
     results: List[Dict[str, Any]] = []
@@ -77,7 +72,6 @@ def extract_tables_bw(
             if img.ndim == 2:
                 gray = img.copy()
             elif img.ndim == 3 and img.shape[2] == 3:
-                # BGR / RGB farkını tolere et
                 try:
                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 except Exception:
@@ -88,28 +82,46 @@ def extract_tables_bw(
             H, W = gray.shape[:2]
 
             # ---------------------------------------------------------
-            # 2) TABLO MASKESİ (sadece kontur bulmak için) - OTSU KALSIN
-            #    Burada çizgi kopukluğu önemli değil; tek amacımız bbox.
+            # 2) TABLO MASKESİ (bw_mask) – ADAPTİF, PERCENTILE TABANLI
+            #    Amaç: tablo alanını bulmak, çizgi kopukluğu değil.
             # ---------------------------------------------------------
+
+            # a) Arka planı normalize et (koyu gri sayfaları aç)
+            #    Büyük median blur ile yavaş değişen arka planı tahmin et
+            k_bg = max(31, (min(H, W) // 20) | 1)  # tek sayı olsun
+            bg = cv2.medianBlur(gray, k_bg)
+
+            # Gölge / ton farklarını azalt: gray / bg
+            norm_mask = cv2.divide(gray, bg, scale=255)
+            norm_mask = cv2.normalize(
+                norm_mask, None, 0, 255, cv2.NORM_MINMAX
+            ).astype(np.uint8)
+
+            # b) Otomatik yüksek eşik: percentile tabanlı
+            #    90. percentile genelde arka plan parlaklığına denk geliyor.
+            p90 = np.percentile(norm_mask, 90)
+            # Eşiği biraz aşağı çek (arka planın da üstünde kalsın)
+            thr = np.clip(p90 - 5, 150, 245).astype(np.uint8)
+
+            # Arka plan > thr; mürekkep <= thr olacak şekilde invert threshold
+            # Sonuç: bw_mask: 255 = ink bölgesi, 0 = arka plan
             _, bw_mask = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                norm_mask, int(thr), 255, cv2.THRESH_BINARY_INV
             )
 
-            # Siyah içeriği (yazı+çizgi) beyaza çevir
-            ink = cv2.subtract(255, bw_mask)
+            # c) Küçük delikleri kapat, tabloyu tek parça yap
+            ink = bw_mask  # zaten ink=255, background=0
             ink = cv2.medianBlur(ink, 3)
 
-            # Tablonun tek büyük bileşen olması için geniş kernel
             kx = max(15, W // 60)
             ky = max(15, H // 60)
             ker = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
             mask = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, ker, iterations=1)
 
-            # Konturu biraz sağlamlaştır
             ker2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
             mask = cv2.dilate(mask, ker2, iterations=1)
 
-            # --- 3) En büyük dış konturu bul (tablo) ---
+            # --- 3) En büyük dış konturu bul (tablo alanı) ---
             cnts, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -130,7 +142,6 @@ def extract_tables_bw(
                     _, best = cand[0]
                     x, y, w, h = cv2.boundingRect(best)
 
-                    # Küçük güvenlik marjı
                     x0 = max(0, x - margin_px)
                     y0 = max(0, y - margin_px)
                     x1 = min(W, x + w + margin_px)
@@ -141,20 +152,20 @@ def extract_tables_bw(
 
             # --- 4) Tablo bölgesini gri olarak kırp ---
             if table_bbox is None:
-                # Tespit yoksa tüm sayfayı tablo varsay (fallback)
                 x0, y0, x1, y1 = 0, 0, W, H
                 table_bbox = (x0, y0, x1, y1)
                 status = "fallback"
+            else:
+                x0, y0, x1, y1 = table_bbox
 
-            x0, y0, x1, y1 = table_bbox
             table_gray = gray[y0:y1, x0:x1].copy()
 
             # ---------------------------------------------------------
-            # 5) Çizgileri bozmadan İKİLİ TABLO (K-means)
+            # 5) ÇİZGİLERİ BOZMADAN BİNARİZE (K-means)
             # ---------------------------------------------------------
             table_bw = binarize_preserve_lines(table_gray)
 
-            # --- 6) Çıkış sözlüğü ---
+            # --- 6) Çıkış ---
             out: Dict[str, Any] = {
                 "image_index": idx,
                 "status": status,
@@ -165,11 +176,15 @@ def extract_tables_bw(
 
             if debug:
                 dbg = {
-                    "bw_mask": bw_mask,    # tüm sayfa Otsu binarize
-                    "ink": ink,            # siyah içerik maskesi
-                    "mask": mask,          # closing sonrası tablo maskesi
-                    "kernel": (kx, ky),
                     "gray": gray,
+                    "bg": bg,
+                    "norm_mask": norm_mask,
+                    "bw_mask": bw_mask,
+                    "ink": ink,
+                    "mask": mask,
+                    "kernel": (kx, ky),
+                    "thr": float(thr),
+                    "p90": float(p90),
                 }
                 out["debug"] = dbg
 
@@ -191,7 +206,12 @@ def extract_tables_bw(
 
 res = extract_tables_bw(table_imgs, min_area_ratio=0.005, margin_px=6, debug=False)
 
+from matplotlib import pyplot as plt
+
 for r in res:
     if r["status"] in ("ok", "fallback") and r["table_bw"] is not None:
-        table = r["table_bw"]
-        # burada show_tables veya kendi plot’un
+        plt.figure(figsize=(6, 8))
+        plt.title(f"page={r['image_index']} ({r['status']})")
+        plt.imshow(r["table_bw"], cmap="gray", vmin=0, vmax=255)
+        plt.axis("off")
+        plt.show()
