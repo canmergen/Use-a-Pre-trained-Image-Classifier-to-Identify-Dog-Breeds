@@ -1,217 +1,264 @@
-import cv2
-import numpy as np
-from typing import List, Dict, Any, Optional
+def extract_and_merge_sermaye(
+    pages_scaled: List[List[Dict[str, Any]]],
+    bottom_temp_df: Optional[pd.DataFrame] = None,
+    fuzzy_threshold: int = 80,
+    line_tol: float = 4.0,
+    max_dx: int = 1600,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
-# ---------------------------------------------------------------------
-# 1) İnce çizgileri koruyan lokal binarizasyon (K=2 K-means)
-# ---------------------------------------------------------------------
-def binarize_preserve_lines(gray: np.ndarray) -> np.ndarray:
-    """
-    Tablo bölgesini, global threshold yerine K-means (K=2) ile
-    binarize eder. Koyu cluster mürekkep (0), açık cluster arka plan (255).
+    import pandas as pd
+    import re
+    from rapidfuzz import fuzz
 
-    Girdi:
-        gray : (H, W) uint8
-    Çıktı:
-        bw   : (H, W) uint8, 0=ink, 255=background
-    """
-    if gray.ndim == 3:
-        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    # ------------------------------------------------------------
+    # 1) GÜVENLİ SAYI PARSE EDİCİ  (5.000.000.00 → 5000000)
+    # ------------------------------------------------------------
+    def normalize_tr_number(s: Optional[str]) -> Optional[int]:
+        if s is None:
+            return None
 
-    # K-means öncesi normalize
-    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    Z = norm.reshape(-1, 1).astype(np.float32)
+        s = str(s).strip()
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                10, 1.0)
-    K = 2
-    try:
-        _, labels, centers = cv2.kmeans(
-            Z, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
-        )
-        labels = labels.reshape(norm.shape)
-        centers = centers.reshape(-1)       # [c0, c1]
-        ink_cluster = int(np.argmin(centers))
-        bw = np.where(labels == ink_cluster, 0, 255).astype(np.uint8)
-    except Exception:
-        # Güvenli fallback
-        _, bw = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
+        # TL/TR/TRY vs temizle
+        s = re.sub(r"(TL|tl|Tİ|ti|TRY|try|₺)", "", s)
+        s = s.replace(" ", "")
 
-    return bw
+        # , → .
+        s = s.replace(",", ".")
 
+        # parçala
+        parts = s.split(".")
 
-# ---------------------------------------------------------------------
-# 2) Sayfalardan tablo tespiti + binarizasyon (kopukluk yok)
-# ---------------------------------------------------------------------
-def extract_tables_bw(
-    pages: List[np.ndarray],
-    min_area_ratio: float = 0.005,   # tablo en az %0.5 alan kaplasın
-    margin_px: int = 6,              # bbox'a küçük pay
-    debug: bool = False
-) -> List[Dict[str, Any]]:
-    """
-    Her sayfada tabloyu bulur, gri tabloyu kırpar ve çizgileri
-    bozmadan ikili (0/255) tablo görüntüsü döndürür.
+        # 2'den fazla . varsa → tüm noktalar thousand separator → integer
+        if len(parts) > 2:
+            merged = "".join(parts)
+            try:
+                return int(merged)
+            except:
+                return None
 
-    Dönen her eleman:
-        {
-            "image_index": int,
-            "status": "ok" | "fallback" | "error",
-            "bbox": (x0, y0, x1, y1) | None,
-            "table_bw": np.ndarray(H,W) | None,
-            "debug": {...} | None
-        }
-    """
-    results: List[Dict[str, Any]] = []
-
-    for idx, img in enumerate(pages):
-        try:
-            # --- 1) Griye çevir ---
-            if img.ndim == 2:
-                gray = img.copy()
-            elif img.ndim == 3 and img.shape[2] == 3:
+        # tam 2 parça varsa "xxxx.yy"
+        if len(parts) == 2:
+            left, right = parts
+            # decimal bozuk veya 0 ise → integer
+            if right in ["0", "00", "000"]:
                 try:
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                except Exception:
-                    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            else:
-                raise ValueError(f"Unsupported image shape: {img.shape}")
+                    return int(left)
+                except:
+                    return None
+            # düz float parse
+            try:
+                return int(float(left + "." + right))
+            except:
+                return None
 
-            H, W = gray.shape[:2]
+        # tek parça
+        try:
+            return int(s)
+        except:
+            return None
 
-            # ---------------------------------------------------------
-            # 2) TABLO MASKESİ (bw_mask) – ADAPTİF, PERCENTILE TABANLI
-            #    Amaç: tablo alanını bulmak, çizgi kopukluğu değil.
-            # ---------------------------------------------------------
+    # ------------------------------------------------------------
+    # 2) NUMERIC DETEKTÖR – kutuda sayı var mı?
+    # ------------------------------------------------------------
+    DIGIT_RX = re.compile(r"\d")
 
-            # a) Arka planı normalize et (koyu gri sayfaları aç)
-            #    Büyük median blur ile yavaş değişen arka planı tahmin et
-            k_bg = max(31, (min(H, W) // 20) | 1)  # tek sayı olsun
-            bg = cv2.medianBlur(gray, k_bg)
+    # ------------------------------------------------------------
+    # 3) BBOX yardımcıları
+    # ------------------------------------------------------------
+    def _center_y(b): return (b["y_min"] + b["y_max"]) / 2.0
+    def _same_line(a, b, tol): return abs(_center_y(a) - _center_y(b)) <= tol
 
-            # Gölge / ton farklarını azalt: gray / bg
-            norm_mask = cv2.divide(gray, bg, scale=255)
-            norm_mask = cv2.normalize(
-                norm_mask, None, 0, 255, cv2.NORM_MINMAX
-            ).astype(np.uint8)
+    # ------------------------------------------------------------
+    # 4) Aynı satırda sağdaki en yakın sayı kutusunu bul
+    # ------------------------------------------------------------
+    def _nearest_value_on_right(items, idx_label, max_dx, line_tol):
+        A = items[idx_label]["bbox"]
+        best_idx = None
+        best_dx = None
 
-            # b) Otomatik yüksek eşik: percentile tabanlı
-            #    90. percentile genelde arka plan parlaklığına denk geliyor.
-            p90 = np.percentile(norm_mask, 90)
-            # Eşiği biraz aşağı çek (arka planın da üstünde kalsın)
-            thr = np.clip(p90 - 5, 150, 245).astype(np.uint8)
+        # 1) Aynı satırda en yakın sağdaki sayı
+        for j, it in enumerate(items):
+            if j == idx_label:
+                continue
+            B = it["bbox"]
+            txt = it.get("text", "")
 
-            # Arka plan > thr; mürekkep <= thr olacak şekilde invert threshold
-            # Sonuç: bw_mask: 255 = ink bölgesi, 0 = arka plan
-            _, bw_mask = cv2.threshold(
-                norm_mask, int(thr), 255, cv2.THRESH_BINARY_INV
+            # sadece sağdaki kutular
+            if B["x_min"] <= A["x_min"]:
+                continue
+
+            dx = B["x_min"] - A["x_min"]
+            if dx > max_dx:
+                continue
+
+            if not _same_line(A, B, line_tol):
+                continue
+
+            if not DIGIT_RX.search(txt):
+                continue
+
+            if best_dx is None or dx < best_dx:
+                best_dx = dx
+                best_idx = j
+
+        # 2) fallback: y-ortalamaya göre en yakın sağdaki kutu
+        if best_idx is None:
+            best_score = None
+            YA = _center_y(A)
+
+            for j, it in enumerate(items):
+                if j == idx_label:
+                    continue
+
+                B = it["bbox"]
+                txt = it.get("text", "")
+
+                if B["x_min"] <= A["x_min"]:
+                    continue
+
+                dx = B["x_min"] - A["x_min"]
+                if dx > max_dx:
+                    continue
+
+                if not DIGIT_RX.search(txt):
+                    continue
+
+                yb = _center_y(B)
+                dy = abs(yb - YA)
+                score = (dy, dx)
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_idx = j
+
+        return best_idx
+
+    # ------------------------------------------------------------
+    # 5) SAYFA BAZINDA SERMAYE ARAMA
+    # ------------------------------------------------------------
+    rows = []
+    n_pages = len(pages_scaled or [])
+
+    for pidx, items in enumerate(pages_scaled or []):
+        if not items:
+            continue
+
+        # reading order
+        items = sorted(
+            items,
+            key=lambda it: (it["bbox"]["y_min"], it["bbox"]["x_min"])
+        )
+
+        for i, it in enumerate(items):
+            raw_text = (it.get("text") or "").casefold()
+
+            # "sermaye" içermeyen kutu elensin
+            if "sermaye" not in raw_text:
+                continue
+
+            # çok kısa (ör “M A”) olan kutular atılsın
+            if len(raw_text.strip()) < 10:
+                continue
+
+            # fuzzy skor
+            score = max(
+                fuzz.partial_ratio(raw_text, "şirketin sermayesi"),
+                fuzz.partial_ratio(raw_text, "sermaye")
             )
+            if score < fuzzy_threshold:
+                continue
 
-            # c) Küçük delikleri kapat, tabloyu tek parça yap
-            ink = bw_mask  # zaten ink=255, background=0
-            ink = cv2.medianBlur(ink, 3)
+            # label kutusu
+            label_bbox = it["bbox"]
+            label_text = it.get("text", "")
 
-            kx = max(15, W // 60)
-            ky = max(15, H // 60)
-            ker = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
-            mask = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, ker, iterations=1)
+            # 1) label'ın kendi içinden sayı çekmeyi dene
+            value_str = None
+            for dig in re.findall(r"[0-9\.\,]+", label_text):
+                value_str = dig
+            value_num = normalize_tr_number(value_str) if value_str else None
+            value_bbox = label_bbox if value_str else None
 
-            ker2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            mask = cv2.dilate(mask, ker2, iterations=1)
+            # 2) sağdaki en yakın sayı kutusundan dene
+            if value_num is None:
+                cand = _nearest_value_on_right(items, i, max_dx, line_tol)
+                if cand is not None:
+                    txt = items[cand].get("text", "")
+                    num_str = re.findall(r"[0-9\.\,]+", txt)
+                    if num_str:
+                        value_str = num_str[-1]
+                        value_num = normalize_tr_number(value_str)
+                        value_bbox = items[cand]["bbox"]
 
-            # --- 3) En büyük dış konturu bul (tablo alanı) ---
-            cnts, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
+            # 3) reading order’da sağa doğru tek tek bak
+            if value_num is None:
+                for j in range(i + 1, len(items)):
+                    txt = items[j].get("text", "")
+                    if DIGIT_RX.search(txt):
+                        num_str = re.findall(r"[0-9\.\,]+", txt)
+                        if num_str:
+                            value_str = num_str[-1]
+                            value_num = normalize_tr_number(value_str)
+                            value_bbox = items[j]["bbox"]
+                            break
 
-            table_bbox: Optional[tuple[int, int, int, int]] = None
-            status = "fallback"
-
-            if cnts:
-                area_img = H * W
-                cand = []
-                for c in cnts:
-                    a = cv2.contourArea(c)
-                    if a >= min_area_ratio * area_img:
-                        cand.append((a, c))
-
-                if cand:
-                    cand.sort(key=lambda x: x[0], reverse=True)
-                    _, best = cand[0]
-                    x, y, w, h = cv2.boundingRect(best)
-
-                    x0 = max(0, x - margin_px)
-                    y0 = max(0, y - margin_px)
-                    x1 = min(W, x + w + margin_px)
-                    y1 = min(H, y + h + margin_px)
-
-                    table_bbox = (x0, y0, x1, y1)
-                    status = "ok"
-
-            # --- 4) Tablo bölgesini gri olarak kırp ---
-            if table_bbox is None:
-                x0, y0, x1, y1 = 0, 0, W, H
-                table_bbox = (x0, y0, x1, y1)
-                status = "fallback"
-            else:
-                x0, y0, x1, y1 = table_bbox
-
-            table_gray = gray[y0:y1, x0:x1].copy()
-
-            # ---------------------------------------------------------
-            # 5) ÇİZGİLERİ BOZMADAN BİNARİZE (K-means)
-            # ---------------------------------------------------------
-            table_bw = binarize_preserve_lines(table_gray)
-
-            # --- 6) Çıkış ---
-            out: Dict[str, Any] = {
-                "image_index": idx,
-                "status": status,
-                "bbox": table_bbox,
-                "table_bw": table_bw,
-                "debug": None,
-            }
-
-            if debug:
-                dbg = {
-                    "gray": gray,
-                    "bg": bg,
-                    "norm_mask": norm_mask,
-                    "bw_mask": bw_mask,
-                    "ink": ink,
-                    "mask": mask,
-                    "kernel": (kx, ky),
-                    "thr": float(thr),
-                    "p90": float(p90),
-                }
-                out["debug"] = dbg
-
-            results.append(out)
-
-        except Exception as e:
-            results.append(
+            rows.append(
                 {
-                    "image_index": idx,
-                    "status": "error",
-                    "error": str(e),
-                    "bbox": None,
-                    "table_bw": None,
-                    "debug": None,
+                    "image_index": pidx,
+                    "label_text": label_text,
+                    "label_bbox": label_bbox,
+                    "value_text": value_str,
+                    "value_bbox": value_bbox,
+                    "value_str": value_str,
+                    "value_num": value_num,
                 }
             )
 
-    return results
+    sermaye_df = pd.DataFrame(rows)
 
-res = extract_tables_bw(table_imgs, min_area_ratio=0.005, margin_px=6, debug=False)
+    # ------------------------------------------------------------
+    # 6) SAYFA BAZINDA EN İYİ SERMAYE SEÇİMİ
+    # ------------------------------------------------------------
+    if sermaye_df.empty:
+        best = pd.DataFrame(columns=["image_index", "sermaye_value", "sermaye_bbox"])
+    else:
+        # numeric satırlar
+        df_nonnull = sermaye_df.dropna(subset=["value_num"])
+        if not df_nonnull.empty:
+            best = (
+                df_nonnull.sort_values(["image_index", "value_num"], ascending=[True, False])
+                .groupby("image_index", as_index=False)
+                .first()[["image_index", "value_num", "value_bbox"]]
+                .rename(columns={"value_num": "sermaye_value", "value_bbox": "sermaye_bbox"})
+            )
+        else:
+            # numeric yoksa string bazlı seç
+            best = (
+                sermaye_df.dropna(subset=["value_str"])
+                .sort_values(["image_index", "value_str"], ascending=[True, False])
+                .groupby("image_index", as_index=False)
+                .first()[["image_index", "value_str", "value_bbox"]]
+                .rename(columns={"value_str": "sermaye_value", "value_bbox": "sermaye_bbox"})
+            )
 
-from matplotlib import pyplot as plt
+    # integer format
+    if "sermaye_value" in best.columns:
+        try:
+            best["sermaye_value"] = best["sermaye_value"].astype(int)
+        except:
+            pass
 
-for r in res:
-    if r["status"] in ("ok", "fallback") and r["table_bw"] is not None:
-        plt.figure(figsize=(6, 8))
-        plt.title(f"page={r['image_index']} ({r['status']})")
-        plt.imshow(r["table_bw"], cmap="gray", vmin=0, vmax=255)
-        plt.axis("off")
-        plt.show()
+    # ------------------------------------------------------------
+    # 7) bottom_temp_df merge
+    # ------------------------------------------------------------
+    if bottom_temp_df is None or not isinstance(bottom_temp_df, pd.DataFrame) or bottom_temp_df.empty:
+        skeleton = pd.DataFrame({"image_index": list(range(n_pages))})
+        merged = skeleton.merge(best, on="image_index", how="left")
+    else:
+        bd = bottom_temp_df.copy()
+        if "image_index" not in bd.columns:
+            bd["image_index"] = range(len(bd))
+        merged = bd.merge(best, on="image_index", how="left")
+
+    return sermaye_df, merged
