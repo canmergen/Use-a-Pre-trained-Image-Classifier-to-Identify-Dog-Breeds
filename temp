@@ -4,47 +4,53 @@ from __future__ import annotations
 import os
 import re
 import json
-import math
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
-import fitz  # pymupdf
+import fitz  # PyMuPDF
 
-# -------------------------
+
+# =========================
 # Config
-# -------------------------
-PDF_PATH = "/mnt/data/tcmb_teblig.pdf"  # TODO: set
+# =========================
+PDF_PATH = "/mnt/data/tcmb_teblig.pdf"
 OUT_JSONL = "/mnt/data/tcmb_teblig_chunks.jsonl"
 
 DOC_ID = "tcmb_teblig"
 DOC_NAME = "TCMB TEBLİĞ"
 
-# RAG chunk controls (token approx; HF tokenizer bağlayabilirsin)
-MAX_CHARS = 1800        # ~ 350-450 token bandına denk gelir (TR metinde değişir)
-MIN_CHARS = 400
+# Chunk sizing (char-based; istersen HF tokenizer ile token'a çevirirsin)
+MAX_CHARS = 2200
+MIN_CHARS = 500
 OVERLAP_CHARS = 250
 
-# Heading detection knobs
-MIN_HEADING_LEN = 2
-MAX_HEADING_LEN = 80
-UPPER_RATIO_TH = 0.70   # satırın büyük harf yoğunluğu
-CENTER_TOL = 0.14       # sayfa genişliğine göre merkez toleransı
-BIG_FONT_Q = 0.88       # font size quantile üstü heading adayı
+# Heading heuristics
+UPPER_RATIO_TH = 0.70
+CENTER_TOL = 0.14
+BIG_FONT_Q = 0.88
 
-# Known TR section headers (alt başlıklar)
+# Known headings (TR)
 KNOWN_SUBHEADINGS = {
     "AMAÇ","KAPSAM","DAYANAK","TANIMLAR","BİLGİLENDİRME","YÜRÜRLÜK","YÜRÜTME",
     "ÜCRETLERİN İADESİ","ÜCRETLERİN SINIFLANDIRILMASI","ÜCRETLERİN DEĞİŞTİRİLMESİ",
-    "SÖZLEŞME ESASLARI","KAMPANYALAR VE ÖZEL HİZMETLER","SON HÜKÜMLER"
+    "SÖZLEŞME ESASLARI","KAMPANYALAR VE ÖZEL HİZMETLER","SON HÜKÜMLER",
+    "BANKA VE KREDİ KARTI ÜCRETLERİ","PARA VE KIYMETLİ MADEN TRANSFER İŞLEMLERİ",
+    "MEVDUAT VE KATILIM FONU İŞLEMLERİ"
 }
 
-BOLUM_RE = re.compile(r"^\s*([IVXLC]+|BİRİNCİ|İKİNCİ|ÜÇÜNCÜ|DÖRDÜNCÜ|BEŞİNCİ|ALTINCI|YEDİNCİ|SEKİZİNCİ|DOKUZUNCU|ONUNCU)\s+BÖLÜM\s*$", re.IGNORECASE)
-MADDE_RE = re.compile(r"^\s*(GEÇİCİ\s+)?MADDE\s+(\d+)\s*[-–]?\s*$", re.IGNORECASE)
-EK_RE = re.compile(r"^\s*EK\s*[-–]?\s*(\d+)\s*.*$", re.IGNORECASE)
+# Patterns
+BOLUM_RE = re.compile(
+    r"^\s*([IVXLC]+|BİRİNCİ|İKİNCİ|ÜÇÜNCÜ|DÖRDÜNCÜ|BEŞİNCİ|ALTINCI|YEDİNCİ|SEKİZİNCİ|DOKUZUNCU|ONUNCU)\s+BÖLÜM\s*$",
+    re.IGNORECASE
+)
+# MADDE line bazen "MADDE 1 – (1) ..." aynı satırda
+MADDE_INLINE_RE = re.compile(r"\b(GEÇİCİ\s+)?MADDE\s+(\d+)\b", re.IGNORECASE)
+EK_RE = re.compile(r"^\s*EK\s*[-–]?\s*(\d+)\b", re.IGNORECASE)
 
-# -------------------------
+
+# =========================
 # Utils
-# -------------------------
+# =========================
 def normalize_ws(s: str) -> str:
     s = s.replace("\u00ad", "")
     s = re.sub(r"[ \t]+", " ", s)
@@ -58,55 +64,23 @@ def upper_ratio(s: str) -> float:
     upp = sum(1 for c in letters if c.upper() == c and c.lower() != c)
     return upp / max(1, len(letters))
 
+def is_known_subheading(line: str) -> bool:
+    t = normalize_ws(line).upper()
+    t = re.sub(r"\s+", " ", t)
+    return t in KNOWN_SUBHEADINGS
+
 def looks_like_heading_text(line: str) -> bool:
     t = normalize_ws(line)
-    if len(t) < MIN_HEADING_LEN or len(t) > MAX_HEADING_LEN:
+    if len(t) < 2 or len(t) > 120:
         return False
-    # başlıklar genelde nokta ile bitmez
     if t.endswith((".", ";", ":", ",")):
         return False
     return True
 
-def is_known_subheading(line: str) -> bool:
-    t = normalize_ws(line).upper()
-    # bazen "Ücretlerin sınıflandırılması" gibi Title Case gelir, normalize edip set'e sokalım
-    t = re.sub(r"\s+", " ", t)
-    return t in KNOWN_SUBHEADINGS
 
-def heading_level(line: str) -> Tuple[int, Dict[str, Any]]:
-    """
-    1: BÖLÜM
-    2: MADDE / GEÇİCİ MADDE / EK
-    3: Alt başlık (Amaç/Kapsam/... veya diğer kısa başlıklar)
-    """
-    t = normalize_ws(line)
-    u = t.upper()
-
-    m = BOLUM_RE.match(u)
-    if m:
-        return 1, {"bolum_title": t}
-
-    m = MADDE_RE.match(u)
-    if m:
-        is_gecici = bool(m.group(1))
-        no = int(m.group(2))
-        return 2, {"article_no": no, "article_kind": "GEÇİCİ MADDE" if is_gecici else "MADDE"}
-
-    m = EK_RE.match(u)
-    if m:
-        no = int(m.group(1))
-        return 2, {"article_no": no, "article_kind": "EK"}
-
-    # known subheading
-    if is_known_subheading(t):
-        return 3, {"subheading": t}
-
-    # generic subheading candidate
-    return 3, {"subheading": t}
-
-# -------------------------
-# Layout line extraction
-# -------------------------
+# =========================
+# Layout model
+# =========================
 @dataclass
 class Line:
     page: int
@@ -118,17 +92,12 @@ class Line:
     y1: float
 
 def extract_lines(doc: fitz.Document) -> List[Line]:
-    """
-    Extract reading-order-ish lines with font size and bbox.
-    """
     lines_out: List[Line] = []
-
     for pi in range(len(doc)):
         page = doc.load_page(pi)
         d = page.get_text("dict")
         page_no = pi + 1
 
-        # collect spans into line strings (keep bbox union)
         for b in d.get("blocks", []):
             if b.get("type", 0) != 0:
                 continue
@@ -136,13 +105,13 @@ def extract_lines(doc: fitz.Document) -> List[Line]:
                 spans = ln.get("spans", [])
                 if not spans:
                     continue
+
                 txt = "".join(sp.get("text", "") for sp in spans).strip()
                 txt = normalize_ws(txt)
                 if not txt:
                     continue
-                # font size: take max (headings usually bigger)
+
                 fs = max(float(sp.get("size", 0)) for sp in spans)
-                # bbox: line bbox
                 x0 = min(sp.get("bbox", [0,0,0,0])[0] for sp in spans)
                 y0 = min(sp.get("bbox", [0,0,0,0])[1] for sp in spans)
                 x1 = max(sp.get("bbox", [0,0,0,0])[2] for sp in spans)
@@ -153,38 +122,51 @@ def extract_lines(doc: fitz.Document) -> List[Line]:
                     x0=float(x0), x1=float(x1), y0=float(y0), y1=float(y1)
                 ))
 
-    # sort by page then y then x
     lines_out.sort(key=lambda L: (L.page, L.y0, L.x0))
     return lines_out
 
+
+# =========================
+# Heading detection (no “section regex splitting”; layout + light patterns)
+# =========================
 def detect_heading_lines(lines: List[Line], doc: fitz.Document) -> List[Dict[str, Any]]:
-    """
-    Decide which lines are headings using:
-    - font size quantile
-    - centered alignment
-    - uppercase ratio
-    - explicit patterns (BÖLÜM/MADDE/EK)
-    """
     if not lines:
         return []
 
-    # font threshold
     sizes = sorted([l.font_size for l in lines if l.font_size > 0])
     q_idx = int(len(sizes) * BIG_FONT_Q)
-    big_th = sizes[min(max(q_idx, 0), len(sizes)-1)] if sizes else 0
+    big_th = sizes[min(max(q_idx, 0), len(sizes) - 1)] if sizes else 0
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for l in lines:
         t = l.text
         u = t.upper()
 
-        # explicit patterns always heading
-        if BOLUM_RE.match(u) or MADDE_RE.match(u) or EK_RE.match(u) or is_known_subheading(t):
-            level, meta = heading_level(t)
-            out.append({"line": l, "is_heading": True, "level": level, "meta": meta})
+        # Level 1: BÖLÜM
+        if BOLUM_RE.match(u):
+            out.append({"line": l, "is_heading": True, "level": 1, "meta": {"bolum": t}})
             continue
 
-        # heuristic heading
+        # Level 2: EK (genelde ayrı bölüm gibi)
+        m_ek = EK_RE.match(u)
+        if m_ek:
+            out.append({"line": l, "is_heading": True, "level": 2, "meta": {"kind": "EK", "no": int(m_ek.group(1)), "raw": t}})
+            continue
+
+        # Level 2: MADDE inline (satır içinde bile olsa)
+        m_md = MADDE_INLINE_RE.search(u)
+        if m_md:
+            is_gecici = bool(m_md.group(1))
+            no = int(m_md.group(2))
+            out.append({"line": l, "is_heading": True, "level": 2, "meta": {"kind": "GEÇİCİ MADDE" if is_gecici else "MADDE", "no": no, "raw": t}})
+            continue
+
+        # Level 3: Known subheadings (Amaç/Kapsam/...)
+        if is_known_subheading(t):
+            out.append({"line": l, "is_heading": True, "level": 3, "meta": {"subheading": t}})
+            continue
+
+        # Heuristic heading (font large OR centered+uppercase-ish)
         if not looks_like_heading_text(t):
             out.append({"line": l, "is_heading": False})
             continue
@@ -194,23 +176,20 @@ def detect_heading_lines(lines: List[Line], doc: fitz.Document) -> List[Dict[str
         line_center = (l.x0 + l.x1) / 2.0
         page_center = w / 2.0
         centered = abs(line_center - page_center) <= (w * CENTER_TOL)
-
         ur = upper_ratio(t)
 
-        # big font OR centered+uppercase-ish -> heading
-        is_h = (l.font_size >= big_th and len(t) <= MAX_HEADING_LEN) or (centered and ur >= UPPER_RATIO_TH)
-
+        is_h = (l.font_size >= big_th) or (centered and ur >= UPPER_RATIO_TH)
         if is_h:
-            level, meta = heading_level(t)
-            out.append({"line": l, "is_heading": True, "level": level, "meta": meta})
+            out.append({"line": l, "is_heading": True, "level": 3, "meta": {"subheading": t}})
         else:
             out.append({"line": l, "is_heading": False})
 
     return out
 
-# -------------------------
-# Section building (hierarchical)
-# -------------------------
+
+# =========================
+# Section building (critical fix: pending subheading attaches to next MADDE)
+# =========================
 @dataclass
 class Section:
     section_id: str
@@ -220,109 +199,124 @@ class Section:
     article_kind: Optional[str]
     article_no: Optional[int]
     subheading: Optional[str]
-    text: str
+    header_path: str
+    body: str
+
+def _make_header_path(bolum: Optional[str], article_kind: Optional[str], article_no: Optional[int], sub: Optional[str]) -> str:
+    parts = [f"# {DOC_NAME}"]
+    if bolum:
+        parts.append(f"## {bolum}")
+    if article_kind and article_no is not None:
+        parts.append(f"### {article_kind} {article_no}")
+    if sub:
+        parts.append(f"#### {sub}")
+    return "\n".join(parts).strip()
 
 def build_sections(annot: List[Dict[str, Any]]) -> List[Section]:
-    """
-    Build sections as:
-      [current headings path] + body until next relevant heading
-    Rules:
-      - Level 1 resets everything (new BÖLÜM)
-      - Level 2 resets article + subheading
-      - Level 3 updates subheading under current article
-    """
     sections: List[Section] = []
 
-    cur_bolum = None
-    cur_article_kind = None
-    cur_article_no = None
-    cur_sub = None
+    cur_bolum: Optional[str] = None
+    cur_article_kind: Optional[str] = None
+    cur_article_no: Optional[int] = None
+    cur_sub: Optional[str] = None
+
+    pending_sub: Optional[str] = None  # <--- Amaç/Kapsam gibi başlıklar MADDE’ye bağlanacak
 
     buf_lines: List[Line] = []
-    buf_page_start = None
-    buf_page_end = None
+    buf_ps: Optional[int] = None
+    buf_pe: Optional[int] = None
 
     def flush():
-        nonlocal buf_lines, buf_page_start, buf_page_end
+        nonlocal buf_lines, buf_ps, buf_pe
         if not buf_lines:
             return
-        text = "\n".join(l.text for l in buf_lines).strip()
-        text = normalize_ws(text)
-        if not text:
+        body = normalize_ws("\n".join(l.text for l in buf_lines))
+        if len(body) < 10:
             buf_lines = []
+            buf_ps = None
+            buf_pe = None
             return
 
+        header_path = _make_header_path(cur_bolum, cur_article_kind, cur_article_no, cur_sub)
+        section_text = (header_path + "\n\n" + body).strip()
+
         sid_parts = [DOC_ID]
-        if cur_bolum: sid_parts.append(re.sub(r"\s+", "_", cur_bolum.strip().lower()))
+        if cur_bolum:
+            sid_parts.append(re.sub(r"\s+", "_", cur_bolum.strip().lower()))
         if cur_article_kind and cur_article_no is not None:
             sid_parts.append(f"{cur_article_kind.lower().replace(' ','_')}_{cur_article_no}")
-        if cur_sub: sid_parts.append(re.sub(r"\s+", "_", cur_sub.strip().lower()))
-
+        if cur_sub:
+            sid_parts.append(re.sub(r"\s+", "_", cur_sub.strip().lower()))
         section_id = "::".join(sid_parts)
 
         sections.append(Section(
             section_id=section_id,
-            page_start=buf_page_start,
-            page_end=buf_page_end,
+            page_start=buf_ps or buf_lines[0].page,
+            page_end=buf_pe or buf_lines[-1].page,
             bolum=cur_bolum,
             article_kind=cur_article_kind,
             article_no=cur_article_no,
             subheading=cur_sub,
-            text=text
+            header_path=header_path,
+            body=body
         ))
+
         buf_lines = []
-        buf_page_start = None
-        buf_page_end = None
+        buf_ps = None
+        buf_pe = None
 
     for a in annot:
         l: Line = a["line"]
-        if a.get("is_heading", False):
-            # heading -> flush previous body
-            flush()
 
+        if a.get("is_heading", False):
             level = a["level"]
             meta = a["meta"]
 
+            # Level 1: BÖLÜM -> yeni context, flush önceki
             if level == 1:
-                cur_bolum = meta.get("bolum_title")
+                flush()
+                cur_bolum = meta.get("bolum")
                 cur_article_kind = None
                 cur_article_no = None
                 cur_sub = None
+                pending_sub = None
+                continue
 
-                # keep the heading line as part of next section context (important for RAG)
+            # Level 3: subheading -> MADDE yoksa pending yap (kritik)
+            if level == 3:
+                # Eğer henüz MADDE context yoksa veya bir sonraki MADDE’ye bağlanmasını istiyorsak:
+                pending_sub = meta.get("subheading")
+                # Not: subheading’i tek başına section yapmıyoruz.
+                continue
+
+            # Level 2: MADDE/EK -> önce eski section flush, sonra yeni MADDE context aç
+            if level == 2:
+                flush()
+                cur_article_kind = meta.get("kind")
+                cur_article_no = meta.get("no")
+                # pending subheading’i buraya bağla
+                cur_sub = pending_sub
+                pending_sub = None
+
+                # MADDE satırı aynı zamanda gövdeye dahil edilmeli (mevzuatta önemli)
                 buf_lines = [l]
-                buf_page_start = l.page
-                buf_page_end = l.page
+                buf_ps = l.page
+                buf_pe = l.page
+                continue
 
-            elif level == 2:
-                cur_article_kind = meta.get("article_kind")
-                cur_article_no = meta.get("article_no")
-                cur_sub = None
-
-                buf_lines = [l]
-                buf_page_start = l.page
-                buf_page_end = l.page
-
-            elif level == 3:
-                cur_sub = meta.get("subheading")
-                buf_lines = [l]
-                buf_page_start = l.page
-                buf_page_end = l.page
-
-            continue
-
-        # normal line -> add to current buffer
-        if buf_page_start is None:
-            buf_page_start = l.page
-        buf_page_end = l.page
+        # normal line
+        if buf_ps is None:
+            buf_ps = l.page
+        buf_pe = l.page
         buf_lines.append(l)
 
     flush()
     return sections
 
-# -------------------------
-# Chunk packing with overlap (by char budget)
-# -------------------------
+
+# =========================
+# Pack sections into chunks (never cross MADDE boundary unless very small)
+# =========================
 @dataclass
 class Chunk:
     chunk_id: str
@@ -341,16 +335,16 @@ class Chunk:
 
 def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[Chunk]:
     chunks: List[Chunk] = []
+
     cur_text_parts: List[str] = []
     cur_section_ids: List[str] = []
-    cur_ps = None
-    cur_pe = None
-
-    # carry top-level meta (use last section’s meta; RAG filtering)
-    cur_meta = {"bolum": None, "article_kind": None, "article_no": None, "subheading": None}
+    cur_ps: Optional[int] = None
+    cur_pe: Optional[int] = None
+    cur_meta: Dict[str, Any] = {"bolum": None, "article_kind": None, "article_no": None, "subheading": None}
+    cur_article_key: Optional[Tuple[Optional[str], Optional[int]]] = None
 
     def flush():
-        nonlocal cur_text_parts, cur_section_ids, cur_ps, cur_pe, cur_meta
+        nonlocal cur_text_parts, cur_section_ids, cur_ps, cur_pe, cur_meta, cur_article_key
         if not cur_text_parts:
             return
         text = "\n\n".join(cur_text_parts).strip()
@@ -359,6 +353,7 @@ def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[C
             cur_section_ids = []
             cur_ps = None
             cur_pe = None
+            cur_article_key = None
             return
 
         chunks.append(Chunk(
@@ -366,8 +361,8 @@ def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[C
             doc_id=DOC_ID,
             doc_name=DOC_NAME,
             source_file=source_file,
-            page_start=cur_ps,
-            page_end=cur_pe,
+            page_start=cur_ps or 1,
+            page_end=cur_pe or (cur_ps or 1),
             bolum=cur_meta["bolum"],
             article_kind=cur_meta["article_kind"],
             article_no=cur_meta["article_no"],
@@ -376,66 +371,60 @@ def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[C
             text=text,
             char_len=len(text)
         ))
+
         cur_text_parts = []
         cur_section_ids = []
         cur_ps = None
         cur_pe = None
+        cur_article_key = None
 
     for s in sections:
-        s_text = s.text.strip()
+        s_text = (s.header_path + "\n\n" + s.body).strip()
         if not s_text:
             continue
 
-        # if single section is huge, we still keep it but can split by paragraphs
-        if len(s_text) > MAX_CHARS * 1.6:
-            # flush current
+        s_article_key = (s.article_kind, s.article_no)
+
+        # MADDE değiştiyse: chunk boundary (mevzuatta çok önemli)
+        if cur_article_key is not None and s_article_key != cur_article_key:
             flush()
 
-            paras = [p.strip() for p in re.split(r"\n\s*\n", s_text) if p.strip()]
+        # büyük section’ı paragraf bazında böl (header_path her parçada korunur)
+        if len(s_text) > MAX_CHARS * 1.7:
+            flush()
+            paras = [p.strip() for p in re.split(r"\n\s*\n", s.body) if p.strip()]
             buf = ""
             for p in paras:
-                if not buf:
-                    buf = p
-                elif len(buf) + 2 + len(p) <= MAX_CHARS:
-                    buf += "\n\n" + p
+                candidate = (s.header_path + "\n\n" + (buf + ("\n\n" if buf else "") + p)).strip()
+                if len(candidate) <= MAX_CHARS:
+                    buf = (buf + ("\n\n" if buf else "") + p).strip()
                 else:
-                    chunks.append(Chunk(
-                        chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
-                        doc_id=DOC_ID,
-                        doc_name=DOC_NAME,
-                        source_file=source_file,
-                        page_start=s.page_start,
-                        page_end=s.page_end,
-                        bolum=s.bolum,
-                        article_kind=s.article_kind,
-                        article_no=s.article_no,
-                        subheading=s.subheading,
-                        section_ids=[s.section_id],
-                        text=buf.strip(),
-                        char_len=len(buf.strip())
-                    ))
+                    if buf:
+                        text_out = (s.header_path + "\n\n" + buf).strip()
+                        chunks.append(Chunk(
+                            chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
+                            doc_id=DOC_ID, doc_name=DOC_NAME, source_file=source_file,
+                            page_start=s.page_start, page_end=s.page_end,
+                            bolum=s.bolum, article_kind=s.article_kind, article_no=s.article_no, subheading=s.subheading,
+                            section_ids=[s.section_id],
+                            text=text_out, char_len=len(text_out)
+                        ))
                     buf = p
-            if buf.strip():
+            if buf:
+                text_out = (s.header_path + "\n\n" + buf).strip()
                 chunks.append(Chunk(
                     chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
-                    doc_id=DOC_ID,
-                    doc_name=DOC_NAME,
-                    source_file=source_file,
-                    page_start=s.page_start,
-                    page_end=s.page_end,
-                    bolum=s.bolum,
-                    article_kind=s.article_kind,
-                    article_no=s.article_no,
-                    subheading=s.subheading,
+                    doc_id=DOC_ID, doc_name=DOC_NAME, source_file=source_file,
+                    page_start=s.page_start, page_end=s.page_end,
+                    bolum=s.bolum, article_kind=s.article_kind, article_no=s.article_no, subheading=s.subheading,
                     section_ids=[s.section_id],
-                    text=buf.strip(),
-                    char_len=len(buf.strip())
+                    text=text_out, char_len=len(text_out)
                 ))
             continue
 
         # normal packing
-        proposed_len = sum(len(x) for x in cur_text_parts) + (2 * max(0, len(cur_text_parts)-1)) + len(s_text)
-        if cur_text_parts and proposed_len > MAX_CHARS and (sum(len(x) for x in cur_text_parts) >= MIN_CHARS):
+        proposed = ("\n\n".join(cur_text_parts + [s_text])).strip() if cur_text_parts else s_text
+        if cur_text_parts and len(proposed) > MAX_CHARS and len("\n\n".join(cur_text_parts)) >= MIN_CHARS:
             flush()
 
         if cur_ps is None:
@@ -443,17 +432,17 @@ def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[C
         cur_pe = s.page_end
 
         cur_meta = {"bolum": s.bolum, "article_kind": s.article_kind, "article_no": s.article_no, "subheading": s.subheading}
+        cur_article_key = s_article_key
         cur_text_parts.append(s_text)
         cur_section_ids.append(s.section_id)
 
     flush()
 
-    # overlap (char tail)
+    # overlap
     if OVERLAP_CHARS > 0 and len(chunks) >= 2:
         out = [chunks[0]]
         for prev, nxt in zip(chunks[:-1], chunks[1:]):
             tail = prev.text[-OVERLAP_CHARS:]
-            # avoid cutting mid-word too ugly
             if " " in tail:
                 tail = tail.split(" ", 1)[-1]
             merged = (tail.strip() + "\n\n" + nxt.text).strip()
@@ -463,43 +452,40 @@ def pack_sections_to_chunks(sections: List[Section], source_file: str) -> List[C
 
     return chunks
 
-# -------------------------
+
+# =========================
 # End-to-end
-# -------------------------
-def chunk_pdf_hierarchical(pdf_path: str, out_jsonl: str) -> List[Chunk]:
+# =========================
+def chunk_pdf_mevzuat(pdf_path: str, out_jsonl: str) -> List[Chunk]:
     assert os.path.exists(pdf_path), f"PDF yok: {pdf_path}"
     doc = fitz.open(pdf_path)
 
-    # sanity: text exists?
     total_chars = sum(len(doc.load_page(i).get_text("text").strip()) for i in range(len(doc)))
     if total_chars == 0:
-        raise RuntimeError(
-            "PDF text-based değil (scanned image). PyMuPDF text çıkaramıyor. "
-            "OCR eklemeden chunk üretilemez."
-        )
+        raise RuntimeError("PDF text-based değil; OCR gerekir.")
 
     lines = extract_lines(doc)
     annot = detect_heading_lines(lines, doc)
     sections = build_sections(annot)
+
+    # Fail-fast: sections boşsa heading detection aşırı kaçmış demektir
+    if not sections:
+        raise RuntimeError("Section üretilemedi. Heading detection çok agresif veya PDF layout farklı.")
+
     chunks = pack_sections_to_chunks(sections, source_file=os.path.basename(pdf_path))
 
-    # write jsonl
     with open(out_jsonl, "w", encoding="utf-8") as f:
         for c in chunks:
             f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
 
     return chunks
 
-# Run
-chunks = chunk_pdf_hierarchical(PDF_PATH, OUT_JSONL)
-print("chunks:", len(chunks))
-print("wrote:", OUT_JSONL)
 
-# quick preview
-for c in chunks[:3]:
-    print("="*80)
-    print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", "len", c.char_len)
-    print("bolum:", c.bolum)
-    print("article:", c.article_kind, c.article_no)
-    print("sub:", c.subheading)
-    print(c.text[:900], "..." if len(c.text) > 900 else "")
+if __name__ == "__main__":
+    chunks = chunk_pdf_mevzuat(PDF_PATH, OUT_JSONL)
+    print("chunks:", len(chunks))
+    print("wrote:", OUT_JSONL)
+    for c in chunks[:3]:
+        print("="*90)
+        print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", "len", c.char_len)
+        print(c.text[:900], "..." if len(c.text) > 900 else "")
