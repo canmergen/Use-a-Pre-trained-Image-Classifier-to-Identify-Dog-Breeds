@@ -1,4 +1,575 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+import re
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict, Any, Tuple
+
+import numpy as np
+import fitz  # PyMuPDF
+
+
+# =========================
+# Config
+# =========================
+PDF_PATH = "/mnt/data/Tebliğ.pdf"
+
+MAX_CHUNK_TOKENS = 450
+MIN_BLOCK_TOKENS = 60
+OVERLAP_TOKENS = 60
+SEMANTIC_OVERFLOW_SIM = 0.86
+OVERFLOW_MAX_EXTRA_TOKENS = 120
+
+MERGE_SIM_THRESHOLD = 0.70
+MERGE_MAX_TOKENS = 280
+
+# Table heuristics (tuned to reduce false positives on legal text)
+TABLE_MIN_LINES = 4
+TABLE_MIN_SPANS_PER_LINE = 3
+TABLE_COL_X_CLUSTER_MIN = 4          # min unique x clusters to call it table
+TABLE_DIGIT_DENSITY = 0.25
+TABLE_MULTI_SPACE = True
+
+
+# =========================
+# Embedding interface
+# =========================
+class Embedder:
+    def embed(self, texts: List[str]) -> np.ndarray:
+        raise NotImplementedError
+
+
+class TransformersBGE(Embedder):
+    def __init__(self, model_name: str):
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
+
+    def embed(self, texts: List[str]) -> np.ndarray:
+        torch = self.torch
+        all_vecs = []
+        with torch.no_grad():
+            for i in range(0, len(texts), 16):
+                batch = texts[i:i+16]
+                enc = self.tokenizer(batch, padding=True, truncation=True,
+                                     return_tensors="pt", max_length=512)
+                out = self.model(**enc)
+                last = out.last_hidden_state
+                mask = enc["attention_mask"].unsqueeze(-1)
+                summed = (last * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1)
+                vec = summed / counts
+                vec = torch.nn.functional.normalize(vec, p=2, dim=1)
+                all_vecs.append(vec.cpu().numpy())
+        return np.vstack(all_vecs).astype(np.float32)
+
+
+# =========================
+# Token counter
+# =========================
+class TokenCounter:
+    def count(self, text: str) -> int:
+        raise NotImplementedError
+
+
+class HFTokenCounter(TokenCounter):
+    def __init__(self, model_name: str):
+        from transformers import AutoTokenizer
+        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+    def count(self, text: str) -> int:
+        return len(self.tok.encode(text, add_special_tokens=False))
+
+
+# =========================
+# Data structures
+# =========================
+@dataclass
+class Block:
+    block_id: str
+    page_start: int
+    page_end: int
+    kind: str               # "text" | "table"
+    text: str
+    token_len: int
+    bbox: Tuple[float, float, float, float]
+    emb: Optional[np.ndarray] = None
+
+
+@dataclass
+class Chunk:
+    chunk_id: str
+    page_start: int
+    page_end: int
+    text: str
+    token_len: int
+    block_ids: List[str]
+    contains_table: bool
+
+
+# =========================
+# Utils
+# =========================
+def clean_inline(text: str) -> str:
+    text = text.replace("\u00ad", "")
+    # join hyphenation across line breaks
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+    # normalize spaces but keep newlines for block-level segmentation
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))  # already normalized
+
+
+def _digits_density(txt: str) -> float:
+    d = sum(ch.isdigit() for ch in txt)
+    return d / max(1, len(txt))
+
+
+def _cluster_x_positions(xs: List[float], tol: float = 6.0) -> int:
+    """Count x clusters (roughly columns) with tolerance in PDF coords."""
+    if not xs:
+        return 0
+    xs = sorted(xs)
+    clusters = 1
+    cur = xs[0]
+    for x in xs[1:]:
+        if abs(x - cur) > tol:
+            clusters += 1
+            cur = x
+    return clusters
+
+
+# =========================
+# Table detection (less false positive)
+# =========================
+def is_table_like_block(block_dict: Dict[str, Any]) -> bool:
+    if block_dict.get("type", 0) != 0:
+        return False
+
+    lines = block_dict.get("lines", [])
+    if len(lines) < TABLE_MIN_LINES:
+        return False
+
+    x_positions = []
+    txt_parts = []
+    spans_per_line = []
+
+    for ln in lines:
+        spans = ln.get("spans", [])
+        spans_per_line.append(len(spans))
+        for sp in spans:
+            bbox = sp.get("bbox", [0, 0, 0, 0])
+            x_positions.append(float(bbox[0]))
+            txt_parts.append(sp.get("text", ""))
+
+    txt = " ".join(t for t in txt_parts if t).strip()
+    if not txt:
+        return False
+
+    # columnish: x clusters across spans
+    x_clusters = _cluster_x_positions(x_positions, tol=6.0)
+    col_hint = x_clusters >= TABLE_COL_X_CLUSTER_MIN
+
+    # consistent multi-span lines (tables often have many spans per line)
+    multi_span_lines = sum(1 for c in spans_per_line if c >= TABLE_MIN_SPANS_PER_LINE)
+    multi_span_ratio = multi_span_lines / max(1, len(spans_per_line))
+
+    # numeric density + multi spaces
+    dens = _digits_density(txt)
+    multi_space = bool(re.search(r"\s{3,}", txt)) if TABLE_MULTI_SPACE else False
+
+    # decision: need either strong column hint + many multi-span lines,
+    # or multi-space + high digit density + multi-span_ratio
+    if col_hint and multi_span_ratio >= 0.55:
+        return True
+    if multi_space and dens >= TABLE_DIGIT_DENSITY and multi_span_ratio >= 0.45:
+        return True
+
+    return False
+
+
+# =========================
+# Block extraction with stable ordering
+# =========================
+def extract_structural_blocks(pdf_path: str) -> List[Block]:
+    doc = fitz.open(pdf_path)
+    blocks: List[Block] = []
+
+    for pi in range(len(doc)):
+        page = doc.load_page(pi)
+        d = page.get_text("dict")
+        page_no = pi + 1
+
+        page_blocks = []
+        for bi, b in enumerate(d.get("blocks", [])):
+            if b.get("type", 0) != 0:
+                continue
+
+            # bbox for ordering
+            bb = b.get("bbox", [0, 0, 0, 0])
+            bbox = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+
+            parts = []
+            for ln in b.get("lines", []):
+                line_txt = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                parts.append(line_txt)
+            raw = "\n".join(parts)
+            txt = clean_inline(raw)
+            if not txt:
+                continue
+
+            kind = "table" if is_table_like_block(b) else "text"
+            block_id = f"p{page_no:03d}_b{bi:03d}"
+
+            page_blocks.append(Block(
+                block_id=block_id,
+                page_start=page_no,
+                page_end=page_no,
+                kind=kind,
+                text=txt,
+                token_len=0,
+                bbox=bbox,
+                emb=None
+            ))
+
+        # stable reading order: top-to-bottom, then left-to-right
+        page_blocks.sort(key=lambda x: (x.bbox[1], x.bbox[0]))
+        blocks.extend(page_blocks)
+
+    return blocks
+
+
+# =========================
+# Split large text blocks into sentence-packed subblocks
+# =========================
+_SENT_SPLIT = re.compile(r"(?<=[\.\!\?;:])\s+")
+
+def split_text_block_to_subblocks(block: Block, counter: TokenCounter,
+                                  max_subblock_tokens: int = 220) -> List[Block]:
+    if block.kind == "table":
+        block.token_len = counter.count(block.text)
+        return [block]
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n", block.text) if p.strip()]
+    out: List[Block] = []
+    sub_i = 0
+
+    for p in paras:
+        sents = [s.strip() for s in _SENT_SPLIT.split(p) if s.strip()]
+        if not sents:
+            continue
+
+        buf = []
+        cur = 0
+        for s in sents:
+            st = counter.count(s)
+            if buf and cur + st > max_subblock_tokens:
+                txt = " ".join(buf).strip()
+                out.append(Block(
+                    block_id=f"{block.block_id}_s{sub_i:03d}",
+                    page_start=block.page_start,
+                    page_end=block.page_end,
+                    kind="text",
+                    text=txt,
+                    token_len=counter.count(txt),
+                    bbox=block.bbox,
+                    emb=None
+                ))
+                sub_i += 1
+                buf = []
+                cur = 0
+            buf.append(s)
+            cur += st
+
+        if buf:
+            txt = " ".join(buf).strip()
+            out.append(Block(
+                block_id=f"{block.block_id}_s{sub_i:03d}",
+                page_start=block.page_start,
+                page_end=block.page_end,
+                kind="text",
+                text=txt,
+                token_len=counter.count(txt),
+                bbox=block.bbox,
+                emb=None
+            ))
+            sub_i += 1
+
+    if not out:
+        block.token_len = counter.count(block.text)
+        return [block]
+
+    return out
+
+
+# =========================
+# Embedding blocks
+# =========================
+def embed_blocks(blocks: List[Block], embedder: Embedder) -> None:
+    texts = [b.text for b in blocks]
+    embs = embedder.embed(texts)
+    for b, e in zip(blocks, embs):
+        b.emb = e
+
+
+# =========================
+# Merge small blocks
+# - merge text<MIN_BLOCK_TOKENS into most similar neighbor (text only)
+# - after merge, re-embed merged text blocks only (cheap)
+# =========================
+def merge_small_blocks(blocks: List[Block], counter: TokenCounter, embedder: Embedder) -> List[Block]:
+    if not blocks:
+        return []
+
+    keep = blocks[:]
+    merged_any = True
+
+    while merged_any:
+        merged_any = False
+        new_list: List[Block] = []
+        i = 0
+
+        while i < len(keep):
+            b = keep[i]
+
+            if b.kind == "table":
+                new_list.append(b)
+                i += 1
+                continue
+
+            if b.token_len >= MIN_BLOCK_TOKENS:
+                new_list.append(b)
+                i += 1
+                continue
+
+            prev_b = new_list[-1] if new_list else None
+            next_b = keep[i + 1] if i + 1 < len(keep) else None
+
+            best_target = None
+            best_sim = -1.0
+
+            if prev_b and prev_b.kind == "text" and prev_b.emb is not None and b.emb is not None:
+                s = cosine(prev_b.emb, b.emb)
+                best_sim, best_target = (s, "prev") if s > best_sim else (best_sim, best_target)
+
+            if next_b and next_b.kind == "text" and next_b.emb is not None and b.emb is not None:
+                s = cosine(next_b.emb, b.emb)
+                best_sim, best_target = (s, "next") if s > best_sim else (best_sim, best_target)
+
+            if best_target is None or best_sim < MERGE_SIM_THRESHOLD:
+                new_list.append(b)
+                i += 1
+                continue
+
+            if best_target == "prev":
+                target = new_list[-1]
+                if target.token_len + b.token_len <= MERGE_MAX_TOKENS:
+                    target.text = (target.text + "\n" + b.text).strip()
+                    target.token_len = counter.count(target.text)
+                    target.page_end = max(target.page_end, b.page_end)
+                    target.block_id = target.block_id + "+" + b.block_id
+                    merged_any = True
+                    i += 1
+                    continue
+
+            if best_target == "next" and next_b is not None:
+                if next_b.token_len + b.token_len <= MERGE_MAX_TOKENS:
+                    next_b.text = (b.text + "\n" + next_b.text).strip()
+                    next_b.token_len = counter.count(next_b.text)
+                    next_b.page_start = min(next_b.page_start, b.page_start)
+                    next_b.block_id = b.block_id + "+" + next_b.block_id
+                    merged_any = True
+                    i += 1
+                    continue
+
+            new_list.append(b)
+            i += 1
+
+        keep = new_list
+
+    # re-embed only text blocks because content changed
+    text_idxs = [idx for idx, b in enumerate(keep) if b.kind == "text"]
+    if text_idxs:
+        texts = [keep[idx].text for idx in text_idxs]
+        embs = embedder.embed(texts)
+        for idx, e in zip(text_idxs, embs):
+            keep[idx].emb = e
+
+    return keep
+
+
+# =========================
+# Pack into chunks with semantic overflow (block-based) + block-overlap
+# =========================
+def pack_into_chunks(blocks: List[Block], counter: TokenCounter) -> List[Chunk]:
+    chunks: List[Chunk] = []
+    cur: List[Block] = []
+    cur_tokens = 0
+    cur_contains_table = False
+
+    def chunk_emb(bs: List[Block]) -> Optional[np.ndarray]:
+        embs = [b.emb for b in bs if b.emb is not None and b.kind == "text"]
+        if not embs:
+            return None
+        m = np.mean(np.stack(embs, axis=0), axis=0)
+        n = np.linalg.norm(m)
+        return (m / n).astype(np.float32) if n > 0 else m.astype(np.float32)
+
+    def finalize():
+        nonlocal cur, cur_tokens, cur_contains_table
+        if not cur:
+            return
+        text = "\n\n".join(b.text for b in cur).strip()
+        ps = min(b.page_start for b in cur)
+        pe = max(b.page_end for b in cur)
+        chunks.append(Chunk(
+            chunk_id=f"chunk_{len(chunks):05d}",
+            page_start=ps,
+            page_end=pe,
+            text=text,
+            token_len=counter.count(text),
+            block_ids=[b.block_id for b in cur],
+            contains_table=cur_contains_table
+        ))
+        cur = []
+        cur_tokens = 0
+        cur_contains_table = False
+
+    for b in blocks:
+        # tables atomic rule: do not mix if it blows budget
+        if b.kind == "table":
+            if cur and cur_tokens + b.token_len > MAX_CHUNK_TOKENS:
+                finalize()
+            cur.append(b)
+            cur_tokens += b.token_len
+            cur_contains_table = True
+            continue
+
+        if not cur:
+            cur.append(b)
+            cur_tokens = b.token_len
+            continue
+
+        if cur_tokens + b.token_len <= MAX_CHUNK_TOKENS:
+            cur.append(b)
+            cur_tokens += b.token_len
+            continue
+
+        # overflow decision
+        ce = chunk_emb(cur)
+        sim = cosine(ce, b.emb) if (ce is not None and b.emb is not None) else -1.0
+        overflow_limit = MAX_CHUNK_TOKENS + OVERFLOW_MAX_EXTRA_TOKENS
+
+        if sim >= SEMANTIC_OVERFLOW_SIM and (cur_tokens + b.token_len) <= overflow_limit:
+            cur.append(b)
+            cur_tokens += b.token_len
+            continue
+
+        finalize()
+        cur.append(b)
+        cur_tokens = b.token_len
+
+    finalize()
+
+    # block-based overlap
+    if OVERLAP_TOKENS > 0 and len(chunks) >= 2:
+        # build id->block map for overlap reconstruction
+        id2block = {b.block_id: b for b in blocks}
+        overlapped = [chunks[0]]
+
+        for prev, nxt in zip(chunks[:-1], chunks[1:]):
+            # pick tail blocks from prev up to OVERLAP_TOKENS
+            tail_blocks = []
+            tok = 0
+            for bid in reversed(prev.block_ids):
+                bb = id2block.get(bid)
+                if bb is None:
+                    continue
+                if tok + bb.token_len > OVERLAP_TOKENS and tail_blocks:
+                    break
+                tail_blocks.append(bb)
+                tok += bb.token_len
+            tail_blocks.reverse()
+
+            # prepend tail blocks' text
+            tail_text = "\n\n".join(b.text for b in tail_blocks).strip()
+            new_text = (tail_text + "\n\n" + nxt.text).strip()
+
+            overlapped.append(Chunk(
+                chunk_id=nxt.chunk_id,
+                page_start=min(prev.page_end, nxt.page_start),
+                page_end=nxt.page_end,
+                text=new_text,
+                token_len=counter.count(new_text),
+                block_ids=nxt.block_ids,
+                contains_table=nxt.contains_table
+            ))
+
+        chunks = overlapped
+
+    return chunks
+
+
+# =========================
+# End-to-end
+# =========================
+def chunk_pdf_agentic(pdf_path: str, embedder: Embedder, token_counter: TokenCounter) -> List[Chunk]:
+    base = extract_structural_blocks(pdf_path)
+
+    # split to subblocks (keep order by inheriting bbox and current order)
+    blocks: List[Block] = []
+    for b in base:
+        blocks.extend(split_text_block_to_subblocks(b, token_counter, max_subblock_tokens=220))
+
+    # token lens
+    for b in blocks:
+        if b.token_len == 0:
+            b.token_len = token_counter.count(b.text)
+
+    # embed
+    embed_blocks(blocks, embedder)
+
+    # merge small blocks (and re-embed changed ones)
+    merged = merge_small_blocks(blocks, token_counter, embedder)
+
+    # pack to chunks
+    chunks = pack_into_chunks(merged, token_counter)
+    return chunks
+
+
+# =========================
+# Run
+# =========================
+if __name__ == "__main__":
+    model = "BAAI/bge-base-en-v1.5"
+    embedder = TransformersBGE(model)
+    token_counter = HFTokenCounter(model)
+
+    chunks = chunk_pdf_agentic(PDF_PATH, embedder, token_counter)
+
+    for c in chunks[:10]:
+        print("=" * 90)
+        print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", f"tokens {c.token_len}", "table:", c.contains_table)
+        print(c.text[:700], ("..." if len(c.text) > 700 else ""))
+
+    out_path = "/mnt/data/agentic_chunks.jsonl"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for c in chunks:
+            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+
+    print("Wrote:", out_path)
+
+
+
+
+# -*- coding: utf-8 -*-
 """
 Agentic / semantic chunker (no regex-based sections)
 - structural blocks (paragraph/sentence + table blocks)
