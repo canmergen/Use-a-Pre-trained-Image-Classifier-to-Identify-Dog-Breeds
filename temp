@@ -1,189 +1,397 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import re
 import json
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple
+from typing import List, Optional, Dict, Tuple
 
+import fitz  # PyMuPDF
+
+
+# =========================
+# Config
+# =========================
 PDF_PATH = "/mnt/data/Tebliğ.pdf"
-OUT_JSONL = "/mnt/data/docling_chunks.jsonl"
+OUT_ATOMS_JSONL = "/mnt/data/atoms.jsonl"
+OUT_WINDOWS_JSONL = "/mnt/data/windows.jsonl"
 
-DOC_ID = "teblig_2021_31676"
-DOC_NAME = "ÖDEME VE ELEKTRONİK PARA KURULUŞLARI ... TEBLİĞ"
-
-# -----------------------------
-# 1) Docling ile dönüştür
-# -----------------------------
-def docling_to_markdown(pdf_path: str) -> str:
-    # Docling quickstart örneği: DocumentConverter().convert(...).document :contentReference[oaicite:4]{index=4}
-    from docling.document_converter import DocumentConverter
-
-    converter = DocumentConverter()
-    result = converter.convert(pdf_path)
-    doc = result.document
-
-    # Docling farklı exportlar destekler; en pratik yol markdown export (API sürüme göre değişebilir).
-    # Eğer doc.export_to_markdown() yoksa, doc.export(...) gibi bir fonksiyon olabilir.
-    # Aşağıdaki satırı kendi ortamında doc objesinin metodlarına göre uyarlayacaksın.
-    if hasattr(doc, "export_to_markdown"):
-        md = doc.export_to_markdown()
-    elif hasattr(doc, "to_markdown"):
-        md = doc.to_markdown()
-    else:
-        # fallback: düz text
-        md = getattr(doc, "text", "") or str(doc)
-    return md
+DOC_ID = "tcmb_teblig_2020_7"
+DOC_NAME = "TCMB - Finansal Tüketicilerden Alınacak Ücretlere İlişkin Tebliğ (2020/7)"
 
 
-# -----------------------------
-# 2) Markdown normalize
-# -----------------------------
-def normalize_md(md: str) -> str:
-    md = md.replace("\u00ad", "")
-    md = re.sub(r"[ \t]+", " ", md)
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
+# =========================
+# Helpers: normalize
+# =========================
+def normalize_pdf_text(s: str) -> str:
+    """
+    PDF extraction artifacts:
+    - soft hyphen
+    - hyphenation at line breaks
+    - repeated spaces
+    - line breaks normalization
+    """
+    if not s:
+        return ""
+
+    s = s.replace("\u00ad", "")  # soft hyphen
+    # join hyphenation across line breaks: "kurul-\nlar" -> "kurullar"
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+
+    # normalize newlines (keep paragraph boundaries)
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    # reduce excessive blank lines
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    # trim whitespace around lines
+    s = "\n".join([ln.rstrip() for ln in s.split("\n")])
+    return s.strip()
 
 
-# -----------------------------
-# 3) Regülasyon için madde bazlı parse (Markdown üzerinden)
-# -----------------------------
-MADDE_RE = re.compile(
-    r"(?mi)^\s*(MADDE)\s+(\d+)\s*[\-–—]\s*(.*?)\s*$"
-)
+def approx_token_count(text: str) -> int:
+    """
+    Lightweight token approximation (model-agnostic).
+    If you want true token counts later, swap this with HF tokenizer count.
+    """
+    if not text:
+        return 0
+    # Roughly 1 token ~ 0.75 word for TR/EN mixed; keep stable.
+    return max(1, int(len(text.split()) / 0.75))
 
-FIKRA_RE = re.compile(r"(\(\d+\))")
+
+# =========================
+# Data structures
+# =========================
+@dataclass
+class Atom:
+    atom_id: str
+    doc_id: str
+    doc_name: str
+    source_file: str
+    page_start: int
+    page_end: int
+
+    # legal-ish structure (best-effort)
+    madde_no: Optional[int]
+    madde_title: Optional[str]
+    fikra_no: Optional[int]
+    bent: Optional[str]  # "a", "b", "ç" etc.
+
+    heading_path: str  # e.g., "BİRİNCİ BÖLÜM > Amaç, Kapsam, ..."
+    text: str
+    token_len: int
+
 
 @dataclass
-class Chunk:
+class WindowChunk:
     chunk_id: str
     doc_id: str
     doc_name: str
     source_file: str
-    article_no: int
-    article_title: str
-    paragraph_no: Optional[int]
-    chunk_type: str  # paragraph/article
+    page_start: int
+    page_end: int
+    heading_path: str
+
+    # window composition
+    atom_ids: List[str]
     text: str
-    char_len: int
+    token_len: int
 
 
-def split_articles_from_md(md: str) -> List[Tuple[int, str, str]]:
+# =========================
+# PDF extraction (page-level, line-preserving)
+# =========================
+def extract_pages(pdf_path: str) -> List[Dict]:
     """
-    Döner: [(article_no, article_title, article_body)]
+    Extract pages as text while preserving line breaks.
+    Using "text" is often ok; "blocks" can reorder lines in some PDFs.
     """
-    lines = md.splitlines()
-    # MADDE başlıklarının line indexlerini bul
-    idxs = []
-    for i, ln in enumerate(lines):
-        m = MADDE_RE.match(ln.strip())
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i in range(len(doc)):
+        page = doc.load_page(i)
+        txt = page.get_text("text")  # keep line breaks
+        pages.append({
+            "page_no": i + 1,
+            "text": normalize_pdf_text(txt)
+        })
+    return pages
+
+
+# =========================
+# Heading inference (lightweight)
+# =========================
+_HEADING_ALLCAPS_RE = re.compile(r"^[A-ZÇĞİÖŞÜ0-9\s\-\–—,()]+$")
+
+def infer_heading_path(lines: List[str], max_scan_lines: int = 30) -> str:
+    """
+    Very lightweight: scan top part for all-caps headings and section labels like "BİRİNCİ BÖLÜM".
+    Works as metadata context, not strict structure.
+    """
+    candidates = []
+    for ln in lines[:max_scan_lines]:
+        t = ln.strip()
+        if not t:
+            continue
+        # ignore very short
+        if len(t) < 6:
+            continue
+        if _HEADING_ALLCAPS_RE.match(t) and any(ch.isalpha() for ch in t):
+            # filter out common noise lines
+            if "TÜRKİYE CUMHURİYET MERKEZ BANKASI" in t:
+                continue
+            candidates.append(t)
+
+    # keep first 2-3 meaningful headings
+    uniq = []
+    for c in candidates:
+        if c not in uniq:
+            uniq.append(c)
+    return " > ".join(uniq[:3]) if uniq else ""
+
+
+# =========================
+# Atomic parsing: MADDE / fıkra / bent (best-effort)
+# =========================
+MADDE_LINE_RE = re.compile(r"^\s*MADDE\s+(\d+)\s*(?:[-–—]\s*(.*))?\s*$", re.IGNORECASE)
+FIKRA_RE = re.compile(r"\(\s*(\d+)\s*\)")
+BENT_RE = re.compile(r"^\s*([a-zçğıöşü])\)\s+", re.IGNORECASE)  # "a) ..."
+
+def split_into_atoms_from_page(page_no: int, page_text: str, heading_path: str) -> List[Atom]:
+    """
+    Strategy:
+    1) Split by MADDE occurrences (line-based).
+    2) For each MADDE block, split by fıkra markers "(1)", "(2)"...
+    3) Inside each fıkra, if it looks like bent list, split by "a) b) c)" at line starts.
+    Fallback:
+    - If no MADDE found, split by paragraphs (double newline) as atoms, madde_no=None.
+    """
+    lines = page_text.split("\n")
+    # find MADDE start line indices
+    madde_starts: List[Tuple[int, int, str]] = []  # (line_idx, madde_no, madde_title)
+    for idx, ln in enumerate(lines):
+        m = MADDE_LINE_RE.match(ln.strip())
         if m:
-            art_no = int(m.group(2))
-            title = (m.group(3) or "").strip()
-            idxs.append((i, art_no, title))
+            madde_no = int(m.group(1))
+            title = (m.group(2) or "").strip()
+            madde_starts.append((idx, madde_no, title))
 
-    if not idxs:
-        raise RuntimeError("Markdown içinde 'MADDE X – ...' patterni bulunamadı.")
+    atoms: List[Atom] = []
 
-    articles = []
-    for k, (start_i, art_no, title) in enumerate(idxs):
-        end_i = idxs[k+1][0] if k+1 < len(idxs) else len(lines)
-        body = "\n".join(lines[start_i+1:end_i]).strip()
-        articles.append((art_no, title or f"MADDE {art_no}", body))
-    return articles
+    def make_atom(madde_no, madde_title, fikra_no, bent, text, local_suffix):
+        text = text.strip()
+        if not text:
+            return
+        atom_id = f"{DOC_ID}::p{page_no:03d}::m{madde_no if madde_no else 'na'}::f{fikra_no if fikra_no else 'na'}::b{bent if bent else 'na'}::{local_suffix}"
+        atoms.append(Atom(
+            atom_id=atom_id,
+            doc_id=DOC_ID,
+            doc_name=DOC_NAME,
+            source_file=PDF_PATH.split("/")[-1],
+            page_start=page_no,
+            page_end=page_no,
+            madde_no=madde_no,
+            madde_title=madde_title if madde_title else None,
+            fikra_no=fikra_no,
+            bent=bent,
+            heading_path=heading_path,
+            text=text,
+            token_len=approx_token_count(text),
+        ))
+
+    # ---- fallback: no MADDE detected
+    if not madde_starts:
+        paras = [p.strip() for p in re.split(r"\n\s*\n", page_text) if p.strip()]
+        for i, p in enumerate(paras):
+            make_atom(None, None, None, None, p, f"para{i:03d}")
+        return atoms
+
+    # ---- parse each MADDE block
+    for mi, (start_i, madde_no, madde_title) in enumerate(madde_starts):
+        end_i = madde_starts[mi + 1][0] if mi + 1 < len(madde_starts) else len(lines)
+        block_lines = lines[start_i:end_i]
+
+        # Remove the "MADDE X ..." header line itself from body
+        header_line = block_lines[0]
+        body_lines = block_lines[1:]
+        body_text = normalize_pdf_text("\n".join(body_lines))
+
+        # If body_text starts immediately with "(1)" on same line issues, also check header_line tail
+        # Some PDFs put "(1)" on same line with MADDE header.
+        # Try to capture "(1)" if exists in header_line after MADDE.
+        header_tail = header_line
+        header_tail = re.sub(r"^\s*MADDE\s+\d+\s*(?:[-–—]\s*.*)?\s*", "", header_tail, flags=re.IGNORECASE).strip()
+        # if header_tail contains "(1)" content, prepend it
+        if header_tail and FIKRA_RE.search(header_tail):
+            body_text = normalize_pdf_text(header_tail + "\n" + body_text)
+
+        if not body_text:
+            continue
+
+        # Split by fıkra markers
+        fikra_matches = list(FIKRA_RE.finditer(body_text))
+        if not fikra_matches:
+            # no explicit fıkra -> one atom
+            make_atom(madde_no, madde_title, None, None, f"MADDE {madde_no} {('- ' + madde_title) if madde_title else ''}\n{body_text}", "0")
+            continue
+
+        # Build fıkra segments
+        for fi, mk in enumerate(fikra_matches):
+            fno = int(mk.group(1))
+            seg_start = mk.start()
+            seg_end = fikra_matches[fi + 1].start() if fi + 1 < len(fikra_matches) else len(body_text)
+            fikra_text = body_text[seg_start:seg_end].strip()
+
+            # Bent split: only if multiple lines start with "a) ..."
+            bent_lines = fikra_text.split("\n")
+            bent_start_idxs = []
+            for li, ln in enumerate(bent_lines):
+                bm = BENT_RE.match(ln)
+                if bm:
+                    bent_start_idxs.append((li, bm.group(1).lower()))
+
+            if len(bent_start_idxs) >= 2:
+                # create one atom per bent
+                for bi, (bli, bent_char) in enumerate(bent_start_idxs):
+                    bend_end = bent_start_idxs[bi + 1][0] if bi + 1 < len(bent_start_idxs) else len(bent_lines)
+                    bent_seg = "\n".join(bent_lines[bli:bend_end]).strip()
+                    make_atom(madde_no, madde_title, fno, bent_char, bent_seg, f"f{fno}_b{bent_char}_{bi:02d}")
+            else:
+                make_atom(madde_no, madde_title, fno, None, fikra_text, f"f{fno}_{fi:02d}")
+
+    return atoms
 
 
-def split_fikra(text: str) -> List[Tuple[Optional[int], str]]:
+def build_atoms(pages: List[Dict]) -> List[Atom]:
+    atoms: List[Atom] = []
+    for p in pages:
+        page_no = p["page_no"]
+        txt = p["text"]
+        lines = txt.split("\n")
+        heading_path = infer_heading_path(lines)
+        atoms.extend(split_into_atoms_from_page(page_no, txt, heading_path))
+    return atoms
+
+
+# =========================
+# Window chunking (retrieval-friendly)
+# =========================
+def build_windows(
+    atoms: List[Atom],
+    max_tokens: int = 520,
+    overlap_tokens: int = 120,
+) -> List[WindowChunk]:
     """
-    (1) ... (2) ... şeklinde ayırır. Yoksa tek parça.
+    Build rolling windows over atoms without merging legal units.
+    Overlap is implemented by sliding start pointer.
     """
-    t = text.strip()
-    if not t:
-        return []
+    windows: List[WindowChunk] = []
+    n = len(atoms)
+    i = 0
 
-    markers = list(FIKRA_RE.finditer(t))
-    if not markers:
-        return [(None, t)]
+    while i < n:
+        cur_tokens = 0
+        j = i
+        atom_ids = []
+        texts = []
+        page_start = atoms[i].page_start
+        page_end = atoms[i].page_end
 
-    out = []
-    for i, mk in enumerate(markers):
-        s = mk.start()
-        e = markers[i+1].start() if i+1 < len(markers) else len(t)
-        seg = t[s:e].strip()
-        mnum = re.match(r"\((\d+)\)", seg)
-        pno = int(mnum.group(1)) if mnum else None
-        out.append((pno, seg))
-    return out
+        heading_path = atoms[i].heading_path or ""
 
+        while j < n and (cur_tokens + atoms[j].token_len) <= max_tokens:
+            atom_ids.append(atoms[j].atom_id)
+            texts.append(atoms[j].text)
+            cur_tokens += atoms[j].token_len
+            page_end = max(page_end, atoms[j].page_end)
+            # keep the most specific heading context we see
+            if atoms[j].heading_path and len(atoms[j].heading_path) > len(heading_path):
+                heading_path = atoms[j].heading_path
+            j += 1
 
-def sentence_pack(text: str, max_chars: int = 1100, overlap_sentences: int = 1) -> List[str]:
-    """
-    Çok uzun fıkralar için kelime kırmadan cümle bazlı paketleme.
-    """
-    sents = re.split(r"(?<=[\.\!\?;:])\s+", text.strip())
-    sents = [s.strip() for s in sents if s.strip()]
+        # if a single atom is larger than max_tokens, still keep it alone
+        if j == i:
+            atom_ids = [atoms[i].atom_id]
+            texts = [atoms[i].text]
+            cur_tokens = atoms[i].token_len
+            page_start = atoms[i].page_start
+            page_end = atoms[i].page_end
+            j = i + 1
 
-    chunks = []
-    buf = []
-    cur = 0
-    for s in sents:
-        if cur + len(s) + 1 > max_chars and buf:
-            chunks.append(" ".join(buf).strip())
-            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
-            cur = sum(len(x) for x in buf) + len(buf)
-        buf.append(s)
-        cur += len(s) + 1
-    if buf:
-        chunks.append(" ".join(buf).strip())
-    return chunks
+        chunk_text = "\n\n".join(texts).strip()
+        chunk_id = f"{DOC_ID}::win::{len(windows):06d}"
 
+        windows.append(WindowChunk(
+            chunk_id=chunk_id,
+            doc_id=DOC_ID,
+            doc_name=DOC_NAME,
+            source_file=PDF_PATH.split("/")[-1],
+            page_start=page_start,
+            page_end=page_end,
+            heading_path=heading_path,
+            atom_ids=atom_ids,
+            text=chunk_text,
+            token_len=approx_token_count(chunk_text),
+        ))
 
-def build_chunks(md: str) -> List[Chunk]:
-    md = normalize_md(md)
-    articles = split_articles_from_md(md)
+        # compute next i with overlap budget
+        if overlap_tokens <= 0:
+            i = j
+            continue
 
-    chunks: List[Chunk] = []
-    for art_no, title, body in articles:
-        fikralar = split_fikra(body)
+        # slide start forward but keep ~overlap_tokens from the end
+        back_tokens = 0
+        k = j - 1
+        while k >= i and back_tokens < overlap_tokens:
+            back_tokens += atoms[k].token_len
+            k -= 1
+        i = max(i + 1, k + 1)
 
-        # Eğer body çok kısaysa madde bazlı tek chunk da tutmak isteyebilirsin (opsiyonel)
-        for (pno, ptext) in fikralar:
-            # çok uzunsa cümle bazlı parçala
-            parts = [ptext] if len(ptext) <= 1100 else sentence_pack(ptext, max_chars=1100, overlap_sentences=1)
-            for j, part in enumerate(parts):
-                cid = f"{DOC_ID}::madde_{art_no}::fikra_{pno if pno is not None else 'na'}::{j}"
-                chunks.append(Chunk(
-                    chunk_id=cid,
-                    doc_id=DOC_ID,
-                    doc_name=DOC_NAME,
-                    source_file="Tebliğ.pdf",
-                    article_no=art_no,
-                    article_title=title,
-                    paragraph_no=pno,
-                    chunk_type="paragraph",
-                    text=part.strip(),
-                    char_len=len(part.strip())
-                ))
-    return chunks
+    return windows
 
 
-def write_jsonl(chunks: List[Chunk], path: str):
+# =========================
+# IO
+# =========================
+def write_jsonl(items, path: str):
     with open(path, "w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+        for it in items:
+            f.write(json.dumps(asdict(it), ensure_ascii=False) + "\n")
 
 
+# =========================
+# Main
+# =========================
 def main():
-    md = docling_to_markdown(PDF_PATH)
-    chunks = build_chunks(md)
-    write_jsonl(chunks, OUT_JSONL)
+    pages = extract_pages(PDF_PATH)
+    atoms = build_atoms(pages)
 
-    print("Markdown length:", len(md))
-    print("Chunks:", len(chunks))
-    print("Output:", OUT_JSONL)
-    print("\n--- First 3 chunks ---")
-    for c in chunks[:3]:
-        print(c.chunk_id, c.article_no, c.paragraph_no, c.char_len)
-        print(c.text[:200].replace("\n", " "), "...\n")
+    # Windows for retrieval
+    windows = build_windows(atoms, max_tokens=520, overlap_tokens=120)
+
+    write_jsonl(atoms, OUT_ATOMS_JSONL)
+    write_jsonl(windows, OUT_WINDOWS_JSONL)
+
+    print("Pages:", len(pages))
+    print("Atoms:", len(atoms), "->", OUT_ATOMS_JSONL)
+    print("Windows:", len(windows), "->", OUT_WINDOWS_JSONL)
+
+    print("\n--- Sample 5 atoms ---")
+    for a in atoms[:5]:
+        print("=" * 80)
+        print(a.atom_id)
+        print("page:", a.page_start, "madde:", a.madde_no, "fikra:", a.fikra_no, "bent:", a.bent)
+        print("heading:", a.heading_path)
+        print(a.text[:700], ("..." if len(a.text) > 700 else ""))
+
+    print("\n--- Sample 5 windows ---")
+    for w in windows[:5]:
+        print("=" * 80)
+        print(w.chunk_id, f"pages {w.page_start}-{w.page_end}", f"tokens~{w.token_len}")
+        print("atoms:", len(w.atom_ids))
+        print("heading:", w.heading_path)
+        print(w.text[:700], ("..." if len(w.text) > 700 else ""))
 
 
 if __name__ == "__main__":
