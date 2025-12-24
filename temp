@@ -1,65 +1,56 @@
 # -*- coding: utf-8 -*-
-"""
-Tebliğ PDF okuma + MADDE bazlı parse + chunk + metadata üretimi
-Input: /mnt/data/Tebliğ.pdf
-Output: /mnt/data/chunks.jsonl
-
-FAISS'e basmadan önce, bu dosyadaki chunk'ları bge ile embed edeceksin.
-"""
-
 import re
 import json
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple
-
-# PDF text extraction
-import fitz  # PyMuPDF
-
+from typing import Optional, List, Tuple
 
 PDF_PATH = "/mnt/data/Tebliğ.pdf"
-OUT_JSONL = "/mnt/data/chunks.jsonl"
+OUT_JSONL = "/mnt/data/docling_chunks.jsonl"
 
-DOC_ID = "teblig_2021_31676"  # istediğin gibi değiştir
+DOC_ID = "teblig_2021_31676"
 DOC_NAME = "ÖDEME VE ELEKTRONİK PARA KURULUŞLARI ... TEBLİĞ"
 
-
 # -----------------------------
-# Utilities
+# 1) Docling ile dönüştür
 # -----------------------------
-def normalize_text(s: str) -> str:
-    # satır sonlarını ve boşlukları normalize et
-    s = s.replace("\u00ad", "")  # soft hyphen
-    s = re.sub(r"[ \t]+", " ", s)
-    # sayfa başı/sonu kırılmalarını daha okunur yap
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+def docling_to_markdown(pdf_path: str) -> str:
+    # Docling quickstart örneği: DocumentConverter().convert(...).document :contentReference[oaicite:4]{index=4}
+    from docling.document_converter import DocumentConverter
 
+    converter = DocumentConverter()
+    result = converter.convert(pdf_path)
+    doc = result.document
 
-def extract_pages(pdf_path: str) -> List[Dict]:
-    """PDF'den sayfa sayfa metin çıkar."""
-    doc = fitz.open(pdf_path)
-    pages = []
-    for i in range(len(doc)):
-        page = doc.load_page(i)
-        txt = page.get_text("text") or ""
-        txt = normalize_text(txt)
-        pages.append({
-            "page_index": i,           # 0-based
-            "page_number": i + 1,      # 1-based
-            "text": txt
-        })
-    return pages
+    # Docling farklı exportlar destekler; en pratik yol markdown export (API sürüme göre değişebilir).
+    # Eğer doc.export_to_markdown() yoksa, doc.export(...) gibi bir fonksiyon olabilir.
+    # Aşağıdaki satırı kendi ortamında doc objesinin metodlarına göre uyarlayacaksın.
+    if hasattr(doc, "export_to_markdown"):
+        md = doc.export_to_markdown()
+    elif hasattr(doc, "to_markdown"):
+        md = doc.to_markdown()
+    else:
+        # fallback: düz text
+        md = getattr(doc, "text", "") or str(doc)
+    return md
 
 
 # -----------------------------
-# MADDE parsing
+# 2) Markdown normalize
 # -----------------------------
-MADDE_HEADER_RE = re.compile(
-    r"(^|\n)\s*MADDE\s+(\d+)\s*[\u2013\-–]\s*(.*?)(?=\n)",  # "MADDE 4 – (1) ..."
-    flags=re.IGNORECASE
+def normalize_md(md: str) -> str:
+    md = md.replace("\u00ad", "")
+    md = re.sub(r"[ \t]+", " ", md)
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
+
+
+# -----------------------------
+# 3) Regülasyon için madde bazlı parse (Markdown üzerinden)
+# -----------------------------
+MADDE_RE = re.compile(
+    r"(?mi)^\s*(MADDE)\s+(\d+)\s*[\-–—]\s*(.*?)\s*$"
 )
 
-# Fıkra: "(1) ...", "(2) ..."
 FIKRA_RE = re.compile(r"(\(\d+\))")
 
 @dataclass
@@ -68,260 +59,131 @@ class Chunk:
     doc_id: str
     doc_name: str
     source_file: str
-    page_start: int
-    page_end: int
     article_no: int
     article_title: str
-    paragraph_no: Optional[int]  # fıkra no (varsa)
-    chunk_type: str              # "paragraph" or "article"
+    paragraph_no: Optional[int]
+    chunk_type: str  # paragraph/article
     text: str
-
-    # ekstra debug/kalite alanları
     char_len: int
 
 
-def build_global_text(pages: List[Dict]) -> Tuple[str, List[int]]:
+def split_articles_from_md(md: str) -> List[Tuple[int, str, str]]:
     """
-    Sayfaları tek string'e birleştirir.
-    Aynı zamanda her sayfanın global string içinde başladığı offset'i tutar,
-    böylece bir text span'ın hangi sayfalara denk geldiğini hesaplayabiliriz.
+    Döner: [(article_no, article_title, article_body)]
     """
-    offsets = []
-    buf = []
-    pos = 0
-    for p in pages:
-        offsets.append(pos)
-        t = p["text"]
-        buf.append(t)
-        # sayfa ayracı koy (line break)
-        buf.append("\n\n")
-        pos += len(t) + 2
-    return "".join(buf), offsets
+    lines = md.splitlines()
+    # MADDE başlıklarının line indexlerini bul
+    idxs = []
+    for i, ln in enumerate(lines):
+        m = MADDE_RE.match(ln.strip())
+        if m:
+            art_no = int(m.group(2))
+            title = (m.group(3) or "").strip()
+            idxs.append((i, art_no, title))
 
+    if not idxs:
+        raise RuntimeError("Markdown içinde 'MADDE X – ...' patterni bulunamadı.")
 
-def find_page_range(span_start: int, span_end: int, page_offsets: List[int]) -> Tuple[int, int]:
-    """
-    Global text içindeki [span_start, span_end) aralığının hangi sayfalar arasında olduğunu bulur.
-    page_offsets: her sayfanın global text'e başladığı offset
-    """
-    # span_start'ın düştüğü sayfa
-    ps = max([i for i, off in enumerate(page_offsets) if off <= span_start], default=0)
-    # span_end'in düştüğü sayfa
-    pe = max([i for i, off in enumerate(page_offsets) if off <= span_end], default=ps)
-    # 1-based dön
-    return ps + 1, pe + 1
-
-
-def parse_articles(global_text: str) -> List[Dict]:
-    """
-    "MADDE X – ..." başlıklarını bulup her madde için içerik bloklarını çıkarır.
-    Çıktı: [{article_no, header_line, title_guess, start, end, body}]
-    """
-    matches = list(MADDE_HEADER_RE.finditer(global_text))
     articles = []
-    for idx, m in enumerate(matches):
-        article_no = int(m.group(2))
-        header_line = (m.group(0) or "").strip()
-        # başlık satırından title çıkarmaya çalış:
-        # ör: "MADDE 4 – (1) Kuruluş, ..." => title genelde önceki satırlarda olur,
-        # ama yoksa ilk cümleden kırpabiliriz.
-        header_rest = (m.group(3) or "").strip()
-        start = m.start(0)
-        end = matches[idx + 1].start(0) if idx + 1 < len(matches) else len(global_text)
-        body = global_text[m.end(0):end].strip()
-
-        # Title heuristic:
-        # Eğer header_rest "(1)" ile başlıyorsa, title'ı "MADDE X" gibi bırak,
-        # yoksa header_rest'ten kısa bir title al.
-        title_guess = "MADDE {}".format(article_no)
-        if header_rest and not header_rest.startswith("("):
-            title_guess = header_rest[:120].strip()
-
-        # Bazı PDF'lerde başlıklar "Bilgi güvenliği ..." gibi ayrı satırda olur.
-        # Basitçe: madde başlamadan önceki 1-2 satırda "BÖLÜM" değilse, title olarak alabiliriz.
-        pre = global_text[max(0, start - 300):start]
-        pre_lines = [ln.strip() for ln in pre.splitlines() if ln.strip()]
-        if pre_lines:
-            candidate = pre_lines[-1]
-            if "BÖLÜM" not in candidate.upper() and not candidate.upper().startswith("MADDE"):
-                # çok uzunsa kırp
-                if 3 <= len(candidate) <= 120:
-                    title_guess = candidate
-
-        articles.append({
-            "article_no": article_no,
-            "header_line": header_line,
-            "title": title_guess,
-            "start": start,
-            "end": end,
-            "body": body
-        })
+    for k, (start_i, art_no, title) in enumerate(idxs):
+        end_i = idxs[k+1][0] if k+1 < len(idxs) else len(lines)
+        body = "\n".join(lines[start_i+1:end_i]).strip()
+        articles.append((art_no, title or f"MADDE {art_no}", body))
     return articles
 
 
-def split_into_paragraphs(article_body: str) -> List[Tuple[Optional[int], str]]:
+def split_fikra(text: str) -> List[Tuple[Optional[int], str]]:
     """
-    Madde gövdesini fıkralara böler:
-    (1) ... (2) ... gibi.
-    Eğer fıkra yakalanamazsa tek parça döndürür.
+    (1) ... (2) ... şeklinde ayırır. Yoksa tek parça.
     """
-    body = article_body.strip()
-    if not body:
+    t = text.strip()
+    if not t:
         return []
 
-    # fıkra marker'larını bul
-    markers = list(FIKRA_RE.finditer(body))
+    markers = list(FIKRA_RE.finditer(t))
     if not markers:
-        return [(None, body)]
+        return [(None, t)]
 
-    parts = []
+    out = []
     for i, mk in enumerate(markers):
-        start = mk.start()
-        end = markers[i + 1].start() if i + 1 < len(markers) else len(body)
-        seg = body[start:end].strip()
-
-        # "(12)" -> 12
-        num_m = re.match(r"\((\d+)\)", seg)
-        para_no = int(num_m.group(1)) if num_m else None
-
-        parts.append((para_no, seg))
-    return parts
+        s = mk.start()
+        e = markers[i+1].start() if i+1 < len(markers) else len(t)
+        seg = t[s:e].strip()
+        mnum = re.match(r"\((\d+)\)", seg)
+        pno = int(mnum.group(1)) if mnum else None
+        out.append((pno, seg))
+    return out
 
 
-def chunk_articles(
-    global_text: str,
-    page_offsets: List[int],
-    articles: List[Dict],
-    max_chars: int = 1200,
-    overlap_chars: int = 120
-) -> List[Chunk]:
+def sentence_pack(text: str, max_chars: int = 1100, overlap_sentences: int = 1) -> List[str]:
     """
-    1) Önce fıkra bazlı chunk üretir.
-    2) Fıkra çok uzunsa, sliding window ile böler.
+    Çok uzun fıkralar için kelime kırmadan cümle bazlı paketleme.
     """
+    sents = re.split(r"(?<=[\.\!\?;:])\s+", text.strip())
+    sents = [s.strip() for s in sents if s.strip()]
+
+    chunks = []
+    buf = []
+    cur = 0
+    for s in sents:
+        if cur + len(s) + 1 > max_chars and buf:
+            chunks.append(" ".join(buf).strip())
+            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
+            cur = sum(len(x) for x in buf) + len(buf)
+        buf.append(s)
+        cur += len(s) + 1
+    if buf:
+        chunks.append(" ".join(buf).strip())
+    return chunks
+
+
+def build_chunks(md: str) -> List[Chunk]:
+    md = normalize_md(md)
+    articles = split_articles_from_md(md)
+
     chunks: List[Chunk] = []
+    for art_no, title, body in articles:
+        fikralar = split_fikra(body)
 
-    for art in articles:
-        art_no = art["article_no"]
-        title = art["title"]
-        # madde metni: header + body'yi birlikte değerlendirmek çoğu zaman iyi
-        art_full = (art["header_line"].strip() + "\n" + art["body"].strip()).strip()
-
-        # page range hesaplamak için global_text içinde span bulalım
-        span_start = art["start"]
-        span_end = art["end"]
-        page_start, page_end = find_page_range(span_start, span_end, page_offsets)
-
-        paragraphs = split_into_paragraphs(art_full)
-
-        # hiç fıkra yoksa tek chunk üret
-        if not paragraphs:
-            cid = f"{DOC_ID}::madde_{art_no}::article"
-            txt = art_full
-            chunks.append(Chunk(
-                chunk_id=cid,
-                doc_id=DOC_ID,
-                doc_name=DOC_NAME,
-                source_file=PDF_PATH,
-                page_start=page_start,
-                page_end=page_end,
-                article_no=art_no,
-                article_title=title,
-                paragraph_no=None,
-                chunk_type="article",
-                text=txt,
-                char_len=len(txt)
-            ))
-            continue
-
-        # fıkra bazlı chunklar
-        for (para_no, para_text) in paragraphs:
-            # para_text çok uzunsa böl
-            if len(para_text) <= max_chars:
-                cid = f"{DOC_ID}::madde_{art_no}::fikra_{para_no or 'na'}::0"
+        # Eğer body çok kısaysa madde bazlı tek chunk da tutmak isteyebilirsin (opsiyonel)
+        for (pno, ptext) in fikralar:
+            # çok uzunsa cümle bazlı parçala
+            parts = [ptext] if len(ptext) <= 1100 else sentence_pack(ptext, max_chars=1100, overlap_sentences=1)
+            for j, part in enumerate(parts):
+                cid = f"{DOC_ID}::madde_{art_no}::fikra_{pno if pno is not None else 'na'}::{j}"
                 chunks.append(Chunk(
                     chunk_id=cid,
                     doc_id=DOC_ID,
                     doc_name=DOC_NAME,
-                    source_file=PDF_PATH,
-                    page_start=page_start,
-                    page_end=page_end,
+                    source_file="Tebliğ.pdf",
                     article_no=art_no,
                     article_title=title,
-                    paragraph_no=para_no,
+                    paragraph_no=pno,
                     chunk_type="paragraph",
-                    text=para_text,
-                    char_len=len(para_text)
+                    text=part.strip(),
+                    char_len=len(part.strip())
                 ))
-            else:
-                # sliding window
-                start = 0
-                part_idx = 0
-                while start < len(para_text):
-                    end = min(len(para_text), start + max_chars)
-                    window = para_text[start:end].strip()
-                    cid = f"{DOC_ID}::madde_{art_no}::fikra_{para_no or 'na'}::{part_idx}"
-                    chunks.append(Chunk(
-                        chunk_id=cid,
-                        doc_id=DOC_ID,
-                        doc_name=DOC_NAME,
-                        source_file=PDF_PATH,
-                        page_start=page_start,
-                        page_end=page_end,
-                        article_no=art_no,
-                        article_title=title,
-                        paragraph_no=para_no,
-                        chunk_type="paragraph",
-                        text=window,
-                        char_len=len(window)
-                    ))
-                    if end == len(para_text):
-                        break
-                    start = max(0, end - overlap_chars)
-                    part_idx += 1
-
     return chunks
 
 
-def write_jsonl(chunks: List[Chunk], out_path: str) -> None:
-    with open(out_path, "w", encoding="utf-8") as f:
-        for ch in chunks:
-            f.write(json.dumps(asdict(ch), ensure_ascii=False) + "\n")
+def write_jsonl(chunks: List[Chunk], path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        for c in chunks:
+            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    pages = extract_pages(PDF_PATH)
-    global_text, page_offsets = build_global_text(pages)
-
-    articles = parse_articles(global_text)
-    if not articles:
-        raise RuntimeError("MADDE başlıkları bulunamadı. Regex'i PDF formatına göre güncellemek gerekebilir.")
-
-    chunks = chunk_articles(
-        global_text=global_text,
-        page_offsets=page_offsets,
-        articles=articles,
-        max_chars=1200,
-        overlap_chars=120
-    )
-
+    md = docling_to_markdown(PDF_PATH)
+    chunks = build_chunks(md)
     write_jsonl(chunks, OUT_JSONL)
 
-    print(f"PDF pages: {len(pages)}")
-    print(f"Articles found: {len(articles)}")
-    print(f"Chunks created: {len(chunks)}")
-    print(f"Output: {OUT_JSONL}")
-    # örnek ilk 2 chunk
-    for ch in chunks[:2]:
-        print("\n--- SAMPLE CHUNK ---")
-        print("chunk_id:", ch.chunk_id)
-        print("article:", ch.article_no, "-", ch.article_title)
-        print("pages:", ch.page_start, "-", ch.page_end)
-        print("len:", ch.char_len)
-        print(ch.text[:400], "...")
+    print("Markdown length:", len(md))
+    print("Chunks:", len(chunks))
+    print("Output:", OUT_JSONL)
+    print("\n--- First 3 chunks ---")
+    for c in chunks[:3]:
+        print(c.chunk_id, c.article_no, c.paragraph_no, c.char_len)
+        print(c.text[:200].replace("\n", " "), "...\n")
 
 
 if __name__ == "__main__":
