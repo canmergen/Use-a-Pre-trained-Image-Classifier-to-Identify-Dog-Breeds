@@ -1,331 +1,586 @@
 # -*- coding: utf-8 -*-
-import re
-import json
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple, Dict
+"""
+Agentic / semantic chunker (no regex-based sections)
+- structural blocks (paragraph/sentence + table blocks)
+- merge small blocks via embedding similarity with neighbors
+- pack blocks into chunks under max_chunk_tokens
+- allow semantic overflow (controlled max extra tokens) if block is very similar
+- NEVER split tables
+- overlap chunks
+"""
 
+from __future__ import annotations
+import re
+import math
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple, Dict, Any
+
+import numpy as np
 import fitz  # PyMuPDF
 
+
+# =========================
+# Config
+# =========================
 PDF_PATH = "/mnt/data/Tebliğ.pdf"
-OUT_JSONL = "/mnt/data/teblig_chunks.jsonl"
 
-DOC_ID = "teblig_2021_31676"
-DOC_NAME = "ÖDEME VE ELEKTRONİK PARA KURULUŞLARI ... TEBLİĞ"
+# Token/size controls
+MAX_CHUNK_TOKENS = 450
+MIN_BLOCK_TOKENS = 60           # blocks smaller than this try to merge with neighbors
+OVERLAP_TOKENS = 60             # chunk overlap target
+SEMANTIC_OVERFLOW_SIM = 0.86    # if next block is very similar, allow overflow
+OVERFLOW_MAX_EXTRA_TOKENS = 120 # allow max_chunk_tokens + extra
 
+# Merge controls
+MERGE_SIM_THRESHOLD = 0.70      # merge small block with neighbor if similarity exceeds this
+MERGE_MAX_TOKENS = 280          # don't merge into a monster block beyond this
 
-# -----------------------------
-# 0) Text normalization (PDF line-break / hyphen / spacing fixes)
-# -----------------------------
-TR_LETTERS = "abcçdefgğhıijklmnoöprsştuüvyz"
-
-def normalize_pdf_text(s: str) -> str:
-    if not s:
-        return ""
-
-    s = s.replace("\u00ad", "")  # soft hyphen
-
-    # Join hyphenated words: "kuru-\nluş" -> "kuruluş"
-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
-
-    # Merge single newlines to space, keep paragraph breaks
-    s = re.sub(r"(?<!\n)\n(?!\n)", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-
-    # Normalize spaces
-    s = re.sub(r"[ \t]+", " ", s)
-
-    # Remove repeated page artifacts (optional)
-    s = s.strip()
-    return s
+# Table detection heuristics (PDF layout)
+TABLE_MIN_LINES = 3
+TABLE_MIN_COLS_HINT = 3
+TABLE_NUMERIC_DENSITY = 0.22    # if many numbers it might be table-like
+TABLE_XPOS_DISTINCT = 5         # how many distinct x positions across spans to suspect columns
 
 
-# -----------------------------
-# 1) PDF -> pages text
-# -----------------------------
-def extract_pages(pdf_path: str) -> List[Dict]:
-    doc = fitz.open(pdf_path)
-    pages = []
-    for i in range(len(doc)):
-        page = doc.load_page(i)
-        txt = page.get_text("text") or ""
-        txt = normalize_pdf_text(txt)
-        pages.append({"page_index": i, "page_number": i + 1, "text": txt})
-    return pages
+# =========================
+# Embedding interface
+# =========================
+class Embedder:
+    def embed(self, texts: List[str]) -> np.ndarray:
+        """Return float32 embeddings shape (n, d), L2-normalized."""
+        raise NotImplementedError
 
 
-def build_global_text(pages: List[Dict]) -> Tuple[str, List[int]]:
-    offsets = []
-    buf = []
-    pos = 0
-    for p in pages:
-        offsets.append(pos)
-        t = p["text"]
-        buf.append(t)
-        buf.append("\n\n")  # hard page separator
-        pos += len(t) + 2
-    return "".join(buf), offsets
+class SentenceTransformersBGE(Embedder):
+    """
+    pip install sentence-transformers
+    model_name example: "BAAI/bge-base-en-v1.5" or TR-friendly BGE if you have.
+    """
+    def __init__(self, model_name: str):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
+
+    def embed(self, texts: List[str]) -> np.ndarray:
+        vecs = self.model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False)
+        return np.asarray(vecs, dtype=np.float32)
 
 
-def find_page_range(span_start: int, span_end: int, page_offsets: List[int]) -> Tuple[int, int]:
-    ps = max([i for i, off in enumerate(page_offsets) if off <= span_start], default=0)
-    pe = max([i for i, off in enumerate(page_offsets) if off <= span_end], default=ps)
-    return ps + 1, pe + 1
+class TransformersBGE(Embedder):
+    """
+    pip install transformers torch
+    Mean-pooling CLS-less; good enough for similarity-driven chunking.
+    """
+    def __init__(self, model_name: str):
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
+
+    def embed(self, texts: List[str]) -> np.ndarray:
+        torch = self.torch
+        all_vecs = []
+        with torch.no_grad():
+            for i in range(0, len(texts), 16):
+                batch = texts[i:i+16]
+                enc = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
+                out = self.model(**enc)
+                # mean pool
+                last = out.last_hidden_state  # [B, T, H]
+                mask = enc["attention_mask"].unsqueeze(-1)  # [B, T, 1]
+                summed = (last * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1)
+                vec = summed / counts
+                # L2 normalize
+                vec = torch.nn.functional.normalize(vec, p=2, dim=1)
+                all_vecs.append(vec.cpu().numpy())
+        return np.vstack(all_vecs).astype(np.float32)
 
 
-# -----------------------------
-# 2) Article (MADDE) detection
-# -----------------------------
-MADDE_HEADER_RE = re.compile(
-    r"(?mi)(^|\n)\s*MADDE\s+(\d+)\s*[\-–—]\s*(.*?)(?=\n)"
-)
-
-FIKRA_MARKER_RE = re.compile(r"(\(\d+\))")
-
-# Bent pattern: "a) ...", "ç) ..." must start line or after newline/paragraph
-ITEM_MARKER_RE = re.compile(r"(?m)^\s*([%s])\)\s+" % TR_LETTERS)
+# =========================
+# Tokenizer (for token counting)
+# =========================
+class TokenCounter:
+    def count(self, text: str) -> int:
+        raise NotImplementedError
 
 
-def parse_articles(global_text: str) -> List[Dict]:
-    matches = list(MADDE_HEADER_RE.finditer(global_text))
-    if not matches:
-        raise RuntimeError("MADDE başlıkları bulunamadı. PDF metin formatı farklı olabilir.")
+class HFTokenCounter(TokenCounter):
+    def __init__(self, model_name: str):
+        from transformers import AutoTokenizer
+        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-    articles = []
-    for idx, m in enumerate(matches):
-        art_no = int(m.group(2))
-        header_rest = (m.group(3) or "").strip()
-
-        start = m.start(0)
-        end = matches[idx + 1].start(0) if idx + 1 < len(matches) else len(global_text)
-
-        # include header line + body
-        header_line = global_text[m.start(0):m.end(0)].strip()
-        body = global_text[m.end(0):end].strip()
-        full = (header_line + "\n" + body).strip()
-
-        # title heuristic
-        title = f"MADDE {art_no}"
-        if header_rest and not header_rest.startswith("("):
-            title = header_rest[:120].strip()
-
-        # sometimes title is one line above
-        pre = global_text[max(0, start - 300):start]
-        pre_lines = [ln.strip() for ln in pre.splitlines() if ln.strip()]
-        if pre_lines:
-            cand = pre_lines[-1]
-            if "BÖLÜM" not in cand.upper() and not cand.upper().startswith("MADDE"):
-                if 3 <= len(cand) <= 120:
-                    title = cand
-
-        articles.append({
-            "article_no": art_no,
-            "title": title,
-            "start": start,
-            "end": end,
-            "text": full
-        })
-    return articles
+    def count(self, text: str) -> int:
+        return len(self.tok.encode(text, add_special_tokens=False))
 
 
-# -----------------------------
-# 3) Chunk strategy
-#    - Prefer: fıkra chunks
-#    - For "Tanımlar..." or if many a)/b)/c) markers: item chunks inside relevant scope
-#    - For very long pieces: sentence packing
-# -----------------------------
-def sentence_pack(text: str, max_chars: int = 1100, overlap_sentences: int = 1) -> List[str]:
-    t = text.strip()
-    if not t:
-        return []
-
-    # Minimal Turkish-friendly sentence split
-    sents = re.split(r"(?<=[\.\!\?;:])\s+", t)
-    sents = [s.strip() for s in sents if s.strip()]
-
-    chunks = []
-    buf = []
-    cur = 0
-
-    for s in sents:
-        if cur + len(s) + 1 > max_chars and buf:
-            chunks.append(" ".join(buf).strip())
-            buf = buf[-overlap_sentences:] if overlap_sentences > 0 else []
-            cur = sum(len(x) for x in buf) + max(0, len(buf) - 1)
-        buf.append(s)
-        cur += len(s) + 1
-
-    if buf:
-        chunks.append(" ".join(buf).strip())
-    return chunks
-
-
-def split_fikra(text: str) -> List[Tuple[Optional[int], str]]:
-    t = text.strip()
-    if not t:
-        return []
-
-    markers = list(FIKRA_MARKER_RE.finditer(t))
-    if not markers:
-        return [(None, t)]
-
-    out = []
-    for i, mk in enumerate(markers):
-        s = mk.start()
-        e = markers[i + 1].start() if i + 1 < len(markers) else len(t)
-        seg = t[s:e].strip()
-        mnum = re.match(r"\((\d+)\)", seg)
-        pno = int(mnum.group(1)) if mnum else None
-        out.append((pno, seg))
-    return out
-
-
-def split_items(text: str) -> List[Tuple[str, str]]:
-    t = text.strip()
-    if not t:
-        return []
-
-    matches = list(ITEM_MARKER_RE.finditer(t))
-    if not matches:
-        return []
-
-    items = []
-    for i, m in enumerate(matches):
-        letter = m.group(1)
-        s = m.start()
-        e = matches[i + 1].start() if i + 1 < len(matches) else len(t)
-        seg = t[s:e].strip()
-        items.append((letter, seg))
-    return items
-
-
-def should_use_item_chunking(article_title: str, article_text: str) -> bool:
-    title_up = (article_title or "").upper()
-    if "TANIM" in title_up:
-        return True
-    # heuristic: if many item markers exist
-    cnt = len(list(ITEM_MARKER_RE.finditer(article_text)))
-    return cnt >= 5
+# =========================
+# Data structures
+# =========================
+@dataclass
+class Block:
+    block_id: str
+    page_start: int
+    page_end: int
+    kind: str               # "text" | "table"
+    text: str
+    token_len: int
+    emb: Optional[np.ndarray] = None
 
 
 @dataclass
 class Chunk:
     chunk_id: str
-    doc_id: str
-    doc_name: str
-    source_file: str
     page_start: int
     page_end: int
-    article_no: int
-    article_title: str
-    paragraph_no: Optional[int]     # fıkra no
-    item_key: Optional[str]         # a/b/c...
-    chunk_type: str                 # paragraph/item/article
     text: str
-    char_len: int
+    token_len: int
+    block_ids: List[str]
+    contains_table: bool
 
 
-def build_chunks_for_article(
-    article: Dict,
-    page_offsets: List[int],
-    max_chars: int = 1100
-) -> List[Chunk]:
-    art_no = article["article_no"]
-    title = article["title"]
-    text = article["text"]
+# =========================
+# PDF extraction (layout-aware blocks)
+# =========================
+def clean_inline(text: str) -> str:
+    text = text.replace("\u00ad", "")
+    # hyphenation join
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # keep paragraph separation if there are double newlines,
+    # but for structural blocks we mostly work per-block anyway
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    page_start, page_end = find_page_range(article["start"], article["end"], page_offsets)
 
-    chunks: List[Chunk] = []
+def is_table_like_block(block_dict: Dict[str, Any]) -> bool:
+    """
+    Heuristic table detection from PyMuPDF dict blocks:
+    - many lines
+    - spans with multiple distinct x positions (columns)
+    - numeric density / repeated spacing patterns
+    """
+    if block_dict.get("type", 0) != 0:  # text blocks only
+        return False
+    lines = block_dict.get("lines", [])
+    if len(lines) < TABLE_MIN_LINES:
+        return False
 
-    # 1) First split by fıkra if present
-    fikralar = split_fikra(text)
-    if not fikralar:
-        fikralar = [(None, text)]
+    x_positions = []
+    raw_text_parts = []
+    for ln in lines:
+        for sp in ln.get("spans", []):
+            x_positions.append(round(sp.get("bbox", [0,0,0,0])[0], 1))
+            raw_text_parts.append(sp.get("text", ""))
 
-    use_items = should_use_item_chunking(title, text)
+    txt = " ".join(raw_text_parts).strip()
+    if not txt:
+        return False
 
-    for (pno, ptext) in fikralar:
-        if use_items:
-            # 2) Within this fıkra, try item split
-            items = split_items(ptext)
-            if items:
-                for (letter, item_text) in items:
-                    parts = [item_text] if len(item_text) <= max_chars else sentence_pack(item_text, max_chars=max_chars, overlap_sentences=1)
-                    for j, part in enumerate(parts):
-                        cid = f"{DOC_ID}::madde_{art_no}::fikra_{pno if pno is not None else 'na'}::item_{letter}::{j}"
-                        chunks.append(Chunk(
-                            chunk_id=cid,
-                            doc_id=DOC_ID,
-                            doc_name=DOC_NAME,
-                            source_file="Tebliğ.pdf",
-                            page_start=page_start,
-                            page_end=page_end,
-                            article_no=art_no,
-                            article_title=title,
-                            paragraph_no=pno,
-                            item_key=letter,
-                            chunk_type="item",
-                            text=part.strip(),
-                            char_len=len(part.strip())
-                        ))
-                continue  # done for this fıkra
+    # distinct x positions suggests columns
+    distinct_x = len(set(x_positions))
+    # numeric density
+    digits = sum(ch.isdigit() for ch in txt)
+    density = digits / max(1, len(txt))
 
-        # 3) default: fıkra chunk (sentence pack if long)
-        parts = [ptext] if len(ptext) <= max_chars else sentence_pack(ptext, max_chars=max_chars, overlap_sentences=1)
-        for j, part in enumerate(parts):
-            cid = f"{DOC_ID}::madde_{art_no}::fikra_{pno if pno is not None else 'na'}::{j}"
-            chunks.append(Chunk(
-                chunk_id=cid,
-                doc_id=DOC_ID,
-                doc_name=DOC_NAME,
-                source_file="Tebliğ.pdf",
-                page_start=page_start,
-                page_end=page_end,
-                article_no=art_no,
-                article_title=title,
-                paragraph_no=pno,
-                item_key=None,
-                chunk_type="paragraph",
-                text=part.strip(),
-                char_len=len(part.strip())
+    # multi-space pattern also hints table
+    multi_space = bool(re.search(r"\s{3,}", txt))
+
+    col_hint = distinct_x >= TABLE_XPOS_DISTINCT
+    return (col_hint and len(lines) >= TABLE_MIN_LINES) or (multi_space and density >= TABLE_NUMERIC_DENSITY)
+
+
+def extract_structural_blocks(pdf_path: str) -> List[Block]:
+    """
+    Extract blocks from PDF using PyMuPDF 'dict' to preserve layout.
+    - table-like blocks are marked as kind="table" and kept atomic
+    - text blocks are cleaned and later can be split further if huge
+    """
+    doc = fitz.open(pdf_path)
+    blocks: List[Block] = []
+
+    for pi in range(len(doc)):
+        page = doc.load_page(pi)
+        d = page.get_text("dict")
+        page_no = pi + 1
+
+        for bi, b in enumerate(d.get("blocks", [])):
+            if b.get("type", 0) != 0:
+                continue  # ignore images etc.
+
+            # gather text
+            parts = []
+            for ln in b.get("lines", []):
+                line_txt = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                parts.append(line_txt)
+            raw = "\n".join(parts)
+            txt = clean_inline(raw)
+            if not txt:
+                continue
+
+            kind = "table" if is_table_like_block(b) else "text"
+            block_id = f"p{page_no:03d}_b{bi:03d}"
+            blocks.append(Block(
+                block_id=block_id,
+                page_start=page_no,
+                page_end=page_no,
+                kind=kind,
+                text=txt,
+                token_len=0,   # fill later
             ))
+    return blocks
+
+
+# =========================
+# Structural refinement: split huge text blocks into paragraphs/sentences
+# =========================
+_SENT_SPLIT = re.compile(r"(?<=[\.\!\?;:])\s+")
+
+def split_text_block_to_subblocks(block: Block, counter: TokenCounter, max_subblock_tokens: int = 220) -> List[Block]:
+    """
+    Convert a big "text" block to smaller paragraph/sentence subblocks.
+    - keep semantic integrity (sentence packing)
+    - do NOT touch tables
+    """
+    if block.kind == "table":
+        block.token_len = counter.count(block.text)
+        return [block]
+
+    # split into paragraphs first
+    paras = [p.strip() for p in re.split(r"\n\s*\n", block.text) if p.strip()]
+    out: List[Block] = []
+    sub_i = 0
+
+    for p in paras:
+        # sentence pack within paragraph
+        sents = [s.strip() for s in _SENT_SPLIT.split(p) if s.strip()]
+        if not sents:
+            continue
+
+        buf = []
+        cur = 0
+        for s in sents:
+            st = counter.count(s)
+            if buf and cur + st > max_subblock_tokens:
+                txt = " ".join(buf).strip()
+                out.append(Block(
+                    block_id=f"{block.block_id}_s{sub_i:03d}",
+                    page_start=block.page_start,
+                    page_end=block.page_end,
+                    kind="text",
+                    text=txt,
+                    token_len=counter.count(txt),
+                ))
+                sub_i += 1
+                buf = []
+                cur = 0
+            buf.append(s)
+            cur += st
+
+        if buf:
+            txt = " ".join(buf).strip()
+            out.append(Block(
+                block_id=f"{block.block_id}_s{sub_i:03d}",
+                page_start=block.page_start,
+                page_end=block.page_end,
+                kind="text",
+                text=txt,
+                token_len=counter.count(txt),
+            ))
+            sub_i += 1
+
+    if not out:
+        block.token_len = counter.count(block.text)
+        return [block]
+
+    return out
+
+
+# =========================
+# Similarity helpers
+# =========================
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    # embeddings already normalized -> dot product
+    return float(np.dot(a, b))
+
+
+def embed_blocks(blocks: List[Block], embedder: Embedder) -> None:
+    texts = [b.text for b in blocks]
+    embs = embedder.embed(texts)
+    for b, e in zip(blocks, embs):
+        b.emb = e
+
+
+# =========================
+# Step 1: merge small blocks with neighbors (agentic merge)
+# =========================
+def merge_small_blocks(blocks: List[Block], counter: TokenCounter) -> List[Block]:
+    """
+    Greedy pass:
+    - For blocks with token_len < MIN_BLOCK_TOKENS and kind="text",
+      merge into the more similar neighbor (prev/next) if similarity >= MERGE_SIM_THRESHOLD
+    - Never merge tables with other tables? We keep tables atomic.
+    - Never split tables; merging tables into text is also avoided (tables remain their own blocks).
+    """
+    if not blocks:
+        return []
+
+    keep = blocks[:]
+    merged = True
+
+    while merged:
+        merged = False
+        new_list: List[Block] = []
+        i = 0
+        while i < len(keep):
+            b = keep[i]
+
+            if b.kind == "table":
+                new_list.append(b)
+                i += 1
+                continue
+
+            if b.token_len >= MIN_BLOCK_TOKENS:
+                new_list.append(b)
+                i += 1
+                continue
+
+            # candidate neighbors (only text neighbors)
+            prev_i = len(new_list) - 1
+            next_i = i + 1 if i + 1 < len(keep) else None
+
+            prev_b = new_list[prev_i] if prev_i >= 0 else None
+            next_b = keep[next_i] if next_i is not None else None
+
+            # compute sims if possible
+            best_target = None
+            best_sim = -1.0
+
+            if prev_b is not None and prev_b.kind == "text" and prev_b.emb is not None and b.emb is not None:
+                s = cosine(prev_b.emb, b.emb)
+                if s > best_sim:
+                    best_sim = s
+                    best_target = "prev"
+
+            if next_b is not None and next_b.kind == "text" and next_b.emb is not None and b.emb is not None:
+                s = cosine(next_b.emb, b.emb)
+                if s > best_sim:
+                    best_sim = s
+                    best_target = "next"
+
+            if best_target is None or best_sim < MERGE_SIM_THRESHOLD:
+                # can't merge safely, keep as is
+                new_list.append(b)
+                i += 1
+                continue
+
+            if best_target == "prev":
+                target = new_list[-1]
+                # don't create huge blocks
+                if target.token_len + b.token_len <= MERGE_MAX_TOKENS:
+                    target.text = (target.text + "\n" + b.text).strip()
+                    target.token_len = counter.count(target.text)
+                    target.page_end = max(target.page_end, b.page_end)
+                    target.block_id = target.block_id + "+" + b.block_id
+                    merged = True
+                    i += 1
+                    continue
+
+            if best_target == "next" and next_b is not None:
+                # merge into next by consuming both
+                if next_b.token_len + b.token_len <= MERGE_MAX_TOKENS:
+                    next_b.text = (b.text + "\n" + next_b.text).strip()
+                    next_b.token_len = counter.count(next_b.text)
+                    next_b.page_start = min(next_b.page_start, b.page_start)
+                    next_b.block_id = b.block_id + "+" + next_b.block_id
+                    merged = True
+                    i += 1
+                    continue
+
+            # fallback keep
+            new_list.append(b)
+            i += 1
+
+        keep = new_list
+
+    return keep
+
+
+# =========================
+# Step 2: pack blocks into chunks with semantic overflow + overlap
+# =========================
+def pack_into_chunks(blocks: List[Block], counter: TokenCounter) -> List[Chunk]:
+    chunks: List[Chunk] = []
+    cur_blocks: List[Block] = []
+    cur_tokens = 0
+    cur_contains_table = False
+
+    # running chunk embedding approximation: mean of block embeddings
+    def chunk_emb(blocks_: List[Block]) -> Optional[np.ndarray]:
+        embs = [b.emb for b in blocks_ if b.emb is not None]
+        if not embs:
+            return None
+        m = np.mean(np.stack(embs, axis=0), axis=0)
+        # renormalize
+        n = np.linalg.norm(m)
+        return (m / n).astype(np.float32) if n > 0 else m.astype(np.float32)
+
+    def finalize_chunk():
+        nonlocal cur_blocks, cur_tokens, cur_contains_table
+        if not cur_blocks:
+            return
+        text = "\n\n".join(b.text for b in cur_blocks).strip()
+        ps = min(b.page_start for b in cur_blocks)
+        pe = max(b.page_end for b in cur_blocks)
+        chunk = Chunk(
+            chunk_id=f"chunk_{len(chunks):05d}",
+            page_start=ps,
+            page_end=pe,
+            text=text,
+            token_len=counter.count(text),
+            block_ids=[b.block_id for b in cur_blocks],
+            contains_table=cur_contains_table
+        )
+        chunks.append(chunk)
+        cur_blocks = []
+        cur_tokens = 0
+        cur_contains_table = False
+
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+
+        # tables are atomic; if adding a table exceeds max, flush first
+        if b.kind == "table":
+            if cur_blocks and cur_tokens + b.token_len > MAX_CHUNK_TOKENS:
+                finalize_chunk()
+            # put table alone or with small preceding context if fits
+            cur_blocks.append(b)
+            cur_tokens += b.token_len
+            cur_contains_table = True
+            i += 1
+            continue
+
+        # normal text block packing with overflow rule
+        if not cur_blocks:
+            cur_blocks.append(b)
+            cur_tokens = b.token_len
+            cur_contains_table = False
+            i += 1
+            continue
+
+        # check if fits
+        if cur_tokens + b.token_len <= MAX_CHUNK_TOKENS:
+            cur_blocks.append(b)
+            cur_tokens += b.token_len
+            i += 1
+            continue
+
+        # does not fit -> semantic overflow?
+        cur_e = chunk_emb(cur_blocks)
+        if cur_e is not None and b.emb is not None:
+            sim = cosine(cur_e, b.emb)
+        else:
+            sim = -1.0
+
+        overflow_limit = MAX_CHUNK_TOKENS + OVERFLOW_MAX_EXTRA_TOKENS
+        if sim >= SEMANTIC_OVERFLOW_SIM and (cur_tokens + b.token_len) <= overflow_limit:
+            # allow controlled overflow
+            cur_blocks.append(b)
+            cur_tokens += b.token_len
+            i += 1
+            continue
+
+        # otherwise close current chunk
+        finalize_chunk()
+
+    finalize_chunk()
+
+    # overlap post-process (token-based tail overlap)
+    if OVERLAP_TOKENS > 0 and len(chunks) >= 2:
+        overlapped: List[Chunk] = [chunks[0]]
+        for prev, nxt in zip(chunks[:-1], chunks[1:]):
+            # take tail from prev up to OVERLAP_TOKENS
+            tail_blocks = prev.block_ids[:]  # ids only
+            # We don't have block objects here; simplest: overlap raw text tail
+            # We'll do text-tail overlap (approx tokens) for generality
+            prev_text = prev.text
+            words = prev_text.split()
+            # approximate tail by words -> not perfect, but stable
+            tail_word_count = min(len(words), max(10, int(OVERLAP_TOKENS * 0.9)))
+            tail_text = " ".join(words[-tail_word_count:])
+
+            new_text = (tail_text + "\n\n" + nxt.text).strip()
+            new_chunk = Chunk(
+                chunk_id=nxt.chunk_id,
+                page_start=min(prev.page_end, nxt.page_start),  # conservative
+                page_end=nxt.page_end,
+                text=new_text,
+                token_len=counter.count(new_text),
+                block_ids=nxt.block_ids,
+                contains_table=nxt.contains_table
+            )
+            overlapped.append(new_chunk)
+        chunks = overlapped
 
     return chunks
 
 
-def write_jsonl(chunks: List[Chunk], path: str):
-    with open(path, "w", encoding="utf-8") as f:
+# =========================
+# End-to-end pipeline
+# =========================
+def chunk_pdf_agentic(
+    pdf_path: str,
+    embedder: Embedder,
+    token_counter: TokenCounter,
+) -> List[Chunk]:
+    # 1) layout blocks
+    base_blocks = extract_structural_blocks(pdf_path)
+
+    # 2) split large text blocks into smaller structural blocks
+    blocks: List[Block] = []
+    for b in base_blocks:
+        blocks.extend(split_text_block_to_subblocks(b, token_counter, max_subblock_tokens=220))
+
+    # ensure token_len set for tables that passed through
+    for b in blocks:
+        if b.token_len == 0:
+            b.token_len = token_counter.count(b.text)
+
+    # 3) embed blocks
+    embed_blocks(blocks, embedder)
+
+    # 4) merge small blocks with neighbors by similarity
+    merged_blocks = merge_small_blocks(blocks, token_counter)
+
+    # 5) pack into final chunks with semantic overflow + overlap + table constraints
+    chunks = pack_into_chunks(merged_blocks, token_counter)
+    return chunks
+
+
+# =========================
+# Example usage
+# =========================
+if __name__ == "__main__":
+    # Pick ONE embedder implementation:
+    # embedder = SentenceTransformersBGE("BAAI/bge-m3")  # if you have it
+    # embedder = SentenceTransformersBGE("BAAI/bge-base-en-v1.5")
+    embedder = TransformersBGE("BAAI/bge-base-en-v1.5")
+
+    token_counter = HFTokenCounter("BAAI/bge-base-en-v1.5")
+
+    chunks = chunk_pdf_agentic(PDF_PATH, embedder, token_counter)
+
+    # Inspect first 10 chunks
+    for c in chunks[:10]:
+        print("=" * 80)
+        print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", f"tokens~{c.token_len}", "table:", c.contains_table)
+        print(c.text[:700], ("..." if len(c.text) > 700 else ""))
+
+    # Optionally write JSONL
+    out_path = "/mnt/data/agentic_chunks.jsonl"
+    with open(out_path, "w", encoding="utf-8") as f:
         for c in chunks:
             f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
-
-
-def main():
-    pages = extract_pages(PDF_PATH)
-    global_text, page_offsets = build_global_text(pages)
-
-    articles = parse_articles(global_text)
-
-    all_chunks: List[Chunk] = []
-    for art in articles:
-        all_chunks.extend(build_chunks_for_article(art, page_offsets, max_chars=1100))
-
-    write_jsonl(all_chunks, OUT_JSONL)
-
-    print("Pages:", len(pages))
-    print("Articles:", len(articles))
-    print("Chunks:", len(all_chunks))
-    print("Output:", OUT_JSONL)
-
-    # print first 10 chunks
-    for c in all_chunks[:10]:
-        print("\n---")
-        print("chunk_id:", c.chunk_id)
-        print("madde:", c.article_no, "| title:", c.article_title)
-        print("fikra:", c.paragraph_no, "| item:", c.item_key, "| pages:", c.page_start, "-", c.page_end)
-        print("len:", c.char_len)
-        print(c.text[:280].replace("\n", " "), "...")
-
-
-if __name__ == "__main__":
-    main()
-
+    print("Wrote:", out_path)
