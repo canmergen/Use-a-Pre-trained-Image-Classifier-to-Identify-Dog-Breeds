@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, re, json
+import os
+import re
+import json
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
 
-import fitz  # pymupdf
+import fitz  # PyMuPDF
+
 
 # =========================
-# Config
+# CONFIG
 # =========================
 PDF_PATH = "/mnt/data/tcmb_teblig.pdf"
 OUT_JSONL = "/mnt/data/tcmb_teblig_chunks.jsonl"
@@ -16,83 +19,122 @@ OUT_JSONL = "/mnt/data/tcmb_teblig_chunks.jsonl"
 DOC_ID = "tcmb_teblig"
 DOC_NAME = "TCMB TEBLİĞ"
 
-# Prefer token budgets; fallback to chars if tokenizer yoksa
-MAX_TOKENS = 450
-MIN_TOKENS = 180
-OVERLAP_TOKENS = 80
+# Chunk budget (RAG için karakter bazlı pratik)
+MAX_CHARS = 1600
+MIN_CHARS = 450
 
-MAX_CHARS_FALLBACK = 1800
-MIN_CHARS_FALLBACK = 400
-OVERLAP_CHARS_FALLBACK = 250
+# Overlap: char tail yerine paragraf overlap (headers + meaning korunur)
+OVERLAP_PARAS = 1  # sonraki chunk'a öncekinin son 1 paragrafını ekle
+
+# Header/footer tespiti için
+HEADER_FOOTER_TOP_Y = 0.14   # sayfanın üst %14'ü
+HEADER_FOOTER_BOT_Y = 0.86   # sayfanın alt %14'ü
+REPEAT_MIN_PAGES = 3         # en az kaç sayfada tekrar ederse header/footer sayalım
 
 KNOWN_SUBHEADINGS = {
     "AMAÇ","KAPSAM","DAYANAK","TANIMLAR","BİLGİLENDİRME","YÜRÜRLÜK","YÜRÜTME",
     "ÜCRETLERİN İADESİ","ÜCRETLERİN SINIFLANDIRILMASI","ÜCRETLERİN DEĞİŞTİRİLMESİ",
-    "SÖZLEŞME ESASLARI","KAMPANYALAR VE ÖZEL HİZMETLER","SON HÜKÜMLER",
-    "ÜCRETLER","ÜCRETLERİN BELİRLENMESİ"
+    "SÖZLEŞME ESASLARI","KAMPANYALAR VE ÖZEL HİZMETLER","SON HÜKÜMLER"
 }
 
-BOLUM_RE = re.compile(r"^\s*(BİRİNCİ|İKİNCİ|ÜÇÜNCÜ|DÖRDÜNCÜ|BEŞİNCİ|ALTINCI|YEDİNCİ|SEKİZİNCİ|DOKUZUNCU|ONUNCU)\s+BÖLÜM\s*$", re.IGNORECASE)
-MADDE_RE = re.compile(r"^\s*(GEÇİCİ\s+)?MADDE\s+(\d+)\s*[-–]?\s*$", re.IGNORECASE)
-EK_RE    = re.compile(r"^\s*EK\s*[-–]?\s*(\d+)\s*.*$", re.IGNORECASE)
+# =========================
+# REGEX (daha toleranslı)
+# =========================
 
-# Fıkra tespiti: satır başı "(1)" "(2)" ...
-FIKRA_RE = re.compile(r"^\s*\((\d+)\)\s+")
+# Örn: "BİRİNCİ BÖLÜM" veya "I. BÖLÜM"
+BOLUM_RE = re.compile(
+    r"^\s*(?:(?P<roman>[IVXLC]+)\.?|(?P<tr>Birinci|İkinci|Üçüncü|Dördüncü|Beşinci|Altıncı|Yedinci|Sekizinci|Dokuzuncu|Onuncu))\s+BÖLÜM\s*$",
+    re.IGNORECASE
+)
 
-# Bent tespiti (opsiyonel): "a)" "b)" ...
-BENT_RE  = re.compile(r"^\s*([a-zçğıöşü])\)\s+", re.IGNORECASE)
+# Örn: "MADDE 5 –" veya "GEÇİCİ MADDE 1 -" veya "MADDE 5-"
+MADDE_INLINE_RE = re.compile(
+    r"^\s*(?P<kind>GEÇİCİ\s+MADDE|MADDE)\s+(?P<no>\d+)\s*[-–:]?\s*(?P<title>.*)\s*$",
+    re.IGNORECASE
+)
+
+# Ek: "EK-1 ..." / "EK 1 ..."
+EK_INLINE_RE = re.compile(
+    r"^\s*EK\s*[-–]?\s*(?P<no>\d+)\s*[-–:]?\s*(?P<title>.*)\s*$",
+    re.IGNORECASE
+)
+
+# Fıkra başlangıcı: "(1) ..." "(2) ..."
+FIKRA_START_RE = re.compile(r"^\s*\((\d+)\)\s+")
+
+# Bent: "a) ..." "b) ..." "ç) ..." "aa) ..." (TR karakterleri dahil)
+BENT_START_RE = re.compile(r"^\s*([a-zçğıöşü]{1,3})\)\s+", re.IGNORECASE)
 
 # =========================
-# Token counter
+# UTILS
 # =========================
-class TokenCounter:
-    def count(self, text: str) -> int:
-        raise NotImplementedError
-
-class HFTokenCounter(TokenCounter):
-    def __init__(self, model_name: str):
-        from transformers import AutoTokenizer
-        self.tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    def count(self, text: str) -> int:
-        return len(self.tok.encode(text, add_special_tokens=False))
-
-class CharFallbackCounter(TokenCounter):
-    def count(self, text: str) -> int:
-        # TR için kaba yaklaşım: ~4 char/token varsayımı
-        return max(1, len(text) // 4)
-
-def norm(s: str) -> str:
+def normalize_ws(s: str) -> str:
+    # soft hyphen kaldır
     s = s.replace("\u00ad", "")
+    # satır içi fazla boşluk
     s = re.sub(r"[ \t]+", " ", s)
+    # aşırı boş satır
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 def up(s: str) -> str:
-    return re.sub(r"\s+", " ", norm(s)).upper()
+    return normalize_ws(s).upper()
 
-def is_known_subheading_line(t: str) -> bool:
-    return up(t) in KNOWN_SUBHEADINGS
+def slugify(s: str) -> str:
+    t = up(s)
+    t = re.sub(r"\s+", "_", t)
+    t = re.sub(r"[^A-Z0-9ÇĞİÖŞÜ_]+", "", t)
+    return t.strip("_")
+
+def is_subheading_line(line: str) -> bool:
+    t = up(line)
+    if t in KNOWN_SUBHEADINGS:
+        return True
+    # Title Case gelenler için: "Amaç" / "Kapsam" vb.
+    t2 = normalize_ws(line).strip()
+    if len(t2) <= 60 and up(t2) in KNOWN_SUBHEADINGS:
+        return True
+    return False
+
+def is_likely_short_heading(line: str) -> bool:
+    t = normalize_ws(line)
+    if not t:
+        return False
+    if len(t) > 80:
+        return False
+    # başlık satırı genelde noktalama ile bitmez
+    if t.endswith((".", ";", ":", ",")):
+        return False
+    # çok kısa / tek kelime başlıklar
+    if is_subheading_line(t):
+        return True
+    return False
+
 
 # =========================
-# Layout extraction
+# TEXT EXTRACTION (layout-safe)
 # =========================
 @dataclass
 class Line:
     page: int
     text: str
-    size: float
-    bold: bool
     x0: float
-    x1: float
     y0: float
+    x1: float
     y1: float
 
-def extract_lines(doc: fitz.Document) -> List[Line]:
+def extract_lines_layout(doc: fitz.Document) -> List[Line]:
+    """
+    get_text("dict") üzerinden satırları alır.
+    - Metin kaçırmayı azaltmak için spans join sırasında boşluk ekler.
+    - Okuma sırası: page -> block -> line
+    """
     out: List[Line] = []
     for pi in range(len(doc)):
         page = doc.load_page(pi)
         d = page.get_text("dict")
-        pno = pi + 1
+        page_no = pi + 1
+
         for b in d.get("blocks", []):
             if b.get("type", 0) != 0:
                 continue
@@ -100,94 +142,277 @@ def extract_lines(doc: fitz.Document) -> List[Line]:
                 spans = ln.get("spans", [])
                 if not spans:
                     continue
-                txt = "".join(sp.get("text", "") for sp in spans)
-                txt = norm(txt)
+
+                parts = []
+                for sp in spans:
+                    tx = sp.get("text", "")
+                    if tx:
+                        parts.append(tx)
+
+                txt = "".join(parts)
+                txt = txt.replace("\xa0", " ")
+                txt = normalize_ws(txt)
                 if not txt:
                     continue
-                size = max(float(sp.get("size", 0.0)) for sp in spans)
-                # font flags: 16 is bold in many PDFs; not guaranteed but useful
-                bold = any(int(sp.get("flags", 0)) & 16 for sp in spans)
 
-                x0 = min(sp.get("bbox", [0,0,0,0])[0] for sp in spans)
-                y0 = min(sp.get("bbox", [0,0,0,0])[1] for sp in spans)
-                x1 = max(sp.get("bbox", [0,0,0,0])[2] for sp in spans)
-                y1 = max(sp.get("bbox", [0,0,0,0])[3] for sp in spans)
-                out.append(Line(pno, txt, size, bold, float(x0), float(x1), float(y0), float(y1)))
+                x0 = min(sp.get("bbox", [0, 0, 0, 0])[0] for sp in spans)
+                y0 = min(sp.get("bbox", [0, 0, 0, 0])[1] for sp in spans)
+                x1 = max(sp.get("bbox", [0, 0, 0, 0])[2] for sp in spans)
+                y1 = max(sp.get("bbox", [0, 0, 0, 0])[3] for sp in spans)
+
+                out.append(Line(page=page_no, text=txt, x0=float(x0), y0=float(y0), x1=float(x1), y1=float(y1)))
 
     out.sort(key=lambda L: (L.page, L.y0, L.x0))
     return out
 
-def page_font_thresholds(lines: List[Line]) -> Dict[int, float]:
+def detect_repeating_header_footer(lines: List[Line], doc: fitz.Document) -> Tuple[set, set]:
     """
-    Sayfa bazında 'büyük font' eşiği: 85p quantile.
-    Böylece ilerleyen sayfalarda font değişse bile başlık yakalanır.
+    Sayfa üst/alt bölgesinde tekrar eden satırları header/footer sayıp temizlemek için set döner.
     """
-    by_page: Dict[int, List[float]] = {}
+    top_counter: Dict[str, set] = {}
+    bot_counter: Dict[str, set] = {}
+
     for l in lines:
-        by_page.setdefault(l.page, []).append(l.size)
-    th = {}
-    for p, sizes in by_page.items():
-        sizes = sorted(sizes)
-        if not sizes:
-            th[p] = 0.0
+        page = doc.load_page(l.page - 1)
+        h = page.rect.height
+        y_mid = (l.y0 + l.y1) / 2.0
+
+        key = up(l.text)
+        if len(key) < 6:
             continue
-        idx = int(len(sizes) * 0.85)
-        th[p] = sizes[min(max(idx, 0), len(sizes)-1)]
-    return th
 
-def looks_like_heading(doc: fitz.Document, l: Line, big_th: float) -> bool:
-    t = l.text
-    u = up(t)
+        if y_mid <= h * HEADER_FOOTER_TOP_Y:
+            top_counter.setdefault(key, set()).add(l.page)
+        elif y_mid >= h * HEADER_FOOTER_BOT_Y:
+            bot_counter.setdefault(key, set()).add(l.page)
 
-    # Hard rules
-    if BOLUM_RE.match(u) or MADDE_RE.match(u) or EK_RE.match(u):
-        return True
-    if is_known_subheading_line(t):
-        return True
+    header = {k for k, pages in top_counter.items() if len(pages) >= REPEAT_MIN_PAGES}
+    footer = {k for k, pages in bot_counter.items() if len(pages) >= REPEAT_MIN_PAGES}
+    return header, footer
 
-    # Soft rules
-    if len(t) < 2 or len(t) > 90:
-        return False
-    if t.endswith((".", ";", ":", ",")):
-        return False
+def remove_header_footer(lines: List[Line], header_set: set, footer_set: set) -> List[Line]:
+    out = []
+    for l in lines:
+        key = up(l.text)
+        if key in header_set or key in footer_set:
+            continue
+        out.append(l)
+    return out
 
-    page = doc.load_page(l.page - 1)
-    w = page.rect.width
-    center = (l.x0 + l.x1) / 2.0
-    centered = abs(center - w/2.0) <= (w * 0.16)
-
-    # uppercase ratio
-    letters = [c for c in t if c.isalpha()]
-    ur = 0.0
-    if letters:
-        upp = sum(1 for c in letters if c.upper() == c and c.lower() != c)
-        ur = upp / len(letters)
-
-    big = l.size >= big_th
-    return (big and centered) or (l.bold and centered) or (centered and ur >= 0.70)
+def join_hyphenated_linebreaks(paragraph: str) -> str:
+    """
+    PDF extraction bazen:
+      "finansal tüketici-\nye" gibi böler.
+    Basit birleştirme: "-\n" -> "" (kelime devamı varsayımı)
+    """
+    paragraph = paragraph.replace("-\n", "")
+    return paragraph
 
 # =========================
-# Structural model
+# STRUCTURE PARSING
 # =========================
-@dataclass
-class HeaderState:
-    bolum: Optional[str] = None
-    bolum_topic: Optional[str] = None   # "Amaç, Kapsam, Dayanak ve Tanımlar" gibi
-    article_kind: Optional[str] = None  # "MADDE"/"GEÇİCİ MADDE"/"EK"
-    article_no: Optional[int] = None
-    article_title: Optional[str] = None # "Amaç" gibi madde üstü başlık
-
 @dataclass
 class Atom:
     """
-    RAG için en küçük güvenli parça: genelde fıkra.
+    Atom: RAG için anlamlı en küçük birim (başlık + takip eden içerik).
     """
-    atom_id: str
     page_start: int
     page_end: int
-    h: HeaderState
-    text: str
+    bolum: Optional[str]
+    bolum_topic: Optional[str]
+    article_kind: Optional[str]
+    article_no: Optional[int]
+    article_title: Optional[str]
+    subheading: Optional[str]
+    item_key: Optional[str]     # fıkra no veya bent (1), a), vb.
+    text: str                   # içerik (başlık satırı dahil değil; biz aşağıda ekleyeceğiz)
 
+def build_atoms(lines: List[Line]) -> List[Atom]:
+    """
+    1) BÖLÜM yakala (ve hemen altındaki topic satırını bağlam olarak al)
+    2) MADDE/GEÇİCİ MADDE/EK yakala
+    3) Alt başlık (Amaç/Kapsam/...) yakala
+    4) İçerik: bir sonraki aynı/üst seviye başlığa kadar topla
+    5) MADDE içeriğini fıkra/bent üzerinden atomlara böl (çok uzun paragrafları kontrol)
+    """
+    atoms: List[Atom] = []
+
+    cur_bolum = None
+    cur_bolum_topic = None
+
+    cur_article_kind = None
+    cur_article_no = None
+    cur_article_title = None
+
+    cur_sub = None
+
+    # Buffer: current section body lines
+    buf: List[Line] = []
+
+    def flush_buf_as_atoms():
+        nonlocal buf, atoms
+        if not buf:
+            return
+
+        ps = buf[0].page
+        pe = buf[-1].page
+
+        # metni paragraf yapısına yakın kur: satırları birleştir
+        raw = "\n".join(l.text for l in buf).strip()
+        raw = normalize_ws(raw)
+        raw = join_hyphenated_linebreaks(raw)
+        if not raw:
+            buf = []
+            return
+
+        # Eğer bir MADDE içindeysek: fıkra/bent parçalamaya çalış
+        if cur_article_kind and cur_article_no is not None:
+            # paragraflara böl
+            paras = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
+            if not paras:
+                buf = []
+                return
+
+            # Her paragrafın "item_key"ini çıkar (varsa)
+            # Sonra küçük atomlar halinde biriktir
+            tmp: List[Tuple[str, Optional[str]]] = []
+            for p in paras:
+                key = None
+                m = FIKRA_START_RE.match(p)
+                if m:
+                    key = f"({m.group(1)})"
+                else:
+                    m2 = BENT_START_RE.match(p)
+                    if m2:
+                        key = f"{m2.group(1).lower()})"
+                tmp.append((p, key))
+
+            # Atom üretimi: aynı item_key ile devam edenleri birleştir (pratik)
+            cur_text_parts: List[str] = []
+            cur_item = None
+
+            def emit(text_joined: str, item_key: Optional[str]):
+                atoms.append(Atom(
+                    page_start=ps, page_end=pe,
+                    bolum=cur_bolum, bolum_topic=cur_bolum_topic,
+                    article_kind=cur_article_kind, article_no=cur_article_no, article_title=cur_article_title,
+                    subheading=cur_sub, item_key=item_key,
+                    text=text_joined.strip()
+                ))
+
+            for p, key in tmp:
+                # yeni fıkra/bent başladıysa önceki atomu bas
+                if key is not None and cur_text_parts:
+                    emit("\n\n".join(cur_text_parts), cur_item)
+                    cur_text_parts = []
+                    cur_item = key
+                    cur_text_parts.append(p)
+                else:
+                    if cur_item is None:
+                        cur_item = key
+                    cur_text_parts.append(p)
+
+            if cur_text_parts:
+                emit("\n\n".join(cur_text_parts), cur_item)
+
+        else:
+            # Madde dışında (örn BÖLÜM başlığı altı genel açıklamalar)
+            atoms.append(Atom(
+                page_start=ps, page_end=pe,
+                bolum=cur_bolum, bolum_topic=cur_bolum_topic,
+                article_kind=cur_article_kind, article_no=cur_article_no, article_title=cur_article_title,
+                subheading=cur_sub, item_key=None,
+                text=raw
+            ))
+
+        buf = []
+
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        l = lines[i]
+        t = normalize_ws(l.text)
+
+        # 1) BÖLÜM
+        mbol = BOLUM_RE.match(t)
+        if mbol:
+            flush_buf_as_atoms()
+
+            cur_bolum = t
+            cur_bolum_topic = None
+            cur_article_kind = None
+            cur_article_no = None
+            cur_article_title = None
+            cur_sub = None
+
+            # Bölüm başlığından sonra gelen "topic" satırını yakala (genelde bir sonraki satır)
+            # Topic satırı: kısa ve başlık gibi, ama "MADDE ..." değil
+            if i + 1 < n:
+                nxt = normalize_ws(lines[i + 1].text)
+                if nxt and not BOLUM_RE.match(nxt) and not MADDE_INLINE_RE.match(nxt) and not EK_INLINE_RE.match(nxt):
+                    # "Amaç, Kapsam, Dayanak ve Tanımlar" gibi
+                    if len(nxt) <= 120:
+                        cur_bolum_topic = nxt
+                        i += 1  # topic'i tükettik
+
+            i += 1
+            continue
+
+        # 2) MADDE / GEÇİCİ MADDE
+        mmad = MADDE_INLINE_RE.match(t)
+        if mmad:
+            flush_buf_as_atoms()
+
+            kind = up(mmad.group("kind"))
+            no = int(mmad.group("no"))
+            title = normalize_ws(mmad.group("title") or "")
+            title = title if title else None
+
+            cur_article_kind = "GEÇİCİ MADDE" if "GEÇİCİ" in kind else "MADDE"
+            cur_article_no = no
+            cur_article_title = title
+            cur_sub = None
+
+            # MADDE satırını “bağlam” olarak body'e koymak yerine metadata'da tutuyoruz.
+            i += 1
+            continue
+
+        # 3) EK
+        mek = EK_INLINE_RE.match(t)
+        if mek:
+            flush_buf_as_atoms()
+
+            no = int(mek.group("no"))
+            title = normalize_ws(mek.group("title") or "")
+            title = title if title else None
+
+            cur_article_kind = "EK"
+            cur_article_no = no
+            cur_article_title = title
+            cur_sub = None
+
+            i += 1
+            continue
+
+        # 4) Alt başlıklar (Amaç/Kapsam/Dayanak/Tanımlar/...)
+        if is_subheading_line(t):
+            flush_buf_as_atoms()
+            cur_sub = t
+            i += 1
+            continue
+
+        # 5) Normal içerik satırı
+        buf.append(l)
+        i += 1
+
+    flush_buf_as_atoms()
+    return atoms
+
+
+# =========================
+# CHUNK PACKING
+# =========================
 @dataclass
 class Chunk:
     chunk_id: str
@@ -196,384 +421,214 @@ class Chunk:
     source_file: str
     page_start: int
     page_end: int
+
     bolum: Optional[str]
     bolum_topic: Optional[str]
+
     article_kind: Optional[str]
     article_no: Optional[int]
     article_title: Optional[str]
+
+    subheading: Optional[str]
+    item_key: Optional[str]
+
     atom_ids: List[str]
     text: str
-    token_len: int
+    char_len: int
 
-def parse_heading(line_text: str) -> Tuple[str, Dict[str, Any]]:
-    t = norm(line_text)
-    u = up(t)
+def atom_id(a: Atom) -> str:
+    parts = [DOC_ID]
+    if a.bolum:
+        parts.append(slugify(a.bolum))
+    if a.bolum_topic:
+        parts.append(slugify(a.bolum_topic))
+    if a.article_kind and a.article_no is not None:
+        parts.append(f"{slugify(a.article_kind)}_{a.article_no}")
+    if a.article_title:
+        parts.append(slugify(a.article_title)[:40])
+    if a.subheading:
+        parts.append(slugify(a.subheading))
+    if a.item_key:
+        parts.append(slugify(a.item_key))
+    parts.append(f"p{a.page_start}-{a.page_end}")
+    return "::".join(parts)
 
-    m = BOLUM_RE.match(u)
-    if m:
-        return "BOLUM", {"bolum": t}
-
-    m = MADDE_RE.match(u)
-    if m:
-        is_gecici = bool(m.group(1))
-        no = int(m.group(2))
-        return "MADDE", {"article_kind": "GEÇİCİ MADDE" if is_gecici else "MADDE", "article_no": no}
-
-    m = EK_RE.match(u)
-    if m:
-        no = int(m.group(1))
-        return "EK", {"article_kind": "EK", "article_no": no}
-
-    # subheading candidate
-    if is_known_subheading_line(t) or (2 <= len(t) <= 90):
-        return "SUB", {"subheading": t}
-
-    return "NONE", {}
-
-def split_article_to_atoms(article_text_lines: List[Line], state: HeaderState, base_atom_id: str) -> List[Atom]:
+def format_atom_for_chunk(a: Atom) -> str:
     """
-    MADDE içini fıkra atomlarına böler. Fıkra yoksa tek atom.
+    RAG için atomu chunk içine koyarken başlık bağlamlarını da metin olarak ekle.
+    Bu sayede retrieval sırasında “Amaç nedir?” gibi sorular direkt yakalanır.
     """
-    # satırları metne çevir
-    lines = [l.text for l in article_text_lines]
-    lines = [norm(x) for x in lines if norm(x)]
-    if not lines:
-        return []
-
-    atoms: List[Atom] = []
-    buf: List[str] = []
-    buf_ps = article_text_lines[0].page
-    buf_pe = article_text_lines[0].page
-    cur_idx = 0
-
-    def flush():
-        nonlocal cur_idx, buf, buf_ps, buf_pe
-        if not buf:
-            return
-        txt = norm("\n".join(buf))
-        if txt:
-            atoms.append(Atom(
-                atom_id=f"{base_atom_id}::atom_{cur_idx:03d}",
-                page_start=buf_ps,
-                page_end=buf_pe,
-                h=HeaderState(**asdict(state)),
-                text=txt
-            ))
-            cur_idx += 1
-        buf = []
-
-    for L in article_text_lines:
-        t = norm(L.text)
-        if not t:
-            continue
-        # yeni fıkra başlangıcı
-        if FIKRA_RE.match(t) and buf:
-            flush()
-            buf_ps = L.page
-        buf_pe = L.page
-        buf.append(t)
-
-    flush()
-
-    # hiç fıkra ayrımı yoksa tek atom yap
-    if len(atoms) == 1:
-        return atoms
-    # bazı maddelerde ilk fıkra numarası kaçabilir; yine de bu yaklaşım metin kaybettirmez
-    return atoms if atoms else [Atom(
-        atom_id=f"{base_atom_id}::atom_000",
-        page_start=article_text_lines[0].page,
-        page_end=article_text_lines[-1].page,
-        h=HeaderState(**asdict(state)),
-        text=norm("\n".join(lines))
-    )]
-
-# =========================
-# Main segmentation
-# =========================
-def build_atoms(doc: fitz.Document, lines: List[Line]) -> List[Atom]:
-    big_th = page_font_thresholds(lines)
-
-    atoms: List[Atom] = []
-    h = HeaderState()
-
-    i = 0
-    # buffer for current article content lines
-    cur_article_lines: List[Line] = []
-    cur_article_head_line: Optional[Line] = None
-
-    # temporary: subheading that should attach to next MADDE as article_title
-    pending_madde_title: Optional[str] = None
-
-    def flush_article():
-        nonlocal cur_article_lines, cur_article_head_line, pending_madde_title, h
-
-        if not cur_article_lines:
-            return
-
-        # build article-level atoms
-        base = f"{DOC_ID}::{h.article_kind or 'NA'}_{h.article_no or 0}"
-        if h.article_title:
-            base += f"::{re.sub(r'\\s+','_', up(h.article_title))}"
-
-        atoms.extend(split_article_to_atoms(cur_article_lines, h, base_atom_id=base))
-        cur_article_lines = []
-        cur_article_head_line = None
-
-    while i < len(lines):
-        L = lines[i]
-        t = L.text
-        u = up(t)
-
-        is_head = looks_like_heading(doc, L, big_th.get(L.page, 0.0))
-
-        if is_head:
-            kind, meta = parse_heading(t)
-
-            if kind == "BOLUM":
-                # flush previous article
-                flush_article()
-                h.bolum = meta["bolum"]
-                h.bolum_topic = None
-                h.article_kind = None
-                h.article_no = None
-                h.article_title = None
-                pending_madde_title = None
-                i += 1
-                continue
-
-            if kind == "SUB":
-                sub = meta["subheading"]
-
-                # Eğer bu SUB'dan kısa süre sonra MADDE geliyorsa, bunu madde_title yap.
-                # Lookahead: sonraki 6 satır içinde MADDE varsa.
-                lookahead = 6
-                will_attach_to_madde = False
-                for j in range(1, lookahead+1):
-                    if i+j >= len(lines):
-                        break
-                    uu = up(lines[i+j].text)
-                    if MADDE_RE.match(uu):
-                        will_attach_to_madde = True
-                        break
-                    # araya başka güçlü heading (BÖLÜM/EK) girerse bağlama
-                    if BOLUM_RE.match(uu) or EK_RE.match(uu):
-                        break
-
-                if will_attach_to_madde:
-                    pending_madde_title = sub
-                else:
-                    # bölüm topic gibi davranabilir (ör. "Amaç, Kapsam, Dayanak ve Tanımlar")
-                    # büyük/ortalanmış ise bolum_topic’a yaz
-                    if h.article_kind is None:
-                        h.bolum_topic = sub
-                    else:
-                        # madde içi alt başlık: bunu article_title olarak da set edebiliriz
-                        h.article_title = sub
-                i += 1
-                continue
-
-            if kind in ("MADDE", "EK"):
-                flush_article()
-                h.article_kind = meta["article_kind"]
-                h.article_no = meta["article_no"]
-                h.article_title = pending_madde_title
-                pending_madde_title = None
-
-                # MADDE başlık satırını içerik buffer’ına dahil et (RAG için iyi)
-                cur_article_lines = [L]
-                cur_article_head_line = L
-                i += 1
-                continue
-
-        # normal line
-        if h.article_kind is not None:
-            cur_article_lines.append(L)
+    ctx = []
+    if a.bolum:
+        ctx.append(a.bolum)
+    if a.bolum_topic:
+        ctx.append(a.bolum_topic)
+    if a.article_kind and a.article_no is not None:
+        if a.article_title:
+            ctx.append(f"{a.article_kind} {a.article_no} – {a.article_title}")
         else:
-            # Preamble / heading dışı: bolum başlamadan metin varsa, onu bolum_topic gibi sakla
-            # ama kaybetme: “preamble atom” üret
-            if norm(t):
-                pre_h = HeaderState(**asdict(h))
-                atoms.append(Atom(
-                    atom_id=f"{DOC_ID}::preamble::p{L.page:03d}::i{i:05d}",
-                    page_start=L.page,
-                    page_end=L.page,
-                    h=pre_h,
-                    text=norm(t)
-                ))
-        i += 1
+            ctx.append(f"{a.article_kind} {a.article_no}")
+    if a.subheading:
+        ctx.append(a.subheading)
+    if a.item_key:
+        ctx.append(a.item_key)
 
-    flush_article()
-    return atoms
+    header = " / ".join(ctx).strip()
+    if header:
+        return header + "\n" + a.text.strip()
+    return a.text.strip()
 
-# =========================
-# Chunk packing (atom-based, no text loss)
-# =========================
-def pack_atoms(atoms: List[Atom], source_file: str, counter: TokenCounter) -> List[Chunk]:
+def pack_atoms_to_chunks(atoms: List[Atom], source_file: str) -> List[Chunk]:
     chunks: List[Chunk] = []
-    cur_atoms: List[Atom] = []
-    cur_tokens = 0
 
-    def meta_of(a: Atom):
-        return a.h
+    cur_parts: List[str] = []
+    cur_atom_ids: List[str] = []
+
+    cur_ps = None
+    cur_pe = None
+
+    # meta: chunk meta'sunu en güncel atomdan taşır
+    cur_meta = dict(
+        bolum=None, bolum_topic=None,
+        article_kind=None, article_no=None, article_title=None,
+        subheading=None, item_key=None
+    )
 
     def flush():
-        nonlocal cur_atoms, cur_tokens
-        if not cur_atoms:
+        nonlocal cur_parts, cur_atom_ids, cur_ps, cur_pe, cur_meta
+        if not cur_parts:
             return
-        text = "\n\n".join(a.text for a in cur_atoms).strip()
-        ps = min(a.page_start for a in cur_atoms)
-        pe = max(a.page_end for a in cur_atoms)
-        h = meta_of(cur_atoms[-1])
+
+        text = "\n\n".join(cur_parts).strip()
+        text = normalize_ws(text)
+        if len(text) < 30:
+            cur_parts = []
+            cur_atom_ids = []
+            cur_ps = None
+            cur_pe = None
+            return
 
         chunks.append(Chunk(
             chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
             doc_id=DOC_ID,
             doc_name=DOC_NAME,
             source_file=source_file,
-            page_start=ps,
-            page_end=pe,
-            bolum=h.bolum,
-            bolum_topic=h.bolum_topic,
-            article_kind=h.article_kind,
-            article_no=h.article_no,
-            article_title=h.article_title,
-            atom_ids=[a.atom_id for a in cur_atoms],
+            page_start=cur_ps,
+            page_end=cur_pe,
+            bolum=cur_meta["bolum"],
+            bolum_topic=cur_meta["bolum_topic"],
+            article_kind=cur_meta["article_kind"],
+            article_no=cur_meta["article_no"],
+            article_title=cur_meta["article_title"],
+            subheading=cur_meta["subheading"],
+            item_key=cur_meta["item_key"],
+            atom_ids=cur_atom_ids[:],
             text=text,
-            token_len=counter.count(text)
+            char_len=len(text)
         ))
-        cur_atoms = []
-        cur_tokens = 0
 
-    def take_overlap_tail(prev_atoms: List[Atom]) -> List[Atom]:
-        if OVERLAP_TOKENS <= 0:
-            return []
-        tail: List[Atom] = []
-        toks = 0
-        for a in reversed(prev_atoms):
-            at = counter.count(a.text)
-            if tail and toks + at > OVERLAP_TOKENS:
-                break
-            tail.append(a)
-            toks += at
-        return list(reversed(tail))
+        cur_parts = []
+        cur_atom_ids = []
+        cur_ps = None
+        cur_pe = None
 
     for a in atoms:
-        a_tok = counter.count(a.text)
-
-        # If single atom is huge (rare), split by paragraphs safely
-        if a_tok > MAX_TOKENS * 1.7:
-            flush()
-            paras = [p.strip() for p in re.split(r"\n\s*\n", a.text) if p.strip()]
-            buf = []
-            bt = 0
-            for p in paras:
-                pt = counter.count(p)
-                if buf and bt + pt > MAX_TOKENS:
-                    tmp = "\n\n".join(buf).strip()
-                    chunks.append(Chunk(
-                        chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
-                        doc_id=DOC_ID,
-                        doc_name=DOC_NAME,
-                        source_file=source_file,
-                        page_start=a.page_start,
-                        page_end=a.page_end,
-                        bolum=a.h.bolum,
-                        bolum_topic=a.h.bolum_topic,
-                        article_kind=a.h.article_kind,
-                        article_no=a.h.article_no,
-                        article_title=a.h.article_title,
-                        atom_ids=[a.atom_id],
-                        text=tmp,
-                        token_len=counter.count(tmp)
-                    ))
-                    buf = []
-                    bt = 0
-                buf.append(p)
-                bt += pt
-            if buf:
-                tmp = "\n\n".join(buf).strip()
-                chunks.append(Chunk(
-                    chunk_id=f"{DOC_ID}::chunk_{len(chunks):05d}",
-                    doc_id=DOC_ID,
-                    doc_name=DOC_NAME,
-                    source_file=source_file,
-                    page_start=a.page_start,
-                    page_end=a.page_end,
-                    bolum=a.h.bolum,
-                    bolum_topic=a.h.bolum_topic,
-                    article_kind=a.h.article_kind,
-                    article_no=a.h.article_no,
-                    article_title=a.h.article_title,
-                    atom_ids=[a.atom_id],
-                    text=tmp,
-                    token_len=counter.count(tmp)
-                ))
+        a_text = format_atom_for_chunk(a)
+        if not a_text:
             continue
 
-        if cur_atoms and (cur_tokens + a_tok > MAX_TOKENS) and (cur_tokens >= MIN_TOKENS):
-            prev_atoms = cur_atoms[:]
-            flush()
-            # overlap = atom tail (no slicing => metin kaybı yok)
-            tail = take_overlap_tail(prev_atoms)
-            if tail:
-                cur_atoms = tail[:]
-                cur_tokens = sum(counter.count(x.text) for x in cur_atoms)
+        # atom id
+        aid = atom_id(a)
 
-        if not cur_atoms:
-            cur_atoms = [a]
-            cur_tokens = a_tok
-        else:
-            cur_atoms.append(a)
-            cur_tokens += a_tok
+        # yeni chunk'a geçme kuralı: char budget aşımı + min chars sağlandıysa
+        cur_len = sum(len(x) for x in cur_parts) + (2 * max(0, len(cur_parts) - 1))
+        proposed = cur_len + (2 if cur_parts else 0) + len(a_text)
+
+        if cur_parts and proposed > MAX_CHARS and cur_len >= MIN_CHARS:
+            flush()
+
+        if cur_ps is None:
+            cur_ps = a.page_start
+        cur_pe = a.page_end
+
+        # meta'yı güncelle
+        cur_meta = dict(
+            bolum=a.bolum, bolum_topic=a.bolum_topic,
+            article_kind=a.article_kind, article_no=a.article_no, article_title=a.article_title,
+            subheading=a.subheading, item_key=a.item_key
+        )
+
+        cur_parts.append(a_text)
+        cur_atom_ids.append(aid)
 
     flush()
+
+    # Paragraf bazlı overlap: sonraki chunk'a öncekinin son N paragrafını ekle
+    if OVERLAP_PARAS > 0 and len(chunks) >= 2:
+        out = [chunks[0]]
+        for prev, nxt in zip(chunks[:-1], chunks[1:]):
+            prev_paras = [p.strip() for p in re.split(r"\n\s*\n", prev.text) if p.strip()]
+            tail = "\n\n".join(prev_paras[-OVERLAP_PARAS:]).strip() if prev_paras else ""
+            merged = (tail + "\n\n" + nxt.text).strip() if tail else nxt.text
+
+            nxt_dict = asdict(nxt)
+            nxt_dict["text"] = merged
+            nxt_dict["char_len"] = len(merged)
+            out.append(Chunk(**nxt_dict))
+        chunks = out
+
     return chunks
 
+
 # =========================
-# End-to-end
+# END-TO-END
 # =========================
-def chunk_pdf_legal(pdf_path: str, out_jsonl: str, token_model: Optional[str] = None) -> List[Chunk]:
+def chunk_pdf_legal(pdf_path: str, out_jsonl: str) -> List[Chunk]:
     assert os.path.exists(pdf_path), f"PDF yok: {pdf_path}"
     doc = fitz.open(pdf_path)
 
-    total_chars = sum(len(doc.load_page(i).get_text("text").strip()) for i in range(len(doc)))
+    # text-based kontrol
+    total_chars = 0
+    for i in range(len(doc)):
+        total_chars += len(doc.load_page(i).get_text("text").strip())
+
     if total_chars == 0:
-        raise RuntimeError("PDF text-based değil. OCR gerekir.")
+        raise RuntimeError("PDF text-based değil (muhtemelen tarama). OCR olmadan chunk üretilemez.")
 
-    counter: TokenCounter
-    if token_model:
-        try:
-            counter = HFTokenCounter(token_model)
-        except Exception:
-            counter = CharFallbackCounter()
-    else:
-        counter = CharFallbackCounter()
+    lines = extract_lines_layout(doc)
 
-    lines = extract_lines(doc)
-    atoms = build_atoms(doc, lines)
+    # header/footer temizliği
+    header_set, footer_set = detect_repeating_header_footer(lines, doc)
+    lines = remove_header_footer(lines, header_set, footer_set)
 
-    chunks = pack_atoms(atoms, source_file=os.path.basename(pdf_path), counter=counter)
+    # atom üret
+    atoms = build_atoms(lines)
 
+    # chunk üret
+    chunks = pack_atoms_to_chunks(atoms, source_file=os.path.basename(pdf_path))
+
+    # yaz
     with open(out_jsonl, "w", encoding="utf-8") as f:
         for c in chunks:
             f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
 
-    print("pages:", len(doc))
-    print("total extracted chars:", total_chars)
-    print("atoms:", len(atoms))
-    print("chunks:", len(chunks))
-    print("wrote:", out_jsonl)
     return chunks
 
-# RUN
-# token_model öneri: "BAAI/bge-m3" veya kullandığın embedding modelinin tokenizer'ı
-chunks = chunk_pdf_legal(PDF_PATH, OUT_JSONL, token_model=None)
 
-# preview
+# =========================
+# RUN + PREVIEW
+# =========================
+chunks = chunk_pdf_legal(PDF_PATH, OUT_JSONL)
+print("pages:", len(fitz.open(PDF_PATH)))
+print("wrote:", OUT_JSONL)
+print("chunks:", len(chunks))
+print("total extracted chars:", sum(c.char_len for c in chunks))
+
 for c in chunks[:5]:
-    print("="*90)
-    print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", "tok", c.token_len)
+    print("=" * 90)
+    print(c.chunk_id, f"pages {c.page_start}-{c.page_end}", "chars:", c.char_len)
     print("bolum:", c.bolum)
     print("topic:", c.bolum_topic)
     print("article:", c.article_kind, c.article_no, "title:", c.article_title)
+    print("sub:", c.subheading, "item:", c.item_key)
     print(c.text[:900], "..." if len(c.text) > 900 else "")
