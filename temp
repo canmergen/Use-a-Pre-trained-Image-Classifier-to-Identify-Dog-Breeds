@@ -1,5 +1,5 @@
 # ============================================================
-# YARDIMCI — PSI (bu hücreden ÖNCE bir kez tanımlı olmalı)
+# YARDIMCILAR (bu hücreden ÖNCE bir kez tanımlı olmalı)
 # ============================================================
 def _psi(base_s, new_s, bins=10):
     """Population Stability Index. base = train, new = OOT.
@@ -30,6 +30,30 @@ def _psi(base_s, new_s, bins=10):
     return float(((pn - pb) * np.log(pn / pb)).sum())
 
 
+def _cramers_v(x, y):
+    """Bias düzeltmeli (Bergsma) Cramér's V — kategorik ↔ hedef ilişkisi.
+
+    Neden IV değil: IV bin sayısı arttıkça KENDİLİĞİNDEN şişiyor. 1.4M
+    satırda hedefle hiç ilişkisi olmayan rastgele değişkenlerde ölçtük:
+    sürekli 0.00004, 5 seviyeli kategorik 0.00002, 81 seviyeli 0.00036,
+    500 seviyeli 0.00231 — yani 500 seviyeli gürültü, sürekli değişkenin
+    50 katı IV alıyor. Bias düzeltmeli Cramér's V'de aynı testte sırasıyla
+    0.0018 / 0.0032 / 0.0000 çıktı; kardinalite yanlılığı yok.
+    """
+    ct = pd.crosstab(pd.Series(x).astype(object).fillna("__NaN__"),
+                     pd.Series(y)).to_numpy()
+    if ct.shape[0] < 2 or ct.shape[1] < 2:
+        return 0.0
+    n = ct.sum()
+    exp = ct.sum(1)[:, None] * ct.sum(0)[None, :] / n
+    chi2 = ((ct - exp) ** 2 / np.maximum(exp, 1e-9)).sum()
+    r, k = ct.shape
+    phi2c = max(0.0, chi2 / n - (k - 1) * (r - 1) / (n - 1))
+    rc = r - (r - 1) ** 2 / (n - 1)
+    kc = k - (k - 1) ** 2 / (n - 1)
+    return float(np.sqrt(phi2c / max(min(kc - 1, rc - 1), 1e-9)))
+
+
 # ============================================================
 # RENK BAZLI MODELLER — her renk: eleme → Optuna → DOSYA (renk renk)
 # ============================================================
@@ -39,35 +63,64 @@ def _psi(base_s, new_s, bins=10):
 # ---------------------------------------------------------------------------
 # Eski akış: train_full → [feature eleme] → train_test_split(train, val)
 #
-# Üç sorun vardı:
-#
-# 1) SIZINTI. Feature eleme (IV, korelasyon, sabit) train_full ÜZERİNDE
-#    yapılıyor, val ise SONRA o kümenin içinden ayrılıyordu. Yani val,
-#    kendisini de görmüş bir feature setiyle değerlendiriliyordu.
-#    Sonuç: val_gini iyimser, ve ondan seçilen eşik de iyimser.
-#
-# 2) GEREKSİZ AYRIM. Model seçimi zaten CV ile yapılıyor (cross_validate).
-#    val'in tek gerçek işlevi eşik seçmekti. Bunun için 280k satırı
-#    eğitimden çıkarmak gereksiz — CV'nin out-of-fold tahminleri aynı işi
-#    1.4M satırın TAMAMI üzerinde ve sızıntısız yapıyor.
-#
-# 3) TUTARSIZLIK. Optuna X_tr üzerinde CV yapıyordu ama final model de
-#    yine sadece X_tr ile eğitiliyordu; val hiç eğitime girmiyordu.
-#    Elde veri varken kullanmamak.
+# 1) SIZINTI. Feature eleme train_full ÜZERİNDE yapılıyor, val ise SONRA
+#    o kümenin içinden ayrılıyordu. val, kendisini de görmüş bir feature
+#    setiyle değerlendiriliyordu → val_gini ve ondan seçilen eşik iyimser.
+# 2) GEREKSİZ AYRIM. Model seçimi zaten CV'den geliyor; val'in tek işlevi
+#    eşik seçmekti. Bunun için 280k satırı eğitimden çıkarmak gereksiz —
+#    CV'nin out-of-fold tahminleri aynı işi 1.4M satırın TAMAMI üzerinde
+#    ve sızıntısız yapıyor.
+# 3) TUTARSIZLIK. Final model de sadece X_tr ile eğitiliyordu; val hiç
+#    eğitime girmiyordu. Elde veri varken kullanmamak.
 #
 # Yeni akış: train_full (tamamı) → [eleme] → CV ile Optuna → tam veriyle fit
 #            → eşik cross_val_predict'in OOF tahminlerinden
+# ---------------------------------------------------------------------------
+# NEDEN IV ELEMESİ KALDIRILDI?
+# ---------------------------------------------------------------------------
+# Üç sorun:
 #
-# Kazanç: eğitimde %20 daha fazla veri, eşik 5x daha fazla satırdan,
-#         sızıntı yok. Maliyet: bir ek CV turu (OOF tahmin için).
+# 1) IV tek değişkenli ve MONOTON ilişki ölçüyor. LightGBM ise ne
+#    monotonluk arıyor ne de tek değişkenli bakıyor. Etkileşimde güçlü ama
+#    tek başına zayıf bir feature (ör. ödeme oranı ancak KKB skoru düşükken
+#    anlamlı) IV'de görünmez, ağaçta görünür.
+# 2) 0.02 SABİT eşiği renkten renge tamamen farklı davranıyordu. Önceki
+#    koşuda elenen feature sayısı: Turuncu 144, Açık yeşil 132, Sarı 114,
+#    Yeşil 85, Kırmızı 70, Koyu yeşil 15. Yani hedef oranı düştükçe IV'ler
+#    sistematik olarak düşüyor ve eşik gereğinden fazla eliyor.
+# 3) Seyreltmeyi model zaten yapıyor: colsample_bytree 0.4–0.7.
+#
+# IV hesabı DURUYOR — rapor amaçlı (kalan_featurelar.csv). Sadece ELEME
+# kaldırıldı. Beklenti: n_feature belirgin artacak, oot_gini sabit ya da
+# hafif yukarı.
+# ---------------------------------------------------------------------------
+# NEDEN KORELASYONDA SPEARMAN + HEDEF İLİŞKİSİ TIE-BREAKER?
+# ---------------------------------------------------------------------------
+# Çift tespiti Pearson yerine SPEARMAN:
+#   Feature'ların çoğu çarpık (bakiye, limit, ödeme oranı) ve preprocess
+#   sonrası büyük sentinel yığınları var (0, -1). Pearson bunlarda gerçek
+#   bağımlılığı olduğundan düşük gösterip gereksiz feature bırakıyordu.
+#   Maliyet yok: rank+matmul, pandas'ın Pearson corr()'undan bile hızlı.
+#
+# Tie-breaker IV yerine |Spearman(feature, target)|:
+#   Binleme yok → bin sayısına bağlı şişme yok. Sıralama tabanlı → çarpık
+#   dağılımdan ve sentinel yığınlarından etkilenmiyor.
+#
+# Kategorikler: 3 kolon olduğu için aralarında eleme yapmaya değmez
+#   (corr() zaten onları almıyor, hiç elenmiyorlardı). Cramér's V sadece
+#   RAPORA giriyor. Not: Cramér's V ile |Spearman| aynı ölçekte DEĞİL —
+#   aynı güçteki sinyalde Cramér's V sistematik olarak yüksek çıkıyor
+#   (5 seviyeli test: 0.715 vs 0.651). Bu yüzden karışık tipli çiftlerde
+#   tie-breaker olarak kullanılmıyor.
 # ---------------------------------------------------------------------------
 #
 # HIZ AYARI — çıktıyı DEĞİŞTİRMEZ.
 # cross_validate(n_jobs=-1) fold'ları paralel başlatıyor, her fold içindeki
-# LightGBM de n_jobs=-1 ile tüm çekirdekleri istiyordu → 5 x 16 = 80 thread,
-# thread'ler birbirini bekliyordu. Fold'ları sırayla çalıştırıyoruz;
-# LightGBM'in gördüğü thread sayısı eskisiyle aynı (-1).
+# LightGBM de n_jobs=-1 ile tüm çekirdekleri istiyordu → 5 x 16 = 80 thread.
+# Fold'ları sırayla çalıştırıyoruz; LightGBM'in gördüğü thread sayısı aynı.
 CV_JOBS = 1
+
+CORR_ESIK = 0.95      # |Spearman| bu değerin üstündeyse çift sayılır
 
 MODEL_RENKLER = [1, 2, 3, 4, 5, 6]   # kırmızı, turuncu, sarı, açık yeşil, yeşil, koyu yeşil
 skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
@@ -120,8 +173,8 @@ for RENK_KOD in MODEL_RENKLER:
     print(f"  ✓ Bölme bitti (train {len(train_full)} / oot {len(oot)})")
 
     # 4) FEATURE ELEME — train'in TAMAMI üzerinde.
-    #    val olmadığı için "eleme val'i gördü" sorunu ortadan kalktı;
-    #    OOT'ye hiç dokunulmuyor, o tamamen temiz kalıyor.
+    #    val olmadığı için "eleme val'i gördü" sorunu yok; OOT'ye hiç
+    #    dokunulmuyor, o tamamen temiz kalıyor.
     _before = len(FEATURES)
     y  = train_full[TARGET]
     Xf = train_full[FEATURES]
@@ -135,26 +188,42 @@ for RENK_KOD in MODEL_RENKLER:
     del Xf          # 1.4M x 338'lik kopya döngü sonuna kadar bellekte kalmasın
     print(f"  ✓ Sabit eleme bitti (elenen {len(drop_const)})")
 
-    # 4b) IV hesabı (korelasyondan ÖNCE)
-    print("  ▶ 4b) IV hesabına başlandı (korelasyondan önce)...")
+    # 4b) HEDEF İLİŞKİSİ — sayısal: |Spearman|, kategorik: Cramér's V
+    #     Bir kez hesaplanıp hem tie-breaker hem rapor olarak kullanılıyor.
+    print("  ▶ 4b) Hedef ilişkisi hesaplanıyor (Spearman / Cramér's V)...")
+    num   = train_full[FEATURES].select_dtypes(include=np.number)
+    _cols = np.asarray(num.columns)
+
+    # Rank matrisi TEK kez: hem feature-feature Spearman hem hedef-Spearman
+    # buradan çıkıyor. Standartlaştırılmış rank'lerin iç çarpımı = Spearman.
+    _R = num.rank().to_numpy(dtype="float64")
+    _R = (_R - _R.mean(0)) / np.maximum(_R.std(0), 1e-9)
+    _R = np.nan_to_num(_R)
+    _yr = y.rank().to_numpy(dtype="float64")
+    _yr = (_yr - _yr.mean()) / max(_yr.std(), 1e-9)
+
+    tgt_assoc = dict(zip(_cols, np.abs(_R.T @ _yr / len(_yr))))
+    for c in FEATURES:                       # kategorikler (3 adet)
+        if c not in tgt_assoc:
+            tgt_assoc[c] = _cramers_v(train_full[c], y)
+
+    # IV artık ELEME için değil, sadece rapor için hesaplanıyor
     iv_scores = {c: _quick_iv(train_full[c], y) for c in FEATURES}
-    print("  ✓ IV hesabı bitti.")
+    print("  ✓ Hedef ilişkisi + IV (rapor) bitti.")
 
-    # 4c) Yüksek korelasyon (|r|>0.95) — çiftte IV'si YÜKSEK olan tutulur
-    print("  ▶ 4c) Korelasyon elemesi başladı (|r|>0.95, düşük IV'li elenir)...")
-    num  = train_full[FEATURES].select_dtypes(include=np.number)
-    corr = num.corr().abs()
+    # 4c) Yüksek korelasyon (|Spearman| > CORR_ESIK)
+    #     Çiftte hedefi DAHA İYİ AÇIKLAYAN tutulur, diğeri elenir.
+    print(f"  ▶ 4c) Korelasyon elemesi başladı (Spearman |r|>{CORR_ESIK})...")
+    _C   = np.abs(_R.T @ _R / len(_R))       # feature x feature Spearman
+    _pos = {c: i for i, c in enumerate(_cols)}
 
-    # SIRALI eleme: IV'si yüksekten düşüğe git, sadece HÂLÂ TUTULAN
-    # feature'larla karşılaştır. Çift bazlı eski döngü, zaten elenmiş bir
-    # feature'ı "kazanan" sayıp gereksiz eleme yapabiliyordu.
-    _C    = corr.to_numpy()
-    _cols = np.asarray(corr.columns)
-    _pos  = {c: i for i, c in enumerate(_cols)}
+    # SIRALI eleme: hedef ilişkisi yüksekten düşüğe git, sadece HÂLÂ
+    # TUTULAN feature'larla karşılaştır. Çift bazlı döngü, zaten elenmiş
+    # bir feature'ı "kazanan" sayıp gereksiz eleme yapabiliyordu.
     _kept, drop_corr = [], set()
-    for c in sorted(_cols, key=lambda k: -iv_scores.get(k, 0.0)):
+    for c in sorted(_cols, key=lambda k: -tgt_assoc.get(k, 0.0)):
         i = _pos[c]
-        if _kept and (_C[i, _kept] > 0.95).any():
+        if _kept and (_C[i, _kept] > CORR_ESIK).any():
             drop_corr.add(c)
         else:
             _kept.append(i)
@@ -162,26 +231,25 @@ for RENK_KOD in MODEL_RENKLER:
     drop_corr = [c for c in FEATURES if c in drop_corr]
     FEATURES  = [c for c in FEATURES if c not in drop_corr]
     print(f"  ✓ Korelasyon elemesi bitti (elenen {len(drop_corr)})")
+    print(f"  eleme: const-{len(drop_const)} corr-{len(drop_corr)}"
+          f"  →  {_before}→{len(FEATURES)}   (IV elemesi YOK)")
 
-    # 4d) Düşük IV (<0.02)
-    print("  ▶ 4d) Düşük IV'li değişken elemesi başladı (IV<0.02)...")
-    drop_iv  = [c for c in FEATURES if iv_scores.get(c, 0.0) < 0.02]
-    FEATURES = [c for c in FEATURES if c not in drop_iv]
-    print("  ✓ IV elemesi bitti.")
-    print(f"  eleme: const-{len(drop_const)} corr-{len(drop_corr)} "
-          f"iv-{len(drop_iv)}  →  {_before}→{len(FEATURES)}")
-
-    # — IV sonuçları — ilk 20 (yüksekten düşüğe)
-    iv_sirali = sorted(iv_scores.items(), key=lambda kv: kv[1], reverse=True)
-    print("  --- IV ilk 20 ---")
-    for c, v in iv_sirali[:20]:
+    # — Hedef ilişkisi — ilk 20 (yüksekten düşüğe)
+    _tgt_sirali = sorted(((c, tgt_assoc.get(c, 0.0)) for c in FEATURES),
+                         key=lambda kv: kv[1], reverse=True)
+    print("  --- Hedef ilişkisi ilk 20 ---")
+    for c, v in _tgt_sirali[:20]:
         print(f"    {v:7.4f}  {c}")
 
     if len(FEATURES) == 0:
         print("  tüm feature elendi, atlandı"); continue
 
-    # 4e) PSI — train vs OOT stabilite. Eleme YAPMIYOR, sadece raporluyor.
-    print("  ▶ 4e) PSI hesaplanıyor (train vs OOT)...")
+    # 4d) PSI — train vs OOT stabilite.
+    #     ELEME YAPMIYOR, sadece raporluyor. Sebep: PSI hedefle ilişkiye
+    #     bakmaz. Yüksek PSI ya veri kalitesi sorunudur (atılmalı) ya da
+    #     gerçek davranış değişimidir (tam da modellemek istediğimiz şey).
+    #     PSI ikisini ayırt edemediği için otomatik eleme riskli — önce bak.
+    print("  ▶ 4d) PSI hesaplanıyor (train vs OOT)...")
     psi_scores = {c: _psi(train_full[c], oot[c]) for c in FEATURES}
     _psi_sirali = sorted(psi_scores.items(), key=lambda kv: kv[1], reverse=True)
     _kaymis = [c for c, v in psi_scores.items() if v > 0.25]
@@ -194,13 +262,14 @@ for RENK_KOD in MODEL_RENKLER:
         for c, v in _psi_sirali[:10]:
             print(f"    {v:7.4f}  {c}")
 
-    # — Bu rengin KALAN feature'larını kendi dosyasına yaz (IV + PSI)
+    # — Bu rengin KALAN feature'larını kendi dosyasına yaz
     print("  ▶ Kalan feature'lar dosyaya yazılıyor...")
     feat_df = pd.DataFrame(
         [{'feature': c,
-          'iv':  round(iv_scores.get(c, np.nan), 4),
-          'psi': round(psi_scores.get(c, np.nan), 4)} for c in FEATURES]
-    ).sort_values('iv', ascending=False)
+          'tgt_assoc': round(tgt_assoc.get(c, np.nan), 4),   # Spearman / Cramér's V
+          'iv':        round(iv_scores.get(c, np.nan), 4),   # sadece referans
+          'psi':       round(psi_scores.get(c, np.nan), 4)} for c in FEATURES]
+    ).sort_values('tgt_assoc', ascending=False)
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv", feat_df)
 
     # 5) Eğitim / test matrisleri (val YOK — train'in tamamı eğitimde)
@@ -292,7 +361,7 @@ for RENK_KOD in MODEL_RENKLER:
     print("  ▶ 8) Özet dosyaya yazılıyor...")
     renk_sonuclari[RENK_KOD] = {'model': best, 'features': FEATURES,
                                 'best_params': BEST_PARAMS, 'threshold': thr,
-                                'psi': psi_scores}
+                                'psi': psi_scores, 'tgt_assoc': tgt_assoc}
     ozet_row = {
         'renk': etiket,
         'n_train': len(X_tr), 'n_oot': len(X_oot),
