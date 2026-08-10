@@ -1,4 +1,12 @@
-import os
+import os, time, json
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import optuna
+from sklearn.base import clone
+from sklearn.model_selection import StratifiedKFold, cross_validate, cross_val_predict
+from sklearn.metrics import roc_auc_score
+
 
 # ============================================================
 # YARDIMCILAR (bu hücreden ÖNCE bir kez tanımlı olmalı)
@@ -71,9 +79,9 @@ def _cramers_v(x, y):
 # NEDEN IV ELEMESİ KALDIRILDI?
 #   1) IV tek değişkenli ve MONOTON ilişki ölçer; LightGBM ikisini de
 #      aramaz. Etkileşimde güçlü ama tek başına zayıf feature'lar atılıyordu.
-#   2) 0.02 sabit eşiği renkten renge çok farklı davranıyordu — önceki
-#      koşuda elenen: Turuncu 144, Açık yeşil 132, Sarı 114, Yeşil 85,
-#      Kırmızı 70, Koyu yeşil 15.
+#   2) 0.02 sabit eşiği renkten renge çok farklı davranıyordu — elenen:
+#      Turuncu 144, Açık yeşil 132, Sarı 114, Yeşil 85, Kırmızı 70,
+#      Koyu yeşil 15.
 #   3) Seyreltmeyi model zaten yapıyor (colsample_bytree 0.4-0.7).
 #   IV hesabı DURUYOR ama sadece rapor amaçlı.
 #
@@ -87,16 +95,16 @@ def _cramers_v(x, y):
 
 # --- HIZ AYARLARI ----------------------------------------------------------
 # CV_FOLDS=2 iken paralelleştirilecek sadece 2 fold var. Fold'ları sıraya
-# sokmak (CV_JOBS=1) burada KAYIP: LightGBM tek fit'te 16 çekirdeği doğrusal
-# kullanamaz, ~8'den sonra verim hızla düşer. İki fold'u paralel çalıştırıp
-# her birine çekirdeklerin yarısını vermek daha verimli.
+# sokmak (CV_JOBS=1) KAYIP: LightGBM tek fit'te tüm çekirdekleri doğrusal
+# kullanamaz. Fold'ları paralel çalıştırıp çekirdekleri paylaştırmak daha
+# verimli.
 N_CORES  = os.cpu_count() or 8
-CV_JOBS  = CV_FOLDS                              # fold'lar paralel
-LGB_JOBS = max(1, N_CORES // max(CV_JOBS, 1))    # her fold'a düşen çekirdek
+CV_JOBS  = CV_FOLDS
+LGB_JOBS = max(1, N_CORES // max(CV_JOBS, 1))
 
-# 0.95 -> 0.90: |Spearman|>0.90 olan çiftte ikisini birden tutmanın modele
-# katkısı çok sınırlı. Daha fazla feature elenir, LightGBM'in split araması
-# feature sayısıyla doğru orantılı olduğu için doğrudan süre kazancı.
+# 0.95 -> 0.90: |Spearman|>0.90 çiftte ikisini birden tutmanın katkısı çok
+# sınırlı. Daha fazla feature elenir; LightGBM'in split araması feature
+# sayısıyla doğru orantılı olduğu için doğrudan süre kazancı.
 CORR_ESIK = 0.90
 
 # Canlı izleme: her trial'da train/CV/OOT gini + params basılır.
@@ -251,6 +259,20 @@ for RENK_KOD in MODEL_RENKLER:
     print(f"  ▶ 6) Model denemeye başlandı (Optuna, {N_ITER} trial, "
           f"CV={CV_FOLDS} fold x {CV_JOBS} paralel, LGB n_jobs={LGB_JOBS})...")
     spw  = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+
+    # --- ARAMA UZAYI, POZİTİF SAYISINA GÖRE DARALTILIYOR ---------------
+    # Kırmızı'da ~1.09M pozitif var; derinlik 7 / 63 yaprak rahat taşınır.
+    # Koyu yeşilde ~1,200 pozitif; 63 yaprak demek yaprak başına ~19 pozitif
+    # demek — ezberleme riski. Sabit bir uzay altı renge birden uymuyor.
+    # min_child_samples da bağlanıyor: 1,200 pozitifte mcs=1500 demek, bir
+    # yaprakta ortalama 1 pozitif demek; model hiçbir şey öğrenemez.
+    _npos    = int(y_tr.sum())
+    _maxd    = 7  if _npos > 100_000 else (5  if _npos > 10_000 else 4)
+    _maxl    = 63 if _npos > 100_000 else (31 if _npos > 10_000 else 15)
+    _mcs_max = min(1500, max(50, _npos // 10))
+    print(f"     pozitif={_npos:,} → max_depth<={_maxd}, "
+          f"num_leaves<={_maxl}, min_child_samples<={_mcs_max}")
+
     base = lgb.LGBMClassifier(objective='binary', metric='auc', scale_pos_weight=spw,
                               random_state=RANDOM_STATE, n_jobs=LGB_JOBS, verbose=-1)
 
@@ -258,21 +280,17 @@ for RENK_KOD in MODEL_RENKLER:
     # Elle geri konmazsa LightGBM varsayılanı 0'a düşer ve bagging tamamen
     # kapanır; CV'de değerlendirilenden FARKLI bir model eğitilmiş olur.
     SABIT_PARAMS = {'subsample_freq': 1}
-    _oot_izleme  = {}          # trial no -> oot gini (sadece rapor)
     _t0 = time.time()
 
     def objective(trial):
         params = {
-            'max_depth': trial.suggest_int('max_depth', 2, 4),
-            # num_leaves ESKİDEN max_depth'e bağlıydı (leaf_cap) → aynı
-            # parametre adı için üç ayrı dağılım, TPE'nin öğrenmesi üçe
-            # bölünüyordu. Uzay artık sabit; max_depth'i LightGBM zorluyor.
-            'num_leaves': trial.suggest_int('num_leaves', 4, 31),
+            'max_depth':  trial.suggest_int('max_depth', 2, _maxd),
+            'num_leaves': trial.suggest_int('num_leaves', 4, _maxl),
             # Alt sınır 150 -> 200: lr=0.01 + 150 ağaç neredeyse hiç
             # öğrenmiyor ama tam süre harcıyordu.
             'n_estimators': trial.suggest_int('n_estimators', 200, 400),
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05, log=True),
-            'min_child_samples': trial.suggest_int('min_child_samples', 300, 1500),
+            'min_child_samples': trial.suggest_int('min_child_samples', 50, _mcs_max),
             'reg_lambda': trial.suggest_float('reg_lambda', 5, 50, log=True),
             'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.7),
@@ -296,7 +314,6 @@ for RENK_KOD in MODEL_RENKLER:
         if TRIAL_LOG and y_oot.nunique() >= 2:
             _p = np.mean([m.predict_proba(X_oot)[:, 1] for m in cv['estimator']], axis=0)
             oot_g = 2 * roc_auc_score(y_oot, _p) - 1
-            _oot_izleme[trial.number] = oot_g
         trial.set_user_attr('oot_gini_izleme', float(oot_g))
 
         if TRIAL_LOG:
@@ -366,6 +383,7 @@ for RENK_KOD in MODEL_RENKLER:
     ozet_row = {
         'renk': etiket,
         'n_train': len(X_tr), 'n_oot': len(X_oot),
+        'n_pozitif': _npos,
         'n_feature': len(FEATURES),
         'target_rate': round(y_tr.mean(), 4),
         'oot_target_rate': round(y_oot.mean(), 4),
