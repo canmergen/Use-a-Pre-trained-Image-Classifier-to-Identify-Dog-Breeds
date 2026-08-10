@@ -1,24 +1,47 @@
 # ============================================================
+# YARDIMCI — PSI (bu hücreden ÖNCE bir kez tanımlı olmalı)
+# ============================================================
+def _psi(base_s, new_s, bins=10):
+    """Population Stability Index. base = train, new = OOT.
+
+    Yorum: <0.10 stabil | 0.10-0.25 dikkat | >0.25 kaymış
+    Binleme train üzerinde yapılır, AYNI kenarlar OOT'ye uygulanır.
+    """
+    b, n = pd.Series(base_s), pd.Series(new_s)
+    if isinstance(b.dtype, pd.CategoricalDtype) or b.dtype == object:
+        bb = b.astype(object).where(b.notna(), "__NaN__").astype(str)
+        nn = n.astype(object).where(n.notna(), "__NaN__").astype(str)
+    else:
+        b, n = b.fillna(-999999), n.fillna(-999999)
+        if b.nunique() > 20:
+            q = np.unique(np.nanquantile(b, np.linspace(0, 1, bins + 1)))
+            if len(q) < 3:
+                return 0.0
+            q[0], q[-1] = -np.inf, np.inf
+            bb = pd.cut(b, q, labels=False, include_lowest=True).astype(str)
+            nn = pd.cut(n, q, labels=False, include_lowest=True).astype(str)
+        else:
+            bb, nn = b.astype(str), n.astype(str)
+    pb = bb.value_counts(normalize=True)
+    pn = nn.value_counts(normalize=True)
+    idx = pb.index.union(pn.index)
+    pb = pb.reindex(idx, fill_value=0) + 1e-6
+    pn = pn.reindex(idx, fill_value=0) + 1e-6
+    return float(((pn - pb) * np.log(pn / pb)).sum())
+
+
+# ============================================================
 # RENK BAZLI MODELLER — her renk: eleme → split → Optuna → DOSYA (renk renk)
 # ============================================================
 #
 # HIZ AYARI — çıktıyı DEĞİŞTİRMEZ.
 # ------------------------------------------------------------
-# Sorun: cross_validate(n_jobs=-1) CV_FOLDS fold'u paralel başlatıyordu,
-# her fold içindeki LightGBM de n_jobs=-1 ile tüm çekirdekleri istiyordu.
-# 16 çekirdekte 5 x 16 = 80 thread → thread'ler birbirini bekliyor (CPU
-# boşa dönüyor). Bu tipik olarak 2-3x yavaşlatır.
-#
-# Çözüm: fold'ları sırayla çalıştır, LightGBM tüm çekirdekleri kullansın.
-# LightGBM'in gördüğü thread sayısı ESKİSİYLE AYNI (-1) olduğu için
-# üretilen model de birebir aynıdır.
+# cross_validate(n_jobs=-1) fold'ları paralel başlatıyor, her fold içindeki
+# LightGBM de n_jobs=-1 ile tüm çekirdekleri istiyordu → 5 x 16 = 80 thread,
+# thread'ler birbirini bekliyordu. Fold'ları sırayla çalıştırıyoruz;
+# LightGBM'in gördüğü thread sayısı eskisiyle aynı (-1) olduğu için model
+# birebir aynı, ama CPU çakışması yok.
 CV_JOBS = 1
-#
-# NOT: Alternatif olarak fold'ları paralelleştirip LightGBM'i kısabilirsin
-# (CV_JOBS=CV_FOLDS, n_jobs=N_CORES//CV_FOLDS). Genelde biraz daha hızlıdır
-# AMA LightGBM farklı thread sayısında toplama sırasını değiştirebildiği
-# için sonuçlar son hanelerde oynayabilir. Birebir aynılık istiyorsan
-# yukarıdaki ayarda kal.
 
 MODEL_RENKLER = [1, 2, 3, 4, 5, 6]   # kırmızı, turuncu, sarı, açık yeşil, yeşil, koyu yeşil
 skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
@@ -55,9 +78,17 @@ for RENK_KOD in MODEL_RENKLER:
     print("  ▶ 3) Zaman bazlı bölme (train / OOT)...")
     train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
     oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+
+    # (4) Train'de olmayan kategoriler OOT'de NaN'a dönüyor — SESSİZ kalmasın
     for c in CAT_COLS:
         if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            _once = oot[c].isna().sum()
             oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+            _yeni = oot[c].isna().sum() - _once
+            if _yeni:
+                print(f"    ⚠ {c}: {_yeni:,} OOT satırı train'de olmayan kategoriye "
+                      f"sahip → NaN ({_yeni/len(oot)*100:.2f}%)")
+
     if train_full[TARGET].nunique() < 2:
         print("  train tek sınıf, atlandı"); continue
     print(f"  ✓ Bölme bitti (train {len(train_full)} / oot {len(oot)})")
@@ -82,17 +113,22 @@ for RENK_KOD in MODEL_RENKLER:
 
     # 4c) Yüksek korelasyon (|r|>0.95) — çiftte IV'si YÜKSEK olan tutulur
     print("  ▶ 4c) Korelasyon elemesi başladı (|r|>0.95, düşük IV'li elenir)...")
-    num   = train_full[FEATURES].select_dtypes(include=np.number)
-    corr  = num.corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    num  = train_full[FEATURES].select_dtypes(include=np.number)
+    corr = num.corr().abs()
 
-    # Çift .loc döngüsü p x p skaler lookup yapıyordu (258 feature'da 66,564
-    # lookup, ~1s). Vektörize hâli AYNI kümeyi ~850x hızlı üretiyor.
-    _A    = upper.to_numpy()
-    _cols = np.asarray(upper.columns)
-    _ivv  = np.array([iv_scores.get(c, 0.0) for c in _cols])
-    _ri, _ci = np.where(np.nan_to_num(_A, nan=0.0) > 0.95)
-    drop_corr = set(np.where(_ivv[_ri] >= _ivv[_ci], _cols[_ci], _cols[_ri]))
+    # (3) SIRALI eleme: IV'si yüksekten düşüğe git, sadece HÂLÂ TUTULAN
+    # feature'larla karşılaştır. Çift bazlı eski döngü, zaten elenmiş bir
+    # feature'ı "kazanan" sayıp gereksiz eleme yapabiliyordu.
+    _C    = corr.to_numpy()
+    _cols = np.asarray(corr.columns)
+    _pos  = {c: i for i, c in enumerate(_cols)}
+    _kept, drop_corr = [], set()
+    for c in sorted(_cols, key=lambda k: -iv_scores.get(k, 0.0)):
+        i = _pos[c]
+        if _kept and (_C[i, _kept] > 0.95).any():
+            drop_corr.add(c)
+        else:
+            _kept.append(i)
 
     drop_corr = [c for c in FEATURES if c in drop_corr]
     FEATURES  = [c for c in FEATURES if c not in drop_corr]
@@ -115,10 +151,27 @@ for RENK_KOD in MODEL_RENKLER:
     if len(FEATURES) == 0:
         print("  tüm feature elendi, atlandı"); continue
 
-    # — Bu rengin KALAN feature'larını kendi dosyasına yaz
+    # (6) PSI — train vs OOT stabilite. Gini düştüğünde hangi değişkenin
+    # kaydığını buradan görürsün. Eleme YAPMIYOR, sadece raporluyor.
+    print("  ▶ 4e) PSI hesaplanıyor (train vs OOT)...")
+    psi_scores = {c: _psi(train_full[c], oot[c]) for c in FEATURES}
+    _psi_sirali = sorted(psi_scores.items(), key=lambda kv: kv[1], reverse=True)
+    _kaymis = [c for c, v in psi_scores.items() if v > 0.25]
+    _dikkat = [c for c, v in psi_scores.items() if 0.10 < v <= 0.25]
+    print(f"  ✓ PSI bitti — kaymış(>0.25): {len(_kaymis)}, "
+          f"dikkat(0.10-0.25): {len(_dikkat)}, stabil: "
+          f"{len(FEATURES) - len(_kaymis) - len(_dikkat)}")
+    if _psi_sirali[0][1] > 0.10:
+        print("  --- PSI en yüksek 10 ---")
+        for c, v in _psi_sirali[:10]:
+            print(f"    {v:7.4f}  {c}")
+
+    # — Bu rengin KALAN feature'larını kendi dosyasına yaz (IV + PSI)
     print("  ▶ Kalan feature'lar dosyaya yazılıyor...")
     feat_df = pd.DataFrame(
-        [{'feature': c, 'iv': round(iv_scores.get(c, np.nan), 4)} for c in FEATURES]
+        [{'feature': c,
+          'iv':  round(iv_scores.get(c, np.nan), 4),
+          'psi': round(psi_scores.get(c, np.nan), 4)} for c in FEATURES]
     ).sort_values('iv', ascending=False)
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv", feat_df)
 
@@ -136,6 +189,11 @@ for RENK_KOD in MODEL_RENKLER:
     base = lgb.LGBMClassifier(objective='binary', metric='auc', scale_pos_weight=spw,
                               random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
 
+    # subsample_freq suggest_* ile önerilmiyor → best_params'ta YER ALMAZ.
+    # Final fit'te elle geri konmalı, yoksa LightGBM varsayılanı 0'a düşer
+    # ve bagging tamamen kapanır (CV'dekinden farklı model eğitilir).
+    SABIT_PARAMS = {'subsample_freq': 1}
+
     def objective(trial):
         max_depth = trial.suggest_int('max_depth', 2, 4)
         leaf_cap  = min(31, 2 ** max_depth - 1)
@@ -149,7 +207,7 @@ for RENK_KOD in MODEL_RENKLER:
             'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.7),
             'subsample': trial.suggest_float('subsample', 0.6, 0.8),
-            'subsample_freq': 1,
+            **SABIT_PARAMS,
         }
 
         model = clone(base).set_params(**params)
@@ -159,13 +217,18 @@ for RENK_KOD in MODEL_RENKLER:
         test_gini  = 2 * cv['test_score'].mean() - 1
         trial.set_user_attr('train_gini', train_gini)
         trial.set_user_attr('test_gini',  test_gini)
-        return cv['test_score'].mean() - max(0, (train_gini - test_gini) - 0.05)
+        # (2) Skor ve ceza AYNI ölçekte (gini). Önceden skor AUC, ceza gini
+        # olduğu için ceza niyet edilenin iki katı ağırlıkta çalışıyordu.
+        return test_gini - max(0, (train_gini - test_gini) - 0.05)
 
     study = optuna.create_study(direction='maximize',
                                 sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
     study.optimize(objective, n_trials=N_ITER)
     print("  ✓ Model denemesi bitti (Optuna).")
-    best = clone(base).set_params(**study.best_params).fit(X_tr, y_tr)
+
+    # (1) subsample_freq geri konuyor
+    BEST_PARAMS = {**study.best_params, **SABIT_PARAMS}
+    best = clone(base).set_params(**BEST_PARAMS).fit(X_tr, y_tr)
 
     # — Bu rengin DENENEN modellerini kendi dosyasına yaz
     print("  ▶ Denenen modeller dosyaya yazılıyor...")
@@ -181,7 +244,7 @@ for RENK_KOD in MODEL_RENKLER:
             'gini_gap':   round(t.user_attrs.get('train_gini', np.nan)
                                 - t.user_attrs.get('test_gini', np.nan), 4),
             'is_best':    int(t.number == study.best_trial.number),
-            'params':     json.dumps(t.params),
+            'params':     json.dumps({**t.params, **SABIT_PARAMS}),
         })
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv", pd.DataFrame(trial_rows))
 
@@ -197,23 +260,35 @@ for RENK_KOD in MODEL_RENKLER:
     # 8) Sakla + bu rengin ÖZETİNİ kendi dosyasına yaz
     print("  ▶ 8) Özet dosyaya yazılıyor...")
     renk_sonuclari[RENK_KOD] = {'model': best, 'features': FEATURES,
-                                'best_params': study.best_params, 'threshold': thr}
+                                'best_params': BEST_PARAMS, 'threshold': thr,
+                                'psi': psi_scores}
     ozet_row = {
         'renk': etiket,
         'n_train': len(X_tr), 'n_oot': len(X_oot),
         'n_feature': len(FEATURES),
         'target_rate': round(y_tr.mean(), 4),
+        'oot_target_rate': round(y_oot.mean(), 4),
         'train_gini': round(tr_gini, 4), 'val_gini': round(val_gini, 4),
         'oot_gini': oot_metrics['Gini'] if oot_metrics else None,
         'oot_ks':   oot_metrics['KS']   if oot_metrics else None,
+        # (5) Eşiğin OOT'de ne ürettiği + aşırı öğrenme göstergesi
+        'oot_alert_rate': oot_metrics['alert_rate'] if oot_metrics else None,
+        'oot_precision':  oot_metrics['precision']  if oot_metrics else None,
+        'oot_recall':     oot_metrics['recall']     if oot_metrics else None,
+        'gini_gap_tr_oot': round(tr_gini - oot_metrics['Gini'], 4) if oot_metrics else None,
+        # (6) Stabilite özeti
+        'psi_max':      round(max(psi_scores.values()), 4) if psi_scores else None,
+        'psi_kaymis_n': len(_kaymis),
+        'psi_dikkat_n': len(_dikkat),
         'threshold': round(thr, 4),
-        'best_params': json.dumps(study.best_params),
+        'best_params': json.dumps(BEST_PARAMS),
     }
     ozet_satirlari.append(ozet_row)
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_ozet.csv", pd.DataFrame([ozet_row]))
 
     print(f"  ✓ {etiket} bitti → train_gini={tr_gini:.4f} val_gini={val_gini:.4f} "
-          f"oot_gini={oot_metrics['Gini'] if oot_metrics else 'NA'}  (3 dosya yazıldı)")
+          f"oot_gini={oot_metrics['Gini'] if oot_metrics else 'NA'} "
+          f"psi_max={max(psi_scores.values()):.3f}  (3 dosya yazıldı)")
 
 # — Tüm renkler tek birleşik özet (opsiyonel)
 print("\n▶ Tüm renklerin birleşik özeti yazılıyor...")
