@@ -31,16 +31,42 @@ def _psi(base_s, new_s, bins=10):
 
 
 # ============================================================
-# RENK BAZLI MODELLER — her renk: eleme → split → Optuna → DOSYA (renk renk)
+# RENK BAZLI MODELLER — her renk: eleme → Optuna → DOSYA (renk renk)
 # ============================================================
 #
+# ---------------------------------------------------------------------------
+# NEDEN "val" KALDIRILDI?
+# ---------------------------------------------------------------------------
+# Eski akış: train_full → [feature eleme] → train_test_split(train, val)
+#
+# Üç sorun vardı:
+#
+# 1) SIZINTI. Feature eleme (IV, korelasyon, sabit) train_full ÜZERİNDE
+#    yapılıyor, val ise SONRA o kümenin içinden ayrılıyordu. Yani val,
+#    kendisini de görmüş bir feature setiyle değerlendiriliyordu.
+#    Sonuç: val_gini iyimser, ve ondan seçilen eşik de iyimser.
+#
+# 2) GEREKSİZ AYRIM. Model seçimi zaten CV ile yapılıyor (cross_validate).
+#    val'in tek gerçek işlevi eşik seçmekti. Bunun için 280k satırı
+#    eğitimden çıkarmak gereksiz — CV'nin out-of-fold tahminleri aynı işi
+#    1.4M satırın TAMAMI üzerinde ve sızıntısız yapıyor.
+#
+# 3) TUTARSIZLIK. Optuna X_tr üzerinde CV yapıyordu ama final model de
+#    yine sadece X_tr ile eğitiliyordu; val hiç eğitime girmiyordu.
+#    Elde veri varken kullanmamak.
+#
+# Yeni akış: train_full (tamamı) → [eleme] → CV ile Optuna → tam veriyle fit
+#            → eşik cross_val_predict'in OOF tahminlerinden
+#
+# Kazanç: eğitimde %20 daha fazla veri, eşik 5x daha fazla satırdan,
+#         sızıntı yok. Maliyet: bir ek CV turu (OOF tahmin için).
+# ---------------------------------------------------------------------------
+#
 # HIZ AYARI — çıktıyı DEĞİŞTİRMEZ.
-# ------------------------------------------------------------
 # cross_validate(n_jobs=-1) fold'ları paralel başlatıyor, her fold içindeki
 # LightGBM de n_jobs=-1 ile tüm çekirdekleri istiyordu → 5 x 16 = 80 thread,
 # thread'ler birbirini bekliyordu. Fold'ları sırayla çalıştırıyoruz;
-# LightGBM'in gördüğü thread sayısı eskisiyle aynı (-1) olduğu için model
-# birebir aynı, ama CPU çakışması yok.
+# LightGBM'in gördüğü thread sayısı eskisiyle aynı (-1).
 CV_JOBS = 1
 
 MODEL_RENKLER = [1, 2, 3, 4, 5, 6]   # kırmızı, turuncu, sarı, açık yeşil, yeşil, koyu yeşil
@@ -74,7 +100,7 @@ for RENK_KOD in MODEL_RENKLER:
     FEATURES = list(dict.fromkeys(FEATURES))
     print(f"  ✓ Feature engineering bitti ({len(FEATURES)} feature)")
 
-    # 3) Zaman bazlı bölme
+    # 3) Zaman bazlı bölme (train / OOT — başka bölme YOK)
     print("  ▶ 3) Zaman bazlı bölme (train / OOT)...")
     train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
     oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
@@ -93,7 +119,9 @@ for RENK_KOD in MODEL_RENKLER:
         print("  train tek sınıf, atlandı"); continue
     print(f"  ✓ Bölme bitti (train {len(train_full)} / oot {len(oot)})")
 
-    # 4) FEATURE ELEME (train_full üzerinde, split'ten ÖNCE)
+    # 4) FEATURE ELEME — train'in TAMAMI üzerinde.
+    #    val olmadığı için "eleme val'i gördü" sorunu ortadan kalktı;
+    #    OOT'ye hiç dokunulmuyor, o tamamen temiz kalıyor.
     _before = len(FEATURES)
     y  = train_full[TARGET]
     Xf = train_full[FEATURES]
@@ -152,8 +180,7 @@ for RENK_KOD in MODEL_RENKLER:
     if len(FEATURES) == 0:
         print("  tüm feature elendi, atlandı"); continue
 
-    # 4e) PSI — train vs OOT stabilite. Gini düştüğünde hangi değişkenin
-    # kaydığını buradan görürsün. Eleme YAPMIYOR, sadece raporluyor.
+    # 4e) PSI — train vs OOT stabilite. Eleme YAPMIYOR, sadece raporluyor.
     print("  ▶ 4e) PSI hesaplanıyor (train vs OOT)...")
     psi_scores = {c: _psi(train_full[c], oot[c]) for c in FEATURES}
     _psi_sirali = sorted(psi_scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -176,13 +203,9 @@ for RENK_KOD in MODEL_RENKLER:
     ).sort_values('iv', ascending=False)
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv", feat_df)
 
-    # 5) Train içi validasyon (indirgenmiş FEATURES ile)
-    print("  ▶ 5) Train/val bölme (stratify)...")
-    train, val = train_test_split(train_full, test_size=VAL_SIZE,
-                                  stratify=train_full[TARGET], random_state=RANDOM_STATE)
-    X_tr,  y_tr  = train[FEATURES], train[TARGET]
-    X_val, y_val = val[FEATURES],   val[TARGET]
-    X_oot, y_oot = oot[FEATURES],   oot[TARGET]
+    # 5) Eğitim / test matrisleri (val YOK — train'in tamamı eğitimde)
+    X_tr,  y_tr  = train_full[FEATURES], train_full[TARGET]
+    X_oot, y_oot = oot[FEATURES],        oot[TARGET]
 
     # 6) Model + Optuna
     print("  ▶ 6) Model denemeye başlandı (Optuna)...")
@@ -229,7 +252,7 @@ for RENK_KOD in MODEL_RENKLER:
     study.optimize(objective, n_trials=N_ITER)
     print("  ✓ Model denemesi bitti (Optuna).")
 
-    # subsample_freq geri konuyor
+    # subsample_freq geri konuyor; final model TRAIN'İN TAMAMI ile
     BEST_PARAMS = {**study.best_params, **SABIT_PARAMS}
     best = clone(base).set_params(**BEST_PARAMS).fit(X_tr, y_tr)
 
@@ -251,12 +274,17 @@ for RENK_KOD in MODEL_RENKLER:
         })
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv", pd.DataFrame(trial_rows))
 
-    # 7) Threshold + metrikler
-    print("  ▶ 7) Threshold seçimi + metrik hesabı...")
-    val_prob = best.predict_proba(X_val)[:, 1]
-    thr      = find_thresholds(y_val, val_prob)['youden_j']
-    tr_gini  = 2 * roc_auc_score(y_tr,  best.predict_proba(X_tr)[:, 1]) - 1
-    val_gini = 2 * roc_auc_score(y_val, val_prob) - 1
+    # 7) Threshold — OOF (out-of-fold) tahminlerden
+    #    Her satır, o satırı GÖRMEMİŞ bir fold modeli tarafından skorlanır.
+    #    Sızıntısız ve eski val'e göre 5x daha fazla satır.
+    print("  ▶ 7) Threshold seçimi (OOF) + metrik hesabı...")
+    oof_prob = cross_val_predict(clone(base).set_params(**BEST_PARAMS),
+                                 X_tr, y_tr, cv=skf,
+                                 method='predict_proba', n_jobs=CV_JOBS)[:, 1]
+    thr      = find_thresholds(y_tr, oof_prob)['youden_j']
+    oof_gini = 2 * roc_auc_score(y_tr, oof_prob) - 1          # dürüst iç metrik
+
+    tr_gini  = 2 * roc_auc_score(y_tr, best.predict_proba(X_tr)[:, 1]) - 1
     oot_prob = best.predict_proba(X_oot)[:, 1]
     oot_metrics = evaluate(y_oot, oot_prob, thr) if y_oot.nunique() >= 2 else None
 
@@ -271,7 +299,8 @@ for RENK_KOD in MODEL_RENKLER:
         'n_feature': len(FEATURES),
         'target_rate': round(y_tr.mean(), 4),
         'oot_target_rate': round(y_oot.mean(), 4),
-        'train_gini': round(tr_gini, 4), 'val_gini': round(val_gini, 4),
+        'train_gini': round(tr_gini, 4),
+        'oof_gini':   round(oof_gini, 4),      # eski val_gini'nin sızıntısız karşılığı
         'oot_gini': oot_metrics['Gini'] if oot_metrics else None,
         'oot_ks':   oot_metrics['KS']   if oot_metrics else None,
         # Eşiğin OOT'de ne ürettiği + aşırı öğrenme göstergesi
@@ -289,7 +318,7 @@ for RENK_KOD in MODEL_RENKLER:
     ozet_satirlari.append(ozet_row)
     _yaz(f"renk_{RENK_KOD}_{renk_adi}_ozet.csv", pd.DataFrame([ozet_row]))
 
-    print(f"  ✓ {etiket} bitti → train_gini={tr_gini:.4f} val_gini={val_gini:.4f} "
+    print(f"  ✓ {etiket} bitti → train_gini={tr_gini:.4f} oof_gini={oof_gini:.4f} "
           f"oot_gini={oot_metrics['Gini'] if oot_metrics else 'NA'} "
           f"psi_max={max(psi_scores.values()):.3f}  (3 dosya yazıldı)")
 
