@@ -1,145 +1,18 @@
-"""Threshold + Değerlendirme - hızlandırılmış sürüm.
+display(df[TARGET].value_counts().map("{:,}".format))
 
-Çıktılar orijinaliyle birebir aynıdır. Değişen tek şey, aynı O(n log n)
-sıralamanın tekrar tekrar yapılmasının önüne geçilmesi:
+renk_map_ters = {v: k for k, v in renk_map.items()}
+renk_txt = df["RENK"].map(renk_map_ters)
 
-  find_thresholds : roc_curve ve precision_recall_curve ikisi de içeride
-                    aynı "_binary_clf_curve" sıralamasını yapıyordu -> 1 sort
-  evaluate        : roc_auc_score kendi içinde roc_curve'ü BİR KEZ DAHA
-                    hesaplıyordu; ayrıca precision/recall/f1 üç ayrı
-                    confusion matrix geçişi yapıyordu -> 1 sort + 1 sayım
-  gains_table     : rank(method='first') + qcut iki ayrı sıralama -> 1 argsort
-"""
+fmt = {"toplam": "{:,.0f}", "kirmizi": "{:,.0f}", "oran": "{:.2f}"}
 
-import numpy as np
-import pandas as pd
-from sklearn.metrics import (roc_curve, precision_recall_curve, roc_auc_score,
-                             precision_score, recall_score, f1_score)
+g = df.groupby(renk_txt)[TARGET].agg(toplam="size", kirmizi="sum")
+g["oran"] = (g["kirmizi"] / g["toplam"] * 100).round(2)
+display(g.style.format(fmt))
 
+f = df.groupby(["DONEM", renk_txt])[TARGET].agg(toplam="size", kirmizi="sum")
+f["oran"] = (f["kirmizi"] / f["toplam"] * 100).round(2)
 
-def find_thresholds(y_true, y_prob):
-    """Validasyon setinde aday threshold'lar: Youden J ve F1-maks."""
-
-    def _clf_curve(y, s):
-        """sklearn'ün _binary_clf_curve'ü ile aynı: tek sıralama, fps/tps/thr."""
-        y = np.asarray(y).ravel()
-        s = np.asarray(s, dtype="float64").ravel()
-        order = np.argsort(s, kind="mergesort")[::-1]
-        s = s[order]
-        y = (y[order] == 1).astype("int64")
-        distinct = np.where(np.diff(s))[0]
-        idx = np.r_[distinct, y.size - 1]
-        tps = np.cumsum(y)[idx]
-        fps = 1 + idx - tps
-        return fps, tps, s[idx]
-
-    fps, tps, thr = _clf_curve(y_true, y_prob)
-    P, N = tps[-1], fps[-1]
-
-    # --- Youden J: roc_curve'ün (0,0,inf) başlangıç noktası dahil ---------
-    # drop_intermediate atılan noktalar doğrusal iç noktalar olduğu için
-    # argmax'ın seçtiği threshold değişmez.
-    # P veya N sıfırsa sklearn 0/0 -> NaN üretir; argmax tamamı NaN olan
-    # dizide 0 döndürdüğü için sonuç inf olur. Bu davranış korunuyor.
-    tpr = np.r_[0.0, tps / P] if P > 0 else np.full(len(tps) + 1, np.nan)
-    fpr = np.r_[0.0, fps / N] if N > 0 else np.full(len(fps) + 1, np.nan)
-    roc_thr = np.r_[np.inf, thr]
-    youden = roc_thr[np.argmax(tpr - fpr)]
-
-    # --- F1 maks: precision_recall_curve ters sırada döndürür -------------
-    ps = tps + fps
-    prec = np.divide(tps, ps, out=np.ones_like(tps, dtype="float64"), where=ps != 0)
-    rec = tps / P if P > 0 else np.ones_like(tps, dtype="float64")
-    sl = slice(None, None, -1)
-    prec_r, rec_r, pr_thr = prec[sl], rec[sl], thr[sl]
-    f1 = 2 * prec_r * rec_r / (prec_r + rec_r + 1e-9)
-    f1_best = pr_thr[np.argmax(f1)]
-
-    return {'youden_j': float(youden), 'f1_max': float(f1_best)}
-
-
-def evaluate(y_true, y_prob, thr):
-    y_true = np.asarray(y_true).ravel()
-    y_prob = np.asarray(y_prob).ravel()
-    y_pred = (y_prob >= thr).astype(int)
-
-    # roc_curve tek kez; roc_auc_score onu içeride tekrar hesaplıyordu.
-    fpr, tpr, _ = roc_curve(y_true, y_prob)
-    auc = float(np.trapezoid(tpr, fpr)) if hasattr(np, "trapezoid") \
-        else float(np.trapz(tpr, fpr))
-
-    # precision / recall / f1 tek sayımdan; üç ayrı geçiş yerine.
-    pos_t = (y_true == 1)
-    pos_p = (y_pred == 1)
-    tp = float(np.count_nonzero(pos_t & pos_p))
-    fp = float(np.count_nonzero(~pos_t & pos_p))
-    fn = float(np.count_nonzero(pos_t & ~pos_p))
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0      # zero_division=0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
-
-    return {
-        'threshold':  round(float(thr), 4),
-        'AUC':        round(auc, 4),
-        'Gini':       round(2 * auc - 1, 4),
-        'KS':         round(float(np.max(tpr - fpr)), 4),
-        'precision':  round(precision, 4),
-        'recall':     round(recall, 4),
-        'f1':         round(f1, 4),
-        'alert_rate': round(float(y_pred.mean()), 4),
-    }
-
-
-def gains_table(y_true, y_prob, bins=10):
-    """Desil bazlı yakalama / lift tablosu (1 = en riskli desil)."""
-    y = np.asarray(y_true).ravel()
-    p = np.asarray(y_prob, dtype="float64").ravel()
-    n = p.size
-    if n == 0:
-        d = pd.DataFrame({'y': y, 'p': p})
-        d['decile'] = np.array([], dtype="int64")
-        g = (d.groupby('decile')
-               .agg(n=('y', 'size'), bad=('y', 'sum'),
-                    min_p=('p', 'min'), max_p=('p', 'max'))
-               .reset_index().sort_values('decile'))
-        total_bad = g['bad'].sum()
-        g['bad_rate'] = g['bad'] / g['n']
-        g['cum_bad'] = g['bad'].cumsum()
-        g['capture'] = g['cum_bad'] / total_bad
-        g['lift'] = g['bad_rate'] / d['y'].mean()
-        return g
-
-    # rank(method='first') kararlı argsort'tan doğrudan çıkar. Ranklar 1..n
-    # ve hepsi farklı olduğu için qcut kenarları analitik: e_j = 1+j*(n-1)/bins.
-    order = np.argsort(p, kind="stable")
-    ps = p[order]
-    ys = y[order]
-    r = np.arange(1, n + 1, dtype="float64")          # sıralı düzende rank
-    edges = 1.0 + np.arange(bins + 1) * (n - 1) / bins
-    lab = np.searchsorted(edges[1:-1], r, side="left")
-
-    # lab sıralı düzende monoton artan -> her desil BİTİŞİK bir dilim.
-    # Böylece groupby'a hiç gerek yok: sayımlar bincount, min/max ise
-    # dilimin ilk/son elemanı.
-    cnt = np.bincount(lab, minlength=bins)
-    bad = np.bincount(lab, weights=ys.astype("float64"), minlength=bins)
-    end = np.cumsum(cnt)
-    start = end - cnt
-    keep = cnt > 0
-
-    dec = (bins - np.arange(bins))[keep]
-    g = pd.DataFrame({
-        'decile': dec.astype("int64"),
-        'n':      cnt[keep].astype("int64"),
-        'bad':    bad[keep].astype(np.asarray(y).dtype if np.issubdtype(
-                      np.asarray(y).dtype, np.integer) else "float64"),
-        'min_p':  ps[start[keep]],
-        'max_p':  ps[end[keep] - 1],
-    }).sort_values('decile').reset_index(drop=True)
-
-    total_bad = g['bad'].sum()
-    g['bad_rate'] = g['bad'] / g['n']
-    g['cum_bad'] = g['bad'].cumsum()
-    g['capture'] = g['cum_bad'] / total_bad
-    g['lift'] = g['bad_rate'] / y.mean()
-    return g
+f_show = f.copy()
+lv = f_show.index.levels[0].astype("int64").astype(str)
+f_show.index = f_show.index.set_levels(lv.str[:4] + "-" + lv.str[4:], level=0)
+display(f_show.style.format(fmt))
