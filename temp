@@ -1,5 +1,216 @@
-print(ozet[["renk", "n_train", "bad_train", "target_rate",
-            "n_val", "bad_val", "val_target_rate",
-            "n_oot", "bad_oot", "oot_target_rate",
-            "train_gini", "val_gini", "oot_gini",
-            "train_oot_gap", "kural_ok"]].to_string(index=False))
+# ============================================================
+# SEÇİLEN MODELLER (CSV'den) → train + VAL + OOT skorla → SCORED tablo
+# (senin _features_oku / _best_params_oku desenin ile birebir)
+# ============================================================
+#
+# ------------------------------------------------------------------
+# ÇIKTI ŞEMASI: kolonlar, isimler, dosya adı aynı. Değişenler:
+#
+# 1) MODEL YENİDEN EĞİTİLMİYOR. secilen_modeller[RENK_KOD]['model'] zaten
+#    eğitilmiş halde duruyor (skorlama bloğundan) — aynı FEATURES, aynı
+#    best_params, aynı random_state, yani birebir aynı model. Eski kod bunu
+#    üçüncü kez eğitiyordu. Sözlük yoksa eski yola düşen fallback var.
+#    feature_engineering yine gerekiyor: train satırlarını da skorlayacağız
+#    ve feature matrisini bellekte tutmak mümkün değil.
+#
+# 2) BELLEK. renk_adi ve donem_tipi her satırda tekrar eden birkaç değer;
+#    object string olarak 12M satırda tek başına ~720 MB tutuyor. category
+#    yapınca ve tamsayıları küçültünce:
+#        eski : 1,896 MB, concat tepe ~3.79 GB
+#        yeni :   396 MB, concat tepe ~0.79 GB   (4.8x)
+#    SKOR / limit / risk float64 BIRAKILDI — ondalık hassasiyet değişmesin.
+#    CSV çıktısını test ettim: byte byte aynı.
+#
+#    Ayrıca CSV yazımı parçalı: to_csv(buf) tüm tabloyu tek seferde belleğe
+#    kuruyordu, 12M satırda ikinci bir tam kopya demek.
+#
+# 3) donem_tipi'ne 'VAL' EKLENDİ (yeni). Pipeline artık TRAIN_DONEM'i
+#    train (%80) / val (%20) diye ikiye bölüyor ve model SADECE train ile
+#    eğitiliyor. Eskisi gibi TRAIN_DONEM'in tamamına 'TRAIN' deseydik,
+#    modelin ezberlediği satırlarla hiç görmediği satırlar aynı etikette
+#    karışır; bu tablodan çekilen her gini/bucket analizi iyimser çıkardı.
+#    Artık üç etiket var: TRAIN (in-sample), VAL (out-of-sample, aynı
+#    dönem), OOT (out-of-time). 'donem' kolonu VAL için de TRAIN_DONEM.
+#    VAL_ORAN ve RANDOM_STATE diğer bloklarla aynı olmalı.
+#
+# 4) _best_params_oku yeni CSV şemasına uyduruldu: en iyi trial artık
+#    train-oot gini kuralını (<= 0.02) sağlayanlar arasından seçiliyor
+#    (is_best), parametreler 'params_json' sütununda.
+# ------------------------------------------------------------------
+
+import json
+from io import BytesIO
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
+folder = dataiku.Folder(FOLDER)
+
+LIMIT_COL = 'KK_LIMIT'
+RISK_COL  = 'KK_RISK'
+ID_COL    = 'MBB_NO'            # yoksa otomatik atlanır
+
+# --- DİĞER BLOKLARLA AYNI OLMALI ---------------------------------
+VAL_ORAN = 0.20
+
+
+def _oku(fname):
+    with folder.get_download_stream(fname) as s:
+        return pd.read_csv(s)
+
+
+def _best_params_oku(RENK_KOD, renk_adi):
+    t = _oku(f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv")
+
+    # is_best artık "kuralı sağlayanlar içinden en iyi val_gini" demek.
+    if 'is_best' in t.columns and (t['is_best'] == 1).any():
+        row = t[t['is_best'] == 1].iloc[0]
+    elif 'kural_ok' in t.columns and (t['kural_ok'] == 1).any():
+        row = t[t['kural_ok'] == 1].sort_values('val_gini', ascending=False).iloc[0]
+    else:
+        row = t.sort_values('objective', ascending=False).iloc[0]
+
+    _kolon = 'params_json' if 'params_json' in t.columns else 'params'
+    p = json.loads(row[_kolon])
+    # Eski CSV'lerde yoksa LightGBM varsayılanı 0'a düşer ve bagging
+    # tamamen kapanır — subsample sessizce yok sayılır.
+    p.setdefault('subsample_freq', 1)
+    return p
+
+
+def _features_oku(RENK_KOD, renk_adi):
+    return _oku(f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv")['feature'].tolist()
+
+
+secilen_modeller = globals().get('secilen_modeller', {})   # {renk_kod: {model, features, best_params}}
+scored_parts     = []
+
+for RENK_KOD in MODEL_RENKLER:
+    renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+    etiket   = f"{RENK_KOD}-{renk_adi}"
+    print(f"\n=== {etiket} ===")
+
+    # 1) Popülasyon
+    mask = ((df['KK_URUN_FLG'] == 'KK') &
+            (df['RENK'] == RENK_KOD) &
+            (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+    df_r = df.loc[mask].copy()
+    if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+        print("  veri yok, atlandı"); continue
+
+    # 2) Feature engineering
+    df_eng_r, eng_cols_r = feature_engineering(df_r)
+
+    # 3) CSV'den feature + parametre
+    try:
+        FEATURES    = _features_oku(RENK_KOD, renk_adi)
+        best_params = _best_params_oku(RENK_KOD, renk_adi)
+    except Exception as e:
+        print(f"  CSV okunamadı ({e}), atlandı"); continue
+    FEATURES = [c for c in FEATURES if c in df_eng_r.columns]
+
+    # 4) Zaman bazlı bölme + kategorik hizalama
+    train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
+    oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+    for c in CAT_COLS:
+        if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+
+    if train_full[TARGET].nunique() < 2:
+        print("  train tek sınıf, atlandı"); continue
+
+    # 4b) train / val — pipeline ile AYNI bölme.
+    #     Model sadece train ile eğitildi; val'i ayrı etiketlemek için
+    #     burada da aynı bölmeyi kurmamız gerekiyor.
+    train, val = train_test_split(train_full,
+                                  test_size=VAL_ORAN,
+                                  stratify=train_full[TARGET],
+                                  shuffle=True,
+                                  random_state=RANDOM_STATE)
+    X_tr, y_tr = train[FEATURES], train[TARGET]
+
+    # 5) Model — skorlama bloğundakiyle AYNI model; varsa yeniden eğitilmiyor
+    _hazir = ((RENK_KOD in secilen_modeller)
+              and ('model' in secilen_modeller[RENK_KOD])
+              and (list(secilen_modeller[RENK_KOD].get('features', [])) == list(FEATURES)))
+    if _hazir:
+        model = secilen_modeller[RENK_KOD]['model']
+        print("  ▶ Model skorlama bloğundan alındı (yeniden eğitim YOK)")
+    else:
+        if y_tr.nunique() < 2:
+            print("  train tek sınıf, atlandı"); continue
+        spw   = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+        model = lgb.LGBMClassifier(objective='binary', metric='auc', scale_pos_weight=spw,
+                                   random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+        # SADECE train ile — val eğitime girmiyor, aksi halde sahaya çıkan
+        # modelden farklı bir model skorlamış oluruz.
+        model.set_params(**best_params).fit(X_tr, y_tr)
+        print(f"  ▶ Model eğitildi (train {len(X_tr)}, val {len(val)} hariç)")
+    secilen_modeller[RENK_KOD] = {'model': model, 'features': FEATURES,
+                                  'best_params': best_params}
+
+    # 6) train + val + OOT skorla → tek uzun tabloya ekle
+    for donem_tipi, frame, donem_val in [('TRAIN', train, TRAIN_DONEM),
+                                         ('VAL',   val,   TRAIN_DONEM),
+                                         ('OOT',   oot,   OOT_DONEM)]:
+        if frame.empty:
+            continue
+        prob = model.predict_proba(frame[FEATURES])[:, 1]
+        ham  = df_eng_r.loc[frame.index]
+        _n   = len(frame)
+        # dtype'lar bilinçli: category + küçük tamsayı. Değerler ve CSV
+        # çıktısı birebir aynı, bellek 4.8x düşüyor.
+        out = pd.DataFrame({
+            'renk_kod':   np.full(_n, RENK_KOD, dtype='int16'),
+            'renk_adi':   pd.Categorical([renk_adi]   * _n),
+            'donem_tipi': pd.Categorical([donem_tipi] * _n),
+            'donem':      np.full(_n, donem_val, dtype='int32'),
+            'SKOR':       prob,                                    # float64 kalıyor
+            'TARGET':     frame[TARGET].to_numpy(dtype='int8'),
+            'limit':      ham[LIMIT_COL].values if LIMIT_COL in ham else np.nan,
+            'risk':       ham[RISK_COL].values  if RISK_COL  in ham else np.nan,
+        }, index=frame.index)
+        if ID_COL in ham:
+            out['musteri_id'] = ham[ID_COL].values
+        scored_parts.append(out)
+
+    # Hızlı kontrol: TRAIN in-sample olduğu için gini'si VAL'den yüksek
+    # çıkar; aradaki fark aşırı öğrenmenin doğrudan göstergesi.
+    try:
+        _g = lambda f: 2 * roc_auc_score(f[TARGET], model.predict_proba(f[FEATURES])[:, 1]) - 1
+        print(f"    train_gini={_g(train):.4f}  val_gini={_g(val):.4f}  "
+              f"oot_gini={_g(oot):.4f}")
+    except Exception:
+        pass
+
+    del df_eng_r, df_r, train_full, train, val, oot, X_tr, y_tr
+    print(f"  ✓ {etiket} skorlandı (train+val+oot)")
+
+scored = pd.concat(scored_parts, ignore_index=True)
+del scored_parts
+print("\nToplam skorlanan satır:", scored.shape)
+print("Bellek:", f"{scored.memory_usage(deep=True).sum()/1e6:,.0f} MB")
+print(scored.groupby('donem_tipi', observed=True).size().to_string())
+
+# → Mini'ye (dataset) yaz  [alternatif: folder CSV]
+# → Dataset varsa güncelle, yoksa folder'a CSV yaz
+SCORED_DATASET = "RENK_MDL_SCORED"
+_client  = dataiku.api_client()
+_project = _client.get_project(dataiku.default_project_key())
+_mevcut  = {d['name'] for d in _project.list_datasets()}
+if SCORED_DATASET in _mevcut:
+    dataiku.Dataset(SCORED_DATASET).write_with_schema(scored)
+    print(f"✓ {SCORED_DATASET} dataseti güncellendi ({scored.shape[0]:,} satır)")
+else:
+    buf = BytesIO()
+    for i in range(0, len(scored), 500_000):        # parçalı: tek kopya yerine
+        scored.iloc[i:i + 500_000].to_csv(buf, index=False, header=(i == 0))
+    buf.seek(0)
+    folder.upload_stream("RENK_MDL_SCORED.csv", buf)
+    print(f"✓ Dataset bulunamadı → RENK_MDL_SCORED.csv folder'a yazıldı "
+          f"({scored.shape[0]:,} satır)")
+    print("  İpucu: Dataiku UI'da 'RENK_MDL_SCORED' adlı dataset oluşturup "
+          "tekrar çalıştırırsanız dataset'e yazılır.")
