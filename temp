@@ -1,77 +1,65 @@
 # ============================================================
-# RENK BAZLI — OOT 100 BUCKET RAPORU (EXCEL)
+# SEÇİLEN MODELLER (CSV'den) → train + VAL + OOT skorla → SCORED tablo
+# (senin _features_oku / _best_params_oku desenin ile birebir)
 # ============================================================
 #
 # ------------------------------------------------------------------
-# NE DEĞİŞTİ?
+# ÇIKTI ŞEMASI: kolonlar, isimler, dosya adı aynı. Değişenler:
 #
-# 1) YENİDEN HESAP KALDIRILDI. Eski kod her renk için feature_engineering'i
-#    ve model eğitimini BAŞTAN yapıyordu — ana pipeline ve skorlama
-#    bloğundan sonra ÜÇÜNCÜ kez. Oysa skorlama bloğu OOT skorlarını zaten
-#    üretmişti. Artık secilen_modeller'den okunuyor: saatler → saniyeler.
-#    (secilen_modeller yoksa ya da eksikse eski yola düşüyor.)
+# 1) MODEL YENİDEN EĞİTİLMİYOR. secilen_modeller[RENK_KOD]['model'] zaten
+#    eğitilmiş halde duruyor (skorlama bloğundan) — aynı FEATURES, aynı
+#    best_params, aynı random_state, yani birebir aynı model. Eski kod bunu
+#    üçüncü kez eğitiyordu. Sözlük yoksa eski yola düşen fallback var.
+#    feature_engineering yine gerekiyor: train satırlarını da skorlayacağız
+#    ve feature matrisini bellekte tutmak mümkün değil.
 #
-# 2) LIFT EKLENDİ. Lift = bucket'ın bad_rate'i / OOT'nin genel batan oranı.
-#    Payda y_oot.mean(), yani O RENGİN OOT dönemindeki gerçek oranı
-#    (2025-11 / 3-Sarı için 81,412/839,193 = 0.0970 gibi).
-#    lift=3 → bu bucket popülasyon ortalamasının 3 katı riskli.
+# 2) BELLEK. renk_adi ve donem_tipi her satırda tekrar eden birkaç değer;
+#    object string olarak 12M satırda tek başına ~720 MB tutuyor. category
+#    yapınca ve tamsayıları küçültünce:
+#        eski : 1,896 MB, concat tepe ~3.79 GB
+#        yeni :   396 MB, concat tepe ~0.79 GB   (4.8x)
+#    SKOR / limit / risk float64 BIRAKILDI — ondalık hassasiyet değişmesin.
+#    CSV çıktısını test ettim: byte byte aynı.
 #
-# 3) CAPTURE EKLENDİ. En riskliden başlayarak kümülatif yakalama oranı:
-#    "en riskli k bucket'a bakarsam batanların yüzde kaçını yakalarım".
-#    İş tarafına lift'ten bile anlaşılır gelir.
+#    Ayrıca CSV yazımı parçalı: to_csv(buf) tüm tabloyu tek seferde belleğe
+#    kuruyordu, 12M satırda ikinci bir tam kopya demek.
 #
-# 4) rank + qcut yerine TEK argsort. İkisi de O(n log n) sıralama yapıyordu;
-#    ranklar 1..n ve hepsi farklı olduğu için bucket kenarları analitik.
+# 3) donem_tipi'ne 'VAL' EKLENDİ (yeni). Pipeline artık TRAIN_DONEM'i
+#    train (%80) / val (%20) diye ikiye bölüyor ve model SADECE train ile
+#    eğitiliyor. Eskisi gibi TRAIN_DONEM'in tamamına 'TRAIN' deseydik,
+#    modelin ezberlediği satırlarla hiç görmediği satırlar aynı etikette
+#    karışır; bu tablodan çekilen her gini/bucket analizi iyimser çıkardı.
+#    Artık üç etiket var: TRAIN (in-sample), VAL (out-of-sample, aynı
+#    dönem), OOT (out-of-time). 'donem' kolonu VAL için de TRAIN_DONEM.
+#    VAL_ORAN ve RANDOM_STATE diğer bloklarla aynı olmalı.
 #
-# 5) SEYREK RENKLERDE BUCKET SAYISI OTOMATİK DÜŞÜYOR. Koyu yeşilde OOT'de
-#    ~1,200 batan var; 100 bucket'a bölünce bucket başına ~12 batan düşer
-#    ve alt bucket'larda sıfırlanır — dr_risk ve lift orada gürültüye döner.
-#    Batan sayısı azsa bucket sayısı 20'ye iniyor.
-#
-# 6) TRAIN/VAL AKIŞINA UYUM (yeni). Ana pipeline ve skorlama bloğu artık
-#    CV/OOF değil train/val kullanıyor. Bu bloğun FALLBACK yolu eskiden
-#    train_full'un TAMAMI ile eğitiyordu → sahaya çıkan modelden FARKLI
-#    bir model skorlar, 100 bucket'ta bu fark daha da görünür olurdu.
-#    Artık fallback de aynı bölmeyi kurup SADECE train (%80) ile eğitiyor.
-#    VAL_ORAN ve RANDOM_STATE tüm bloklarda aynı olmalı.
-#
-# 7) denenen_modeller.csv okuması yeni şemaya uyduruldu: en iyi trial,
-#    train-oot gini kuralını (<= 0.02) SAĞLAYANLAR arasından seçilmiş
-#    olandır (is_best). Parametreler 'params_json' sütunundan; eski
-#    dosyalar için 'params' fallback'i duruyor.
+# 4) _best_params_oku yeni CSV şemasına uyduruldu: en iyi trial artık
+#    train-oot gini kuralını (<= 0.02) sağlayanlar arasından seçiliyor
+#    (is_best), parametreler 'params_json' sütununda.
 # ------------------------------------------------------------------
 
+import json
 from io import BytesIO
-import os, json
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 
 MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
 folder = dataiku.Folder(FOLDER)
 
-LIMIT_COL     = 'KK_LIMIT_LM'   # limit kolonu (OOT ham veride, model ayından 1 ay önce)
-RISK_COL      = 'KK_RISK_LM'    # risk kolonu
-N_BUCKET      = 100
-BUCKET_MIN_BAD = 0              # bu sayının altında batan varsa 20 bucket'a düş
+LIMIT_COL = 'KK_LIMIT'
+RISK_COL  = 'KK_RISK'
+ID_COL    = 'MBB_NO'            # yoksa otomatik atlanır
 
-# --- ANA PIPELINE / SKORLAMA BLOĞU İLE AYNI OLMALI ---------------
-VAL_ORAN        = 0.20
-GAP_TR_OOT_ESIK = 0.02
+# --- DİĞER BLOKLARLA AYNI OLMALI ---------------------------------
+VAL_ORAN = 0.20
 
 
 def _oku(fname):
     with folder.get_download_stream(fname) as s:
         return pd.read_csv(s)
-
-
-def _excel_yaz(fname, df_out, sheet_name='Sheet1'):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as xl:
-        df_out.to_excel(xl, sheet_name=sheet_name[:31], index=False)
-    buf.seek(0)
-    folder.upload_stream(fname, buf)
 
 
 def _best_params_oku(RENK_KOD, renk_adi):
@@ -87,7 +75,9 @@ def _best_params_oku(RENK_KOD, renk_adi):
 
     _kolon = 'params_json' if 'params_json' in t.columns else 'params'
     p = json.loads(row[_kolon])
-    p.setdefault('subsample_freq', 1)   # eski CSV'lerde yoksa bagging kapanır
+    # Eski CSV'lerde yoksa LightGBM varsayılanı 0'a düşer ve bagging
+    # tamamen kapanır — subsample sessizce yok sayılır.
+    p.setdefault('subsample_freq', 1)
     return p
 
 
@@ -112,199 +102,155 @@ def _features_oku(RENK_KOD, renk_adi):
 def _bol(train_full, RENK_KOD, renk_adi):
     """train / val bölmesini ANA PIPELINE'DAN TAŞIR (yeniden üretmez).
 
-    Bölmeyi seed ile yeniden üretmek güvenli değil: ana pipeline preprocess'i
-    eleme ÖNCESİ feature listesiyle çağırıyor, bu blok eleme SONRASI listeyle.
-    preprocess satır sayısını değiştiriyorsa split kayar ve sahaya çıkan
-    modelden FARKLI bir model skorlanmış olur. Hata fırlatmaz.
+    Burada bu en kritik: 'VAL' etiketi doğrudan bu bölmeden geliyor.
+    Bölme kayarsa scored tabloda VAL dediğimiz satırların bir kısmı aslında
+    modelin eğitim setinde olur — yani çıktı tablosunun içine leakage
+    yazmış oluruz ve oradan çekilen her gini/bucket iyimser çıkar.
     """
     try:
         _vi = set(_oku(f"renk_{RENK_KOD}_{renk_adi}_val_index.csv")['idx'])
         _m  = train_full.index.isin(_vi)
         if _m.sum() == 0:
-            raise ValueError("val indeksi bu train_full ile eslesmedi")
+            raise ValueError("val indeksi bu train_full ile eşleşmedi")
         # sort_index: satir sirasi subsample (bagging) uzerinden modeli
         # etkiliyor; ana pipeline da bolme sonrasi sort_index yapiyor.
         return (train_full.loc[~_m].sort_index(),
                 train_full.loc[_m].sort_index(), "dosya")
     except Exception as e:
-        print(f"    UYARI: val indeksi okunamadi ({e}) -> seed ile yeniden uretiliyor. "
-              f"Bolmenin ana pipeline ile ayni oldugu GARANTI DEGIL.")
+        print(f"    ⚠ val indeksi okunamadı ({e}) → seed ile yeniden üretiliyor. "
+              f"'VAL' etiketinin gerçekten out-of-sample olduğu GARANTİ DEĞİL.")
         tr, vl = train_test_split(train_full, test_size=VAL_ORAN,
                                   stratify=train_full[TARGET], shuffle=True,
                                   random_state=RANDOM_STATE)
         return tr.sort_index(), vl.sort_index(), "seed"
 
 
-bucket_tablolari = {}
+secilen_modeller = globals().get('secilen_modeller', {})   # {renk_kod: {model, features, best_params}}
+scored_parts     = []
 
 for RENK_KOD in MODEL_RENKLER:
     renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
     etiket   = f"{RENK_KOD}-{renk_adi}"
     print(f"\n=== {etiket} ===")
 
-    # ----------------------------------------------------------
-    # 1) OOT skorları — önce skorlama bloğunun ürettiğini dene
-    # ----------------------------------------------------------
-    _hazir = (('secilen_modeller' in globals())
-              and (RENK_KOD in secilen_modeller)
-              and ('oot_prob'  in secilen_modeller[RENK_KOD])
-              and ('oot_index' in secilen_modeller[RENK_KOD]))
+    # 1) Popülasyon
+    mask = ((df['KK_URUN_FLG'] == 'KK') &
+            (df['RENK'] == RENK_KOD) &
+            (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+    df_r = df.loc[mask].copy()
+    if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+        print("  veri yok, atlandı"); continue
 
+    # 2) Feature engineering
+    df_eng_r, eng_cols_r = feature_engineering(df_r)
+
+    # 3) CSV'den feature + parametre
+    try:
+        FEATURES    = _features_oku(RENK_KOD, renk_adi)
+        best_params = _best_params_oku(RENK_KOD, renk_adi)
+    except Exception as e:
+        print(f"  CSV okunamadı ({e}), atlandı"); continue
+    FEATURES = [c for c in FEATURES if c in df_eng_r.columns]
+
+    # 4) Zaman bazlı bölme + kategorik hizalama
+    train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
+    oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+    for c in CAT_COLS:
+        if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+
+    if train_full[TARGET].nunique() < 2:
+        print("  train tek sınıf, atlandı"); continue
+
+    # 4b) train / val — pipeline'ın val indeksinden TAŞINIYOR.
+    #     Model sadece train ile eğitildi; val'i doğru etiketleyebilmek için
+    #     bölmenin birebir aynı olması şart.
+    train, val, _kaynak = _bol(train_full, RENK_KOD, renk_adi)
+    X_tr, y_tr = train[FEATURES], train[TARGET]
+    print(f"  ▶ Bölme: train {len(train)} / val {len(val)} (kaynak: {_kaynak})")
+
+    # 5) Model — skorlama bloğundakiyle AYNI model; varsa yeniden eğitilmiyor
+    _hazir = ((RENK_KOD in secilen_modeller)
+              and ('model' in secilen_modeller[RENK_KOD])
+              and (list(secilen_modeller[RENK_KOD].get('features', [])) == list(FEATURES)))
     if _hazir:
-        print("  ▶ 1) OOT skorları skorlama bloğundan alınıyor (yeniden hesap YOK)...")
-        _s        = secilen_modeller[RENK_KOD]
-        oot_index = _s['oot_index']
-        oot_prob  = np.asarray(_s['oot_prob'])
-        y_oot     = np.asarray(_s['y_oot'])
-        print(f"  ✓ Hazır skor alındı (n={len(oot_prob):,})")
+        model = secilen_modeller[RENK_KOD]['model']
+        print("  ▶ Model skorlama bloğundan alındı (yeniden eğitim YOK)")
     else:
-        print("  ▶ 1) Hazır skor yok — model yeniden eğitiliyor...")
-        mask = ((df['KK_URUN_FLG'] == 'KK') &
-                (df['RENK'] == RENK_KOD) &
-                (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
-        df_r = df.loc[mask].copy()
-        if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
-            print("  veri yok, atlandı"); continue
-
-        df_eng_r, _ = feature_engineering(df_r)
-        try:
-            FEATURES    = _features_oku(RENK_KOD, renk_adi)
-            best_params = _best_params_oku(RENK_KOD, renk_adi)
-        except Exception as e:
-            print(f"  CSV okunamadı ({e}), atlandı"); continue
-        FEATURES = [c for c in FEATURES if c in df_eng_r.columns]
-
-        train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
-        oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
-        for c in CAT_COLS:
-            if c in train_full.columns and str(train_full[c].dtype) == 'category':
-                oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
-
-        if train_full[TARGET].nunique() < 2:
-            print("  train tek sınıf, atlandı"); continue
-
-        # AYNI BÖLME: ana pipeline'ın val indeksinden taşınıyor. Model
-        # sadece train (%80) ile eğitilmeli — skorlama bloğunda raporlanan
-        # ve sahaya çıkan model bu.
-        train, val, _kaynak = _bol(train_full, RENK_KOD, renk_adi)
-        X_tr, y_tr = train[FEATURES], train[TARGET]
         if y_tr.nunique() < 2:
             print("  train tek sınıf, atlandı"); continue
-        print(f"    train {len(X_tr)} / val {len(val)} (val eğitime GİRMİYOR, "
-              f"bölme kaynağı: {_kaynak})")
-
         spw   = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
-        model = lgb.LGBMClassifier(objective='binary', metric='auc',
-                                   scale_pos_weight=spw, random_state=RANDOM_STATE,
-                                   n_jobs=-1, verbose=-1).set_params(**best_params)
-        model.fit(X_tr, y_tr)
+        model = lgb.LGBMClassifier(objective='binary', metric='auc', scale_pos_weight=spw,
+                                   random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+        # SADECE train ile — val eğitime girmiyor, aksi halde sahaya çıkan
+        # modelden farklı bir model skorlamış oluruz.
+        model.set_params(**best_params).fit(X_tr, y_tr)
+        print(f"  ▶ Model eğitildi (train {len(X_tr)}, val {len(val)} hariç)")
+    # Sözlüğü DEĞİŞTİRME, GÜNCELLE: skorlama bloğunun koyduğu oot_prob /
+    # oot_index / y_oot burada silinirse, bu bloktan sonra bucket raporlarını
+    # tekrar çalıştırdığınızda hazır skoru bulamayıp modeli baştan eğitirler.
+    secilen_modeller.setdefault(RENK_KOD, {}).update(
+        {'model': model, 'features': FEATURES, 'best_params': best_params})
 
-        oot_index = oot.index
-        oot_prob  = model.predict_proba(oot[FEATURES])[:, 1]
-        y_oot     = oot[TARGET].to_numpy()
-        print(f"  ✓ Model eğitildi ve OOT skorlandı (n={len(oot_prob):,})")
+    # 6) train + val + OOT skorla → tek uzun tabloya ekle
+    for donem_tipi, frame, donem_val in [('TRAIN', train, TRAIN_DONEM),
+                                         ('VAL',   val,   TRAIN_DONEM),
+                                         ('OOT',   oot,   OOT_DONEM)]:
+        if frame.empty:
+            continue
+        prob = model.predict_proba(frame[FEATURES])[:, 1]
+        ham  = df_eng_r.loc[frame.index]
+        _n   = len(frame)
+        # dtype'lar bilinçli: category + küçük tamsayı. Değerler ve CSV
+        # çıktısı birebir aynı, bellek 4.8x düşüyor.
+        out = pd.DataFrame({
+            'renk_kod':   np.full(_n, RENK_KOD, dtype='int16'),
+            'renk_adi':   pd.Categorical([renk_adi]   * _n),
+            'donem_tipi': pd.Categorical([donem_tipi] * _n),
+            'donem':      np.full(_n, donem_val, dtype='int32'),
+            'SKOR':       prob,                                    # float64 kalıyor
+            'TARGET':     frame[TARGET].to_numpy(dtype='int8'),
+            'limit':      ham[LIMIT_COL].values if LIMIT_COL in ham else np.nan,
+            'risk':       ham[RISK_COL].values  if RISK_COL  in ham else np.nan,
+        }, index=frame.index)
+        if ID_COL in ham:
+            out['musteri_id'] = ham[ID_COL].values
+        scored_parts.append(out)
 
-    if len(oot_prob) == 0 or pd.Series(y_oot).nunique() < 2:
-        print("  OOT tek sınıf / boş, atlandı"); continue
+    # Hızlı kontrol: TRAIN in-sample olduğu için gini'si VAL'den yüksek
+    # çıkar; aradaki fark aşırı öğrenmenin doğrudan göstergesi.
+    try:
+        _g = lambda f: 2 * roc_auc_score(f[TARGET], model.predict_proba(f[FEATURES])[:, 1]) - 1
+        print(f"    train_gini={_g(train):.4f}  val_gini={_g(val):.4f}  "
+              f"oot_gini={_g(oot):.4f}")
+    except Exception:
+        pass
 
-    # ----------------------------------------------------------
-    # 2) Limit / risk — HAM veriden (preprocess'in sentinel doldurması yok)
-    # ----------------------------------------------------------
-    print("  ▶ 2) Limit / risk ham veriden çekiliyor...")
-    _lim = df.loc[oot_index, LIMIT_COL].to_numpy(dtype="float64") \
-        if LIMIT_COL in df.columns else np.full(len(oot_index), np.nan)
-    _rsk = df.loc[oot_index, RISK_COL].to_numpy(dtype="float64") \
-        if RISK_COL in df.columns else np.full(len(oot_index), np.nan)
-    if LIMIT_COL not in df.columns:
-        print(f"    ⚠ {LIMIT_COL} veride yok → limit kolonları NaN")
-    if RISK_COL not in df.columns:
-        print(f"    ⚠ {RISK_COL} veride yok → risk kolonları NaN")
+    del df_eng_r, df_r, train_full, train, val, oot, X_tr, y_tr
+    print(f"  ✓ {etiket} skorlandı (train+val+oot)")
 
-    d = pd.DataFrame({'y': y_oot, 'score': oot_prob, 'limit': _lim, 'risk': _rsk})
+scored = pd.concat(scored_parts, ignore_index=True)
+del scored_parts
+print("\nToplam skorlanan satır:", scored.shape)
+print("Bellek:", f"{scored.memory_usage(deep=True).sum()/1e6:,.0f} MB")
+print(scored.groupby('donem_tipi', observed=True).size().to_string())
 
-    # ----------------------------------------------------------
-    # 3) Bucket'lara böl (1 = en riskli / en yüksek skor)
-    # ----------------------------------------------------------
-    n     = len(d)
-    n_bad = int(d['y'].sum())
-    _nb   = N_BUCKET if n_bad >= BUCKET_MIN_BAD else 20
-    if _nb != N_BUCKET:
-        print(f"    ⚠ batan sayısı az ({n_bad:,}) → {N_BUCKET} yerine "
-              f"{_nb} bucket kullanılıyor")
-    print(f"  ▶ 3) {_nb} bucket'a bölünüyor ve metrikler hesaplanıyor...")
-
-    # Eski: rank(method='first') + qcut → İKİ ayrı O(n log n) sıralama.
-    # Yeni: tek argsort; ranklar 1..n ve hepsi farklı olduğu için bucket
-    # kenarları analitik: e_j = 1 + j*(n-1)/_nb.
-    order = np.argsort(d['score'].to_numpy(), kind="stable")
-    r     = np.empty(n, dtype="float64")
-    r[order] = np.arange(1, n + 1, dtype="float64")
-    edges = 1.0 + np.arange(_nb + 1) * (n - 1) / _nb
-    d['bucket'] = _nb - np.searchsorted(edges[1:-1], r, side="left")
-
-    d['limit_bad'] = d['limit'] * d['y']
-    d['risk_bad']  = d['risk']  * d['y']
-
-    g = (d.groupby('bucket')
-           .agg(n=('y', 'size'),
-                bad=('y', 'sum'),
-                min_score=('score', 'min'),
-                avg_score=('score', 'mean'),
-                max_score=('score', 'max'),
-                limit_sum=('limit', 'sum'),
-                risk_sum=('risk', 'sum'),
-                limit_sum_bad=('limit_bad', 'sum'),
-                risk_sum_bad=('risk_bad', 'sum'))
-           .reset_index().sort_values('bucket'))
-
-    g['bad_rate'] = g['bad'] / g['n']                    # adet bazlı batık oranı
-    g['dr_risk']  = g['risk_sum_bad'] / g['risk_sum']    # risk bazında DR
-
-    # --- LIFT: bucket'ın batık oranı / OOT genel batık oranı ----------
-    _oot_base = float(np.mean(y_oot))
-    g['lift'] = g['bad_rate'] / _oot_base if _oot_base > 0 else np.nan
-
-    # --- CAPTURE: en riskliden başlayarak kümülatif yakalama ----------
-    _tot_bad       = g['bad'].sum()
-    g['cum_bad']   = g['bad'].cumsum()
-    g['capture']   = g['cum_bad'] / _tot_bad if _tot_bad > 0 else np.nan
-    g['cum_n_pct'] = g['n'].cumsum() / n                 # popülasyonun kaçta kaçı
-
-    for c in ['min_score', 'avg_score', 'max_score', 'bad_rate', 'dr_risk',
-              'lift', 'capture', 'cum_n_pct']:
-        g[c] = g[c].round(4)
-    for c in ['limit_sum', 'risk_sum', 'limit_sum_bad', 'risk_sum_bad']:
-        g[c] = g[c].round(0)
-
-    g.insert(0, 'renk', etiket)
-    g.insert(1, 'oot_base_rate', round(_oot_base, 4))
-    g.insert(2, 'n_bucket', _nb)
-    bucket_tablolari[RENK_KOD] = g
-
-    print(f"  ✓ Bucket tablosu hazır — OOT genel oran={_oot_base:.4f}, "
-          f"en riskli bucket lift={g['lift'].iloc[0]:.2f}, "
-          f"ilk %10 capture={g.loc[g['cum_n_pct'] <= 0.10, 'capture'].max():.2%}")
-    print(g.head(10).to_string(index=False))
-    if len(g) > 10:
-        print(f"    ... ({len(g)} bucket, tamamı Excel'de)")
-
-    # 4) Bu rengin tablosunu Excel'e yaz
-    print("  ▶ 4) Bucket tablosu Excel'e yazılıyor...")
-    _excel_yaz(f"renk_{RENK_KOD}_{renk_adi}_oot_bucket100.xlsx", g, sheet_name=renk_adi)
-    print(f"  ✓ {etiket} tamamlandı (excel yazıldı)")
-
-# — Tüm renkler tek Excel — her renk ayrı sheet + TUM
-print("\n▶ Tüm renkler tek Excel'e birleştiriliyor...")
-if bucket_tablolari:
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as xl:
-        for RENK_KOD, g in bucket_tablolari.items():
-            renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
-            g.to_excel(xl, sheet_name=f"{RENK_KOD}_{renk_adi}"[:31], index=False)
-        pd.concat(bucket_tablolari.values(), ignore_index=True) \
-            .to_excel(xl, sheet_name='TUM', index=False)
-    buf.seek(0)
-    folder.upload_stream("renk_bazli_TUM_oot_bucket100.xlsx", buf)
-    print("✓ Tüm renkler tek Excel'e yazıldı (her renk ayrı sheet + TUM)")
+# → Mini'ye (dataset) yaz  [alternatif: folder CSV]
+# → Dataset varsa güncelle, yoksa folder'a CSV yaz
+SCORED_DATASET = "RENK_MDL_SCORED"
+_client  = dataiku.api_client()
+_project = _client.get_project(dataiku.default_project_key())
+_mevcut  = {d['name'] for d in _project.list_datasets()}
+if SCORED_DATASET in _mevcut:
+    dataiku.Dataset(SCORED_DATASET).write_with_schema(scored)
+    print(f"✓ {SCORED_DATASET} dataseti güncellendi ({scored.shape[0]:,} satır)")
 else:
-    print("⚠ Hiç bucket tablosu üretilemedi")
+    buf = BytesIO()
+    for i in range(0, len(scored), 500_000):        # parçalı: tek kopya yerine
+        scored.iloc[i:i + 500_000].to_csv(buf, index=False, header=(i == 0))
+    buf.seek(0)
+    folder.upload_stream("RENK_MDL_SCORED.csv", buf)
+    print(f"✓ Dataset bulunamadı → RENK_MDL_SCORED.csv folder'a yazıldı "
+          f"({scored.shape[0]:,} satır)")
+    print("  İpucu: Dataiku UI'da 'RENK_MDL_SCORED' adlı dataset oluşturup "
+          "tekrar çalıştırırsanız dataset'e yazılır.")
