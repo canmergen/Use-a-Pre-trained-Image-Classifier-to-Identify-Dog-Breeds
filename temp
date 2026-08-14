@@ -1,3 +1,145 @@
-mask = ((df['KK_URUN_FLG']=='KK') & (df['RENK']==4) & (df['DONEM']==OOT_DONEM))
-print("ham df'te takip:", int(df.loc[mask, TAKIP_COL].fillna(0).sum()),
-      "| NaN:", int(df.loc[mask, TAKIP_COL].isna().sum()))
+# ================================================================
+# İKİ MODEL ÇAPRAZ MATRİSİ — MİNİMAL
+# Satır: 3M KIRMIZI modelinin bucket'ı (1 = en riskli)
+# Sütun: 6M TAKİP modelinin bucket'ı  (1 = en riskli)
+# SORU: Kırmızının riskli dedikleri (1-4) takipte de 1-4'te mi
+# kümeleniyor? Kümeleniyorsa ayrı takip modeline gerek yok.
+# ================================================================
+# Renk başına iki sheet:
+#   {renk}_N   : müşteri ADEDİ
+#   {renk}_PCT : SATIR YÜZDESİ — o kırmızı bucket'ındakilerin takip
+#                bucket'larına dağılımı (%). Sol üst kümelenme burada
+#                okunur; rastgele dağılımda her hücre ~%5 olurdu.
+#
+# İki model de KENDİ klasöründen deterministik kurulur; notebook
+# durumundan (secilen_modeller vb.) bağımsızdır. Gerekli globals:
+# df, feature_engineering, preprocess, CAT_COLS, COLOR_MAP,
+# TRAIN_DONEM, OOT_DONEM, RANDOM_STATE, TARGET, FOLDER.
+
+from io import BytesIO
+import json
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
+folder = dataiku.Folder(FOLDER)                 # çıktı buraya
+
+TAKIP_COL = 'AKB_TAKIP_6M'
+N_BUCKET  = 20
+
+KIRMIZI_FOLDER = 'renk_gecis_model_3mdeneme_updt_v3'
+TAKIP_FOLDER   = 'renk_gecis_model_folder_6mtkp_v2'
+_kir_folder = dataiku.Folder(KIRMIZI_FOLDER)
+_tk_folder  = dataiku.Folder(TAKIP_FOLDER)
+
+try:
+    LGB_JOBS
+except NameError:
+    LGB_JOBS = 8
+
+
+def _csv_oku(fld, fname):
+    with fld.get_download_stream(fname) as _s:
+        return pd.read_csv(_s)
+
+
+def _skorla(fld, RENK_KOD, renk_adi, hedef_col, df_eng, ad):
+    """Klasördeki ayarlarla (feature+sira, best_params, val_index) modeli
+    kurar, train(%80) ile eğitir, OOT skorunu Series olarak döner."""
+    f = _csv_oku(fld, f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv")
+    if 'sira' in f.columns:                       # kolon SIRASI modeli değiştirir
+        f = f.sort_values('sira')
+    feats = [c for c in f['feature'] if c in df_eng.columns]
+
+    t = _csv_oku(fld, f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv")
+    row = (t[t['is_best'] == 1].iloc[0]
+           if 'is_best' in t.columns and (t['is_best'] == 1).any()
+           else t.sort_values('objective', ascending=False).iloc[0])
+    prm = json.loads(row['params_json' if 'params_json' in t.columns else 'params'])
+    prm.setdefault('subsample_freq', 1)
+
+    def _hazirla(_donem):
+        _x = df_eng.loc[df_eng['DONEM'] == _donem, feats].copy()
+        _x[hedef_col] = df_eng.loc[_x.index, hedef_col].fillna(0).astype(int)
+        return preprocess(_x)
+
+    _tr_full, _oot = _hazirla(TRAIN_DONEM), _hazirla(OOT_DONEM)
+    for c in CAT_COLS:
+        if c in _tr_full.columns and str(_tr_full[c].dtype) == 'category':
+            _oot[c] = pd.Categorical(_oot[c], categories=_tr_full[c].cat.categories)
+
+    try:                                           # bölme TAŞINIR, üretilmez
+        _vi = set(_csv_oku(fld, f"renk_{RENK_KOD}_{renk_adi}_val_index.csv")['idx'])
+        _tr = _tr_full.loc[~_tr_full.index.isin(_vi)].sort_index()
+    except Exception:
+        print(f"    ⚠ {ad}: val_index yok → train_full ile")
+        _tr = _tr_full.sort_index()
+
+    y_tr = _tr[hedef_col].astype(int)
+    if y_tr.nunique() < 2:
+        return None
+    prm.setdefault('scale_pos_weight', (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1))
+    m = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
+                           random_state=RANDOM_STATE, n_jobs=LGB_JOBS,
+                           verbose=-1).set_params(**prm)
+    m.fit(_tr[feats], y_tr)
+    print(f"  ▶ {ad}: {len(feats)} feature, train {len(_tr):,}, oot {len(_oot):,}")
+    return pd.Series(m.predict_proba(_oot[feats])[:, 1], index=_oot.index)
+
+
+def _bucketle(prob, nb=N_BUCKET):
+    """1 = en riskli."""
+    p = np.asarray(prob); n = len(p)
+    order = np.argsort(p, kind="stable")
+    r = np.empty(n, dtype="float64"); r[order] = np.arange(1, n + 1)
+    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
+    return nb - np.searchsorted(edges[1:-1], r, side="left")
+
+
+sheetler = {}
+
+for RENK_KOD in MODEL_RENKLER:
+    renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+    etiket   = f"{RENK_KOD}-{renk_adi}"
+    print(f"\n=== {etiket} ===")
+
+    mask = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD) &
+            (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+    df_r = df.loc[mask].copy()
+    if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+        print("  veri yok, atlandı"); continue
+    df_eng, _ = feature_engineering(df_r)        # bir kez, iki model paylaşır
+
+    kir = _skorla(_kir_folder, RENK_KOD, renk_adi, TARGET,    df_eng, "kırmızı")
+    tak = _skorla(_tk_folder,  RENK_KOD, renk_adi, TAKIP_COL, df_eng, "takip")
+    if kir is None or tak is None:
+        print("  model kurulamadı, atlandı"); continue
+
+    d = pd.DataFrame({'kir': kir, 'tak': tak.reindex(kir.index)}).dropna()
+    d['kb'] = _bucketle(d['kir'].to_numpy())
+    d['tb'] = _bucketle(d['tak'].to_numpy())
+
+    n_mat = (d.pivot_table(index='kb', columns='tb', values='kir',
+                           aggfunc='count', fill_value=0)
+               .rename_axis(index='kirmizi_bucket', columns='takip_bucket'))
+    pct   = (n_mat.div(n_mat.sum(axis=1), axis=0) * 100).round(1)
+
+    sheetler[f"{RENK_KOD}_{renk_adi}_N"]   = n_mat.reset_index()
+    sheetler[f"{RENK_KOD}_{renk_adi}_PCT"] = pct.reset_index()
+
+    # tek satır kontrol: sol üst 4x4 kümelenme (rastgele beklenen %20)
+    _oran = d.loc[d.kb <= 4, 'tb'].le(4).mean()
+    print(f"  kırmızı 1-4'tekilerin {_oran:.1%}'i takipte de 1-4'te "
+          f"(rastgele beklenen %20)")
+
+if sheetler:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as xl:
+        for ad, m in sheetler.items():
+            m.to_excel(xl, sheet_name=ad[:31], index=False)
+    buf.seek(0)
+    folder.upload_stream("capraz_matris_minimal.xlsx", buf)
+    print("\n✓ capraz_matris_minimal.xlsx yazıldı ({renk}_N adet, {renk}_PCT satır-%)")
+else:
+    print("⚠ Hiç matris üretilemedi")
