@@ -116,11 +116,29 @@ def _capture(y, prob, pct):
 # ----------------------------------------------------------------
 adim1, adim2, adim3_bloklar, karar, detay_bloklar = [], [], [], [], []
 kontrol_satirlari = []          # ADIM1 altına: takibe düşenlerin ilk kırmızı ayı
+kontrol2_satirlari = []         # basit ek: geçmiş 12 ay (df'in lag kolonları)
 
-# --- KONTROL İÇİN: X+1..X+6 aylarında İLK KIRMIZI ayı ---------------
-# Uzman itirazının çözümü: "pencerede kırmızı olmayan %" kolonunun
-# kaynağını gösterir — kırmızı ÇOĞU vakada geliyor ama A'nın 3 aylık
-# penceresinden SONRA geliyor. Ay 1-3 = pencere içi, 4-6 = kör nokta.
+# --- KONTROL: TAKİBE DÜŞENLERİN İLK KIRMIZI AYI — VERİ KAYNAĞI ------
+# İki kaynak desteklenir:
+#   'dataset'  (ÖNERİLEN): webapp'in beslendiği hazır agregat tablo —
+#       RISK_JOURNEY_ILK_KIRMIZIYA_GECIS (zone'unuza kopyaladınız).
+#       Kolonları: RENK, ILK_KIRMIZI_AY, AKB_TAKIP_12M_FLG, MUSTERI.
+#       ⚠ İKİ TANIM FARKI, tabloya not düşülür:
+#         (1) flag 12M'dir (bizim rapor 6M) → toplamlar ADIM1'le birebir
+#             TUTMAZ, tutması da beklenmez.
+#         (2) AY 7+ görülebilir (12 aylık izleme) → ayrı kolonda gösterilir.
+#   'df_aylik': df'te X+1..X+6 aylık RENK kayıtları varsa oradan hesap.
+# dataset okunamazsa otomatik df_aylik'e düşer; o da yoksa tablo atlanır.
+#   'sonraki_dataset' (EN BASİT VE DOĞRUSU — kendi hesabınız):
+#       RENK_MDL_ALL_INP'te RENK_SONRAKI_AY.._6AY kolonları zaten X+1..X+6
+#       renkleridir → DONEM = X satırından 6 ayın tamamı doğrudan okunur.
+KONTROL_KAYNAK  = 'sonraki_dataset'
+KONTROL_SNK_DATASET = 'RENK_MDL_ALL_INP'
+KONTROL_SNK_ID      = 'MBB_NO'
+KONTROL_SNK_DONEM   = 'DONEM'
+
+KONTROL_DATASET = 'RISK_JOURNEY_ILK_KIRMIZIYA_GECIS'
+K_RENK, K_AY, K_FLG, K_ADET = 'RENK', 'ILK_KIRMIZI_AY', 'AKB_TAKIP_12M_FLG', 'MUSTERI'
 ID_COL = 'MBB_NO'
 
 
@@ -130,16 +148,77 @@ def _ay_ekle(yyyymm, k):
     return y * 100 + m
 
 
-KONTROL_AYLAR  = [_ay_ekle(OOT_DONEM, i) for i in range(1, 7)]
-_kontrol_mevcut = sorted(set(df['DONEM'].unique()) & set(KONTROL_AYLAR))
-KONTROL_EKSIK   = [a for a in KONTROL_AYLAR if a not in _kontrol_mevcut]
-if KONTROL_EKSIK:
-    print(f"⚠ KONTROL: df'te olmayan izleme ayları {KONTROL_EKSIK} — "
-          f"'hiç kırmızı yok' bu yüzden şişebilir.")
-_kk = (df.loc[df['DONEM'].isin(_kontrol_mevcut) & (df['RENK'] == 1),
-              [ID_COL, 'DONEM']].drop_duplicates())
-_kk['AY'] = _kk['DONEM'].map({a: i + 1 for i, a in enumerate(KONTROL_AYLAR)})
-_ILK_KIRMIZI = _kk.groupby(ID_COL)['AY'].min()
+_KONTROL_DS, KONTROL_EKSIK, _ILK_KIRMIZI = None, [], None
+
+if KONTROL_KAYNAK == 'sonraki_dataset':
+    try:
+        # ay k → kolon adı: 1. ay 'RENK_SONRAKI_AY', sonrası 'RENK_SONRAKI_{k}AY'
+        _snk_cols = ['RENK_SONRAKI_AY'] + [f'RENK_SONRAKI_{k}AY'
+                                           for k in range(2, 7)]
+        try:
+            _L = dataiku.Dataset(KONTROL_SNK_DATASET).get_dataframe(
+                columns=[KONTROL_SNK_ID, KONTROL_SNK_DONEM] + _snk_cols)
+        except TypeError:
+            _L = dataiku.Dataset(KONTROL_SNK_DATASET).get_dataframe()
+        _L = _L.loc[pd.to_numeric(_L[KONTROL_SNK_DONEM],
+                                  errors='coerce') == OOT_DONEM].copy()
+        if _L.empty:
+            raise RuntimeError(f"DONEM={OOT_DONEM} satırı yok")
+
+        def _kirmizi_mi(v):
+            sv = str(v).strip()
+            return sv.startswith('1') and not sv.startswith(('10', '11', '12'))
+
+        _ilk = pd.Series(np.nan, index=_L.index)
+        for k in range(6, 0, -1):                 # ay6→ay1: küçük ay ezsin
+            _ilk[_L[_snk_cols[k - 1]].map(_kirmizi_mi)] = k
+        # ID'yi iki tabloda da AYNI tipe (int) zorla — bigint vs double/string
+        # farkı eşleşmeyi sessizce sıfırlar. Ayrıca aynı müşteri-DONEM çifti
+        # yanlışlıkla çoğaltılmışsa min() ile teke iner.
+        _ids = pd.to_numeric(_L[KONTROL_SNK_ID], errors='coerce')
+        _ILK_KIRMIZI = (pd.Series(_ilk.values, index=_ids.values)
+                          .dropna().groupby(level=0).min())
+        _ILK_KIRMIZI.index = _ILK_KIRMIZI.index.astype('int64')
+        # eşleşme sağlığı: df'in OOT müşterilerinin yüzde kaçı bu tabloda var?
+        _df_ids = pd.to_numeric(
+            df.loc[df['DONEM'] == OOT_DONEM, ID_COL], errors='coerce'
+        ).dropna().astype('int64').unique()
+        _kapsayan = pd.Index(_df_ids).isin(
+            pd.Index(_ids.dropna().astype('int64').unique())).mean()
+        print(f"KONTROL kaynağı: '{KONTROL_SNK_DATASET}' RENK_SONRAKI_1..6AY "
+              f"(DONEM={OOT_DONEM}, {len(_L):,} satır, "
+              f"kırmızı göreni {len(_ILK_KIRMIZI):,}) | "
+              f"df OOT müşterilerinin kapsanma oranı: {_kapsayan:.1%}"
+              + ("  ⚠ DÜŞÜK — ID eşleşmesini/DONEM filtresini kontrol edin!"
+                 if _kapsayan < 0.95 else ""))
+    except Exception as e:
+        print(f"⚠ sonraki dataset kullanılamadı ({e}) → 'dataset' kaynağına düşülüyor")
+        KONTROL_KAYNAK = 'dataset'
+
+if KONTROL_KAYNAK == 'dataset':
+    try:
+        _KONTROL_DS = dataiku.Dataset(KONTROL_DATASET).get_dataframe()
+        _KONTROL_DS[K_AY]  = pd.to_numeric(_KONTROL_DS[K_AY], errors='coerce')
+        _KONTROL_DS[K_FLG] = pd.to_numeric(_KONTROL_DS[K_FLG],
+                                           errors='coerce').fillna(0).astype(int)
+        print(f"KONTROL kaynağı: dataset '{KONTROL_DATASET}' "
+              f"({len(_KONTROL_DS):,} satır)")
+    except Exception as e:
+        print(f"⚠ KONTROL dataset okunamadı ({e}) → df_aylik'e düşülüyor")
+        _KONTROL_DS = None
+
+if _KONTROL_DS is None:                          # df_aylik yolu / fallback
+    KONTROL_AYLAR   = [_ay_ekle(OOT_DONEM, i) for i in range(1, 7)]
+    _kontrol_mevcut = sorted(set(df['DONEM'].unique()) & set(KONTROL_AYLAR))
+    KONTROL_EKSIK   = [a for a in KONTROL_AYLAR if a not in _kontrol_mevcut]
+    if KONTROL_EKSIK:
+        print(f"⚠ KONTROL: df'te olmayan izleme ayları {KONTROL_EKSIK}")
+    if _kontrol_mevcut:
+        _kk = (df.loc[df['DONEM'].isin(_kontrol_mevcut) & (df['RENK'] == 1),
+                      [ID_COL, 'DONEM']].drop_duplicates())
+        _kk['AY'] = _kk['DONEM'].map(
+            {a: i + 1 for i, a in enumerate(KONTROL_AYLAR)})
+        _ILK_KIRMIZI = _kk.groupby(ID_COL)['AY'].min()
 GRUP_AD = ["B1-4 (EN RISKLI)", "B5-8", "B9-12", "B13-16", "B17-20"]
 
 for RENK_KOD in MODEL_RENKLER:
@@ -196,25 +275,87 @@ for RENK_KOD in MODEL_RENKLER:
 
     # --- KONTROL: bu rengin takibe düşenlerinde ilk kırmızı ayı ---
     # Kırmızı segment hariç (orada herkes ay 0'da zaten kırmızı).
-    if RENK_KOD != 1 and ID_COL in df.columns:
-        _tk_ids = df.loc[(df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD)
-                         & (df['DONEM'] == OOT_DONEM)
-                         & (df[TAKIP_COL].fillna(0).astype(int) == 1), ID_COL]
-        _nt = len(_tk_ids)
-        if _nt:
-            _ay = _ILK_KIRMIZI.reindex(_tk_ids.values)
-            _r = {'RENK': etiket, 'TAKİBE DÜŞEN (OOT)': _nt}
-            for _i in range(1, 7):
-                _r[f'AY {_i} (adet)'] = int((_ay == _i).sum())
-            _p13, _p46 = int(_ay.le(3).sum()), int(_ay.between(4, 6).sum())
-            _hic = int(_ay.isna().sum())
-            _r['PENCERE İÇİ ay1-3 (adet)'] = _p13
-            _r['PENCERE İÇİ %'] = round(_p13 / _nt, 4)
-            _r['PENCERE SONRASI ay4-6 (adet)'] = _p46
-            _r['PENCERE SONRASI %'] = round(_p46 / _nt, 4)
-            _r['HİÇ KIRMIZI YOK (adet)'] = _hic
-            _r['HİÇ KIRMIZI YOK %'] = round(_hic / _nt, 4)
+    if RENK_KOD != 1:
+        _r = None
+        if _KONTROL_DS is not None:
+            # dataset agregat: renk eşleşmesi hem kod hem "K - Ad" formatını tanır
+            _rk = _KONTROL_DS[K_RENK].astype(str).str.strip()
+            _m_ds = (_rk == str(RENK_KOD)) | _rk.str.startswith(f"{RENK_KOD} ") | \
+                    _rk.str.startswith(f"{RENK_KOD}-") | (_rk == etiket)
+            _d = _KONTROL_DS.loc[_m_ds & (_KONTROL_DS[K_FLG] == 1)]
+            _nt = int(_d[K_ADET].sum())
+            if _nt:
+                _ayadet = _d.groupby(K_AY)[K_ADET].sum()
+                _r = {'RENK': etiket, 'TAKİBE DÜŞEN (kaynak: 12M flag)': _nt}
+                for _i in range(1, 7):
+                    _r[f'AY {_i} (adet)'] = int(_ayadet.get(_i, 0))
+                _p13 = int(_ayadet.reindex([1, 2, 3]).fillna(0).sum())
+                _p46 = int(_ayadet.reindex([4, 5, 6]).fillna(0).sum())
+                _p7  = int(_ayadet[_ayadet.index > 6].sum())
+                _hic = _nt - _p13 - _p46 - _p7
+                _r['PENCERE İÇİ ay1-3 (adet)'] = _p13
+                _r['PENCERE İÇİ %'] = round(_p13 / _nt, 4)
+                _r['PENCERE SONRASI ay4-6 (adet)'] = _p46
+                _r['PENCERE SONRASI %'] = round(_p46 / _nt, 4)
+                _r['GEÇ ay7+ (adet)'] = _p7
+                _r['GEÇ ay7+ %'] = round(_p7 / _nt, 4)
+                _r['HİÇ KIRMIZI YOK (adet)'] = _hic
+                _r['HİÇ KIRMIZI YOK %'] = round(_hic / _nt, 4)
+        elif _ILK_KIRMIZI is not None and ID_COL in df.columns:
+            _tk_ids = pd.to_numeric(
+                df.loc[(df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD)
+                       & (df['DONEM'] == OOT_DONEM)
+                       & (df[TAKIP_COL].fillna(0).astype(int) == 1), ID_COL],
+                errors='coerce').dropna().astype('int64')
+            _nt = len(_tk_ids)
+            if _nt:
+                _ay = _ILK_KIRMIZI.reindex(_tk_ids.values)
+                _r = {'RENK': etiket, 'TAKİBE DÜŞEN (OOT, 6M)': _nt}
+                for _i in range(1, 7):
+                    _r[f'AY {_i} (adet)'] = int((_ay == _i).sum())
+                _p13, _p46 = int(_ay.le(3).sum()), int(_ay.between(4, 6).sum())
+                _hic = int(_ay.isna().sum())
+                _r['PENCERE İÇİ ay1-3 (adet)'] = _p13
+                _r['PENCERE İÇİ %'] = round(_p13 / _nt, 4)
+                _r['PENCERE SONRASI ay4-6 (adet)'] = _p46
+                _r['PENCERE SONRASI %'] = round(_p46 / _nt, 4)
+                _r['HİÇ KIRMIZI YOK (adet)'] = _hic
+                _r['HİÇ KIRMIZI YOK %'] = round(_hic / _nt, 4)
+        if _r:
             kontrol_satirlari.append(_r)
+
+        # --- BASİT EK: GEÇMİŞ 12 AY (df'in KENDİ RENK_LxM kolonlarından) ---
+        # Harici kaynak yok: X anındaki satırda RENK_LM = X-1'in rengi,
+        # L2M = X-2 ... L12M = X-12. Takibe düşenler X'ten ÖNCE kırmızı
+        # görmüş mü, en son ne kadar önce? (uzmanların "%99 görür" dediği
+        # geçmiş pencerenin bizim verimizdeki karşılığı)
+        _lagc = [c for c in (['RENK_LM'] + [f'RENK_L{k}M' for k in range(2, 13)])
+                 if c in df.columns]
+        if _lagc:
+            _oot_m = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD)
+                      & (df['DONEM'] == OOT_DONEM)
+                      & (df[TAKIP_COL].fillna(0).astype(int) == 1))
+            _T = df.loc[_oot_m, _lagc]
+            _n2 = len(_T)
+            if _n2:
+                def _kmz(col):          # '1-Kırmızı' / 1 → True
+                    sv = _T[col].astype(str).str.strip()
+                    return sv.str.startswith('1') & ~sv.str.startswith(('10','11','12'))
+                # en son kırmızı kaç ay önce (1 = geçen ay)
+                _son = pd.Series(np.nan, index=_T.index)
+                for i in range(len(_lagc), 0, -1):   # uzaktan yakına: yakın ay ezsin
+                    _son[_kmz(_lagc[i-1])] = i
+                _s13  = int(_son.le(3).sum())
+                _s412 = int(_son.between(4, 12).sum())
+                _hic2 = int(_son.isna().sum())
+                kontrol2_satirlari.append({
+                    'RENK': etiket, 'TAKİBE DÜŞEN (OOT)': _n2,
+                    'SON 3 AYDA KIRMIZI (adet)': _s13,
+                    'SON 3 AYDA %': round(_s13 / _n2, 4),
+                    'SON 4-12 AYDA KIRMIZI (adet)': _s412,
+                    'SON 4-12 AYDA %': round(_s412 / _n2, 4),
+                    'SON 12 AYDA HİÇ YOK (adet)': _hic2,
+                    'SON 12 AYDA HİÇ YOK %': round(_hic2 / _n2, 4)})
 
     # Hüküm (T1) OOT satırından beslenir — model içeren testlerle aynı dönem.
     k1, t1 = d.kir_gercek == 1, d.tak_gercek == 1
@@ -659,11 +800,15 @@ with pd.ExcelWriter(buf, engine='openpyxl') as xl:
                       "yüksekse veri/eşleşme sorunudur. Kırmızı segment hariç: orada "
                       "herkes ay 0'da zaten kırmızı.")
         ws.cell(row=_b + 2, column=1,
-                value=("⚠ df'te eksik izleme ayları: " +
-                       ", ".join(map(str, KONTROL_EKSIK)) +
-                       " — 'hiç kırmızı yok' şişmiş olabilir.")
-                      if KONTROL_EKSIK else
-                      "İzlenen 6 ayın tamamı df'te mevcut.")
+                value=(f"Kaynak: '{KONTROL_DATASET}' dataset'i. ⚠ TANIM FARKI: "
+                       f"flag 12 AYLIK takiptir (rapor 6M) → toplamlar ADIM1 ile "
+                       f"birebir TUTMAZ; AY 7+ kolonu 12 aylık izlemenin sonucudur. "
+                       f"Pencere yorumu değişmez: ay 4+ = A'nın göremediği vakalar.")
+                      if _KONTROL_DS is not None else
+                      (("⚠ df'te eksik izleme ayları: " +
+                        ", ".join(map(str, KONTROL_EKSIK)) +
+                        " — 'hiç kırmızı yok' şişmiş olabilir.")
+                       if KONTROL_EKSIK else "İzlenen 6 ayın tamamı df'te mevcut."))
         kdf2.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK',
                       index=False, startrow=_b + 3)
         for c in range(1, kdf2.shape[1] + 1):
@@ -673,6 +818,29 @@ with pd.ExcelWriter(buf, engine='openpyxl') as xl:
         for _c in _pct_c:
             for _r in range(_b + 5, _b + 5 + len(kdf2)):
                 ws.cell(row=_r, column=_c).number_format = '0.0%'
+
+        # --- ikinci küçük tablo: GEÇMİŞ 12 AY (df'in kendi lag kolonları) ---
+        if kontrol2_satirlari:
+            kdf3 = pd.DataFrame(kontrol2_satirlari)
+            _b2 = _b + 4 + len(kdf2) + 2
+            ws.cell(row=_b2, column=1,
+                    value="EK — TAKİBE DÜŞENLERİN X ÖNCESİ 12 AYDA KIRMIZI GEÇMİŞİ "
+                          "(kaynak: df'in RENK_LxM kolonları, harici veri yok)"
+                    ).font = Font(bold=True)
+            ws.cell(row=_b2 + 1, column=1,
+                    value="En son kırmızı kaç ay önce görüldü? Yukarıdaki tablo "
+                          "GELECEK pencereye (X sonrası), bu tablo GEÇMİŞE bakar — "
+                          "uzmanların 'takibe düşen kırmızıyı mutlaka görür' tezinin "
+                          "bizim verimizdeki karşılığı. HİÇ YOK yüksekse ani bozulma "
+                          "yolu (renk merdivenini atlayan) gerçektir.")
+            kdf3.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK',
+                          index=False, startrow=_b2 + 2)
+            for c in range(1, kdf3.shape[1] + 1):
+                h = ws.cell(row=_b2 + 3, column=c); h.fill = _fill; h.font = _byz
+                h.alignment = Alignment(wrap_text=True, vertical='top')
+            for _c in [i + 1 for i, c in enumerate(kdf3.columns) if c.endswith('%')]:
+                for _r in range(_b2 + 4, _b2 + 4 + len(kdf3)):
+                    ws.cell(row=_r, column=_c).number_format = '0.0%'
 
     # ---- ADIM2 ----
     a2 = pd.DataFrame(adim2)
