@@ -1,123 +1,49 @@
-select count(*) from SBXKVA.MUS_YENI_RENKLER_TUM_PORTFOY_FINAL where DONEM in (202504,202506,202511) and TARIH != LAST_DAY(TRUNC(TARIH,'MM'))
+import numpy as np
+import pandas as pd
 
-/* =============================================================================
-   RENK_MDL_DS_INPUT  —  Davranış skoru lag feature tablosu
+JOIN_KEYS = ["DONEM", "MBB_NO"]
 
-   AMAÇ
-   Renk/segment geçiş modeli için müşteri-dönem bazında girdi seti üretir.
-   Hedef dönemlerdeki her müşteriye, geriye dönük 12 aylık davranış skoru
-   (DAV_SKOR_LM ... DAV_SKOR_L12M) yan yana kolon olarak eklenir.
+# df2'den sadece join anahtarları + taşımak istediğin kolonlar
+TARGET_COLS = [
+    "TARGET_RENK3MSONRASIKIRMIZI",
+    "TARGET_RENK6MSONRASIKIRMIZI",
+    "TARGET_RENK12MSONRASIKIRMIZI",
+    "TARGET_TAKIP6M",
+]
 
-   YAPI
-   baz : SBXKVA.MUS_YENI_RENKLER_TUM_PORTFOY_FINAL'dan hedef dönemler
-         (202504, 202506, 202511). Her satır bir müşteri-dönem.
-   ds  : PSKR.SKR_TBRY_MST_DAVR_SKOR_FNL_SAS'tan aylık davranış skoru havuzu.
-         2024-01 – 2025-11 ay sonları. 202504 için 12 ay geriye gidildiğinde
-         2024-04'e denk gelir, yani en erken hedef dönem için bile geçmiş tam.
-   Ana sorgu: ds tablosu 12 kez (T2..T13) LEFT JOIN edilir; her join
-         ADD_MONTHS ile bir ay daha geriye kayar. LEFT JOIN olduğu için
-         geçmişi olmayan müşteri elenmez, ilgili lag kolonu null kalır.
+df2_slim = df2[JOIN_KEYS + TARGET_COLS].copy()
 
-   DIŞLAMA MANTIĞI (EXCL_DS_FLG / DAV_SKOR)
-   Flag yönleri karışık — üçü "1 = kontrolden geçti", ikisi "0 = temiz":
-     PERSONEL_FLAG       = 1  -> personel kontrolü tamam
-     VIP_FLAG            = 1  -> VIP kontrolü tamam
-     YAS_FLAG            = 1  -> yaş kontrolü tamam
-     FRAUD_FLAG          = 0  -> fraud kaydı yok
-     DOLANDIRICILIK_FLAG = 0  -> dolandırıcılık kaydı yok
-   Beşi birden sağlanıyorsa EXCL_DS_FLG = 0 (modele dahil).
-   Biri bile bozuksa EXCL_DS_FLG = 1 (dışla) ve DAV_SKOR null'lanır.
-   Not: PERSONEL_FLAG=1 "bu kişi personeldir" DEĞİL, "personel kontrolünden
-   geçti" demektir — 168M satırın neredeyse tamamı 1, isim yanıltıcı.
+# 1) Anahtar tiplerini iki tarafta da aynı yap (float 202506.0 vs int 202506 join'i sessizce boş getirir)
+for col in JOIN_KEYS:
+    df1[col] = pd.to_numeric(df1[col], errors="coerce").astype("Int64")
+    df2_slim[col] = pd.to_numeric(df2_slim[col], errors="coerce").astype("Int64")
 
-   QA DOĞRULAMALARI — TAMAMLANDI (2026-08-20)
-   1) QA_FLAG_DAGILIM — dışlama oranı: 168.540.462 satırın 168.205.054'ü
-      dahil (%99,8), 335.408'i dışlanıyor (%0,2). Dışlananların büyük kısmı
-      PERSONEL_FLAG=0 (275.475); FRAUD=1: 53.288, DOLANDIRICILIK=1: 4.746,
-      VIP=0: 2.231, YAS=0: 25. YAS/VIP pratikte ölü kolon.
-   2) QA_FLAG_DAGILIM — skor doluluğu: EXCL_DS_FLG=0 satırlarda DAV_SKOR
-      doluluğu %100, EXCL_DS_FLG=1 satırlarda %0. Kaynakta ek null yok.
-   3) QA_TARIH_TEKILLIK — ds tarafı: MBB_NO+TARIH birebir tekil
-      (168.540.462 = 168.540.462). Saat içeren satır 0, farklı tarih 23
-      (ay sonları). ADD_MONTHS eşitliği güvenle tutar, fan-out riski yok.
-   4) Baz tarafı tekillik kontrolü yapıldı, doğrulandı. QA_BAZ_TEKILLIK
-      dönem adetleri (67 dönem, 202101–202607, monoton artan):
-        202504 = 12.063.581 | 202506 = 12.202.497 | 202511 = 12.433.990
-      Beklenen çıktı satır sayısı = 36.700.068.
+# 2) df2 anahtar bazında tekil mi? Değilse left join satır sayısını şişirir
+dup_cnt = df2_slim.duplicated(subset=JOIN_KEYS).sum()
+print("df2 mükerrer anahtar satırı:", dup_cnt)
 
-   NOT
-   Eski sürümdeki 'gncl' join'i (cari ay olması beklenirken ADD_MONTHS -1 ile
-   yazılmıştı) T2 ile birebir aynı sonucu üretiyordu; DAV_SKOR = DAV_SKOR_LM.
-   Cari ay skoru modelde kullanılmayacağı için kolon ve join kaldırıldı.
-   ============================================================================= */
+if dup_cnt > 0:
+    # Tekilleştirme gerekiyorsa (ilk satırı al):
+    df2_slim = df2_slim.drop_duplicates(subset=JOIN_KEYS, keep="first")
 
-with baz as
-(
-SELECT MBB_NO, TARIH, DONEM
-FROM "SBXKVA"."MUS_YENI_RENKLER_TUM_PORTFOY_FINAL"
-WHERE "DONEM" in (202506, 202504, 202511)
-),
+# 3) Left join
+n_before = len(df1)
 
--- Aylık davranış skoru havuzu; dışlama kuralı burada uygulanır
-ds as
-(
-select
-MBB_NO,
-TARIH,
-to_number(TO_CHAR(TARIH, 'YYYYMM')) as DONEM,
-
-case when PERSONEL_FLAG = 1        -- personel kontrolü OK
-      AND VIP_FLAG = 1             -- VIP kontrolü OK
-      AND YAS_FLAG = 1             -- yaş kontrolü OK
-      AND FRAUD_FLAG = 0           -- fraud kaydı YOK
-      AND DOLANDIRICILIK_FLAG = 0  -- dolandırıcılık kaydı YOK
-     then 0                        -- beşi de temiz -> DIŞLAMA (0)
-     else 1                        -- biri bile bozuksa -> DIŞLA (1)
-end as EXCL_DS_FLG,
-
-case when PERSONEL_FLAG = 1
-      AND VIP_FLAG = 1
-      AND YAS_FLAG = 1
-      AND FRAUD_FLAG = 0
-      AND DOLANDIRICILIK_FLAG = 0
-     then KALIBRE_SKOR_SN_YIL_YENI  -- dahil edilen müşterinin skoru
-     else null                      -- dışlananın skoru taşınmasın
-end as DAV_SKOR
-
-from PSKR.SKR_TBRY_MST_DAVR_SKOR_FNL_SAS
-WHERE
-TARIH >= LAST_DAY(TO_DATE('2024-01', 'YYYY-MM')) and TARIH <= LAST_DAY(TO_DATE('2025-11', 'YYYY-MM'))
+df_merged = df1.merge(
+    df2_slim,
+    on=JOIN_KEYS,
+    how="left",
+    validate="m:1",      # df2 tarafı tekil değilse hata fırlatır, sessizce şişmez
+    indicator="_merge_flg",
 )
 
-SELECT
-T1."MBB_NO",
-T1."TARIH",
-T1."DONEM",
+# 4) Kontroller
+print("df1 satır:", n_before, "| merge sonrası:", len(df_merged))
+print(df_merged["_merge_flg"].value_counts())
+print("eşleşmeyen oran:", (df_merged["_merge_flg"] == "left_only").mean())
 
--- Geriye dönük 12 ay: LM = 1 ay önce ... L12M = 12 ay önce
-T2.DAV_SKOR  as DAV_SKOR_LM,
-T3.DAV_SKOR  as DAV_SKOR_L2M,
-T4.DAV_SKOR  as DAV_SKOR_L3M,
-T5.DAV_SKOR  as DAV_SKOR_L4M,
-T6.DAV_SKOR  as DAV_SKOR_L5M,
-T7.DAV_SKOR  as DAV_SKOR_L6M,
-T8.DAV_SKOR  as DAV_SKOR_L7M,
-T9.DAV_SKOR  as DAV_SKOR_L8M,
-T10.DAV_SKOR as DAV_SKOR_L9M,
-T11.DAV_SKOR as DAV_SKOR_L10M,
-T12.DAV_SKOR as DAV_SKOR_L11M,
-T13.DAV_SKOR as DAV_SKOR_L12M
+# 5) Eşleşmeyenlerde target'lar NaN kalır; int8 istiyorsan doldur
+for col in TARGET_COLS:
+    df_merged[col] = df_merged[col].fillna(0).astype("int8")
 
-FROM baz T1
-LEFT JOIN ds T2  ON T1.MBB_NO=T2.MBB_NO  AND ADD_MONTHS(T1.TARIH, -1)  = T2.TARIH
-LEFT JOIN ds T3  ON T1.MBB_NO=T3.MBB_NO  AND ADD_MONTHS(T1.TARIH, -2)  = T3.TARIH
-LEFT JOIN ds T4  ON T1.MBB_NO=T4.MBB_NO  AND ADD_MONTHS(T1.TARIH, -3)  = T4.TARIH
-LEFT JOIN ds T5  ON T1.MBB_NO=T5.MBB_NO  AND ADD_MONTHS(T1.TARIH, -4)  = T5.TARIH
-LEFT JOIN ds T6  ON T1.MBB_NO=T6.MBB_NO  AND ADD_MONTHS(T1.TARIH, -5)  = T6.TARIH
-LEFT JOIN ds T7  ON T1.MBB_NO=T7.MBB_NO  AND ADD_MONTHS(T1.TARIH, -6)  = T7.TARIH
-LEFT JOIN ds T8  ON T1.MBB_NO=T8.MBB_NO  AND ADD_MONTHS(T1.TARIH, -7)  = T8.TARIH
-LEFT JOIN ds T9  ON T1.MBB_NO=T9.MBB_NO  AND ADD_MONTHS(T1.TARIH, -8)  = T9.TARIH
-LEFT JOIN ds T10 ON T1.MBB_NO=T10.MBB_NO AND ADD_MONTHS(T1.TARIH, -9)  = T10.TARIH
-LEFT JOIN ds T11 ON T1.MBB_NO=T11.MBB_NO AND ADD_MONTHS(T1.TARIH, -10) = T11.TARIH
-LEFT JOIN ds T12 ON T1.MBB_NO=T12.MBB_NO AND ADD_MONTHS(T1.TARIH, -11) = T12.TARIH
-LEFT JOIN ds T13 ON T1.MBB_NO=T13.MBB_NO AND ADD_MONTHS(T1.TARIH, -12) = T13.TARIH
+df_merged = df_merged.drop(columns=["_merge_flg"])
