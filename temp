@@ -1,14 +1,147 @@
+import re
 import dataiku
 
-mf_test = dataiku.Folder("MODEL_RESULTS")
+RANDOM_STATE = 42
+TARGET       = 'TARGET'
+TRAIN_DONEM  = 202504
+OOT_DONEM    = 202511
 
-# 1) Nokta ile başlayan, boş dosya
-with mf_test.get_writer("/TEST_A/.keep") as w:
-    w.write(b"")
+main_folder = "MODEL_RESULTS"                        # <- hedef üst folder adı
+mf     = dataiku.Folder(main_folder)
+FOLDER = "3M_KIRMIZI_RENGE_GOC"                      # <- bu notebook'un yazdığı folder
+PATH   = "/" + FOLDER.strip("/")                     # -> "/3M_KIRMIZI_RENGE_GOC"
 
-# 2) Normal isimli, içerikli dosya
-with mf_test.get_writer("/TEST_B/_klasor.txt") as w:
-    w.write(b"klasor isareti\n")
+# --- Karşılaştırma raporu için iki alt klasör (SADECE KONTROL, oluşturulmaz) ---
+KIRMIZI_FOLDER = "3M_KIRMIZI_RENGE_GOC"              # 3M kırmızıya geçiş modeli çıktıları
+TAKIP_FOLDER   = "6M_TAKIP"                          # 6M takibe geçiş modeli çıktıları
+KIRMIZI_PATH   = "/" + KIRMIZI_FOLDER.strip("/")
+TAKIP_PATH     = "/" + TAKIP_FOLDER.strip("/")
 
-mf_test = dataiku.Folder("MODEL_RESULTS")   # handle yenile
-print("Listeleme:", mf_test.list_paths_in_partition())
+
+def _mf_yollar(folder=None):
+    """Folder içindeki tüm dosya yollarını döner.
+    Bu folder'da list_paths_in_partition() boş dönüyor (UI'da dosyalar
+    görünmesine rağmen), o yüzden yedek olarak get_path_details ile
+    kökten aşağı recursive gezilir."""
+    folder = folder or mf
+    try:
+        yollar = folder.list_paths_in_partition()
+        if yollar:
+            return yollar
+    except Exception:
+        pass
+
+    bulunan = []
+
+    def _gez(p):
+        try:
+            det = folder.get_path_details(path=p)
+        except Exception:
+            return
+        for c in det.get("children", []):
+            tam = c.get("fullPath")
+            if not tam:
+                continue
+            if c.get("directory"):
+                _gez(tam)
+            else:
+                bulunan.append(tam)
+
+    _gez("/")
+    return bulunan
+
+
+def klasor_var(alt_yol, folder=None):
+    """MODEL_RESULTS içinde alt_yol klasörü var mı (= içinde en az bir dosya var mı)."""
+    p = "/" + str(alt_yol).strip("/")
+    return any(x.startswith(p + "/") for x in _mf_yollar(folder))
+
+
+def dosya_var(alt_yol, fname, folder=None):
+    """alt_yol klasöründe fname dosyası var mı."""
+    hedef = "/" + str(alt_yol).strip("/") + "/" + str(fname).lstrip("/")
+    return hedef in _mf_yollar(folder)
+
+
+print("Hedef yol:", PATH)
+print("Mevcut icerik:", _mf_yollar())
+
+# --- HEDEF YOL: yoksa oluştur, varsa dokunma ---
+if klasor_var(PATH):
+    print("Hedef klasor zaten var, mevcut klasor ile devam ediliyor:", PATH)
+else:
+    with mf.get_writer(PATH + "/_klasor_olusturuldu.txt") as w:
+        w.write(f"{FOLDER} klasoru olusturuldu.\n".encode("utf-8"))
+    mf = dataiku.Folder(main_folder)                 # handle yenile
+    if klasor_var(PATH):
+        print("Hedef klasor yoktu, olusturuldu:", PATH)
+    else:
+        print("⚠ Hedef klasor olusturulamadi:", PATH,
+              "- yazma yetkisi / connection tipini kontrol edin")
+
+# --- Karşılaştırma klasörleri: sadece durum bilgisi ---
+print("Karsilastirma klasorleri:",
+      f"{KIRMIZI_PATH} = {'VAR' if klasor_var(KIRMIZI_PATH) else 'YOK'}",
+      "|",
+      f"{TAKIP_PATH} = {'VAR' if klasor_var(TAKIP_PATH) else 'YOK'}")
+
+CV_FOLDS = 2       # cross-validation fold sayısı
+VAL_SIZE = 0.20    # train içi validasyon oranı (threshold seçimi için)
+N_ITER   = 25      # Optuna deneme sayısı
+
+renk_map  = {'0-İnaktif': 0, '1-Kırmızı': 1, '2-Turuncu': 2, '3-Sarı': 3,
+             '4-Açık Yeşil': 4, '5-Yeşil': 5, '6-Koyu yeşil': 6}
+COLOR_MAP = {0: 'INAKTIF', 1: 'KIRMIZI', 2: 'TURUNCU', 3: 'SARI',
+             4: 'ACK_YESIL', 5: 'YESIL', 6: 'KOY_YESIL'}
+CAT_COLS  = ['SM_CALISMA_SEKLI_KOD', 'SM_MESLEK_GRP', 'SM_MESLEK_KOD']
+
+# Modelde kullanılmayacak kolonlar:
+#   - hedef bileşenleri (target'ı sızdırır)
+#   - geleceğe bakan _SONRASI ve _SONRAKI_ alanları (data leakage)
+#   - model ayı rengi ve dönem bilgisi
+LEAK_COLS = {
+    'AKB_GGS_12_90', 'AKB_TAKIP_12M_FLG', 'AKB_TKP_FLG_12M',
+    'RENK_3M_SONRASI', 'RENK_6M_SONRASI', 'RENK_12M_SONRASI',
+    'DAV_SKOR', 'KK_LIMIT', 'KK_RISK', 'MMS',
+    'AKB_TAKIP_6M', 'AKB_TAKIP_12M', 'AKB_GGS_6_90',
+    'RENK', 'DONEM', 'KK_URUN_FLG', 'TARIH',
+    'KDS_LOK_BRC_SRG_ANAHTAR', 'TARGET',
+    'RENK_SONRAKI_AY', 'RENK_SONRAKI_2AY', 'RENK_SONRAKI_3AY',
+    'RENK_SONRAKI_4AY', 'RENK_SONRAKI_5AY', 'RENK_SONRAKI_6AY',
+}
+
+# --- Geleceğe bakan kolonları desenle otomatik yakala ---
+# RENK_<herhangi>_SONRASI  : RENK_3M_SONRASI, RENK_6M_SONRASI, RENK_18M_SONRASI, RENK_1Y_SONRASI ...
+# RENK_SONRAKI_<herhangi>  : RENK_SONRAKI_AY, RENK_SONRAKI_2AY, RENK_SONRAKI_9AY ...
+SIZINTI_DESENLERI = [
+    re.compile(r'^RENK_.+_SONRASI$'),
+    re.compile(r'^RENK_SONRAKI_.+$'),
+]
+
+if 'df' in globals():
+    def _dogal_siralama_anahtari(s):
+        return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
+
+    def _liste_metni(kolonlar):
+        if not kolonlar:
+            return "[]"
+        _sirali = sorted(kolonlar, key=_dogal_siralama_anahtari)
+        return "[" + ", ".join(_sirali) + "]"
+
+    _otomatik = {c for c in df.columns
+                 if any(d.match(c) for d in SIZINTI_DESENLERI)}
+    _once = set(LEAK_COLS)
+    _zaten_olan   = _otomatik & _once
+    _yeni_eklenen = _otomatik - _once
+    LEAK_COLS.update(_otomatik)
+
+    def _liste_yaz(baslik, kolonlar):
+        print(f"\n{baslik} ({len(kolonlar)}): {_liste_metni(kolonlar)}")
+
+    _liste_yaz("Otomatik bulunan sizinti kolonu", _otomatik)
+    _liste_yaz("Zaten LEAK_COLS icinde olan", _zaten_olan)
+    _liste_yaz("Yeni eklenen", _yeni_eklenen)
+else:
+    print("⚠ df bellekte yok -> otomatik sizinti taramasi atlandi")
+
+print("\nLEAK_COLS toplam:", len(LEAK_COLS))
