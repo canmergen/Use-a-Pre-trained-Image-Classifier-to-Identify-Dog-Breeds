@@ -1,133 +1,1401 @@
-RANDOM_STATE = 42
-TARGET       = 'TARGET'
-TRAIN_DONEM  = 202504
-OOT_DONEM    = 202511
+# ============================================================
+# 3M KIRMIZI x 6M TAKİP — TEK-SHEET YÖNETİCİ RAPORU
+# ============================================================
+# EXCEL YAPISI (her analiz TEK sheet, tüm renkler alt alta):
+#   MANTIK : 3 adımlı analiz mantığı düz yazıyla — rapor kendini anlatır
+#   ADIM1  : GERÇEK x GERÇEK        (model yok; iki olay gerçekte bağlı mı)
+#   ADIM2  : MODEL -> GERÇEK TAKİP (kırmızı modeli takibi ne kadar yakalıyor,
+#            kıyas çıpası: özel takip modelinin aynı metriği)
+#   ADIM3  : MODEL x MODEL 5x5      (aynı müşterileri mi işaret ediyorlar)
+#   KARAR  : renk başına tek satır sonuç
+#   DETAY_20x20 : tam çözünürlük (tüm renkler alt alta, satır-%)
+#
+# İki model de KENDİ klasöründen deterministik kurulur.
+# Gerekli globals: df, feature_engineering, preprocess, CAT_COLS,
+# COLOR_MAP, TRAIN_DONEM, OOT_DONEM, RANDOM_STATE, TARGET, FOLDER.
 
-main_folder = "MODEL_RESULTS"                    # <- hedef üst folder adı
-mf     = dataiku.Folder(main_folder)
-FOLDER = "3M_KIRMIZI_RENGE_GOC"                  # <- bu notebook'un yazdığı folder
-PATH   = "/" + FOLDER.strip("/")                 # -> "/3M_KIRMIZI_RENGE_GOC"
+import json
+from io import BytesIO
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+import argparse
+import os
+import time
+import warnings
+from types import SimpleNamespace
 
-# --- Karşılaştırma raporu için iki alt klasör (SADECE KONTROL, oluşturulmaz) ---
-KIRMIZI_FOLDER = "3M_KIRMIZI_RENGE_GOC"          # 3M kırmızıya geçiş modeli çıktıları
-TAKIP_FOLDER   = "6M_TAKIP"                      # 6M takibe geçiş modeli çıktıları
-KIRMIZI_PATH   = "/" + KIRMIZI_FOLDER.strip("/")
-TAKIP_PATH     = "/" + TAKIP_FOLDER.strip("/")
+import dataiku
+import lightgbm as lgb
+import numpy as np
+import optuna
+import pandas as pd
+import psutil
+import pyarrow.dataset as pads
+import pyarrow.fs as pafs
+from IPython.display import display
+from dataiku import pandasutils as pdu
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from scipy.stats import randint, uniform as sp_uniform
+from sklearn.base import clone
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    make_scorer,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import (
+    GridSearchCV,
+    ParameterGrid,
+    ParameterSampler,
+    RandomizedSearchCV,
+    StratifiedKFold,
+    cross_val_predict,
+    cross_validate,
+    train_test_split,
+)
 
-def _mf_yollar(folder=None):
-    """Folder içindeki tüm dosya yollarını döner.
-    Bu folder'da list_paths_in_partition() boş dönüyor (UI'da dosyalar
-    görünmesine rağmen), o yüzden yedek olarak get_path_details ile
-    kökten aşağı recursive gezilir."""
-    folder = folder or mf
+MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
+# Folder erişimi: MODEL_RESULTS (mf) ve PATH config hücresinde tanımlı.
+# Bu bölüm mf + alt klasör yolları (KIRMIZI_PATH / TAKIP_PATH) kullanır.
+
+TAKIP_COL = 'AKB_TAKIP_6M'
+N_BUCKET  = 20
+UST       = 4                              # "en riskli" = bucket 1-4 (üst %20)
+# Tum rapor TEK esik kullanir: "en riskli" = bucket 1-4 = ust %20.
+# (Onceki taslakta ADIM2 capture@10%, KARAR B1-4 kullaniyordu — tutarsizdi.)
+CAPTURE_PCT = UST / N_BUCKET               # = 0.20
+
+# --- HÜKÜM EŞİKLERİ (öneri — iş tarafıyla mutabık kalınmalı) -------
+ESIK_SINYAL = 2.0     # T1: KAÇ KAT alt sınırı
+ESIK_KIYAS  = 0.05    # T2: özel modelin kabul edilebilir capture katkısı (puan)
+ESIK_KACAN  = 1.5     # T3: kaçan dilim / genel oran üst sınırı
+
+# --- Kaynak alt klasörler (MODEL_RESULTS içinde) ---
+# KIRMIZI_PATH / TAKIP_PATH config hücresinde tanımlı; tanımsızsa türet.
+try:
+    KIRMIZI_PATH
+except NameError:
+    KIRMIZI_PATH = "/" + str(FOLDER).strip("/")
+try:
+    TAKIP_PATH
+except NameError:
+    TAKIP_PATH = "/6M_TAKIP"
+
+
+def _dosya_var(yol):
+    """mf içinde dosya var mı. list_paths_in_partition bu folder'da boş
+    döndüğü için get_path_details ile bakılır."""
     try:
-        yollar = folder.list_paths_in_partition()
-        if yollar:
-            return yollar
+        d = mf.get_path_details("/" + str(yol).lstrip("/"))
+        return bool(d) and not bool(d.get("directory", False))
     except Exception:
-        pass
+        return False
 
-    bulunan = []
 
-    def _gez(p):
+def _klasor_var_p(yol):
+    try:
+        d = mf.get_path_details("/" + str(yol).lstrip("/"))
+        return bool(d)
+    except Exception:
+        return False
+
+
+def _renk_dosyalari_tam(fld_path, RENK_KOD, renk_adi):
+    """Bir rengin model dosyaları klasörde tam mı (val_index opsiyonel)."""
+    gerekli = [f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv",
+               f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv"]
+    return all(_dosya_var(str(fld_path).rstrip("/") + "/" + g) for g in gerekli)
+
+
+# --- GATE: iki klasör de yoksa bu bölüm hiç çalışmaz ---
+_eksik_klasor = [p for p in (KIRMIZI_PATH, TAKIP_PATH) if not _klasor_var_p(p)]
+if _eksik_klasor:
+    print(f"⚠ Eksik klasör: {_eksik_klasor} → 3M x 6M karşılaştırma raporu atlandı")
+    raise SystemExit
+
+try:
+    LGB_JOBS
+except NameError:
+    LGB_JOBS = 8
+
+
+def _csv_oku(fld_path, fname):
+    """fld_path: MODEL_RESULTS içindeki alt klasör yolu (ör. KIRMIZI_PATH)."""
+    hedef = "/" + str(fld_path).strip("/") + "/" + str(fname).lstrip("/")
+    with mf.get_download_stream(hedef) as _s:
+        return pd.read_csv(_s)
+
+
+def _skorla(fld_path, RENK_KOD, renk_adi, hedef_col, df_eng, ad):
+    """fld_path klasöründeki ayarlarla (feature+sira, best_params, val_index)
+    modeli kurar, train(%80) ile eğitir, OOT skorunu Series döner."""
+    f = _csv_oku(fld_path, f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv")
+    if 'sira' in f.columns:
+        f = f.sort_values('sira')
+    _leak = set(LEAK_COLS) if 'LEAK_COLS' in globals() else set()
+    feats = [c for c in f['feature']
+             if c in df_eng.columns and c != hedef_col and c not in _leak]
+    _dusen = [c for c in f['feature'] if c not in df_eng.columns]
+    if _dusen:
+        print(f"   ⚠ {ad}: {len(_dusen)} feature df_eng'te yok, düşürüldü "
+              f"(karşılaştırma bu model aleyhine olabilir)")
+    t = _csv_oku(fld_path, f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv")
+    row = (t[t['is_best'] == 1].iloc[0]
+           if 'is_best' in t.columns and (t['is_best'] == 1).any()
+           else t.sort_values('objective', ascending=False).iloc[0])
+    prm = json.loads(row['params_json' if 'params_json' in t.columns else 'params'])
+    prm.setdefault('subsample_freq', 1)
+
+    def _hazirla(_donem):
+        _x = df_eng.loc[df_eng['DONEM'] == _donem, feats].copy()
+        _x[hedef_col] = df_eng.loc[_x.index, hedef_col].fillna(0).astype(int)
+        return preprocess(_x)
+
+    _tr_full, _oot = _hazirla(TRAIN_DONEM), _hazirla(OOT_DONEM)
+    for c in CAT_COLS:
+        if c in _tr_full.columns and str(_tr_full[c].dtype) == 'category':
+            _oot[c] = pd.Categorical(_oot[c], categories=_tr_full[c].cat.categories)
+    try:
+        _vi = set(_csv_oku(fld_path, f"renk_{RENK_KOD}_{renk_adi}_val_index.csv")['idx'])
+        _tr = _tr_full.loc[~_tr_full.index.isin(_vi)].sort_index()
+    except Exception:
+        _tr = _tr_full.sort_index()
+    y_tr = _tr[hedef_col].astype(int)
+    if y_tr.nunique() < 2:
+        return None
+    prm.setdefault('scale_pos_weight', (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1))
+    m = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
+                           random_state=RANDOM_STATE, n_jobs=LGB_JOBS,
+                           verbose=-1).set_params(**prm)
+    m.fit(_tr[feats], y_tr)
+    print(f"   ▶ {ad}: {len(feats)} feature, train {len(_tr):,}, oot {len(_oot):,}")
+    return pd.Series(m.predict_proba(_oot[feats])[:, 1], index=_oot.index)
+
+
+def _bucketle(prob, nb=N_BUCKET):
+    p = np.asarray(prob); n = len(p)
+    order = np.argsort(p, kind="stable")
+    r = np.empty(n, dtype="float64"); r[order] = np.arange(1, n + 1)
+    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
+    return nb - np.searchsorted(edges[1:-1], r, side="left")
+
+
+def _capture(y, prob, pct):
+    y = np.asarray(y); n = len(y); tot = y.sum()
+    if tot <= 0 or n == 0:
+        return np.nan
+    k = max(1, int(pct * n))
+    top = np.argpartition(-np.asarray(prob), min(k, n - 1))[:k] if n > 1 else np.array([0])
+    return float(y[top].sum() / tot)
+
+
+# ------------------------------------------------------------
+# HESAP — tüm renkler için üç adımın verisi toplanır
+# ------------------------------------------------------------
+adim1, adim2, adim3_bloklar, karar, detay_bloklar = [], [], [], [], []
+adim1_kume_ozet = []
+kontrol_satirlari = []          # ADIM1 altına: takibe düşenlerin ilk kırmızı ayı
+kontrol2_satirlari = []         # basit ek: geçmiş 12 ay (df'in lag kolonları)
+
+# --- KONTROL: TAKİBE DÜŞENLERİN İLK KIRMIZI AYI — VERİ KAYNAĞI ------
+# İki kaynak desteklenir:
+#    'dataset'  (ÖNERİLEN): webapp'in beslendiği hazır agregat tablo —
+#        RISK_JOURNEY_ILK_KIRMIZIYA_GECIS (zone'unuza kopyaladınız).
+#        Kolonları: RENK, ILK_KIRMIZI_AY, AKB_TAKIP_12M_FLG, MUSTERI.
+#        ⚠ İKİ TANIM FARKI, tabloya not düşülür:
+#           (1) flag 12M'dir (bizim rapor 6M) → toplamlar ADIM1'le birebir
+#               TUTMAZ, tutması da beklenmez.
+#           (2) AY 7+ görülebilir (12 aylık izleme) → ayrı kolonda gösterilir.
+#    'df_aylik': df'te X sonrasi aylik RENK kayitlari varsa oradan hesap.
+# dataset okunamazsa otomatik df_aylik'e düşer; o da yoksa tablo atlanır.
+# KAYNAK: ana akışta df_raw; ADIM1 kontrolünde df_ham varsa ÖNCELİKLİ kullan.
+# Yani: sadece RENK_SONRAKI_AY..RENK_SONRAKI_6AY için df_ham'dan okunur,
+# df_ham yoksa aynı kontrol df_raw'dan hesaplanır.
+# Harici dataset'e (RISK_JOURNEY_*) İHTİYAÇ YOK — hesap tamamen bizim.
+# Hicbiri yoksa otomatik df_aylik yontemine duser (X sonrasi snapshot'lar).
+KONTROL_KAYNAK    = 'df_raw'
+KONTROL_RAW_ID    = 'MBB_NO'
+KONTROL_RAW_DONEM = 'DONEM'
+ID_COL = 'MBB_NO'
+
+
+def _ay_ekle(yyyymm, k):
+    y, m = divmod(int(yyyymm), 100)
+    m += k; y += (m - 1) // 12; m = (m - 1) % 12 + 1
+    return y * 100 + m
+
+
+KONTROL_EKSIK, _ILK_KIRMIZI = [], None
+_KONTROL_DS = None                  # (eski agregat yol kaldırıldı; uyumluluk için)
+
+_kontrol_kaynak_adi = None
+_kontrol_df = None
+_ILK_KIRMIZI_BY_DONEM = {}
+_AY45_FLAGS_BY_DONEM = {}
+_KONTROL_MODU = None  # 'renk_sonraki' | 'df_aylik'
+
+
+def _kirmizi_mi(v):
+    if pd.isna(v):
+        return False
+    sv = str(v).strip().lower()
+    # Etiket bazlı güvenli kontrol: '0-Kırmızı', '1-Kırmızı', 'KIRMIZI' vb.
+    if ('kırmızı' in sv) or ('kirmizi' in sv):
+        return True
+    return False
+
+
+def _ilk_kirmizi_from_renk_sonraki(_anchor_donem):
+    _snk_cols = ['RENK_SONRAKI_AY'] + [f'RENK_SONRAKI_{k}AY' for k in range(2, 7)]
+    _L = _kontrol_df.loc[
+        pd.to_numeric(_kontrol_df[KONTROL_RAW_DONEM], errors='coerce') == _anchor_donem,
+        [KONTROL_RAW_ID] + _snk_cols
+    ].copy()
+    if _L.empty:
+        raise RuntimeError(f"{_kontrol_kaynak_adi}'da DONEM={_anchor_donem} satırı yok")
+
+    _ilk = pd.Series(np.nan, index=_L.index)
+    for _k in range(6, 0, -1):
+        _ilk[_L[_snk_cols[_k - 1]].map(_kirmizi_mi)] = _k
+    _ids = pd.to_numeric(_L[KONTROL_RAW_ID], errors='coerce')
+    _s = (pd.Series(_ilk.values, index=_ids.values)
+          .dropna().groupby(level=0).min())
+    _s.index = _s.index.astype('int64')
+    return _s, _L
+
+
+def _ilk_kirmizi_from_df_aylik(_anchor_donem):
+    _aylar = [_ay_ekle(_anchor_donem, i) for i in range(1, 7)]
+    _mevcut = sorted(set(df['DONEM'].unique()) & set(_aylar))
+    _eksik = [a for a in _aylar if a not in _mevcut]
+    if _eksik:
+        print(f"⚠ KONTROL (DONEM={_anchor_donem}): df'te olmayan izleme ayları {_eksik}")
+    if not _mevcut:
+        return None, _eksik
+
+    _kk = (df.loc[df['DONEM'].isin(_mevcut) & (df['RENK'] == 1),
+                  [ID_COL, 'DONEM']].drop_duplicates())
+    _kk['AY'] = _kk['DONEM'].map({a: i + 1 for i, a in enumerate(_aylar)})
+    _s = _kk.groupby(ID_COL)['AY'].min()
+    return _s, _eksik
+
+
+def _ilk_kirmizi_get(_anchor_donem):
+    if _anchor_donem in _ILK_KIRMIZI_BY_DONEM:
+        return _ILK_KIRMIZI_BY_DONEM[_anchor_donem]
+    if _KONTROL_MODU == 'renk_sonraki':
         try:
-            det = folder.get_path_details(path=p)
+            _s, _ = _ilk_kirmizi_from_renk_sonraki(_anchor_donem)
+            _ILK_KIRMIZI_BY_DONEM[_anchor_donem] = _s
+            return _s
         except Exception:
-            return
-        for c in det.get("children", []):
-            tam = c.get("fullPath")
-            if not tam:
-                continue
-            if c.get("directory"):
-                _gez(tam)
+            return None
+    if _KONTROL_MODU == 'df_aylik':
+        _s, _ = _ilk_kirmizi_from_df_aylik(_anchor_donem)
+        _ILK_KIRMIZI_BY_DONEM[_anchor_donem] = _s
+        return _s
+    return None
+
+
+def _ay45_flags_get(_anchor_donem):
+    """DONEM=X satiri icin AY4/AY5'te kirmizi bayraklarini ID bazinda dondurur.
+    Cikti index=int64 ID, kolonlar: AY4_KIRMIZI(bool), AY5_KIRMIZI(bool)
+    """
+    if _anchor_donem in _AY45_FLAGS_BY_DONEM:
+        return _AY45_FLAGS_BY_DONEM[_anchor_donem]
+
+    _empty = pd.DataFrame(columns=['AY4_KIRMIZI', 'AY5_KIRMIZI'])
+    if _KONTROL_MODU == 'renk_sonraki':
+        try:
+            _need = [KONTROL_RAW_ID, KONTROL_RAW_DONEM, 'RENK_SONRAKI_4AY', 'RENK_SONRAKI_5AY']
+            _L = _kontrol_df.loc[
+                pd.to_numeric(_kontrol_df[KONTROL_RAW_DONEM], errors='coerce') == _anchor_donem,
+                _need
+            ].copy()
+            if _L.empty:
+                _AY45_FLAGS_BY_DONEM[_anchor_donem] = _empty
+                return _empty
+
+            _L['ID64'] = pd.to_numeric(_L[KONTROL_RAW_ID], errors='coerce').astype('Int64')
+            _L = _L.dropna(subset=['ID64'])
+            if _L.empty:
+                _AY45_FLAGS_BY_DONEM[_anchor_donem] = _empty
+                return _empty
+
+            _L['AY4_KIRMIZI'] = _L['RENK_SONRAKI_4AY'].map(_kirmizi_mi)
+            _L['AY5_KIRMIZI'] = _L['RENK_SONRAKI_5AY'].map(_kirmizi_mi)
+            _F = (_L.groupby('ID64')[['AY4_KIRMIZI', 'AY5_KIRMIZI']]
+                  .max()
+                  .astype(bool))
+            _F.index = _F.index.astype('int64')
+            _AY45_FLAGS_BY_DONEM[_anchor_donem] = _F
+            return _F
+        except Exception:
+            _AY45_FLAGS_BY_DONEM[_anchor_donem] = _empty
+            return _empty
+
+    if _KONTROL_MODU == 'df_aylik':
+        _a4, _a5 = _ay_ekle(_anchor_donem, 4), _ay_ekle(_anchor_donem, 5)
+        _f4 = df.loc[(df['DONEM'] == _a4) & (df['RENK'] == 1), [ID_COL]].copy()
+        _f5 = df.loc[(df['DONEM'] == _a5) & (df['RENK'] == 1), [ID_COL]].copy()
+        _f4['ID64'] = pd.to_numeric(_f4[ID_COL], errors='coerce').astype('Int64')
+        _f5['ID64'] = pd.to_numeric(_f5[ID_COL], errors='coerce').astype('Int64')
+        _id4 = set(_f4['ID64'].dropna().astype('int64').tolist())
+        _id5 = set(_f5['ID64'].dropna().astype('int64').tolist())
+        _all = sorted(_id4 | _id5)
+        if not _all:
+            _AY45_FLAGS_BY_DONEM[_anchor_donem] = _empty
+            return _empty
+        _F = pd.DataFrame(index=pd.Index(_all, dtype='int64'))
+        _F['AY4_KIRMIZI'] = _F.index.isin(_id4)
+        _F['AY5_KIRMIZI'] = _F.index.isin(_id5)
+        _AY45_FLAGS_BY_DONEM[_anchor_donem] = _F
+        return _F
+
+    _AY45_FLAGS_BY_DONEM[_anchor_donem] = _empty
+    return _empty
+
+
+if 'df_ham' in globals() or 'df_raw' in globals():
+    try:
+        if 'df_ham' in globals():
+            _kontrol_df = globals()['df_ham']
+            _kontrol_kaynak_adi = 'df_ham'
+        else:
+            _kontrol_df = globals()['df_raw']
+            _kontrol_kaynak_adi = 'df_raw'
+        _snk_cols = ['RENK_SONRAKI_AY'] + [f'RENK_SONRAKI_{k}AY'
+                                           for k in range(2, 7)]
+        _eksik_kolon = [c for c in _snk_cols if c not in _kontrol_df.columns]
+        if _eksik_kolon:
+            raise RuntimeError(f"{_kontrol_kaynak_adi}'da eksik kolon: {_eksik_kolon}")
+        _KONTROL_MODU = 'renk_sonraki'
+
+        # OOT kapsama metriği için OOT çıpasını hesapla; TRAIN de aynı
+        # yöntemle _ilk_kirmizi_get(TRAIN_DONEM) ile kullanılacak.
+        _ILK_KIRMIZI, _L = _ilk_kirmizi_from_renk_sonraki(OOT_DONEM)
+        _ILK_KIRMIZI_BY_DONEM[OOT_DONEM] = _ILK_KIRMIZI
+
+        try:
+            _ILK_KIRMIZI_BY_DONEM[TRAIN_DONEM], _ = _ilk_kirmizi_from_renk_sonraki(TRAIN_DONEM)
+        except Exception:
+            pass
+
+        _ids = pd.to_numeric(_L[KONTROL_RAW_ID], errors='coerce')
+        _df_ids = pd.to_numeric(df.loc[df['DONEM'] == OOT_DONEM, ID_COL],
+                                errors='coerce').dropna().astype('int64').unique()
+        _kaps = pd.Index(_df_ids).isin(
+            pd.Index(_ids.dropna().astype('int64').unique())).mean()
+        print(f"KONTROL kaynağı: {_kontrol_kaynak_adi} RENK_SONRAKI_1..6AY "
+              f"(DONEM={OOT_DONEM}, {len(_L):,} satır, kırmızı göreni "
+              f"{len(_ILK_KIRMIZI):,}) | df OOT kapsanma: {_kaps:.1%}"
+              + ("  ⚠ DÜŞÜK — ID/DONEM eşleşmesini kontrol edin!"
+                 if _kaps < 0.95 else ""))
+    except Exception as e:
+        print(f"⚠ RENK_SONRAKI kontrolü kullanılamadı ({e}) → df_aylik'e düşülüyor")
+        _ILK_KIRMIZI = None
+else:
+    print("⚠ df_ham/df_raw bellekte yok → df_aylik'e düşülüyor")
+
+if _ILK_KIRMIZI is None:                          # df_aylik yolu / fallback
+    _KONTROL_MODU = 'df_aylik'
+    _ILK_KIRMIZI, KONTROL_EKSIK = _ilk_kirmizi_from_df_aylik(OOT_DONEM)
+    _ILK_KIRMIZI_BY_DONEM[OOT_DONEM] = _ILK_KIRMIZI
+    _ilk_train, _ = _ilk_kirmizi_from_df_aylik(TRAIN_DONEM)
+    _ILK_KIRMIZI_BY_DONEM[TRAIN_DONEM] = _ilk_train
+GRUP_AD = ["B1-4 (EN RISKLI)", "B5-8", "B9-12", "B13-16", "B17-20"]
+
+for RENK_KOD in MODEL_RENKLER:
+    renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+    etiket   = f"{RENK_KOD}-{renk_adi}"
+    print(f"\n=== {etiket} ===")
+
+    # İçerik gate'i: bu rengin dosyaları iki klasörde de tam değilse atla
+    if not (_renk_dosyalari_tam(KIRMIZI_PATH, RENK_KOD, renk_adi)
+            and _renk_dosyalari_tam(TAKIP_PATH, RENK_KOD, renk_adi)):
+        print("   model dosyaları eksik (kırmızı/takip klasörü), atlandı"); continue
+
+    mask = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD) &
+            (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+    df_r = df.loc[mask].copy()
+    if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+        print("   veri yok, atlandı"); continue
+    df_eng, _ = feature_engineering(df_r)
+
+    kir = _skorla(KIRMIZI_PATH, RENK_KOD, renk_adi, TARGET, df_eng,
+                  "MODEL A (X+3 aninda kirmizi mi?)")
+    tak = _skorla(TAKIP_PATH, RENK_KOD, renk_adi, TAKIP_COL, df_eng,
+                  "MODEL B (X+6 aninda takipte mi?)")
+    if kir is None or tak is None:
+        print("   model kurulamadı, atlandı"); continue
+
+    d = pd.DataFrame({'kir_skor': kir, 'tak_skor': tak.reindex(kir.index)}).dropna()
+    d['kir_gercek'] = df.loc[d.index, TARGET].fillna(0).astype(int)
+    d['tak_gercek'] = df.loc[d.index, TAKIP_COL].fillna(0).astype(int)
+    d['kb'] = _bucketle(d['kir_skor'].to_numpy())
+    d['tb'] = _bucketle(d['tak_skor'].to_numpy())
+    n = len(d)
+
+    # ---- ADIM 1: GERCEK x GERCEK (TRAIN + OOT) ----
+    # Tek cipa X'tir ve endpoint tanimi kullanilir:
+    # kirmizi olayi X+3 anindaki durum, takip olayi X+6 anindaki durumdur.
+    # Bu adim model skoru kullanmaz; iki donemde de ayni tanimla hesaplanir.
+    # Ozet: TRAIN/OOT benzerse sinyal stabil, fark buyukse karar kirilgandir.
+    def _a1_satir(_don, _don_ad):
+        _m = df_r['DONEM'] == _don
+        _k = df_r.loc[_m, TARGET].fillna(0).astype(int) == 1
+        _t = df_r.loc[_m, TAKIP_COL].fillna(0).astype(int) == 1
+        _r0 = df_r.loc[_m, 'RENK'].fillna(-1).astype(int) == 1
+        _m_n = int(_m.sum())
+        _k_n = int(_k.sum())
+        _k0_n = int((~_k).sum())
+        _kt_n = int((_k & _t).sum())
+        _k0t_n = int((~_k & _t).sum())
+        _kt_not_n = int((_k & (~_t)).sum())
+        _p1 = float(_t[_k].mean()) if _k.any() else np.nan
+        _p0 = float(_t[~_k].mean()) if (~_k).any() else np.nan
+
+        _k0_t = (~_k) & _t
+        _k0_t_n = int(_k0_t.sum())
+        _t_n = int(_t.sum())
+        _t_r03_n = int((_t & (_r0 | _k)).sum())
+        _tk_13_n, _tk_13_p = None, None
+        _tk_not13_n, _tk_not13_p = None, None
+        _tk_46_n, _tk_46_p = None, None
+        _tk_none_n, _tk_none_p = None, None
+        _ay46_n, _hic6_n = None, None
+        _ay46_p, _hic6_p = None, None
+
+        # Ek teshis: endpoint tanimini degistirmez; sadece profil okumasi icin
+        # ara aylardaki (ay1-6) kirmizi zamanlamasini ayirir.
+        _ilk_kirmizi_donem = _ilk_kirmizi_get(_don)
+        if (_ilk_kirmizi_donem is not None) and (ID_COL in df_r.columns) and (_t_n > 0):
+            _tk_ids_all = pd.to_numeric(df_r.loc[_m & _t, ID_COL], errors='coerce').dropna().astype('int64')
+            _ilk_all = _ilk_kirmizi_donem.reindex(_tk_ids_all.values)
+            _tk_13_n = int(_ilk_all.le(3).sum())
+            _tk_not13_n = int(_t_n - _tk_13_n)
+            _tk_46_n = int(_ilk_all.between(4, 6).sum())
+            _tk_none_n = int(_ilk_all.isna().sum())
+            _tk_13_p = round(_tk_13_n / _t_n, 4)
+            _tk_not13_p = round(_tk_not13_n / _t_n, 4)
+            _tk_46_p = round(_tk_46_n / _t_n, 4)
+            _tk_none_p = round(_tk_none_n / _t_n, 4)
+
+        if (_ilk_kirmizi_donem is not None) and (ID_COL in df_r.columns) and (_k0_t_n > 0):
+            _ids = pd.to_numeric(df_r.loc[_m & _k0_t, ID_COL], errors='coerce').dropna().astype('int64')
+            _ilk = _ilk_kirmizi_donem.reindex(_ids.values)
+            _ay46_n = int(_ilk.between(4, 6).sum())
+            _hic6_n = int(_ilk.isna().sum())
+            _ay46_p = round(_ay46_n / _k0_t_n, 4)
+            _hic6_p = round(_hic6_n / _k0_t_n, 4)
+
+        # X+3'te kirmizi degil ama X+6'da takipte olan alt kume icin AY4/AY5
+        # kirmizi kirilimi: hem KIRMIZI bakisinda (baz _k_n) hem TAKIP
+        # bakisinda (baz _t_n) oran verilir.
+        _ay4_n, _ay5_n, _ay45_any_n = None, None, None
+        _ay4_p_k, _ay5_p_k, _ay45_any_p_k = None, None, None
+        _ay4_p_t, _ay5_p_t, _ay45_any_p_t = None, None, None
+        if (ID_COL in df_r.columns) and (_k0_t_n > 0):
+            _flags = _ay45_flags_get(_don)
+            if _flags is not None and len(_flags) > 0:
+                _ids45 = pd.to_numeric(df_r.loc[_m & _k0_t, ID_COL], errors='coerce').dropna().astype('int64')
+                _sub = _flags.reindex(_ids45.values).fillna(False)
+                _ay4_n = int(_sub['AY4_KIRMIZI'].sum())
+                _ay5_n = int(_sub['AY5_KIRMIZI'].sum())
+                _ay45_any_n = int((_sub['AY4_KIRMIZI'] | _sub['AY5_KIRMIZI']).sum())
+                _ay4_p_k = round(_ay4_n / max(_k_n, 1), 4) if _k_n > 0 else None
+                _ay5_p_k = round(_ay5_n / max(_k_n, 1), 4) if _k_n > 0 else None
+                _ay45_any_p_k = round(_ay45_any_n / max(_k_n, 1), 4) if _k_n > 0 else None
+                _ay4_p_t = round(_ay4_n / max(_t_n, 1), 4) if _t_n > 0 else None
+                _ay5_p_t = round(_ay5_n / max(_t_n, 1), 4) if _t_n > 0 else None
+                _ay45_any_p_t = round(_ay45_any_n / max(_t_n, 1), 4) if _t_n > 0 else None
+
+        return {
+            'RENK': etiket, 'DÖNEM': _don_ad, 'MÜŞTERİ': _m_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLAN KİTLE (adet)': _k_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLAN KİTLE (%)':
+                round(float(_k_n / max(_m_n, 1)), 4) if _m_n > 0 else None,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİP (adet)': _kt_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİP (%)':
+                round(float(_kt_n / max(_k_n, 1)), 4) if _k_n > 0 else None,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİPTE OLMAYAN (adet)': _kt_not_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİPTE OLMAYAN (%)':
+                round(float(_kt_not_n / max(_k_n, 1)), 4) if _k_n > 0 else None,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYAN KİTLE (adet)': _k0_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYANLARDA X+6 TAKİP (adet)': _k0t_n,
+            'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYANLARDA X+6 TAKİP (%)': round(_p0, 4) if np.isfinite(_p0) else None,
+            'TAKİP RİSK KATI (GEÇEN/GEÇMEYEN)': round(_p1 / _p0, 1)
+                if np.isfinite(_p1) and np.isfinite(_p0) and _p0 > 0 else None,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLAN KİTLE (adet)': int(_t.sum()),
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLAN KİTLE (%)':
+                round(float(_t.sum() / max(_m_n, 1)), 4) if _m_n > 0 else None,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA AY0-3 KIRMIZI GÖREN (%, AY0 dahil)':
+                round(float(_t_r03_n / max(_t_n, 1)), 4) if _t.any() else None,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA AY0-3 KIRMIZI GÖREN (adet, AY0 dahil)': _t_r03_n,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞEN (adet)': _tk_13_n,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞEN (%)': _tk_13_p,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞMEYEN (adet)': _tk_not13_n,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞMEYEN (%)': _tk_not13_p,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 4-6 AY KIRMIZIYA DÜŞEN (adet)': _tk_46_n,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 4-6 AY KIRMIZIYA DÜŞEN (%)': _tk_46_p,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 6 AY HİÇ KIRMIZIYA DÜŞMEYEN (adet)': _tk_none_n,
+            'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 6 AY HİÇ KIRMIZIYA DÜŞMEYEN (%)': _tk_none_p,
+            'ALT KÜME | X+3 KIRMIZI DEĞİL & X+6 TAKİPTE (adet)': _k0_t_n,
+            'ALT KÜME | X+4 KIRMIZI OLAN (adet)': _ay4_n,
+            'ALT KÜME | X+4 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]': _ay4_p_k,
+            'ALT KÜME | X+4 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]': _ay4_p_t,
+            'ALT KÜME | X+5 KIRMIZI OLAN (adet)': _ay5_n,
+            'ALT KÜME | X+5 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]': _ay5_p_k,
+            'ALT KÜME | X+5 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]': _ay5_p_t,
+            'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (adet)': _ay45_any_n,
+            'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]': _ay45_any_p_k,
+            'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]': _ay45_any_p_t,
+            'ALT KÜME | 4-6 AYDA KIRMIZI OLAN (adet)': _ay46_n,
+            'ALT KÜME | 4-6 AYDA KIRMIZI OLAN (%)': _ay46_p,
+            'ALT KÜME | 6 AY HİÇ KIRMIZI OLMAYAN (adet)': _hic6_n,
+            'ALT KÜME | 6 AY HİÇ KIRMIZI OLMAYAN (%)': _hic6_p,
+        }
+    adim1.append(_a1_satir(TRAIN_DONEM, f'TRAIN {TRAIN_DONEM}'))
+    adim1.append(_a1_satir(OOT_DONEM,   f'OOT {OOT_DONEM}'))
+
+    def _a1_kume_tablo_satirlari(_don, _don_ad):
+        _m = df_r['DONEM'] == _don
+        _k = df_r.loc[_m, TARGET].fillna(0).astype(int) == 1
+        _t = df_r.loc[_m, TAKIP_COL].fillna(0).astype(int) == 1
+        _flags = _ay45_flags_get(_don)
+
+        def _ozet(_grup_mask):
+            # Grup maskesi parcali indexle gelebilir; once df_r indexine
+            # guvenli sekilde hizala, sonra donem filtresiyle kes.
+            if isinstance(_grup_mask, pd.Series):
+                _mask = _grup_mask.reindex(df_r.index, fill_value=False).astype(bool)
             else:
-                bulunan.append(tam)
+                _mask = pd.Series(_grup_mask, index=df_r.index).astype(bool)
+            _mask = _mask & _m
+            _n = int(_mask.sum())
+            if _n == 0:
+                return {'BAZ KİTLE (adet)': 0,
+                        'X+4 KIRMIZI (adet)': 0, 'X+4 KIRMIZI (%)': None,
+                        'X+5 KIRMIZI (adet)': 0, 'X+5 KIRMIZI (%)': None,
+                        'X+4 veya X+5 KIRMIZI (adet)': 0, 'X+4 veya X+5 KIRMIZI (%)': None}
 
-    _gez("/")
-    return bulunan
+            if (ID_COL not in df_r.columns) or (_flags is None) or (len(_flags) == 0):
+                return {'BAZ KİTLE (adet)': _n,
+                        'X+4 KIRMIZI (adet)': None, 'X+4 KIRMIZI (%)': None,
+                        'X+5 KIRMIZI (adet)': None, 'X+5 KIRMIZI (%)': None,
+                        'X+4 veya X+5 KIRMIZI (adet)': None, 'X+4 veya X+5 KIRMIZI (%)': None}
 
-def klasor_var(alt_yol, folder=None):
-    """MODEL_RESULTS içinde alt_yol klasörü var mı (= içinde en az bir dosya var mı)."""
-    p = "/" + str(alt_yol).strip("/")
-    return any(x.startswith(p + "/") for x in _mf_yollar(folder))
+            _ids = pd.to_numeric(df_r.loc[_mask, ID_COL], errors='coerce').dropna().astype('int64')
+            _sub = _flags.reindex(_ids.values).fillna(False)
+            _x4 = int(_sub['AY4_KIRMIZI'].sum())
+            _x5 = int(_sub['AY5_KIRMIZI'].sum())
+            _x45 = int((_sub['AY4_KIRMIZI'] | _sub['AY5_KIRMIZI']).sum())
+            return {
+                'BAZ KİTLE (adet)': _n,
+                'X+4 KIRMIZI (adet)': _x4,
+                'X+4 KIRMIZI (%)': round(_x4 / _n, 4),
+                'X+5 KIRMIZI (adet)': _x5,
+                'X+5 KIRMIZI (%)': round(_x5 / _n, 4),
+                'X+4 veya X+5 KIRMIZI (adet)': _x45,
+                'X+4 veya X+5 KIRMIZI (%)': round(_x45 / _n, 4),
+            }
 
-def dosya_var(alt_yol, fname, folder=None):
-    """alt_yol klasöründe fname dosyası var mı."""
-    hedef = "/" + str(alt_yol).strip("/") + "/" + str(fname).lstrip("/")
-    return hedef in _mf_yollar(folder)
+        _gruplar = [
+            ('TABLO 0', 'TUM MUSTERI', _m),
+            ('TABLO 1', 'TAKİP BAZI: X+6 TAKİPTE', _t),
+            ('TABLO 2', 'KIRMIZI BAZI: X+3 KIRMIZI', _k),
+            ('TABLO 3', 'ORTAK: X+3 KIRMIZI & X+6 TAKİP', _k & _t),
+            ('TABLO 3', 'SADECE KIRMIZI: X+3 KIRMIZI & X+6 TAKİP DEĞİL', _k & (~_t)),
+            ('TABLO 3', 'SADECE TAKİP (DIŞTA KALAN): X+3 KIRMIZI DEĞİL & X+6 TAKİP', (~_k) & _t),
+        ]
 
-print("Hedef yol:", PATH)
-print("Mevcut icerik:", _mf_yollar())
+        for _tablo, _grup_ad, _grup_mask in _gruplar:
+            _sat = _ozet(_grup_mask)
+            adim1_kume_ozet.append({
+                'RENK': etiket,
+                'DÖNEM': _don_ad,
+                'TABLO': _tablo,
+                'GRUP': _grup_ad,
+                **_sat,
+            })
 
-# --- HEDEF YOL: varsa mevcutla devam, yoksa ilk cikti yazildiginda olusur ---
-if klasor_var(PATH):
-    print("Hedef klasor zaten var, mevcut klasor ile devam ediliyor:", PATH)
-else:
-    print("Hedef klasor henuz yok; ilk cikti dosyasi yazildiginda olusacak:", PATH)
+    _a1_kume_tablo_satirlari(TRAIN_DONEM, f'TRAIN {TRAIN_DONEM}')
+    _a1_kume_tablo_satirlari(OOT_DONEM, f'OOT {OOT_DONEM}')
 
-# --- Karşılaştırma klasörleri: sadece durum bilgisi ---
-print("Karsilastirma klasorleri:",
-      f"{KIRMIZI_PATH} = {'VAR' if klasor_var(KIRMIZI_PATH) else 'YOK'}",
-      "|",
-      f"{TAKIP_PATH} = {'VAR' if klasor_var(TAKIP_PATH) else 'YOK'}")
+    # --- KONTROL: bu rengin takibe düşenlerinde ilk kırmızı ayı ---
+    # Kırmızı segment hariç (orada herkes ay 0'da zaten kırmızı).
+    if RENK_KOD != 1:
+        _r = None
+        if False:
+            pass
+        elif _ilk_kirmizi_get(OOT_DONEM) is not None and ID_COL in df.columns:
+            _tk_ids = pd.to_numeric(
+                df.loc[(df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD)
+                       & (df['DONEM'] == OOT_DONEM)
+                       & (df[TAKIP_COL].fillna(0).astype(int) == 1), ID_COL],
+                errors='coerce').dropna().astype('int64')
+            _nt = len(_tk_ids)
+            if _nt:
+                _ay = _ilk_kirmizi_get(OOT_DONEM).reindex(_tk_ids.values)
+                _r = {'RENK': etiket, 'TAKİBE DÜŞEN (OOT, 6M)': _nt}
+                for _i in range(1, 7):
+                    _r[f'AY {_i} (adet)'] = int((_ay == _i).sum())
+                _p13, _p46 = int(_ay.le(3).sum()), int(_ay.between(4, 6).sum())
+                _hic = int(_ay.isna().sum())
+                _r['PENCERE İÇİ ay1-3 (adet)'] = _p13
+                _r['PENCERE İÇİ %'] = round(_p13 / _nt, 4)
+                _r['PENCERE SONRASI ay4-6 (adet)'] = _p46
+                _r['PENCERE SONRASI %'] = round(_p46 / _nt, 4)
+                _r['HİÇ KIRMIZI YOK (adet)'] = _hic
+                _r['HİÇ KIRMIZI YOK %'] = round(_hic / _nt, 4)
+        if _r:
+            kontrol_satirlari.append(_r)
 
-CV_FOLDS = 2          # cross-validation fold sayısı
-VAL_SIZE = 0.20       # train içi validasyon oranı (threshold seçimi için)
-N_ITER   = 25         # Optuna deneme sayısı
+    # --- BASİT EK: GEÇMİŞ 12 AY (df'in KENDİ RENK_LxM kolonlarından) ---
+    # Harici kaynak yok: X anındaki satırda RENK_LM = X-1'in rengi,
+    # L2M = X-2 ... L12M = X-12. Takibe düşenler X'ten ÖNCE kırmızı
+    # görmüş mü, en son ne kadar önce? (uzmanların "%99 görür" dediği
+    # geçmiş pencerenin bizim verimizdeki karşılığı)
+    _lagc = [c for c in (['RENK_LM'] + [f'RENK_L{k}M' for k in range(2, 13)])
+             if c in df.columns]
+    if _lagc:
+        _oot_m = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD)
+                  & (df['DONEM'] == OOT_DONEM)
+                  & (df[TAKIP_COL].fillna(0).astype(int) == 1))
+        _T = df.loc[_oot_m, _lagc]
+        _n2 = len(_T)
+        if _n2:
+            def _kmz(col):                    # '1-Kırmızı' / 1 → True
+                sv = _T[col].astype(str).str.strip()
+                return sv.str.startswith('1') & ~sv.str.startswith(('10', '11', '12'))
+            # en son kırmızı kaç ay önce (1 = geçen ay)
+            _son = pd.Series(np.nan, index=_T.index)
+            for i in range(len(_lagc), 0, -1):    # uzaktan yakına: yakın ay ezsin
+                _son[_kmz(_lagc[i-1])] = i
+            _s13  = int(_son.le(3).sum())
+            _s412 = int(_son.between(4, 12).sum())
+            _hic2 = int(_son.isna().sum())
+            kontrol2_satirlari.append({
+                'RENK': etiket, 'TAKİBE DÜŞEN (OOT)': _n2,
+                'SON 3 AYDA KIRMIZI (adet)': _s13,
+                'SON 3 AYDA %': round(_s13 / _n2, 4),
+                'SON 4-12 AYDA KIRMIZI (adet)': _s412,
+                'SON 4-12 AYDA %': round(_s412 / _n2, 4),
+                'SON 12 AYDA HİÇ YOK (adet)': _hic2,
+                'SON 12 AYDA HİÇ YOK %': round(_hic2 / _n2, 4)})
 
-renk_map  = {'0-İnaktif': 0, '1-Kırmızı': 1, '2-Turuncu': 2, '3-Sarı': 3,
-             '4-Açık Yeşil': 4, '5-Yeşil': 5, '6-Koyu yeşil': 6}
-COLOR_MAP = {0: 'INAKTIF', 1: 'KIRMIZI', 2: 'TURUNCU', 3: 'SARI',
-             4: 'ACK_YESIL', 5: 'YESIL', 6: 'KOY_YESIL'}
-CAT_COLS  = ['SM_CALISMA_SEKLI_KOD', 'SM_MESLEK_GRP', 'SM_MESLEK_KOD']
+    # Hüküm (T1) OOT satırından beslenir — model içeren testlerle aynı dönem.
+    k1, t1 = d.kir_gercek == 1, d.tak_gercek == 1
+    p_t_k1 = float(t1[k1].mean()) if k1.any() else np.nan
+    p_t_k0 = float(t1[~k1].mean()) if (~k1).any() else np.nan
 
-# Modelde kullanılmayacak kolonlar:
-#   - hedef bileşenleri (target'ı sızdırır)
-#   - geleceğe bakan _SONRASI ve _SONRAKI_ alanları (data leakage)
-#   - model ayı rengi ve dönem bilgisi
-LEAK_COLS = {
-    'AKB_GGS_12_90', 'AKB_TAKIP_12M_FLG', 'AKB_TKP_FLG_12M',
-    'RENK_3M_SONRASI', 'RENK_6M_SONRASI', 'RENK_12M_SONRASI',
-    'DAV_SKOR', 'KK_LIMIT', 'KK_RISK', 'MMS',
-    'AKB_TAKIP_6M', 'AKB_TAKIP_12M', 'AKB_GGS_6_90',
-    'RENK', 'DONEM', 'KK_URUN_FLG', 'TARIH',
-    'KDS_LOK_BRC_SRG_ANAHTAR', 'TARGET',
-    'RENK_SONRAKI_AY', 'RENK_SONRAKI_2AY', 'RENK_SONRAKI_3AY',
-    'RENK_SONRAKI_4AY', 'RENK_SONRAKI_5AY', 'RENK_SONRAKI_6AY',
-}
+    # ---- ADIM 2: model -> gerçek takip (kıyas çıpalı) ----
+    cap_kir_takip = _capture(d.tak_gercek, d.kir_skor, CAPTURE_PCT)
+    cap_tak_takip = _capture(d.tak_gercek, d.tak_skor, CAPTURE_PCT)
+    _kb_ust = d.kb <= UST
+    adim2.append({
+        'RENK': etiket,
+        'KIRMIZI MODELİ B1-4 MÜŞTERİ': int(_kb_ust.sum()),
+        'B1-4te GERÇEK TAKİP ORANI': round(float(d.loc[_kb_ust, 'tak_gercek'].mean()), 4),
+        'RENK GENELİ TAKİP ORANI': round(float(d.tak_gercek.mean()), 4),
+        'KIRMIZI MODELİN TAKİP CAPTURE@20%': round(cap_kir_takip, 4),
+        'ÖZEL TAKİP MODELİNİN CAPTURE@20% (KIYAS)': round(cap_tak_takip, 4),
+        'FARK (özel modelin kattığı)': round(cap_tak_takip - cap_kir_takip, 4)
+            if np.isfinite(cap_tak_takip) and np.isfinite(cap_kir_takip) else None,
+    })
 
-# --- Geleceğe bakan kolonları desenle otomatik yakala ---
-# RENK_<herhangi>_SONRASI  : RENK_3M_SONRASI, RENK_6M_SONRASI, RENK_18M_SONRASI, RENK_1Y_SONRASI ...
-# RENK_SONRAKI_<herhangi>  : RENK_SONRAKI_AY, RENK_SONRAKI_2AY, RENK_SONRAKI_9AY ...
-SIZINTI_DESENLERI = [
-    re.compile(r'^RENK_.+_SONRASI$'),
-    re.compile(r'^RENK_SONRAKI_.+$'),
-]
+    # ---- ADIM 3: 5x5 model x model — ADET ve SATIR-% YAN YANA ----
+    d['kb_g'] = ((d.kb - 1) // 4 + 1)
+    d['tb_g'] = ((d.tb - 1) // 4 + 1)
+    g = d.pivot_table(index='kb_g', columns='tb_g', values='kir_skor',
+                      aggfunc='count', fill_value=0)
+    gp = (g.div(g.sum(axis=1), axis=0) * 100).round(1)
+    blok = pd.DataFrame({
+        'RENK': etiket,
+        'SATIR: KIRMIZI modeli / SUTUN: TAKIP modeli':
+            [f"KIRMIZIYA-GECIS SKORU {GRUP_AD[i-1]}" for i in g.index]})
+    for c in g.columns:                                    # önce ADET bloğu
+        blok[f"ADET | TAKIP {GRUP_AD[c-1]}"] = g[c].values
+    blok['TOPLAM'] = g.sum(axis=1).values
+    for c in gp.columns:                                   # sonra % bloğu
+        blok[f"% | TAKIP {GRUP_AD[c-1]}"] = gp[c].values
+    adim3_bloklar.append(blok)
 
-if 'df' in globals():
-    def _dogal_siralama_anahtari(s):
-        return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
+    # ---- KARAR ----
+    _t_ust = d.tb <= UST
+    ortusme = float((_kb_ust & _t_ust).sum() / max(int(_kb_ust.sum()), 1))
+    _kacan = (~_kb_ust) & _t_ust
+    kacan_rate = float(d.loc[_kacan, 'tak_gercek'].mean()) if _kacan.any() else np.nan
+    # Eşik gerekçesi: rastgele örtüşme tabanı %20 (4/20 bucket).
+    #    >= 3x rastgele (%60)   → güçlü örtüşme
+    #    >= ~1.75x rastgele (%35) → kısmi
+    #    altı                     → rastgeleden zor ayrışıyor
+    if ortusme >= 0.60:
+        sonuc = "ÖRTÜŞÜYOR (≥3x rastgele) — tek model tartışılabilir"
+    elif ortusme >= 0.35:
+        sonuc = "KISMİ (~2x rastgele) — kaçan dilime bakın"
+    else:
+        sonuc = "AYRIŞIYOR (rastgeleye yakın) — iki model de gerekli"
+    ort_rate  = float(d.loc[_kb_ust & _t_ust, 'tak_gercek'].mean()) \
+        if (_kb_ust & _t_ust).any() else np.nan
+    genel_rate = float(d.tak_gercek.mean())
+    karar.append({
+        '_n_takip': int(d.tak_gercek.sum()),   # hüküm için taşıyıcı; KARAR sheet'ine yazılmaz
+        'RENK': etiket,
+        'ÖRTÜŞME: kırmızı B1-4ün takipte de B1-4te olan oranı': round(ortusme, 4),
+        'RASTGELE BEKLENEN': 0.20,
+        'KAÇAN DİLİM MÜŞTERİ (takip B1-4, kırmızı B5-20)': int(_kacan.sum()),
+        'KAÇAN DİLİMİN GERÇEK TAKİP ORANI': round(kacan_rate, 4)
+            if np.isfinite(kacan_rate) else None,
+        # KIYAS: kaçan dilim tek başına yorumlanamaz — örtüşen dilim ve
+        # renk geneli yanında olmadan "%X çok mu?" sorusu cevapsız kalır.
+        'ÖRTÜŞEN DİLİMİN GERÇEK TAKİP ORANI': round(ort_rate, 4)
+            if np.isfinite(ort_rate) else None,
+        'RENK GENELİ TAKİP ORANI': round(genel_rate, 4),
+        'KAÇAN / GENEL (kaç kat)': round(kacan_rate / genel_rate, 1)
+            if np.isfinite(kacan_rate) and genel_rate > 0 else None,
+        'SONUÇ': sonuc,
+    })
+    # --- HİÇ BİLMEYEN BİRİNİN OKUYABİLECEĞİ RENK ÖZETİ ---
+    _f  = cap_tak_takip - cap_kir_takip
+    _ek = int(round(_f * int(d.tak_gercek.sum())))
+    print()
+    print(f"  —— {etiket} SEGMENTİ: NE BULDUK? " + "—" * 30)
+    print(f"  İki ayrı tahmin modeli karşılaştırılıyor:")
+    print(f"    MODEL A: müşteri X+3 anında KIRMIZI olur mu?")
+    print(f"    MODEL B: müşteri X+6 anında TAKİPTE olur mu?")
+    print(f"  Soru: A modeli B'nin işini de görüyor mu? Görüyorsa B'ye gerek yok.")
+    print(f"  Test dönemi: {OOT_DONEM} — modellerin eğitimde HİÇ görmediği ay.")
+    print(f"  Bu ay gerçekten takibe düşen: {int(d.tak_gercek.sum()):,} müşteri.")
+    print()
+    print(f"  1) İKİ MODEL AYNI KİŞİLERİ Mİ İŞARET EDİYOR?")
+    print(f"     A'nın 'en riskli %20' dediği müşterilerin {ortusme:.1%}'i, B'de de")
+    print(f"     en riskli %20'de. Kıyas: iki model tamamen ALAKASIZ olsaydı bile")
+    print(f"     bu oran ~%20 çıkardı. → "
+          + ("Büyük ölçüde aynı kitle." if ortusme >= 0.60 else
+             "Kısmen örtüşüyor." if ortusme >= 0.35 else
+             "Neredeyse alakasız çalışıyorlar."))
+    print()
+    _n_tak   = int(d.tak_gercek.sum())
+    _a_adet  = int(round(cap_kir_takip * _n_tak))
+    _b_adet  = int(round(cap_tak_takip * _n_tak))
+    print(f"  2) GERÇEKTEN TAKİBE DÜŞENLERİ HANGİSİ ÖNCEDEN İŞARETLERDİ?")
+    print(f"     Her model tüm müşterileri risk sırasına dizer. Diyelim ki her")
+    print(f"     modelin listesindeki EN RİSKLİ %20'lik gruba önceden aksiyon")
+    print(f"     alıyoruz (arama, limit, yakın izleme).")
+    print(f"     Bu ay takibe düşen {_n_tak:,} kişiden önceden işaretlenmiş olurdu:")
+    print(f"        A modelinin listesiyle: {_a_adet:>10,} kişi  ({cap_kir_takip:.1%})")
+    print(f"        B modelinin listesiyle: {_b_adet:>10,} kişi  ({cap_tak_takip:.1%})")
+    print(f"     → B ile {_b_adet - _a_adet:+,} kişi FAZLA erken yakalanırdı."
+          + ("  A'nın listesi bu segmentte rastgele %20 seçmekten bile az"
+             " yakalıyor — çünkü A'nın hedefi (kırmızıda kalış) takiple"
+             " TERS ilişkili." if cap_kir_takip < CAPTURE_PCT else ""))
+    print()
+    if np.isfinite(kacan_rate) and genel_rate > 0:
+        _kacan_n   = int(_kacan.sum())
+        # Ölçek otomatik: oranlar küçükse "her 100 kişi" ezilip ~0 basıyordu
+        # (yeşil segmentlerde 0.0x%). Taban, genel oranı en az 1'e getirecek
+        # şekilde 100 / 1.000 / 10.000 / 100.000 arasından seçilir.
+        _taban = 100
+        while _taban < 100_000 and genel_rate * _taban < 1:
+            _taban *= 10
+        _kacan_t = round(kacan_rate * _taban)
+        _genel_t = round(genel_rate * _taban)
+        _tb_ad   = f"{_taban:,}".replace(",", ".")
+        print(f"  3) SADECE A MODELİNİ KULLANSAYDIK KİMLER GÖZDEN KAÇARDI?")
+        print(f"     B'nin 'riskli' bulduğu ama A'nın listesine GİRMEYEN {_kacan_n:,}")
+        print(f"     kişi var. Sadece A'yı kullansaydık bu gruba kimse bakmazdı.")
+        print(f"     Peki gerçekte ne oldu? Bu gruptaki her {_tb_ad} kişiden ~{_kacan_t}'i")
+        print(f"     takibe düştü. Kıyas: segmentte sıradan {_tb_ad} kişiden ~{_genel_t}'i")
+        print(f"     düşüyor. → "
+              + (f"Kaçan grup sıradan müşteri DEĞİL — {kacan_rate/genel_rate:.1f} kat"
+                 f" yoğun risk taşıyor, göz ardı edilemez."
+                 if kacan_rate/genel_rate > ESIK_KACAN else
+                 f"Kaçan grubun riski segment ortalamasına yakın"
+                 f" ({kacan_rate/genel_rate:.1f} kat), kritik bir kayıp değil."))
+    print(f"  " + "—" * 62)
 
-    def _liste_metni(kolonlar):
-        if not kolonlar:
-            return "[]"
-        _sirali = sorted(kolonlar, key=_dogal_siralama_anahtari)
-        return "[" + ", ".join(_sirali) + "]"
+    # ---- 20x20 detay — ADET ve SATIR-% YAN YANA ----
+    nm = d.pivot_table(index='kb', columns='tb', values='kir_skor',
+                       aggfunc='count', fill_value=0)
+    pm = (nm.div(nm.sum(axis=1), axis=0) * 100).round(1)
+    det = pd.DataFrame({
+        'RENK': etiket,
+        'SATIR: KIRMIZI / SUTUN: TAKIP':
+            [f"KIRMIZI_B{i}" for i in nm.index]})
+    for c in nm.columns:
+        det[f"ADET T_B{c}"] = nm[c].values
+    for c in pm.columns:
+        det[f"% T_B{c}"] = pm[c].values
+    detay_bloklar.append(det)
 
-    _otomatik = {c for c in df.columns
-                 if any(d.match(c) for d in SIZINTI_DESENLERI)}
-    _once = set(LEAK_COLS)
-    _zaten_olan   = _otomatik & _once
-    _yeni_eklenen = _otomatik - _once
-    LEAK_COLS.update(_otomatik)
+def _genel_kume_satirlari(_don, _don_ad):
+    # Filtre uygulanmadan tum portfoy: TRAIN/OOT ayrik satirlar
+    _m = df['DONEM'] == _don
+    _k = df.loc[_m, TARGET].fillna(0).astype(int) == 1
+    _t = df.loc[_m, TAKIP_COL].fillna(0).astype(int) == 1
+    _flags = _ay45_flags_get(_don)
 
-    def _liste_yaz(baslik, kolonlar):
-        print(f"\n{baslik} ({len(kolonlar)}): {_liste_metni(kolonlar)}")
+    def _ozet(_grup_mask):
+        # Grup maskesi parcali indexle gelebilir; once df indexine
+        # guvenli sekilde hizala, sonra donem filtresiyle kes.
+        if isinstance(_grup_mask, pd.Series):
+            _mask = _grup_mask.reindex(df.index, fill_value=False).astype(bool)
+        else:
+            _mask = pd.Series(_grup_mask, index=df.index).astype(bool)
+        _mask = _mask & _m
+        _n = int(_mask.sum())
+        if _n == 0:
+            return {'BAZ KİTLE (adet)': 0,
+                    'X+4 KIRMIZI (adet)': 0, 'X+4 KIRMIZI (%)': None,
+                    'X+5 KIRMIZI (adet)': 0, 'X+5 KIRMIZI (%)': None,
+                    'X+4 veya X+5 KIRMIZI (adet)': 0, 'X+4 veya X+5 KIRMIZI (%)': None}
 
-    _liste_yaz("Otomatik bulunan sizinti kolonu", _otomatik)
-    _liste_yaz("Zaten LEAK_COLS icinde olan", _zaten_olan)
-    _liste_yaz("Yeni eklenen", _yeni_eklenen)
-else:
-    print("⚠ df bellekte yok -> otomatik sizinti taramasi atlandi")
+        if (ID_COL not in df.columns) or (_flags is None) or (len(_flags) == 0):
+            return {'BAZ KİTLE (adet)': _n,
+                    'X+4 KIRMIZI (adet)': None, 'X+4 KIRMIZI (%)': None,
+                    'X+5 KIRMIZI (adet)': None, 'X+5 KIRMIZI (%)': None,
+                    'X+4 veya X+5 KIRMIZI (adet)': None, 'X+4 veya X+5 KIRMIZI (%)': None}
 
-print("\nLEAK_COLS toplam:", len(LEAK_COLS))
+        _ids = pd.to_numeric(df.loc[_mask, ID_COL], errors='coerce').dropna().astype('int64')
+        _sub = _flags.reindex(_ids.values).fillna(False)
+        _x4 = int(_sub['AY4_KIRMIZI'].sum())
+        _x5 = int(_sub['AY5_KIRMIZI'].sum())
+        _x45 = int((_sub['AY4_KIRMIZI'] | _sub['AY5_KIRMIZI']).sum())
+        return {
+            'BAZ KİTLE (adet)': _n,
+            'X+4 KIRMIZI (adet)': _x4,
+            'X+4 KIRMIZI (%)': round(_x4 / _n, 4),
+            'X+5 KIRMIZI (adet)': _x5,
+            'X+5 KIRMIZI (%)': round(_x5 / _n, 4),
+            'X+4 veya X+5 KIRMIZI (adet)': _x45,
+            'X+4 veya X+5 KIRMIZI (%)': round(_x45 / _n, 4),
+        }
+
+    _gruplar = [
+        ('TABLO 0', 'TUM MUSTERI', _m),
+        ('TABLO 1', 'TAKİP BAZI: X+6 TAKİPTE', _t),
+        ('TABLO 2', 'KIRMIZI BAZI: X+3 KIRMIZI', _k),
+        ('TABLO 3', 'ORTAK: X+3 KIRMIZI & X+6 TAKİP', _k & _t),
+        ('TABLO 3', 'SADECE KIRMIZI: X+3 KIRMIZI & X+6 TAKİP DEĞİL', _k & (~_t)),
+        ('TABLO 3', 'SADECE TAKİP (DIŞTA KALAN): X+3 KIRMIZI DEĞİL & X+6 TAKİP', (~_k) & _t),
+    ]
+
+    for _tablo, _grup_ad, _grup_mask in _gruplar:
+        _sat = _ozet(_grup_mask)
+        adim1_kume_ozet.append({
+            'RENK': 'GENEL (TUM RENKLER)',
+            'DÖNEM': _don_ad,
+            'TABLO': _tablo,
+            'GRUP': _grup_ad,
+            **_sat,
+        })
+
+
+_genel_kume_satirlari(TRAIN_DONEM, f'TRAIN {TRAIN_DONEM}')
+_genel_kume_satirlari(OOT_DONEM, f'OOT {OOT_DONEM}')
+
+# ------------------------------------------------------------
+# EXCEL
+# ------------------------------------------------------------
+if not karar:
+    print("⚠ Hiç sonuç üretilemedi"); raise SystemExit
+
+# ------------------------------------------------------------
+# HÜKÜM: "ayrı takip modeline gerek yok" diyebilmek için ÜÇ TEST
+# BİRDEN geçmeli. Biri bile kalırsa model gereklidir — sebebiyle.
+#    TEST 1 SİNYAL (ADIM1): KAÇ KAT >= 2 → kırmızıya geçiş takibin
+#       gerçek öncüsü mü? (<1 ise vekil TERS çalışıyor — Kırmızı segment)
+#    TEST 2 KIYAS (ADIM2): özel modelin capture katkısı <= 5 puan →
+#       kırmızı modeli takibi neredeyse özel model kadar sıralıyor mu?
+#    TEST 3 KAÇAN (KARAR): kaçan dilimin takip oranı genelin <= 1.5
+#       katı → kırmızının görmediği dilimde gerçek risk birikmiyor mu?
+# Eşikler iş kararına göre oynatılabilir; sabitler aşağıda tek yerde.
+# ------------------------------------------------------------
+print("""
+================================================================
+ HÜKÜM: 6M TAKİP MODELİ AYRICA GEREKLİ Mİ?
+================================================================
+ Kural: "gerek yok" diyebilmek için ÜÇ TEST BİRDEN geçmeli.
+ Biri bile kalırsa takip modeli GEREKLİDİR (sebep hükümde yazar).
+
+ T1 SİNYAL (delil: ADIM1, gerçekxgerçek)
+   Soru : Kırmızıya geçmek takibin gerçekten öncüsü mü?
+   Ölçüm: P(takip|geçti) / P(takip|geçmedi) = KAÇ KAT, eşik ≥ {t1}
+   Kalırsa: kırmızı hedefi takip için YAPISAL olarak yanlış vekil.
+
+ T2 KIYAS (delil: ADIM2, modelxgerçek)
+   Soru : Özel model, kırmızı modelinin üstüne ne katıyor?
+   Ölçüm: capture@%{cp} farkı (puan) + adet karşılığı, eşik ≤ {t2}
+   Kalırsa: kırmızı modeli sinyali yeterince İYİ SIRALAYAMIYOR.
+
+ T3 KAÇAN (delil: KARAR, modelxmodel + gerçekleşme)
+   Soru : Kırmızının görmediği dilimde gerçek risk birikiyor mu?
+   Ölçüm: kaçan dilimin takip oranı / genel oran, eşik ≤ {t3}
+   Kalırsa: kaçırılanlar küçük ama ÇOK RİSKLİ bir cepte toplanmış.
+
+ Kısa ezber: T1 = sinyal var mı, T2 = model taşıyor mu,
+             T3 = kaçırdığı yerde yangın var mı.
+ (SINIRDA = değer eşiğe ±%{sb} bandında; hüküm kırılgan, ek dönemle
+  doğrulanmalı. Eşikler öneridir — ESIK_* sabitlerinden ayarlanır.)
+================================================================""".format(
+    t1=ESIK_SINYAL, t2=ESIK_KIYAS, t3=ESIK_KACAN,
+    cp=int(CAPTURE_PCT * 100), sb=int(0.15 * 100)))
+
+hukum = []
+for k in karar:
+    _r  = k['RENK']
+    _a1 = next(x for x in adim1
+               if x['RENK'] == _r and str(x.get('DÖNEM', '')).startswith('OOT'))
+    _a2 = next(x for x in adim2 if x['RENK'] == _r)
+    kac_kat = _a1.get('TAKİP RİSK KATI (GEÇEN/GEÇMEYEN)')   # OOT dönemi T1
+    fark    = _a2.get('FARK (özel modelin kattığı)')
+    kacan_k = k.get('KAÇAN / GENEL (kaç kat)')
+
+    # 1) Somut adet: özel modelin B1-4'te yakaladığı EK takip vakası.
+    #    T2'deki "+X puan"ın TL/adet karşılığı — bütçe kararı puanla değil
+    #    adetle verilir. hesap: fark (capture puanı) x toplam takip vakası.
+    _n_takip = k.get('_n_takip')              # karar dict'ine aşağıda eklendi
+    ek_vaka = (int(round(fark * _n_takip))
+               if fark is not None and _n_takip else None)
+
+    t1 = (kac_kat is not None) and (kac_kat >= ESIK_SINYAL)
+    t2 = (fark is not None) and (fark <= ESIK_KIYAS)
+    t3 = (kacan_k is not None) and (kacan_k <= ESIK_KACAN)
+
+    # SINIRDA tespiti: değer eşiğe ±%15 bandında ise hüküm KIRILGANDIR —
+    # nokta tahminler örneklem gürültüsü taşır (özellikle az vakalı
+    # renklerde); eşiğin hemen iki yanı istatistiksel olarak ayırt
+    # edilemez olabilir. Bu durumda GEÇTİ/KALDI yerine SINIRDA yazılır
+    # ve nihai hüküm "eşik mutabakatı + ek dönem doğrulaması" ister.
+    SINIR_BANT = 0.15
+    def _durum(v, esik, buyuk_gecer):
+        if v is None:
+            return 'VERİ YOK', False
+        sinirda = abs(v - esik) <= SINIR_BANT * esik
+        gecti = (v >= esik) if buyuk_gecer else (v <= esik)
+        if sinirda:
+            return 'SINIRDA', gecti
+        return ('GEÇTİ' if gecti else 'KALDI'), gecti
+
+    d1, t1 = _durum(kac_kat, ESIK_SINYAL, buyuk_gecer=True)
+    d2, t2 = _durum(fark,    ESIK_KIYAS,  buyuk_gecer=False)
+    d3, t3 = _durum(kacan_k, ESIK_KACAN,  buyuk_gecer=False)
+    _sinirda = 'SINIRDA' in (d1, d2, d3)
+
+    sebep = []
+    if not t1:
+        sebep.append(f"kırmızı hedefi takip için zayıf/ters vekil (KAÇ KAT={kac_kat})")
+    if not t2:
+        sebep.append(f"özel model capture'a +{fark} puan katıyor")
+    if not t3:
+        sebep.append(f"kaçan dilim genelin {kacan_k} katı riskli")
+
+    if t1 and t2 and t3:
+        _hkm = 'GEREKMEYEBİLİR — üç test de geçti'
+    else:
+        _hkm = 'GEREKLİ — ' + '; '.join(sebep)
+    if _sinirda:
+        _hkm += ' [SINIRDA test var — eşik mutabakatı + ek dönemle doğrulanmalı]'
+
+    hukum.append({
+        'RENK': _r,
+        # 3) Güven bağlamı: hüküm kaç TAKİP VAKASINA dayanıyor? Az vakalı
+        #    renkte (örn. koyu yeşil) oranlar geniş oynar — hangi hükmün
+        #    ince buz üstünde olduğu bu kolondan görülür.
+        'TAKİP VAKASI (OOT) — hükmün dayandığı örneklem': _n_takip,
+        'TEST1 SİNYAL: kırmızıya geçenler kaç kat riskli (≥2 geçer)': kac_kat,
+        'TEST1': d1,
+        'TEST2 KIYAS: özel modelin capture katkısı (≤0.05 geçer)': fark,
+        'TEST2': d2,
+        # 1) puanın adet karşılığı
+        'ÖZEL MODELİN YAKALADIĞI EK VAKA (adet/dönem)': ek_vaka,
+        'TEST3 KAÇAN: kaçan dilim / genel oran (≤1.5 geçer)': kacan_k,
+        'TEST3': d3,
+        'TAKİP MODELİ GEREKLİ Mİ?': _hkm,
+    })
+    print(f"  HÜKÜM {_r}: {_hkm}")
+    print(f"          T1 SİNYAL={d1} ({kac_kat}x)  T2 KIYAS={d2} ({fark:+.3f} puan"
+          f"{', ≈'+str(ek_vaka)+' vaka' if ek_vaka is not None else ''})  "
+          f"T3 KAÇAN={d3} ({kacan_k}x)")
+
+BOSLUK = 2    # bloklar arası boş satır
+
+
+def _yaz_bloklu(xl, sheet, bloklar, baslik, skala=None, baslik_satiri=3):
+    """Tüm renklerin bloklarını TEK sheet'e alt alta yazar."""
+    wb = xl.book
+    r = baslik_satiri
+    ilk = True
+    for b in bloklar:
+        b.to_excel(xl, sheet_name=sheet, index=False, startrow=r, header=ilk)
+        satir = len(b) + (1 if ilk else 0)
+        if skala:
+            ws = wb[sheet]
+            c0, c1 = skala['col0'], b.shape[1]
+            r0 = r + (2 if ilk else 1)
+            rng = f"{get_column_letter(c0)}{r0}:{get_column_letter(c1)}{r0 + len(b) - 1}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type='num', start_value=0, start_color='FFFFFF',
+                mid_type='num', mid_value=skala['mid'], mid_color='FFEB84',
+                end_type='num', end_value=skala['max'], end_color='C00000'))
+        r += satir + BOSLUK
+        ilk = False
+    ws = wb[sheet]
+    ws['A1'] = baslik
+    ws['A1'].font = Font(bold=True, size=11)
+    ws['A1'].alignment = Alignment(wrap_text=True)
+    ws.freeze_panes = f"C{baslik_satiri + 2}"       # RENK+etiket kolonları donuk
+    return ws
+
+
+buf = BytesIO()
+with pd.ExcelWriter(buf, engine='openpyxl') as xl:
+    wb = xl.book
+    _fill = PatternFill("solid", fgColor="F4CCCC")
+    _byz  = Font(bold=True, color="7A1F1F")
+
+    # ---- GEREKLILIK: hüküm sheet'i (İLK SHEET — cevap burada) ----
+    hd = pd.DataFrame(hukum)
+    hd.to_excel(xl, sheet_name='GEREKLILIK', index=False, startrow=5)
+    ws = wb['GEREKLILIK']
+    ws['A1'] = (f"SORU: 6M TAKİP modeli ayrıca GEREKLİ Mİ, yoksa 3M KIRMIZI modeli "
+                f"yeterli mi?  (Tüm model testleri OOT {OOT_DONEM} üzerindedir — "
+                f"modellerin eğitimde görmediği dönem. ADIM1 hem TRAIN hem OOT gösterir.)")
+    ws['A2'] = ("KURAL: 'gerek yok' diyebilmek için ÜÇ TEST BİRDEN geçmeli — T1 SİNYAL "
+                "(kırmızıya geçiş takibin gerçek öncüsü mü, ADIM1), T2 KIYAS (özel model "
+                "capture'a kayda değer katkı yapıyor mu, ADIM2), T3 KAÇAN (kırmızının "
+                "görmediği dilimde gerçek risk birikiyor mu, KARAR).")
+    ws['A3'] = ("Biri bile kalırsa takip modeli GEREKLİDİR; sebep son kolonda yazar. "
+                "EK VAKA kolonu = T2 puanının adet karşılığı (bütçe kıyası için); TAKİP VAKASI kolonu = hükmün dayandığı "
+                "örneklem — küçükse hüküm geniş oynar. SARI=SINIRDA: değer eşiğe ±%15 bandında — hüküm kırılgandır, eşik "
+                "mutabakatı ve ek dönem doğrulaması gerekir. Delil detayları ilgili sheet'lerde.")
+    # --- EŞİK GEREKÇELERİ: sayılar nereden geliyor, dosyanın içinde yazsın ---
+    ws['A4'] = ("EŞİKLER (öneri — iş tarafıyla mutabık kalınmalı): "
+                "T1≥2: nötr nokta 1.0'dır (kırmızıya geçiş takip hakkında bilgi taşımıyor); "
+                "2 kat, sinyalin örneklem gürültüsünden net ayrıştığı seviyedir. "
+                "T2≤0.05: özel modelin en riskli %20'de yakaladığı EK takip payı; 5 puan ≈ "
+                "renkteki takip vakasının %5'i — 'bu kadar ek vaka ikinci modeli yaşatmaya "
+                "değer mi' maliyet-fayda sorusudur, kesin cevabı iş tarafındadır. "
+                "T3≤1.5: kaçan dilim genelden %50'den fazla riskliyse o dilimi bilerek "
+                "görmezden gelmek savunulamaz hale gelir. "
+                "ÜÇÜ DE AYARLANABİLİR — kodda ESIK_SINYAL / ESIK_KIYAS / ESIK_KACAN.")
+    ws['A4'].alignment = Alignment(wrap_text=True, vertical='top')
+    ws.row_dimensions[4].height = 60
+    for _r in ('A1', 'A2', 'A3', 'A4'): ws[_r].font = Font(bold=(_r == 'A1'))
+    for c in range(1, hd.shape[1] + 1):
+        h = ws.cell(row=6, column=c); h.fill = _fill; h.font = _byz
+        h.alignment = Alignment(wrap_text=True, vertical='top')
+        ws.column_dimensions[get_column_letter(c)].width = 18
+    ws.column_dimensions[get_column_letter(hd.shape[1])].width = 60
+    ws.freeze_panes = 'B7'
+    # GEÇTİ/KALDI hücrelerini renklendir
+    _yesil = PatternFill("solid", fgColor="C6EFCE")
+    _kirm  = PatternFill("solid", fgColor="FFC7CE")
+    for _r in range(7, 7 + len(hd)):
+        for _c, col in enumerate(hd.columns, start=1):
+            v = ws.cell(row=_r, column=_c).value
+            if v == 'GEÇTİ':
+                ws.cell(row=_r, column=_c).fill = _yesil
+            elif v == 'KALDI':
+                ws.cell(row=_r, column=_c).fill = _kirm
+            elif v == 'SINIRDA':
+                ws.cell(row=_r, column=_c).fill = PatternFill("solid", fgColor="FFEB84")
+            elif isinstance(v, str) and v.startswith('GEREKLİ'):
+                ws.cell(row=_r, column=_c).fill = _kirm
+            elif isinstance(v, str) and v.startswith('GEREKMEYEBİLİR'):
+                ws.cell(row=_r, column=_c).fill = _yesil
+
+    # ---- MANTIK sheet: 3 adımlı kurgu düz yazıyla ----
+    mantik = pd.DataFrame({'ADIM': [
+        'AMAC', '',
+        'ADIM 1 - GERCEK x GERCEK', '', '',
+        'ADIM 2 - MODEL -> GERCEK TAKIP', '', '',
+        'ADIM 3 - MODEL x MODEL (matris)', '', '',
+        'KARAR KURALI', '',
+        'HÜKÜM (GEREKLILIK sayfası)', '',
+        'KIRMIZI SEGMENT NOTU', ''],
+        'ACIKLAMA': [
+        'Iki ayri model var: (A) X+3 aninda KIRMIZI mi, '
+        '(B) X+6 aninda TAKIPTE mi. '
+        'Soru: A modeli takip riskini de yakaliyorsa B modeline gerek var mi?',
+        '',
+        'Model YOK, sadece gerceklesme: kirmiziya gecenlerin takibe dusme orani vs gecmeyenlerinki.',
+        'Bu iki olayin dogada ne kadar bagli oldugunun tabani. KAC KAT >> 1 ise kirmiziya gecis '
+        'takibin oncusu demektir; model kurmaya deger bir sinyal var.',
+        'TAKIBE DUSENLERIN KIRMIZIYA HIC GECMEYEN %si = A hedefinin YAPISAL kor noktasi.',
+        'A modelinin en riskli dedigi dilimde (B1-4) GERCEK takip orani + capture@20%.',
+        'KIYAS CIPASI: ayni metrik ozel takip modeli icin de hesaplanir. A modelinki ozel '
+        'modele yakinsa "ayri modele gerek yok" denebilir; belirgin dusukse ozel model deger katiyor.',
+        'Adim 2 TOPLAMDA ne kadar yakalandigini soyler ama KIMLERIN kacirildigini soylemez.',
+        'Her musteri iki modelden bucket alir. Satir: A modelinin grubu, sutun: B modelinin grubu. '
+        'Hucre: o A grubundakilerin B gruplarina dagilimi (%). Rastgelede her hucre ~%20.',
+        'SOL UST koyu = iki model AYNI musterileri gosteriyor -> adim 2 sonucu guvenle genellenir. '
+        'Dagitik = ayni toplami yakalasalar bile FARKLI insanlari yakaliyorlar -> ikisi de gerekli.',
+        'Iki model %25er capture verebilir ama farkli %25leri yakaliyor olabilir - matris bunu ayirir.',
+        'ORTUSME >= %60 -> tek model tartisilabilir; %35-60 -> kacan dilimin gercek takip oranina bak; '
+        '< %35 -> iki model de gerekli.',
+        'ORTUSME tek basina yetmez: kacan dilimin GERCEK takip orani yuksekse o dilim kaybedilemez.',
+        '"Ayri takip modeline gerek yok" hukmu icin UC TEST BIRDEN gecmeli: T1 sinyal gercek mi '
+        '(KAC KAT>=2), T2 ozel modelin katkisi kucuk mu (<=5 puan), T3 kacan dilim guvenli mi (<=1.5x).',
+        'Uc testten biri bile kalirsa hukum GEREKLIDIR - tek metrikle (or. sadece ortusme) verilen '
+        'hukum yaniltir: ornegin Kirmizida ortusme yuksek cikabilir ama T1 ters oldugu icin model yine gereklidir.',
+        'Kirmizi segmentte A hedefi "kirmizida KALIR mi" (kalicilik) anlamina gelir; takibe dusen '
+        'skaladan ciktigi icin iki hedef TERS iliskilidir.',
+        'Bu segmentte ortusmenin dusuk cikmasi modelin hatasi degil, sorunun yapisidir - '
+        'Kirmizi icin ayri takip modeli yapisal olarak gereklidir.']})
+    mantik.to_excel(xl, sheet_name='MANTIK', index=False)
+    ws = wb['MANTIK']
+    ws.column_dimensions['A'].width = 34
+    ws.column_dimensions['B'].width = 130
+    for row in ws.iter_rows(min_row=2):
+        row[1].alignment = Alignment(wrap_text=True, vertical='top')
+        if row[0].value and str(row[0].value).strip():
+            row[0].font = Font(bold=True)
+
+    # ---- ADIM1 (tek sayfa, detayli) ----
+    a1_full = pd.DataFrame(adim1)
+    _a1_oncelik = [
+        'RENK', 'DÖNEM', 'MÜŞTERİ',
+        'KIRMIZI BAKIŞI | X+3 KIRMIZI OLAN KİTLE (adet)', 'KIRMIZI BAKIŞI | X+3 KIRMIZI OLAN KİTLE (%)',
+        'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİP (adet)', 'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİP (%)',
+        'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİPTE OLMAYAN (adet)', 'KIRMIZI BAKIŞI | X+3 KIRMIZI OLANLARDA X+6 TAKİPTE OLMAYAN (%)',
+        'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYAN KİTLE (adet)', 'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYANLARDA X+6 TAKİP (adet)',
+        'KIRMIZI BAKIŞI | X+3 KIRMIZI OLMAYANLARDA X+6 TAKİP (%)', 'TAKİP RİSK KATI (GEÇEN/GEÇMEYEN)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLAN KİTLE (adet)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLAN KİTLE (%)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA AY0-3 KIRMIZI GÖREN (adet, AY0 dahil)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA AY0-3 KIRMIZI GÖREN (%, AY0 dahil)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞEN (adet)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞEN (%)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞMEYEN (adet)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA İLK 3 AY KIRMIZIYA DÜŞMEYEN (%)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 4-6 AY KIRMIZIYA DÜŞEN (adet)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 4-6 AY KIRMIZIYA DÜŞEN (%)',
+        'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 6 AY HİÇ KIRMIZIYA DÜŞMEYEN (adet)', 'TAKİP BAKIŞI | X+6 TAKİPTE OLANLARDA 6 AY HİÇ KIRMIZIYA DÜŞMEYEN (%)',
+        'ALT KÜME | X+3 KIRMIZI DEĞİL & X+6 TAKİPTE (adet)',
+        'ALT KÜME | X+4 KIRMIZI OLAN (adet)', 'ALT KÜME | X+4 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]', 'ALT KÜME | X+4 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]',
+        'ALT KÜME | X+5 KIRMIZI OLAN (adet)', 'ALT KÜME | X+5 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]', 'ALT KÜME | X+5 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]',
+        'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (adet)', 'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (%) [KIRMIZI KİTLESİ baz]', 'ALT KÜME | X+4 veya X+5 KIRMIZI OLAN (%) [TAKİP KİTLESİ baz]',
+        'ALT KÜME | 4-6 AYDA KIRMIZI OLAN (adet)', 'ALT KÜME | 4-6 AYDA KIRMIZI OLAN (%)',
+        'ALT KÜME | 6 AY HİÇ KIRMIZI OLMAYAN (adet)', 'ALT KÜME | 6 AY HİÇ KIRMIZI OLMAYAN (%)',
+    ]
+    _a1_kalan = [c for c in a1_full.columns if c not in _a1_oncelik]
+    a1_full = a1_full[[c for c in _a1_oncelik if c in a1_full.columns] + _a1_kalan]
+
+    # ADIM1_GERCEKxGERCEK: detayli tam kolon seti
+    pd.DataFrame().to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK')
+    ws = wb['ADIM1_GERCEKxGERCEK']
+    ws['A1'] = ("GERÇEK x GERÇEK — model YOK, iki gerçekleşme karşılaştırılır: "
+                "aynı X çıpasında müşteri X+3 anında kırmızı mı x "
+                "X+6 anında takipte mi.")
+    ws['A2'] = ("NEDEN: iki olay doğada bağlı mı onu ölçer. Her renk için İKİ SATIR: "
+                "TRAIN ve OOT dönemi. KAÇ KAT iki dönemde de benzerse sinyal STABİL, "
+                "hüküm güvenilir; dönemler arası zıplıyorsa hüküm kırılgandır. "
+                "Hüküm (T1) OOT satırından beslenir. Not: ana tanım endpointtir "
+                "(X+3 renk, X+6 takip); ara ay kırılımları sadece ek teşhistir.")
+    ws['A3'] = ("OKUMA SIRASI: UST TABLODA iki bakis var: (1) KIRMIZI BAKIŞI = X+3 kirmizi olanlarda "
+                "X+6 takip dagilimi. (2) TAKIP BAKIŞI = X+6 takipte olanlarda ek teshis olarak "
+                "ara ay kirmizi zamanlamasi (ay1-3 / ay4-6 / hic). ALTTA kohort tablolari var: "
+                "TABLO 0 tum musteri, TABLO 1 takip bazi, TABLO 2 kirmizi bazi, TABLO 3 ortak/disda kalan.")
+    ws['A4'] = ("⚠ TANIM NOTU: 'ALT KÜME (TAKİPTE & İLK 3 AY KIRMIZI DEĞİL)' = takibe düşenler "
+                "içinde ilk 3 ayda kırmızıya düşmeyen grup. Altındaki 'ALT KÜMEDE 4-6 AY...' ve "
+                "'ALT KÜMEDE 6 AY HİÇ...' kolonları sadece bu grubun iç dağılımını verir. "
+                "AY0-3 kolonlarında AY0 mevcut RENK'i içerir; ilk 3 ay kolonları ay1-3 penceresidir.")
+    ws['A5'] = ("Perspektif ayrımı: 'KIRMIZI BAKIŞI | ...' oranları kırmızı kitlesini baz alır; "
+                "'TAKİP BAKIŞI | ...' oranları takip kitlesini baz alır. ALT KÜME'de X+4/X+5 "
+                "kolonlarında her iki baza göre oran ayrı verilir.")
+    for _r in ('A1', 'A2', 'A3', 'A4', 'A5'): ws[_r].font = Font(bold=(_r == 'A1'))
+    a1_full.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK', index=False, startrow=5)
+    for c in range(1, a1_full.shape[1] + 1):
+        h = ws.cell(row=6, column=c); h.fill = _fill; h.font = _byz
+        h.alignment = Alignment(wrap_text=True, vertical='top')
+        ws.column_dimensions[get_column_letter(c)].width = 16
+    ws.freeze_panes = 'B7'                              # 6) donuk bölme
+    _a1_pct_cols = [i + 1 for i, c in enumerate(a1_full.columns)
+                    if ('%' in c) or c.startswith('P(')]
+    for _c in _a1_pct_cols:                             # P(...) ve % kolonları
+        for _r in range(7, 7 + len(a1_full)):
+            ws.cell(row=_r, column=_c).number_format = '0.0%'
+
+    # --- ADIM1 ALT TABLOLARI: 4 farkli kohort bakisi (TABLO 0-1-2-3) ---
+    _son_satir = 6 + len(a1_full) + 2
+    if adim1_kume_ozet:
+        kx = pd.DataFrame(adim1_kume_ozet)
+        _kol = ['RENK', 'DÖNEM', 'GRUP', 'BAZ KİTLE (adet)',
+                'X+4 KIRMIZI (adet)', 'X+4 KIRMIZI (%)',
+                'X+5 KIRMIZI (adet)', 'X+5 KIRMIZI (%)',
+                'X+4 veya X+5 KIRMIZI (adet)', 'X+4 veya X+5 KIRMIZI (%)']
+
+        _tablo_baslik = {
+            'TABLO 0': "TABLO 0 — TUM MUSTERI BAZI",
+            'TABLO 1': "TABLO 1 — TAKİP BAZI (baz: X+6 takipte olanlar)",
+            'TABLO 2': "TABLO 2 — 3M KIRMIZI BAZI (baz: X+3 kırmızı olanlar)",
+            'TABLO 3': "TABLO 3 — ORTAK / SADECE KIRMIZI / SADECE TAKİP (dışta kalan)"
+        }
+
+        for _tb in ['TABLO 0', 'TABLO 1', 'TABLO 2', 'TABLO 3']:
+            _dfx = kx.loc[kx['TABLO'] == _tb, _kol].copy()
+            if _dfx.empty:
+                continue
+            ws.cell(row=_son_satir, column=1, value=_tablo_baslik[_tb]).font = Font(bold=True)
+            _dfx.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK', index=False, startrow=_son_satir)
+            for c in range(1, _dfx.shape[1] + 1):
+                h = ws.cell(row=_son_satir + 1, column=c); h.fill = _fill; h.font = _byz
+                h.alignment = Alignment(wrap_text=True, vertical='top')
+            for _c in [i + 1 for i, cc in enumerate(_dfx.columns) if '%' in cc]:
+                for _r in range(_son_satir + 2, _son_satir + 2 + len(_dfx)):
+                    ws.cell(row=_r, column=_c).number_format = '0.0%'
+            _son_satir += len(_dfx) + 3
+
+    # --- KONTROL TABLOSU: aynı sheet'te, ADIM1 tablosunun ALTINDA ---
+    if kontrol_satirlari:
+        kdf2 = pd.DataFrame(kontrol_satirlari)
+        _b = _son_satir
+        _kaynak_not = (
+            ("Kaynak: df_raw RENK_SONRAKI_1..6AY kolonları — hesap "
+             "tamamen KENDİ verimizden, harici dataset yok. Kohort: "
+             f"DONEM={OOT_DONEM} (herkesin 'sonraki 6 ayı' aynı çıpaya "
+             "göre). Takip flag: AKB_TAKIP_6M (raporla aynı tanım).")
+            if _ilk_kirmizi_get(OOT_DONEM) is not None and _kontrol_kaynak_adi is not None
+            else (("⚠ df'te eksik izleme ayları: " + ", ".join(map(str, KONTROL_EKSIK)))
+                  if KONTROL_EKSIK else "İzlenen 6 ayın tamamı df'te mevcut.")
+        )
+        ws.cell(row=_b, column=1,
+                value="KONTROL — TAKİBE DÜŞENLERİN İLK KIRMIZI AYI "
+                      f"(X={OOT_DONEM} sonrası 6 ay izlenir)").font = Font(bold=True)
+        ws.cell(
+            row=_b + 1,
+            column=1,
+            value=(
+                "Ay 1-3 = A modelinin hedef penceresi İÇİ (model görebilir). "
+                "Ay 4-6 = pencere SONRASI (A tanım gereği göremez — yukarıdaki "
+                "'pencerede kırmızı olmayan %' büyük ölçüde BU gruptur; "
+                "'hiç kırmızı görmedi' DEĞİLDİR). Not: KIRMIZI segmentte 'ay0' zaten "
+                "kırmızı olduğu için bu tabloda %100 beklemek doğru değildir; tablo "
+                "ek teşhis olarak X sonrası ay dağılımını gösterir (kalış/çıkış). HİÇ KIRMIZI YOK oranı "
+                "yüksekse veri/eşleşme veya hızlı renk çıkışı etkisi kontrol edilmelidir."
+            ),
+        )
+        ws.cell(row=_b + 2, column=1, value=_kaynak_not)
+        kdf2.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK',
+                      index=False, startrow=_b + 3)
+        for c in range(1, kdf2.shape[1] + 1):
+            h = ws.cell(row=_b + 4, column=c); h.fill = _fill; h.font = _byz
+            h.alignment = Alignment(wrap_text=True, vertical='top')
+        _pct_c = [i + 1 for i, c in enumerate(kdf2.columns) if c.endswith('%')]
+        for _c in _pct_c:
+            for _r in range(_b + 5, _b + 5 + len(kdf2)):
+                ws.cell(row=_r, column=_c).number_format = '0.0%'
+
+        # --- ikinci küçük tablo: GEÇMİŞ 12 AY (df'in kendi lag kolonları) ---
+        if kontrol2_satirlari:
+            kdf3 = pd.DataFrame(kontrol2_satirlari)
+            _b2 = _b + 4 + len(kdf2) + 2
+            ws.cell(row=_b2, column=1,
+                    value="EK — TAKİBE DÜŞENLERİN X ÖNCESİ 12 AYDA KIRMIZI GEÇMİŞİ "
+                          "(kaynak: df'in RENK_LxM kolonları, harici veri yok)"
+                    ).font = Font(bold=True)
+            ws.cell(row=_b2 + 1, column=1,
+                    value="En son kırmızı kaç ay önce görüldü? Yukarıdaki tablo "
+                          "GELECEK pencereye (X sonrası), bu tablo GEÇMİŞE bakar — "
+                          "uzmanların 'takibe düşen kırmızıyı mutlaka görür' tezinin "
+                          "bizim verimizdeki karşılığı. HİÇ YOK yüksekse ani bozulma "
+                          "yolu (renk merdivenini atlayan) gerçektir.")
+            kdf3.to_excel(xl, sheet_name='ADIM1_GERCEKxGERCEK',
+                          index=False, startrow=_b2 + 2)
+            for c in range(1, kdf3.shape[1] + 1):
+                h = ws.cell(row=_b2 + 3, column=c); h.fill = _fill; h.font = _byz
+                h.alignment = Alignment(wrap_text=True, vertical='top')
+            for _c in [i + 1 for i, c in enumerate(kdf3.columns) if c.endswith('%')]:
+                for _r in range(_b2 + 4, _b2 + 4 + len(kdf3)):
+                    ws.cell(row=_r, column=_c).number_format = '0.0%'
+
+    # ---- ADIM2 ----
+    a2 = pd.DataFrame(adim2)
+    a2.to_excel(xl, sheet_name='ADIM2_MODELxGERCEK', index=False, startrow=4)
+    ws = wb['ADIM2_MODELxGERCEK']
+    ws['A1'] = ("MODEL x GERÇEK — KIRMIZI modelinin TAHMİNİ x GERÇEK takip: modelin "
+                "riskli dediği dilim (B1-4) gerçekte takibe düşüyor mu?")
+    ws['A2'] = ("NEDEN: A modelinin takip için ERKEN UYARI değeri bu. Tek başına yetmez — "
+                "kıyas çıpası olarak özel takip modelinin AYNI metriği yanına konur. "
+                "Tüm raporda tek eşik: en riskli = B1-4 = üst %20 (capture@20%). "
+                "DÖNEM: bu analiz OOT (" + str(OOT_DONEM) + ") üzerindedir — modeller bu "
+                "dönemi eğitimde GÖRMEMİŞTİR. Train üzerinde hesaplamak in-sample "
+                "iyimserlik yaratacağı için bilinçli olarak yapılmamıştır.")
+    ws['A3'] = ("NE KANITLAR: FARK kolonu küçükse kırmızı modeli takibi de yeterince "
+                "sıralıyordur, ayrı modele gerek olmayabilir; büyükse özel model değer katıyordur.")
+    for _r in ('A1', 'A2', 'A3'): ws[_r].font = Font(bold=(_r == 'A1'))
+    for c in range(1, a2.shape[1] + 1):
+        h = ws.cell(row=5, column=c); h.fill = _fill; h.font = _byz
+        h.alignment = Alignment(wrap_text=True, vertical='top')
+        ws.column_dimensions[get_column_letter(c)].width = 17
+    ws.freeze_panes = 'B6'
+    for _c in [3, 4, 5, 6, 7]:                          # oran/capture kolonları
+        for _r in range(6, 6 + len(a2)):
+            ws.cell(row=_r, column=_c).number_format = '0.0%'
+
+    # ---- ADIM3: tüm renkler tek sheet, alt alta 5x5 ----
+    # %'ler ADET+TOPLAM'dan sonra basliyor: 2 etiket + 5 adet + 1 toplam = 8
+    ws = _yaz_bloklu(xl, 'ADIM3_MODELxMODEL_5x5', adim3_bloklar,
+                     "MODEL x MODEL — iki modelin TAHMINLERI caprazlanir (gerceklesme yok). "
+                     f"DONEM: OOT ({OOT_DONEM}) — modeller bu donemi egitimde gormedi; "
+                     "train uzerinde caprazlamak in-sample iyimserlik yaratacagi icin yapilmadi. "
+                     "SATIR = KIRMIZIYA-GECIS modelinin bucket grubu, SUTUN = TAKIBE-DUSME "
+                     "modelinin bucket grubu (B1-4 = en riskli). Once ADET, sonra SATIR-% "
+                     "bloklari. NEDEN: Adim 2 toplami soyler, KIMLERIN ayni oldugunu soylemez. "
+                     "NE KANITLAR: %-blogunda SOL UST koyuysa iki model AYNI musterileri "
+                     "isaret ediyor (rastgelede her hucre ~%20); dagitiksa farkli riskleri "
+                     "yakaliyorlar, ikisi de gereklidir.",
+                     skala={'col0': 9, 'mid': 20, 'max': 60})
+    ws.column_dimensions['A'].width = 13
+    ws.column_dimensions['B'].width = 34
+    for c in range(3, 14):
+        ws.column_dimensions[get_column_letter(c)].width = 17
+
+    # ---- KARAR ----
+    kd = pd.DataFrame(karar).drop(columns=['_n_takip'])
+    kd.to_excel(xl, sheet_name='KARAR', index=False, startrow=2)
+    ws = wb['KARAR']
+    ws.freeze_panes = 'B4'
+    # 7) oran kolonları % formatında görünsün
+    _pct_cols = [i + 1 for i, c in enumerate(kd.columns)
+                 if 'ORAN' in c or 'ÖRTÜŞME' in c or 'BEKLENEN' in c]
+    for _c in _pct_cols:
+        for _r in range(4, 4 + len(kd)):
+            ws.cell(row=_r, column=_c).number_format = '0.0%'
+    ws['A1'] = (f"KARAR (DÖNEM: OOT {OOT_DONEM} — modellerin görmediği dönem): ÖRTÜŞME ve KAÇAN DİLİMİN GERCEK TAKIP ORANI birlikte okunur. "
+                "Ortusme yuksek AMA kacan dilimin orani da yuksekse o dilim kaybedilemez.")
+    ws['A1'].font = Font(bold=True)
+    for c in range(1, kd.shape[1] + 1):
+        h = ws.cell(row=3, column=c); h.fill = _fill; h.font = _byz
+        h.alignment = Alignment(wrap_text=True, vertical='top')
+        ws.column_dimensions[get_column_letter(c)].width = 18
+    ws.column_dimensions[get_column_letter(kd.shape[1])].width = 34
+
+    # ---- DETAY 20x20 (tüm renkler alt alta) ----
+    # %'ler 20 ADET kolonundan sonra: 2 etiket + 20 adet = 22 -> %'ler 23'ten
+    ws = _yaz_bloklu(xl, 'DETAY_20x20', detay_bloklar,
+                     "DETAY (MODEL x MODEL, tam cozunurluk) — SATIR: KIRMIZIYA-GECIS modeli "
+                     "bucketi (KIRMIZI_B1 = en riskli %5), SUTUN: TAKIBE-DUSME modeli bucketi "
+                     "(T_B1 = en riskli %5). Once 20 ADET kolonu, sonra 20 SATIR-% kolonu. "
+                     "Rastgelede her %-hucresi ~%5.",
+                     skala={'col0': 23, 'mid': 5, 'max': 25})
+    ws.column_dimensions['A'].width = 14
+    ws.column_dimensions['B'].width = 20
+
+    # sheet sırası
+    _sira = ['GEREKLILIK', 'MANTIK', 'ADIM1_GERCEKxGERCEK', 'ADIM2_MODELxGERCEK',
+             'ADIM3_MODELxMODEL_5x5', 'KARAR', 'DETAY_20x20']
+    wb._sheets = [wb[s] for s in _sira if s in wb.sheetnames]
+
+buf.seek(0)
+_rapor_yolu = PATH + "/kirmizi_x_takip_yonetici_raporu.xlsx"
+mf.upload_stream(_rapor_yolu, buf)
+print(f"\n✓ {_rapor_yolu} yazıldı")
+print("   MANTIK → ADIM1 → ADIM2 → ADIM3 (5x5) → KARAR → DETAY_20x20")
