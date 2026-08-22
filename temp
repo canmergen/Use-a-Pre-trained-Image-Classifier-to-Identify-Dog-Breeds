@@ -68,7 +68,36 @@ MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
 # Folder erişimi: MODEL_RESULTS (mf) ve PATH config hücresinde tanımlı.
 # Bu bölüm mf + alt klasör yolları (KIRMIZI_PATH / TAKIP_PATH) kullanır.
 
-TAKIP_COL = 'AKB_TAKIP_6M'
+# --- TAKİP HEDEFİ: 6M_TAKIP modelinin eğitildiği tanımla BİREBİR aynı olmalı ---
+# Bölüm 4'te 6M_TAKIP target'ı: (AKB_GGS_6_90 == 1) | (AKB_TAKIP_6M == 1)
+# Burada sadece AKB_TAKIP_6M kullanılırsa model B kendi hedefinden farklı bir
+# hedefe göre ölçülür -> haksız yere zayıf görünür -> "6M gerekmiyor" hükmü
+# sahte çıkar. O yüzden aynı bileşik tanım burada da üretilir.
+TAKIP_BILESENLERI = ['AKB_GGS_6_90', 'AKB_TAKIP_6M']
+TAKIP_COL = 'TAKIP_GERCEK_6M'
+
+_mevcut_bilesen = [c for c in TAKIP_BILESENLERI if c in df.columns]
+if not _mevcut_bilesen:
+    raise KeyError(f"Takip hedefi kurulamıyor: {TAKIP_BILESENLERI} df'te yok")
+if len(_mevcut_bilesen) < len(TAKIP_BILESENLERI):
+    print(f"⚠ Takip hedefi eksik bileşenle kuruluyor: {_mevcut_bilesen} "
+          f"(beklenen: {TAKIP_BILESENLERI}) — 6M modelinin hedefiyle "
+          f"birebir aynı OLMAYABİLİR!")
+
+_takip_flag = None
+for _c in _mevcut_bilesen:
+    _s = (df[_c].fillna(0).astype(int) == 1)
+    _takip_flag = _s if _takip_flag is None else (_takip_flag | _s)
+df[TAKIP_COL] = _takip_flag.astype('int8')
+
+# Türetilen hedef asla feature olmasın
+try:
+    LEAK_COLS.add(TAKIP_COL)
+except (NameError, AttributeError):
+    pass
+
+print(f"Takip hedefi: {TAKIP_COL} = " + " | ".join(f"{c}==1" for c in _mevcut_bilesen)
+      + f"  → pozitif oran {df[TAKIP_COL].mean():.4%}")
 N_BUCKET  = 20
 UST       = 4                              # "en riskli" = bucket 1-4 (üst %20)
 # Tum rapor TEK esik kullanir: "en riskli" = bucket 1-4 = ust %20.
@@ -171,12 +200,23 @@ if _hazir:
         if 'sira' in f.columns:
             f = f.sort_values('sira')
         _leak = set(LEAK_COLS) if 'LEAK_COLS' in globals() else set()
-        feats = [c for c in f['feature']
-                 if c in df_eng.columns and c != hedef_col and c not in _leak]
-        _dusen = [c for c in f['feature'] if c not in df_eng.columns]
-        if _dusen:
-            print(f"   ⚠ {ad}: {len(_dusen)} feature df_eng'te yok, düşürüldü "
-                  f"(karşılaştırma bu model aleyhine olabilir)")
+        _leak |= {TARGET, TAKIP_COL}          # iki hedef de her modelde yasak
+        _istenen = list(f['feature'])
+        _yok     = [c for c in _istenen if c not in df_eng.columns]
+        _leakli  = [c for c in _istenen if c in df_eng.columns and c in _leak]
+        feats    = [c for c in _istenen
+                    if c in df_eng.columns and c not in _leak]
+        if _yok:
+            print(f"   ⚠ {ad}: {len(_yok)} feature df_eng'te yok, düşürüldü "
+                  f"→ bu model olduğundan zayıf görünebilir. Örnek: {_yok[:3]}")
+        if _leakli:
+            print(f"   ⚠ {ad}: {len(_leakli)} feature LEAK_COLS'ta olduğu için "
+                  f"düşürüldü → {_leakli[:5]}")
+            print("      (Bu liste boş olmalıydı: model kendi klasöründe sızıntılı "
+                  "feature ile eğitilmişse karşılaştırma güvenilmez.)")
+        if not feats:
+            print(f"   ✗ {ad}: kullanılabilir feature kalmadı, model kurulamadı")
+            return None
         t = _csv_oku(fld_path, f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv")
         row = (t[t['is_best'] == 1].iloc[0]
                if 'is_best' in t.columns and (t['is_best'] == 1).any()
@@ -186,7 +226,10 @@ if _hazir:
 
         def _hazirla(_donem):
             _x = df_eng.loc[df_eng['DONEM'] == _donem, feats].copy()
-            _x[hedef_col] = df_eng.loc[_x.index, hedef_col].fillna(0).astype(int)
+            # Hedef df_eng'te yoksa (ör. sonradan türetilen TAKIP_GERCEK_6M)
+            # kaynak df'ten indeksle çekilir.
+            _kaynak = df_eng if hedef_col in df_eng.columns else df
+            _x[hedef_col] = _kaynak.loc[_x.index, hedef_col].fillna(0).astype(int)
             return preprocess(_x)
 
         _tr_full, _oot = _hazirla(TRAIN_DONEM), _hazirla(OOT_DONEM)
@@ -726,6 +769,14 @@ if _hazir:
         # ---- ADIM 2: model -> gerçek takip (kıyas çıpalı) ----
         cap_kir_takip = _capture(d.tak_gercek, d.kir_skor, CAPTURE_PCT)
         cap_tak_takip = _capture(d.tak_gercek, d.tak_skor, CAPTURE_PCT)
+        # Capture sadece üst %20'ye bakar; AUC tüm sıralamayı ölçer.
+        # "A, B'nin işini görüyor mu" sorusu iki açıdan da cevaplanmalı:
+        # A üst dilimde iyi ama genel sıralamada kötü olabilir (ya da tersi).
+        if d.tak_gercek.nunique() > 1:
+            auc_kir = float(roc_auc_score(d.tak_gercek, d.kir_skor))
+            auc_tak = float(roc_auc_score(d.tak_gercek, d.tak_skor))
+        else:
+            auc_kir = auc_tak = np.nan
         _kb_ust = d.kb <= UST
         adim2.append({
             'RENK': etiket,
@@ -736,6 +787,12 @@ if _hazir:
             'ÖZEL TAKİP MODELİNİN CAPTURE@20% (KIYAS)': round(cap_tak_takip, 4),
             'FARK (özel modelin kattığı)': round(cap_tak_takip - cap_kir_takip, 4)
                 if np.isfinite(cap_tak_takip) and np.isfinite(cap_kir_takip) else None,
+            'KIRMIZI MODELİN TAKİP GINI': round(2 * auc_kir - 1, 4)
+                if np.isfinite(auc_kir) else None,
+            'ÖZEL TAKİP MODELİNİN GINI (KIYAS)': round(2 * auc_tak - 1, 4)
+                if np.isfinite(auc_tak) else None,
+            'GINI FARKI (özel - kırmızı)': round(2 * (auc_tak - auc_kir), 4)
+                if np.isfinite(auc_kir) and np.isfinite(auc_tak) else None,
         })
 
         # ---- ADIM 3: 5x5 model x model — ADET ve SATIR-% YAN YANA ----
