@@ -1,30 +1,68 @@
-# --- RENK GEÇİŞ ANALİZİ ---
-# Dönem bazında: müşterinin ŞU ANKİ rengi (satır) -> k ay sonraki rengi (sütun)
-# Her ufuk (RENK_SONRAKI_AY .. RENK_SONRAKI_6AY) için adet + satır-% tablosu
+# =====================================================================
+# VERİ YÜKLEME — Dataiku dataset'ini S3'ten DOĞRUDAN parquet olarak okur
+#
+# NEDEN BÖYLE: d.get_dataframe() aynı işi tek satırda yapar ama tüm
+# veriyi Dataiku backend'i üzerinden stream eder — 23M satırda çok
+# yavaş ve bellek dostu değil. Burada dataset'in S3'teki parquet
+# dosyalarına pyarrow ile DOĞRUDAN bağlanıyoruz: paralel okuma
+# (use_threads) + tek kopya pandas dönüşümü. Sonuç: dakikalar yerine
+# ~2dk, yaklaşık yarı RAM.
+# =====================================================================
 
-SNK_COLS = ['RENK_SONRAKI_AY'] + [f'RENK_SONRAKI_{k}AY' for k in range(2, 7)]
-SNK_COLS = [c for c in SNK_COLS if c in df.columns]
+t0 = time.time()                                        # yükleme süresini ölçmek için başlangıç zamanı
 
-SADECE_KK    = True    # False yaparsan tüm portföy
-YUZDE_GOSTER = True    # False yaparsan sadece adet tabloları
+# --- 1) Dataset'in S3'teki yerini ve erişim bilgilerini Dataiku'dan al ---
+d    = dataiku.Dataset("KIAILAYDABETULAKISSANDBOX.RENK_MDL_ALL_INP")
+info = d.get_location_info(sensitive_info=True)["info"] # sensitive_info=True: access/secret key'leri de getir
+cp   = info["connectionParams"]                         # S3 bağlantı bilgileri (key'ler, endpoint)
+root = info["path"].replace("s3://", "")                # pyarrow "s3://" öneki istemez, sadece bucket/yol
+print("Kaynak:", info["path"])
 
-_d = df[df['KK_URUN_FLG'] == 'KK'] if SADECE_KK else df
+# --- 2) S3 dosya sistemine pyarrow ile bağlan ---
+s3 = pafs.S3FileSystem(
+    access_key                = cp["accessKey"],
+    secret_key                = cp["secretKey"],
+    endpoint_override         = "loscdlhp.aknet.akb:9000",  # kurum içi S3 (MinIO benzeri); AWS değil
+    scheme                    = "https",
+    force_virtual_addressing  = False,                      # kurum içi S3'ler path-style adresleme kullanır
+)
 
-for _don in sorted(_d['DONEM'].dropna().astype(int).unique()):
-    _m = _d['DONEM'] == _don
-    _renk = _d.loc[_m, 'RENK'].fillna('(bos)')
-    print("=" * 110)
-    print(f"DONEM {_don}   (satır: {int(_m.sum()):,}"
-          + (", sadece KK" if SADECE_KK else ", tüm portföy") + ")")
+# --- 3) Parquet dataset'i tanı ve boyutunu göster (henüz veri OKUNMUYOR) ---
+dset = pads.dataset(root, filesystem=s3, format="parquet")  # sadece metadata taranır, hızlıdır
+print(f"Dataset Boyutu: {dset.count_rows():,} satır x {len(dset.schema)} sütun")
 
-    for _col in SNK_COLS:
-        _snk = _d.loc[_m, _col].fillna('(bos)')
+# --- 4) Kolon tiplerini Dataiku şemasından al ---
+# NEDEN: parquet'teki ham tipler ile Dataiku'nun beklediği tipler farklı
+# olabilir (örn. int kolonlar null içerdiği için float'a çevrilmeli).
+# get_dataframe_schema_st bize Dataiku'nun "doğru" tip haritasını verir.
+sch = d.read_schema()
+names, dtypes, date_idx = d.get_dataframe_schema_st(sch, int_as_float=True)
+date_cols = {names[i] for i in date_idx} if date_idx else set()   # tarih kolonları ayrı işlenir, cast'e girmez
 
-        ct = pd.crosstab(_renk, _snk, margins=True, margins_name='TOPLAM')
-        print(f"\n--- {_don} | RENK -> {_col}  (ADET) ---")
-        print(ct.to_string())
+# --- 5) Asıl okuma: S3 -> Arrow tablosu -> pandas ---
+vm0 = psutil.virtual_memory().used                      # RAM ölçümü için okuma öncesi seviye
+tbl = dset.to_table(use_threads=True)                   # tüm parquet parçalarını PARALEL indir (en uzun adım)
 
-        if YUZDE_GOSTER:
-            pct = (pd.crosstab(_renk, _snk, normalize='index') * 100).round(1)
-            print(f"--- {_don} | RENK -> {_col}  (SATIR %) ---")
-            print(pct.to_string())
+df   = tbl.to_pandas(self_destruct=True, split_blocks=True)
+#      self_destruct=True : Arrow tablosu pandas'a dönüşürken imha edilir
+#                           -> veri bellekte İKİ kopya olarak durmaz (~%50 RAM tasarrufu)
+#      split_blocks=True  : kolonlar ayrı bloklara açılır, kopyasız dönüşümü kolaylaştırır
+cast = {c: t for c, t in dtypes.items() if c in df.columns and c not in date_cols}
+df   = df.astype(cast)[names]                           # Dataiku tiplerine çevir + kolonları şema sırasına diz
+
+# --- 6) Özet: süre, RAM, boyut ---
+_elapsed = time.time() - t0
+_vm      = psutil.virtual_memory()
+_ram_add = (_vm.used - vm0) / 1e9                       # sadece bu okuma adımının RAM maliyeti
+
+print(f"Yükleme süresi : {int(_elapsed//60)}dk {int(_elapsed%60)}sn")
+print(f"Bu adım RAM    : +{_ram_add:.1f} GB")
+print(f"Sunucu RAM     : {_vm.used/1e9:.0f} / {_vm.total/1e9:.0f} GB  (%{_vm.percent:.0f} dolu)")
+print(f"Kalan RAM      : {_vm.available/1e9:.0f} GB")
+print(f"\nDataFrame: {df.shape[0]:,} satır x {df.shape[1]:,} sütun")
+print(f"Dönemler : {sorted(df['DONEM'].dropna().astype(int).unique().tolist())}")
+print(f"Bellek   : {df.memory_usage(deep=True).sum() / 1e9:.1f} GB")
+
+df_raw = df.copy()      # HAM KOPYA: bölüm 11'deki RENK_SONRAKI_* kontrolü df_raw'dan okur;
+                        # df sonraki adımlarda değişse bile ham hali elde kalsın
+display(df.head())
