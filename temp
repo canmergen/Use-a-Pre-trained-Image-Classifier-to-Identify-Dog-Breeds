@@ -1,16 +1,156 @@
-import re
+# =========================================================
+# TEK MODEL - SADECE RAW FEATURE'LAR (renk/dönem segmenti YOK)
+# df_train_raw, df_val_raw, df_oot_raw üzerinde çalışır
+# Önceki pipeline'daki eleme adımlarını (sabit, korelasyon,
+# hedef ilişkisi, PSI) aynen kullanır, tek seferlik çalışır.
+# =========================================================
 
-ARANACAK_GRUP = "bireysel_v7_qwen36_v7"   # <- grup adında aranacak kelime
+print("▶ 1) Feature listesi hazırlanıyor (RAW, feature engineering YOK)...")
+FEATURES = [c for c in df_train_raw.columns
+            if c not in LEAK_COLS and c != TARGET]
+print(f"  ✓ Başlangıç feature sayısı: {len(FEATURES)}")
 
-filtrelenmis = [
-    s for s in sonuclar
-    if ARANACAK_GRUP.lower() in s["grup"].lower()
-    and re.match(r"^H\d+\.md$", s["dosya"], flags=re.IGNORECASE)
-]
+y_tr,  Xf = df_train_raw[TARGET], df_train_raw[FEATURES]
 
-print(f"Eşleşen kayıt sayısı: {len(filtrelenmis)}\n")
+# --- 2a) Sabit / neredeyse sabit ---
+print("▶ 2a) Sabit / neredeyse sabit değişken elemesi...")
+drop_const = [c for c in FEATURES
+              if Xf[c].nunique(dropna=False) <= 1
+              or Xf[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
+FEATURES = [c for c in FEATURES if c not in drop_const]
+del Xf
+print(f"  ✓ Elenen: {len(drop_const)} | kalan: {len(FEATURES)}")
 
-for s in filtrelenmis:
-    print(f"{'='*80}\n[{s['grup']}] {s['dosya']}\n{'='*80}")
-    print(s["feature"] if s["feature"] else "(Önerilen Feature bölümü bulunamadı)")
-    print()
+# --- 2b) Hedef ilişkisi: sayısal |Spearman|, kategorik Cramér's V ---
+print("▶ 2b) Hedef ilişkisi hesaplanıyor...")
+num = df_train_raw[FEATURES].select_dtypes(include=np.number)
+_cols = np.asarray(num.columns)
+
+_R = num.rank().to_numpy(dtype="float64")
+_R = (_R - _R.mean(0)) / np.maximum(_R.std(0), 1e-9)
+_R = np.nan_to_num(_R)
+_yr = y_tr.rank().to_numpy(dtype="float64")
+_yr = (_yr - _yr.mean()) / max(_yr.std(), 1e-9)
+
+tgt_assoc = dict(zip(_cols, np.abs(_R.T @ _yr / len(_yr))))
+for c in FEATURES:
+    if c not in tgt_assoc:
+        tgt_assoc[c] = _cramers_v(df_train_raw[c], y_tr)
+
+iv_scores = {c: _quick_iv(df_train_raw[c], y_tr) for c in FEATURES}
+print("  ✓ Hedef ilişkisi + IV bitti.")
+
+# --- 2c) Yüksek korelasyon - çiftte hedefi DAHA İYİ AÇIKLAYAN tutulur ---
+print(f"▶ 2c) Korelasyon elemesi (Spearman |r|>{CORR_ESIK})...")
+_C = np.abs(_R.T @ _R / len(_R))
+_pos = {c: i for i, c in enumerate(_cols)}
+
+_kept, drop_corr = [], set()
+for c in sorted(_cols, key=lambda k: -tgt_assoc.get(k, 0.0)):
+    i = _pos[c]
+    if _kept and (_C[i, _kept] > CORR_ESIK).any():
+        drop_corr.add(c)
+    else:
+        _kept.append(i)
+
+drop_corr = [c for c in FEATURES if c in drop_corr]
+FEATURES = [c for c in FEATURES if c not in drop_corr]
+print(f"  ✓ Elenen: {len(drop_corr)} | kalan: {len(FEATURES)}")
+
+if len(FEATURES) == 0:
+    raise RuntimeError("Tüm feature'lar elendi, işlem durduruldu.")
+
+# --- 2d) PSI (train vs oot) ---
+print("▶ 2d) PSI hesaplanıyor (train vs OOT)...")
+psi_scores = {c: _psi(df_train_raw[c], df_oot_raw[c]) for c in FEATURES}
+_ele = [c for c in FEATURES
+        if psi_scores[c] > 0.25 and tgt_assoc.get(c, 0.0) < 0.05]
+FEATURES = [c for c in FEATURES if c not in _ele]
+print(f"  ✓ PSI elemesi: {len(_ele)} feature elendi | kalan: {len(FEATURES)}")
+
+if len(FEATURES) == 0:
+    raise RuntimeError("Tüm feature'lar elendi, işlem durduruldu.")
+
+print(f"\n✓ FINAL FEATURE SAYISI: {len(FEATURES)}\n")
+
+# --- 3) train/val/oot final matrisleri ---
+X_tr,  y_tr  = df_train_raw[FEATURES], df_train_raw[TARGET]
+X_val, y_val = df_val_raw[FEATURES],   df_val_raw[TARGET]
+X_oot, y_oot = df_oot_raw[FEATURES],   df_oot_raw[TARGET]
+print(f"✓ Matrisler hazır - train {X_tr.shape} / val {X_val.shape} / oot {X_oot.shape}")
+
+# --- 4) Model + Optuna (tek model, renk ayrımı YOK) ---
+spw = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+_spw_lo, _spw_hi = min(1.0, spw), max(1.0, spw)
+if not (_spw_hi > _spw_lo * 1.001):
+    _spw_lo, _spw_hi = 0.8, 1.25
+
+base = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
+                           random_state=RANDOM_STATE, n_jobs=LGB_JOBS, verbose=-1)
+SABIT_PARAMS = {'subsample_freq': 1}
+_t0 = time.time()
+
+def objective(trial):
+    params = {
+        'max_depth':        trial.suggest_int('max_depth', 2, 8),
+        'num_leaves':       trial.suggest_int('num_leaves', 4, 127),
+        'n_estimators':     trial.suggest_int('n_estimators', 200, 800),
+        'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.10, log=True),
+        'min_child_samples':trial.suggest_int('min_child_samples', 20, 200),
+        'reg_lambda':       trial.suggest_float('reg_lambda', 0.1, 50, log=True),
+        'scale_pos_weight': trial.suggest_float('scale_pos_weight', _spw_lo, _spw_hi, log=True),
+        'reg_alpha':        trial.suggest_float('reg_alpha', 0.0, 10.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.7),
+        'subsample':        trial.suggest_float('subsample', 0.6, 0.8),
+        **SABIT_PARAMS,
+    }
+    model = clone(base).set_params(**params)
+    model.fit(X_tr, y_tr)
+
+    _pval = model.predict_proba(X_val)[:, 1]
+    val_gini = 2 * roc_auc_score(y_val, _pval) - 1
+    cap_val = _capture_at(y_val, _pval, CAPTURE_PCT)
+    return cap_val
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+study = optuna.create_study(direction='maximize',
+                             sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+study.optimize(objective, n_trials=N_ITER)
+print(f"✓ Optuna bitti ({(time.time()-_t0)/60:.1f} dk).")
+
+best_trial = study.best_trial
+BEST_PARAMS = {**best_trial.params, **SABIT_PARAMS}
+print(f"en iyi trial: #{best_trial.number} | capture_val={best_trial.value:.4f}")
+
+# --- 5) Final model (train ile) ---
+best = clone(base).set_params(n_jobs=LGB_JOBS, **BEST_PARAMS).fit(X_tr, y_tr)
+
+val_prob = best.predict_proba(X_val)[:, 1]
+thr = find_thresholds(y_val, val_prob)['youden_j']
+if not np.isfinite(thr):
+    thr = 0.5
+
+tr_prob  = best.predict_proba(X_tr)[:, 1]
+oot_prob = best.predict_proba(X_oot)[:, 1]
+
+tr_gini  = 2 * roc_auc_score(y_tr,  tr_prob)  - 1
+val_gini = 2 * roc_auc_score(y_val, val_prob) - 1
+oot_gini = 2 * roc_auc_score(y_oot, oot_prob) - 1 if y_oot.nunique() >= 2 else None
+
+print(f"\n✓ RAW-ONLY MODEL SONUÇ")
+print(f"  gini  -> train={tr_gini:.4f}  val={val_gini:.4f}  oot={oot_gini if oot_gini else 'NA'}")
+print(f"  threshold(youden_j) = {thr:.4f}")
+print(f"  final feature sayısı = {len(FEATURES)}")
+
+# --- 6) Özet dosyaya yaz ---
+raw_ozet = {
+    'n_train': len(X_tr), 'n_val': len(X_val), 'n_oot': len(X_oot),
+    'n_feature': len(FEATURES),
+    'train_gini': round(tr_gini, 4), 'val_gini': round(val_gini, 4),
+    'oot_gini': round(oot_gini, 4) if oot_gini is not None else None,
+    'threshold': round(thr, 4),
+    'best_trial': best_trial.number,
+    'best_params': json.dumps(BEST_PARAMS),
+}
+_yaz("raw_only_ozet.csv", pd.DataFrame([raw_ozet]))
+print("✓ Özet dosyaya yazıldı: raw_only_ozet.csv")
