@@ -1,0 +1,149 @@
+def renk_bazli_bucket_raporu(n_bucket_deger):
+    """Tüm renkler için TRAIN/VAL/OOT bucket raporunu üretir ve Excel'e yazar.
+    n_bucket_deger: bu run için kullanılacak bucket sayısı (örn. 20 veya 100).
+    """
+    bucket_tablolari, karsilastirma = {}, []
+
+    for RENK_KOD in MODEL_RENKLER:
+        renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+        etiket   = f"{RENK_KOD}-{renk_adi}"
+        print(f"\n=== {etiket} (N_BUCKET={n_bucket_deger}) ===")
+
+        # ------------------------------------------------------------
+        # 1) Skorlar - önce skorlama bloğunun ürettiğini dene
+        # ------------------------------------------------------------
+        _s = secilen_modeller.get(RENK_KOD, {}) if 'secilen_modeller' in globals() else {}
+        _gerekli = ('train_prob', 'train_index', 'y_train',
+                    'val_prob', 'val_index', 'y_val',
+                    'oot_prob', 'oot_index', 'y_oot')
+        if all(k in _s for k in _gerekli):
+            print("  ▶ 1) Skorlar skorlama bloğundan alınıyor (yeniden hesap YOK)...")
+            kumeler = [
+                ('TRAIN', np.asarray(_s['y_train']), np.asarray(_s['train_prob']), _s['train_index']),
+                ('VAL',   np.asarray(_s['y_val']),   np.asarray(_s['val_prob']),   _s['val_index']),
+                ('OOT',   np.asarray(_s['y_oot']),   np.asarray(_s['oot_prob']),   _s['oot_index']),
+            ]
+            print(f"  ✓ Hazır skor alındı (train={len(kumeler[0][1]):,} "
+                  f"val={len(kumeler[1][1]):,} oot={len(kumeler[2][1]):,})")
+        else:
+            print("  ▶ 1) Hazır skor yok - model yeniden eğitiliyor...")
+            mask = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == RENK_KOD) &
+                    (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+            df_r = df.loc[mask].copy()
+            if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+                print("  veri yok, atlandı"); continue
+
+            df_eng_r, _ = feature_engineering(df_r)
+            try:
+                FEATURES    = _features_oku(RENK_KOD, renk_adi)
+                best_params = _best_params_oku(RENK_KOD, renk_adi)
+            except Exception as e:
+                print(f"  CSV okunamadı ({e}), atlandı"); continue
+            FEATURES = [c for c in FEATURES if c in df_eng_r.columns]
+
+            train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
+            oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+            for c in CAT_COLS:
+                if c in train_full.columns and str(train_full[c].dtype) == 'category':
+                    oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+            if train_full[TARGET].nunique() < 2:
+                print("  train tek sınıf, atlandı"); continue
+
+            train, val, _kaynak = _bol(train_full, RENK_KOD, renk_adi)
+            X_tr, y_tr = train[FEATURES], train[TARGET]
+            if y_tr.nunique() < 2:
+                print("  train tek sınıf, atlandı"); continue
+            print(f"    train {len(X_tr)} / val {len(val)} (val eğitime GİRMİYOR, "
+                  f"bölme kaynağı: {_kaynak})")
+
+            spw   = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+            model = lgb.LGBMClassifier(objective='binary', metric='auc',
+                                        scale_pos_weight=spw, random_state=RANDOM_STATE,
+                                        n_jobs=LGB_JOBS, verbose=-1).set_params(**best_params)
+            model.fit(X_tr, y_tr)
+            kumeler = [
+                ('TRAIN', y_tr.to_numpy(),        model.predict_proba(X_tr)[:, 1],          train.index),
+                ('VAL',   val[TARGET].to_numpy(), model.predict_proba(val[FEATURES])[:, 1], val.index),
+                ('OOT',   oot[TARGET].to_numpy(), model.predict_proba(oot[FEATURES])[:, 1], oot.index),
+            ]
+            print("  ✓ Model eğitildi ve üç küme skorlandı")
+
+        # ------------------------------------------------------------
+        # 2) Her küme için bucket tablosu
+        # ------------------------------------------------------------
+        try:
+            _nb_ortak = _nb_sec(kumeler, n_bucket_deger)
+        except (ValueError, ZeroDivisionError) as e:
+            print(f"  bucket sayısı belirlenemedi ({e}), atlandı"); continue
+        if _nb_ortak != n_bucket_deger:
+            print(f"  ▶ 2) batan sayısı düşük → {n_bucket_deger} yerine {_nb_ortak} bucket "
+                  f"(üç kümede de aynı, karşılaştırılabilir kalsın diye)")
+        print(f"  ▶ 2) {_nb_ortak} bucket'a bölünüyor (TRAIN / VAL / OOT)...")
+        parcalar = []
+        for kume_adi, y_k, p_k, idx_k in kumeler:
+            if len(y_k) == 0 or pd.Series(y_k).nunique() < 2:
+                print(f"    {kume_adi}: tek sınıf / boş, atlandı"); continue
+            g, ozet = _bucket_tablosu(y_k, p_k, idx_k, etiket, kume_adi, _nb_ortak)
+            parcalar.append(g)
+            karsilastirma.append(ozet)
+            _cN = int(CAPTURE_PCT * 100)
+            _f = lambda v, f="{:.2f}": (f.format(v) if v is not None and pd.notna(v) else "NA")
+            _p = lambda v: (f"{v:.0%}" if v is not None and pd.notna(v) else "NA")
+            print(f"    {kume_adi:<5} base={ozet['base_rate']:.4f} "
+                  f"lift_tavan={_f(ozet['lift_tavan'])} | lift1={_f(ozet['lift1'])} "
+                  f"({_p(ozet['lift1_tavan_pct'])} tavan) | "
+                  f"cap{_cN}={_f(ozet[f'capture{_cN}'], '{:.4f}')} / "
+                  f"{_f(ozet[f'capture{_cN}_tavan'], '{:.4f}')} "
+                  f"({_p(ozet[f'capture{_cN}_tavan_pct'])} tavan) | "
+                  f"monoton={_p(ozet['monoton_pct'])} | nb={ozet['n_bucket']}")
+
+        if not parcalar:
+            print("  hiç küme üretilemedi, atlandı"); continue
+        g_all = pd.concat(parcalar, ignore_index=True)
+        bucket_tablolari[RENK_KOD] = g_all
+
+        # 3) Bu rengin tablosunu Excel'e yaz (tek sheet, kume kolonu ile)
+        _excel_yaz(f"renk_{RENK_KOD}_{renk_adi}_bucket{n_bucket_deger}_train_val_oot.xlsx",
+                   g_all, sheet_name=renk_adi)
+        print(f"  ✓ {etiket} tamamlandı (excel yazıldı)")
+
+    # - Tüm renkler tek Excel: her renk ayrı sheet + TUM + KARSILASTIRMA
+    print("\n▶ Tüm renkler tek Excel'e birleştiriliyor...")
+    if bucket_tablolari:
+        kars = pd.DataFrame(karsilastirma)
+        print("\n===== KÜME KARŞILAŞTIRMA (teşhis tablosu) =====")
+        print(kars.to_string(index=False))
+        print("\n  Okuma kılavuzu:")
+        print("    TRAIN de kötü          → model o bölgede sinyal bulamamış (kapasite/feature)")
+        print("    TRAIN iyi, VAL kötü    → aşırı öğrenme")
+        print("    TRAIN+VAL iyi, OOT kötü→ zamansal bozulma (popülasyon kayması)")
+        print("    lift1_tavan_pct        → renkler arası TEK karşılaştırılabilir lift ölçüsü")
+        print("      tavan = min(1/base_rate, n_bucket) - bucket sayısını GEÇEMEZ")
+        print("    capture tavanı = min(1, pct/base_rate)")
+        print("    monoton_pct < 1.00     → bucket sıralaması bozuk, iş tarafında güven kaybı")
+
+        fname = f"renk_bazli_TUM_bucket{n_bucket_deger}_train_val_oot.xlsx"
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as xl:
+            kars.to_excel(xl, sheet_name='KARSILASTIRMA', index=False)
+            for RENK_KOD, g in bucket_tablolari.items():
+                renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+                g.to_excel(xl, sheet_name=f"{RENK_KOD}_{renk_adi}"[:31], index=False)
+            pd.concat(bucket_tablolari.values(), ignore_index=True) \
+                .to_excel(xl, sheet_name='TUM', index=False)
+        buf.seek(0)
+        mf.upload_stream(PATH + "/" + fname, buf)          # <- alt klasöre yazılıyor
+
+        print(f"\n✓ {PATH}/{fname} yazıldı "
+              f"(KARSILASTIRMA + her renk ayrı sheet + TUM)")
+    else:
+        print("⚠ Hiç bucket tablosu üretilemedi")
+
+    return bucket_tablolari, karsilastirma
+
+
+# --- İKİ BUCKET DEĞERİNİ DE TEK RUN'DA ÜRET ---------------------------
+BUCKET_DEGERLERI = [20, 100]
+for _n in BUCKET_DEGERLERI:
+    print(f"\n{'='*70}\n N_BUCKET = {_n} ÇALIŞTIRILIYOR\n{'='*70}")
+    renk_bazli_bucket_raporu(_n)
