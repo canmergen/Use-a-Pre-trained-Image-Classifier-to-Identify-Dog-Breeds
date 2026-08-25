@@ -1,156 +1,109 @@
 # =========================================================
-# TEK MODEL - SADECE RAW FEATURE'LAR (renk/dönem segmenti YOK)
-# df_train_raw, df_val_raw, df_oot_raw üzerinde çalışır
-# Önceki pipeline'daki eleme adımlarını (sabit, korelasyon,
-# hedef ilişkisi, PSI) aynen kullanır, tek seferlik çalışır.
+# HİPOTEZ FEATURE'LARI (H01-H06) - train / val / oot için
+# Hepsi RAW kolonlardan türetiliyor, feature engineering
+# fonksiyonu olarak yazıp train/val/oot'a AYRI AYRI uyguluyoruz
+# ki her set kendi satırlarından hesaplansın (leakage yok,
+# çünkü hepsi satır-bazlı/aynı satır içi oranlar - zaman
+# ötesi bir istatistik değil).
 # =========================================================
 
-print("▶ 1) Feature listesi hazırlanıyor (RAW, feature engineering YOK)...")
-FEATURES = [c for c in df_train_raw.columns
-            if c not in LEAK_COLS and c != TARGET]
-print(f"  ✓ Başlangıç feature sayısı: {len(FEATURES)}")
+def hipotez_featurelari_ekle(df):
+    """H01-H06 hipotezlerindeki önerilen feature'ları df'e ekler.
+    df'i kopyalayıp üzerine ekleme yapar, orijinali bozmaz."""
+    df = df.copy()
 
-y_tr,  Xf = df_train_raw[TARGET], df_train_raw[FEATURES]
+    # --- H01: Gelen para saat-bazlı konsantrasyon endeksi (HHI) ---
+    # 4 saat diliminin payının karesi toplamı (0.25-1 arası).
+    # Düşük HHI -> saatlere yayılmış (düşük risk), yüksek HHI ->
+    # tek saat dilimine yığılmış (yüksek batma riski).
+    df["GLN_TIME_HHI_90D"] = (
+        df["TXN_GLN_H00_06_90D_AMT_SHR"] ** 2 +
+        df["TXN_GLN_H06_12_90D_AMT_SHR"] ** 2 +
+        df["TXN_GLN_H12_18_90D_AMT_SHR"] ** 2 +
+        df["TXN_GLN_H18_24_90D_AMT_SHR"] ** 2
+    )
+    # Not (H01'de belirtildiği gibi): TXN_GLN_90D_CNT == 0 olan
+    # müşterilerde payların hepsi 0 olduğundan HHI de 0 çıkar.
+    # Bu durumu ayırt etmek isterseniz aşağıdaki flag'i kullanabilirsiniz:
+    df["GLN_TIME_HHI_90D_AKTIF_FLAG"] = (df["TXN_GLN_90D_CNT"] > 0).astype(int)
 
-# --- 2a) Sabit / neredeyse sabit ---
-print("▶ 2a) Sabit / neredeyse sabit değişken elemesi...")
-drop_const = [c for c in FEATURES
-              if Xf[c].nunique(dropna=False) <= 1
-              or Xf[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
-FEATURES = [c for c in FEATURES if c not in drop_const]
-del Xf
-print(f"  ✓ Elenen: {len(drop_const)} | kalan: {len(FEATURES)}")
+    # --- H02: Giden/gelen tutar trend yönü ve etkileşimi ---
+    # log1p farkı: yakın dönem (90D) toplamla uzun dönem (180D) toplamı
+    # karşılaştırıp artış/azalış yönünü ölçüyor.
+    df["GDN_TREND_90D"] = (
+        np.log1p(df["TXN_GDN_90D_AMT"]) - np.log1p(df["TXN_GDN_180D_AMT"])
+    )
+    df["GLN_TREND_90D"] = (
+        np.log1p(df["TXN_GLN_90D_AMT"]) - np.log1p(df["TXN_GLN_180D_AMT"])
+    )
+    # Etkileşim terimi: her iki tutar da (180D bazında) sıfırdan büyükse
+    # iki trendin çarpımı; değilse NaN (sıfır-bölme/anlamsızlık durumu).
+    df["TREND_INTERACTION"] = np.where(
+        (df["TXN_GDN_180D_AMT"] > 0) & (df["TXN_GLN_180D_AMT"] > 0),
+        df["GDN_TREND_90D"] * df["GLN_TREND_90D"],
+        np.nan
+    )
 
-# --- 2b) Hedef ilişkisi: sayısal |Spearman|, kategorik Cramér's V ---
-print("▶ 2b) Hedef ilişkisi hesaplanıyor...")
-num = df_train_raw[FEATURES].select_dtypes(include=np.number)
-_cols = np.asarray(num.columns)
+    # --- H03: Gelen paranın ödeme şirketlerinden gelme oranı (binary eşik) ---
+    # Hem aktif ay sayısı hem pay oranı pozitifse VE pay >= 0.83 ise flag=1.
+    # Aksi halde (sıfır alt kümesi dahil) flag=0.
+    df["GLN_ODEME_DOMINANT_FLAG"] = np.where(
+        (df["TXN_GLN_ODEME_ACTIVE_MONTH_CNT"] > 0) & (df["TXN_GLN_ODEME_90D_AMT_SHR"] > 0),
+        (df["TXN_GLN_ODEME_90D_AMT_SHR"] >= 0.83).astype(int),
+        0
+    )
 
-_R = num.rank().to_numpy(dtype="float64")
-_R = (_R - _R.mean(0)) / np.maximum(_R.std(0), 1e-9)
-_R = np.nan_to_num(_R)
-_yr = y_tr.rank().to_numpy(dtype="float64")
-_yr = (_yr - _yr.mean()) / max(_yr.std(), 1e-9)
+    # --- H04: Giden işlemde banka çeşitliliğinin yakın dönemde daralması ---
+    # 180 günlük banka sayısı ile 90 günlük banka sayısı farkı (0-18 arası tamsayı).
+    # Yüksek değer -> banka çeşitliliği daralmış (bad rate artışıyla ilişkili).
+    df["BNK_CONTRACTION"] = df["TXN_GDN_180D_BNK_ADT"] - df["TXN_GDN_90D_BNK_ADT"]
 
-tgt_assoc = dict(zip(_cols, np.abs(_R.T @ _yr / len(_yr))))
-for c in FEATURES:
-    if c not in tgt_assoc:
-        tgt_assoc[c] = _cramers_v(df_train_raw[c], y_tr)
+    # --- H05: Son 7 günün 90 günlük toplam içindeki payı + U-şekilli uç flag ---
+    # 1e-8 eklenerek sıfıra bölme engelleniyor.
+    df["GDN_7D_SHR_90D"] = df["TXN_GDN_7D_AMT"] / (df["TXN_GDN_90D_AMT"] + 1e-8)
+    # Üst uç (yüksek yoğunlaşma) flag'i: sadece 90D'de işlem hacmi olan
+    # müşterilerde pay >= 0.20 ise 1, aksi halde 0.
+    df["GDN_7D_CONCENTRATION_HIGH"] = np.where(
+        df["TXN_GDN_90D_CNT"] > 0,
+        (df["GDN_7D_SHR_90D"] >= 0.20).astype(int),
+        0
+    )
 
-iv_scores = {c: _quick_iv(df_train_raw[c], y_tr) for c in FEATURES}
-print("  ✓ Hedef ilişkisi + IV bitti.")
+    # --- H06: Geçmişte bahis aktifliğinin son 7 güne taşınması ---
+    # Binary flag: 180 günde bahis aktif VE son 7 günde de bahis aktif.
+    df["BAHIS_DEVAM_FLAG"] = (
+        (df["TXN_GDN_BAHIS_180D_CNT"] > 0) & (df["TXN_GDN_BAHIS_7D_CNT"] > 0)
+    ).astype(int)
+    # Alternatif oran-bazlı gösterim: 180D bahis aktifse 7D'de devam
+    # ediyor mu (1.0/0.0), 180D'de hiç aktif değilse 0.0.
+    df["BAHIS_DEVAM_RATIO"] = np.where(
+        df["TXN_GDN_BAHIS_180D_CNT"] > 0,
+        (df["TXN_GDN_BAHIS_7D_CNT"] > 0).astype(float),
+        0.0
+    )
 
-# --- 2c) Yüksek korelasyon - çiftte hedefi DAHA İYİ AÇIKLAYAN tutulur ---
-print(f"▶ 2c) Korelasyon elemesi (Spearman |r|>{CORR_ESIK})...")
-_C = np.abs(_R.T @ _R / len(_R))
-_pos = {c: i for i, c in enumerate(_cols)}
+    return df
 
-_kept, drop_corr = [], set()
-for c in sorted(_cols, key=lambda k: -tgt_assoc.get(k, 0.0)):
-    i = _pos[c]
-    if _kept and (_C[i, _kept] > CORR_ESIK).any():
-        drop_corr.add(c)
-    else:
-        _kept.append(i)
 
-drop_corr = [c for c in FEATURES if c in drop_corr]
-FEATURES = [c for c in FEATURES if c not in drop_corr]
-print(f"  ✓ Elenen: {len(drop_corr)} | kalan: {len(FEATURES)}")
+# --- Fonksiyonu train / val / oot setlerine ayrı ayrı uygula ---
+print("▶ Hipotez feature'ları ekleniyor (train / val / oot)...")
 
-if len(FEATURES) == 0:
-    raise RuntimeError("Tüm feature'lar elendi, işlem durduruldu.")
+df_train_raw = hipotez_featurelari_ekle(df_train_raw)
+df_val_raw   = hipotez_featurelari_ekle(df_val_raw)
+df_oot_raw   = hipotez_featurelari_ekle(df_oot_raw)
 
-# --- 2d) PSI (train vs oot) ---
-print("▶ 2d) PSI hesaplanıyor (train vs OOT)...")
-psi_scores = {c: _psi(df_train_raw[c], df_oot_raw[c]) for c in FEATURES}
-_ele = [c for c in FEATURES
-        if psi_scores[c] > 0.25 and tgt_assoc.get(c, 0.0) < 0.05]
-FEATURES = [c for c in FEATURES if c not in _ele]
-print(f"  ✓ PSI elemesi: {len(_ele)} feature elendi | kalan: {len(FEATURES)}")
+_yeni_kolonlar = [
+    "GLN_TIME_HHI_90D", "GLN_TIME_HHI_90D_AKTIF_FLAG",
+    "GDN_TREND_90D", "GLN_TREND_90D", "TREND_INTERACTION",
+    "GLN_ODEME_DOMINANT_FLAG",
+    "BNK_CONTRACTION",
+    "GDN_7D_SHR_90D", "GDN_7D_CONCENTRATION_HIGH",
+    "BAHIS_DEVAM_FLAG", "BAHIS_DEVAM_RATIO",
+]
+print(f"  ✓ Eklenen feature sayısı: {len(_yeni_kolonlar)}")
+print(f"  ✓ train shape: {df_train_raw.shape} | val shape: {df_val_raw.shape} | oot shape: {df_oot_raw.shape}")
 
-if len(FEATURES) == 0:
-    raise RuntimeError("Tüm feature'lar elendi, işlem durduruldu.")
-
-print(f"\n✓ FINAL FEATURE SAYISI: {len(FEATURES)}\n")
-
-# --- 3) train/val/oot final matrisleri ---
-X_tr,  y_tr  = df_train_raw[FEATURES], df_train_raw[TARGET]
-X_val, y_val = df_val_raw[FEATURES],   df_val_raw[TARGET]
-X_oot, y_oot = df_oot_raw[FEATURES],   df_oot_raw[TARGET]
-print(f"✓ Matrisler hazır - train {X_tr.shape} / val {X_val.shape} / oot {X_oot.shape}")
-
-# --- 4) Model + Optuna (tek model, renk ayrımı YOK) ---
-spw = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
-_spw_lo, _spw_hi = min(1.0, spw), max(1.0, spw)
-if not (_spw_hi > _spw_lo * 1.001):
-    _spw_lo, _spw_hi = 0.8, 1.25
-
-base = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
-                           random_state=RANDOM_STATE, n_jobs=LGB_JOBS, verbose=-1)
-SABIT_PARAMS = {'subsample_freq': 1}
-_t0 = time.time()
-
-def objective(trial):
-    params = {
-        'max_depth':        trial.suggest_int('max_depth', 2, 8),
-        'num_leaves':       trial.suggest_int('num_leaves', 4, 127),
-        'n_estimators':     trial.suggest_int('n_estimators', 200, 800),
-        'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.10, log=True),
-        'min_child_samples':trial.suggest_int('min_child_samples', 20, 200),
-        'reg_lambda':       trial.suggest_float('reg_lambda', 0.1, 50, log=True),
-        'scale_pos_weight': trial.suggest_float('scale_pos_weight', _spw_lo, _spw_hi, log=True),
-        'reg_alpha':        trial.suggest_float('reg_alpha', 0.0, 10.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.7),
-        'subsample':        trial.suggest_float('subsample', 0.6, 0.8),
-        **SABIT_PARAMS,
-    }
-    model = clone(base).set_params(**params)
-    model.fit(X_tr, y_tr)
-
-    _pval = model.predict_proba(X_val)[:, 1]
-    val_gini = 2 * roc_auc_score(y_val, _pval) - 1
-    cap_val = _capture_at(y_val, _pval, CAPTURE_PCT)
-    return cap_val
-
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-study = optuna.create_study(direction='maximize',
-                             sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
-study.optimize(objective, n_trials=N_ITER)
-print(f"✓ Optuna bitti ({(time.time()-_t0)/60:.1f} dk).")
-
-best_trial = study.best_trial
-BEST_PARAMS = {**best_trial.params, **SABIT_PARAMS}
-print(f"en iyi trial: #{best_trial.number} | capture_val={best_trial.value:.4f}")
-
-# --- 5) Final model (train ile) ---
-best = clone(base).set_params(n_jobs=LGB_JOBS, **BEST_PARAMS).fit(X_tr, y_tr)
-
-val_prob = best.predict_proba(X_val)[:, 1]
-thr = find_thresholds(y_val, val_prob)['youden_j']
-if not np.isfinite(thr):
-    thr = 0.5
-
-tr_prob  = best.predict_proba(X_tr)[:, 1]
-oot_prob = best.predict_proba(X_oot)[:, 1]
-
-tr_gini  = 2 * roc_auc_score(y_tr,  tr_prob)  - 1
-val_gini = 2 * roc_auc_score(y_val, val_prob) - 1
-oot_gini = 2 * roc_auc_score(y_oot, oot_prob) - 1 if y_oot.nunique() >= 2 else None
-
-print(f"\n✓ RAW-ONLY MODEL SONUÇ")
-print(f"  gini  -> train={tr_gini:.4f}  val={val_gini:.4f}  oot={oot_gini if oot_gini else 'NA'}")
-print(f"  threshold(youden_j) = {thr:.4f}")
-print(f"  final feature sayısı = {len(FEATURES)}")
-
-# --- 6) Özet dosyaya yaz ---
-raw_ozet = {
-    'n_train': len(X_tr), 'n_val': len(X_val), 'n_oot': len(X_oot),
-    'n_feature': len(FEATURES),
-    'train_gini': round(tr_gini, 4), 'val_gini': round(val_gini, 4),
-    'oot_gini': round(oot_gini, 4) if oot_gini is not None else None,
-    'threshold': round(thr, 4),
-    'best_trial': best_trial.number,
-    'best_params': json.dumps(BEST_PARAMS),
-}
-_yaz("raw_only_ozet.csv", pd.DataFrame([raw_ozet]))
-print("✓ Özet dosyaya yazıldı: raw_only_ozet.csv")
+# Hızlı kontrol: NaN oranları (özellikle TREND_INTERACTION ve
+# GDN_7D_SHR_90D gibi sıfır-bölme/koşullu NaN üretebilen kolonlar için)
+print("\n  NaN oranları (train):")
+print(df_train_raw[_yeni_kolonlar].isna().mean().round(4))
