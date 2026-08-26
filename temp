@@ -1,183 +1,49 @@
-# =========================================================
-# 1) Elenen yeni feature'ların hangi feature(ler)le yüksek
-#    korelasyonlu olduğunu bulma (Spearman |r| > CORR_ESIK)
-# =========================================================
+import time
+import dataiku
+import pyarrow.fs as pafs
+import pyarrow.dataset as pads
+import psutil
 
-elenen_kontrol = [c for c in _yeni_kolonlar if c in df_train_raw.columns
-                  and c not in imp_df["feature"].values]
-print(f"Elenen yeni feature'lar: {elenen_kontrol}\n")
+PROJECT = "KKKSSGGSERKANYASARSANDBOX"
+DATASET_NAMES = ["HAVALE_EFT_NTT", "HAVALE_EFT_NTT_prepared"]
 
-# Tüm sayısal kolonlarla (final FEATURES + elenenler dahil, TARGET hariç)
-# rank-tabanlı Spearman korelasyonu tek seferde hesaplıyoruz.
-_tum_num_cols = [c for c in df_train_raw.columns
-                 if c != TARGET and pd.api.types.is_numeric_dtype(df_train_raw[c])]
+dfs = {}
 
-_R_all = df_train_raw[_tum_num_cols].rank().to_numpy(dtype="float64")
-_R_all = (_R_all - np.nanmean(_R_all, axis=0)) / np.maximum(np.nanstd(_R_all, axis=0), 1e-9)
-_R_all = np.nan_to_num(_R_all)
-_pos_all = {c: i for i, c in enumerate(_tum_num_cols)}
+for name in DATASET_NAMES:
+    t0 = time.time()
 
-for feat in elenen_kontrol:
-    if feat not in _pos_all:
-        print(f"[{feat}] sayısal değil veya bulunamadı, atlandı.")
-        continue
-    i = _pos_all[feat]
-    corr_vec = np.abs(_R_all.T @ _R_all[:, [i]] / len(_R_all)).flatten()
-    _s = pd.Series(corr_vec, index=_tum_num_cols).drop(feat)
-    _yuksek = _s[_s > CORR_ESIK].sort_values(ascending=False)
-    print(f"\n[{feat}] ile |Spearman r| > {CORR_ESIK} olan feature'lar:")
-    if len(_yuksek):
-        display(_yuksek.rename("abs_corr").to_frame())
-    else:
-        print("  (Bu eşiğin üzerinde eşleşme yok — muhtemelen sabit değişken/PSI adımında elendi, korelasyon değil.)")
+    d = dataiku.Dataset(f"{PROJECT}.{name}")
+    info = d.get_location_info(sensitive_info=True)["info"]
+    cp = info["connectionParams"]
+    root = info["path"].replace("s3://", "")
 
-    # tgt_assoc karşılaştırması: hangisi hedefi daha iyi açıklıyordu, o yüzden mi elendi?
-    if feat in tgt_assoc:
-        print(f"  {feat} tgt_assoc = {tgt_assoc.get(feat, 0):.4f}")
-        for rakip in _yuksek.index[:3]:
-            print(f"    rakip {rakip} tgt_assoc = {tgt_assoc.get(rakip, 0):.4f}")
+    s3 = pafs.S3FileSystem(
+        access_key=cp["accessKey"],
+        secret_key=cp["secretKey"],
+        endpoint_override="loscdlhp.aknet.akb:9000",
+        scheme="https",
+        force_virtual_addressing=False,
+    )
 
-# =========================================================
-# 2) SADECE yeni H01-H06 feature'larıyla mini model
-#    (eleme adımı YOK, direkt bu feature'larla fit)
-# =========================================================
+    dset = pads.dataset(root, filesystem=s3, format="parquet")
 
-FEATURES_YENI = _yeni_kolonlar.copy()
-print(f"Kullanılan feature sayısı: {len(FEATURES_YENI)} -> {FEATURES_YENI}")
+    sch = d.read_schema()
+    names, dtypes, date_idx = d.get_dataframe_schema_st(sch, int_as_float=True)
+    date_cols = {names[i] for i in date_idx} if date_idx else set()
 
-X_tr_y  = df_train_raw[FEATURES_YENI].fillna(-999)
-X_val_y = df_val_raw[FEATURES_YENI].fillna(-999)
-X_oot_y = df_oot_raw[FEATURES_YENI].fillna(-999)
-y_tr_y, y_val_y, y_oot_y = df_train_raw[TARGET], df_val_raw[TARGET], df_oot_raw[TARGET]
+    vm0 = psutil.virtual_memory().used
+    tbl = dset.to_table(use_threads=True)
+    df = tbl.to_pandas(self_destruct=True, split_blocks=True)
 
-model_yeni = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
-                                 random_state=RANDOM_STATE, n_jobs=LGB_JOBS, verbose=-1,
-                                 max_depth=4, num_leaves=31, n_estimators=300,
-                                 learning_rate=0.05, min_child_samples=50)
-model_yeni.fit(X_tr_y, y_tr_y)
+    cast = {c: t for c, t in dtypes.items() if c in df.columns and c not in date_cols}
+    df = df.astype(cast)[names]
 
-tr_prob_y  = model_yeni.predict_proba(X_tr_y)[:, 1]
-val_prob_y = model_yeni.predict_proba(X_val_y)[:, 1]
-oot_prob_y = model_yeni.predict_proba(X_oot_y)[:, 1]
+    elapsed = time.time() - t0
+    ram_add = (psutil.virtual_memory().used - vm0) / 1e9
+    print(f"[{name}] süre: {int(elapsed//60)}dk {int(elapsed%60)}sn | RAM: +{ram_add:.1f} GB | {df.shape[0]:,} satır x {df.shape[1]} sütun")
 
-tr_gini_y  = 2 * roc_auc_score(y_tr_y, tr_prob_y) - 1
-val_gini_y = 2 * roc_auc_score(y_val_y, val_prob_y) - 1
-oot_gini_y = 2 * roc_auc_score(y_oot_y, oot_prob_y) - 1 if y_oot_y.nunique() >= 2 else None
+    globals()[f"df_{name}"] = df
+    dfs[name] = df
 
-print(f"\n✓ SADECE YENİ FEATURE'LAR (H01-H06) İLE MODEL")
-print(f"  gini -> train={tr_gini_y:.4f}  val={val_gini_y:.4f}  oot={oot_gini_y:.4f}")
-
-# Karşılaştırma için tüm-model (150 feature) sonuçlarıyla yan yana
-print(f"\n--- Karşılaştırma ---")
-print(f"  tüm model (150 feature) -> train={ozet['train_gini']}  val={ozet['val_gini']}  oot={ozet['oot_gini']}")
-print(f"  sadece yeniler (11 feat) -> train={tr_gini_y:.4f}  val={val_gini_y:.4f}  oot={oot_gini_y:.4f}")
-
-_yaz("sadece_yeni_feature_model_ozet.csv", pd.DataFrame([{
-    "n_feature": len(FEATURES_YENI),
-    "train_gini": round(tr_gini_y, 4),
-    "val_gini": round(val_gini_y, 4),
-    "oot_gini": round(oot_gini_y, 4) if oot_gini_y is not None else None,
-}]))
-print("\n✓ Sonuç dosyaya yazıldı: sadece_yeni_feature_model_ozet.csv")
-
-
-
-
-
-
-
-
-
-
-
-
-# =========================================================
-# ÖNCESİ / SONRASI KARŞILAŞTIRMA - Raw-only vs +H01-H06
-# =========================================================
-
-karsilastirma = pd.DataFrame({
-    "öncesi (raw-only)": {
-        "n_feature":   raw_ozet["n_feature"],
-        "train_gini":  raw_ozet["train_gini"],
-        "val_gini":    raw_ozet["val_gini"],
-        "oot_gini":    raw_ozet["oot_gini"],
-        "threshold":   raw_ozet["threshold"],
-        "best_trial":  raw_ozet["best_trial"],
-    },
-    "sonrası (+H01-H06)": {
-        "n_feature":   ozet["n_feature"],
-        "train_gini":  ozet["train_gini"],
-        "val_gini":    ozet["val_gini"],
-        "oot_gini":    ozet["oot_gini"],
-        "threshold":   ozet["threshold"],
-        "best_trial":  ozet["best_trial"],
-    },
-})
-
-karsilastirma["fark"] = (karsilastirma["sonrası (+H01-H06)"] - karsilastirma["öncesi (raw-only)"]).round(4)
-karsilastirma["fark_%"] = ((karsilastirma["sonrası (+H01-H06)"] / karsilastirma["öncesi (raw-only)"] - 1) * 100).round(2)
-
-print("--- Önceki / Sonraki Karşılaştırma ---")
-display(karsilastirma)
-
-# --- Train-val gap yorumu (overfit sinyali kontrolü) ---
-gap_once = raw_ozet["train_gini"] - raw_ozet["val_gini"]
-gap_sonra = ozet["train_gini"] - ozet["val_gini"]
-print(f"\ntrain-val gap  -> öncesi: {gap_once:.4f}  |  sonrası: {gap_sonra:.4f}  "
-      f"(fark: {gap_sonra - gap_once:+.4f})")
-
-_yaz("karsilastirma_oncesi_sonrasi.csv", karsilastirma.reset_index().rename(columns={"index": "metrik"}))
-print("\n✓ Karşılaştırma dosyaya yazıldı: karsilastirma_oncesi_sonrasi.csv")
-
-
-
-# =========================================================
-# FEATURE IMPORTANCE - yeni eklenen H01-H06 feature'larına
-# özel karşılaştırma (LightGBM'in kendi importance'ı + rank)
-# =========================================================
-
-_yeni_kolonlar = [
-    "GLN_TIME_HHI_90D", "GLN_TIME_HHI_90D_AKTIF_FLAG",
-    "GDN_TREND_90D", "GLN_TREND_90D", "TREND_INTERACTION",
-    "GLN_ODEME_DOMINANT_FLAG",
-    "BNK_CONTRACTION",
-    "GDN_7D_SHR_90D", "GDN_7D_CONCENTRATION_HIGH",
-    "BAHIS_DEVAM_FLAG", "BAHIS_DEVAM_RATIO",
-]
-
-# --- 1) Modelin tüm feature importance'larını al ---
-imp_df = pd.DataFrame({
-    "feature": best.feature_name_,
-    "importance_gain": best.booster_.feature_importance(importance_type="gain"),
-    "importance_split": best.booster_.feature_importance(importance_type="split"),
-}).sort_values("importance_gain", ascending=False).reset_index(drop=True)
-
-# Rank kolonu ekle (1 = en önemli feature)
-imp_df["rank"] = imp_df.index + 1
-imp_df["gain_pct"] = (imp_df["importance_gain"] / imp_df["importance_gain"].sum() * 100).round(2)
-
-print(f"✓ Toplam feature sayısı (final listede): {len(imp_df)}")
-print(f"✓ Yeni eklenen H01-H06 feature'larından finalde kalan: "
-      f"{imp_df['feature'].isin(_yeni_kolonlar).sum()} / {len(_yeni_kolonlar)}")
-
-# --- 2) Sadece yeni feature'ları filtrele, rank sırasına göre göster ---
-yeni_imp = imp_df[imp_df["feature"].isin(_yeni_kolonlar)].sort_values("rank")
-
-print("\n--- Yeni (H01-H06) feature'ların importance'ı ---")
-display(yeni_imp[["rank", "feature", "importance_gain", "gain_pct", "importance_split"]])
-
-# --- 3) Finalde hiç kalmayan (elenmiş) yeni feature'lar var mı? ---
-elenen_yeniler = [c for c in _yeni_kolonlar if c not in imp_df["feature"].values]
-if elenen_yeniler:
-    print(f"\n⚠ Şu yeni feature'lar eleme adımlarında (sabit/korelasyon/PSI) elendi, "
-          f"finalde YOK: {elenen_yeniler}")
-else:
-    print("\n✓ Yeni feature'ların hepsi final modele girdi, eleme adımlarında hiçbiri düşmedi.")
-
-# --- 4) Tüm feature'lar içinde top 20 - yenileri işaretlenmiş olarak görmek için ---
-imp_df["yeni_mi"] = imp_df["feature"].isin(_yeni_kolonlar)
-print("\n--- Genel top 20 (yeni feature'lar işaretli) ---")
-display(imp_df.head(20)[["rank", "feature", "importance_gain", "gain_pct", "yeni_mi"]])
-
-_yaz("feature_importance_full.csv", imp_df)
-print("\n✓ Tam importance listesi dosyaya yazıldı: feature_importance_full.csv")
+df_HAVALE_EFT_NTT = dfs["HAVALE_EFT_NTT"]
+df_HAVALE_EFT_NTT_prepared = dfs["HAVALE_EFT_NTT_prepared"]
