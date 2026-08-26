@@ -1,39 +1,117 @@
 import re
+from collections import defaultdict
 
-# Aile token'ı -> açıklamada geçmesi gereken kelime eşlemesi
-def check_family_semantics(families):
-    problems = []
-    for fam, items in families.items():
-        toks = fam.split("_")
-        for metric, desc in items:
-            d = desc.lower()
-            # 1) YÖN kontrolü
-            if "giden" in d and not ("GDN" in toks or toks[0] == "OUT"):
-                problems.append((fam, metric, "yön: açıklama 'giden' diyor", desc))
-            if "gelen" in d and not ("GLN" in toks or toks[0] == "IN"):
-                problems.append((fam, metric, "yön: açıklama 'gelen' diyor", desc))
-            # 2) PENCERE kontrolü (ilk 'son N gün' ifadesi aile adında olmalı)
-            m = re.search(r"son\s+(\d+)\s+g[üu]n", d)
-            if m and f"{m.group(1)}D" not in toks:
-                problems.append((fam, metric, f"pencere: açıklama 'son {m.group(1)} gün' diyor", desc))
-            # 3) SEGMENT kontrolü
-            for tok_ad, kelime in (("KRIPTO", "kripto"), ("ODEME", "ödeme"), ("BAHIS", "bahis")):
-                if kelime in d and tok_ad not in toks:
-                    problems.append((fam, metric, f"segment: açıklama '{kelime}' diyor", desc))
-                if tok_ad in toks and kelime not in d:
-                    problems.append((fam, metric, f"segment: aile {tok_ad} ama açıklamada '{kelime}' yok", desc))
-    return problems
+# ============================================================
+# EKSEN 3+4+5: metrik anlamı, TAM sayı tutarlılığı, aile homojenliği
+# ============================================================
 
-problems = check_family_semantics(families)
-print(f"Anlamsal uyumsuzluk: {len(problems)} / 1038 kolon")
-for fam, metric, sorun, desc in problems[:30]:
-    print(f"  {fam}_{metric} | {sorun}\n    -> {desc}")
+# Metrik token'ı -> açıklamada geçmesi gereken kelime(ler)den en az biri
+METRIC_KEYWORDS = {
+    "CNT": ["adet", "adedi", "sayısı"],
+    "AMT": ["tutar"],
+    "AVG": ["ortalama"],
+    "MAX": ["maksimum"],
+    "STD": ["standart"],
+    "CV": ["katsayısı"],
+    "PER": ["günlük"],           # PER_DAY -> PER + DAY
+    "DAY": ["günlük"],
+    "BNK": ["banka"],
+    "ADT": ["adet", "adedi"],
+    "SHR": ["pay"],
+    "RATIO": ["oran"],
+    "TMSNCFRST": ["ilk"],
+    "TMSNCLST": ["son"],
+    "HS": ["hafta sonu"],
+    "ACTIVE": ["ay"],
+    "MONTH": ["ay"],
+    # --- CP metrik parçaları ---
+    "TOP1": ["en çok"],
+    "TOTAL": ["toplam"],
+    "DISTINCT": ["farklı"],
+    "EFFECTIVE": ["etkin"],
+    "CP": ["karşı taraf"],
+    "HHI": ["hhi", "yoğunlaş"],
+    "ENTROPY": ["entropi"],
+    "SUM": ["tutar"],
+    "RAW": ["ham"],
+    "SHRUNK": ["düzeltilmiş", "shrink"],
+    "SUPPORT": ["destek"],
+    "CONC": ["yoğunlaş"],
+    "SCORE": ["skor"],
+    "FLAG": ["bayrağı", "bayrak"],
+    "NO": ["yok"],
+    "LOW": ["düşük"],
+    "HIGH": ["yüksek"],
+    "TXN": ["işlem"],
+    "BY": [],   # bağlaç, tek başına anlam taşımıyor -> denetim dışı değil, bilinçli muaf
+}
 
-# --- GÖZ KONTROLÜ: rastgele 5 ailenin TÜM içeriği ---
-import random
-random.seed(0)
-print("\n=== RASTGELE 5 AİLE (göz kontrolü) ===")
-for fam in random.sample(list(families), 5):
-    print(f"\n{fam}:")
-    for metric, desc in families[fam]:
-        print(f"  _{metric}: {desc}")
+violations = []       # (kolon, sorun, açıklama)
+unaudited = defaultdict(int)  # kural tanımsız token -> kaç kez görüldü
+
+def num_tokens(s):
+    return re.findall(r"\d+", s)
+
+for fam, items in families.items():
+    fam_nums = num_tokens(fam)
+    for metric, desc in items:
+        col = f"{fam}_{metric}"
+        d = desc.lower()
+
+        # --- EKSEN 4: TAM sayı tutarlılığı (iki yönlü) ---
+        col_nums = sorted(set(num_tokens(col)), key=int)
+        desc_nums = sorted(set(num_tokens(desc)), key=int)
+        # Açıklamadaki 00/06 gibi başı sıfırlıları normalize et
+        if sorted(map(int, col_nums)) != sorted(map(int, desc_nums)):
+            violations.append((col, f"SAYI: ad={col_nums} vs açıklama={desc_nums}", desc))
+
+        # --- EKSEN 3: metrik anlamı ---
+        for tok in metric.split("_"):
+            if tok.isdigit() or tok.endswith("D") and tok[:-1].isdigit():
+                continue  # sayısal/pencere token'ı, eksen 4 zaten kontrol etti
+            if tok in METRIC_KEYWORDS:
+                kws = METRIC_KEYWORDS[tok]
+                if kws and not any(k in d for k in kws):
+                    violations.append((col, f"METRİK: '{tok}' için {kws} açıklamada yok", desc))
+            else:
+                unaudited[tok] += 1
+
+# --- EKSEN 5: aile içi homojenlik ---
+# İskelet = açıklamadan sayıları ve bilinen metrik kelimelerini çıkarınca kalan yapı.
+# Bir ailede >1 iskelet varsa o aile iki farklı anlam yapısı barındırıyor demektir.
+STRIP_WORDS = sorted(
+    {w for kws in METRIC_KEYWORDS.values() for w in kws} |
+    {"işlem", "işlemlerde", "işlemden", "bu", "yana", "geçen", "süre"},
+    key=len, reverse=True)
+
+def skeleton(desc):
+    s = desc.lower()
+    s = re.sub(r"\d+", "#", s)
+    for w in STRIP_WORDS:
+        s = s.replace(w, "")
+    return re.sub(r"\s+", " ", s).strip()
+
+hetero = []
+for fam, items in families.items():
+    skels = {skeleton(desc) for _, desc in items}
+    if len(skels) > 1:
+        hetero.append((fam, len(items), skels))
+
+# ================= RAPOR =================
+print(f"EKSEN 3+4 İHLALLERİ: {len(violations)}")
+for col, sorun, desc in violations[:40]:
+    print(f"  {col}\n    {sorun}\n    -> {desc}")
+
+print(f"\nEKSEN 5 — HETEROJEN AİLELER: {len(hetero)} / {len(families)}")
+for fam, n, skels in sorted(hetero, key=lambda x: -x[1])[:20]:
+    print(f"  {fam} ({n} kolon, {len(skels)} farklı yapı):")
+    for s in skels:
+        print(f"    - {s}")
+
+print(f"\nDENETİM DIŞI TOKEN'LAR (kural tanımsız): {dict(sorted(unaudited.items(), key=lambda kv: -kv[1]))}")
+
+if not violations and not hetero and not unaudited:
+    print("\n✓ 5 eksenin 5'i de temiz — sözlük kilitlenebilir.")
+else:
+    print("\n→ Yukarıdaki listeler boşalana kadar sözlük kilitli SAYILMAZ. "
+          "Listeleri paylaş, tek tek kapatalım.")
