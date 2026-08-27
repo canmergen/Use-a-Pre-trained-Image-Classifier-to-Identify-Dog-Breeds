@@ -1,50 +1,103 @@
-PROMPT_SABLON = """# ROL
-Kıdemli bir kredi riski analistisin. Görevin: aşağıdaki veriden batma riskini
-öngören YENİ bir feature tasarlamak.
+## 1.8 Doğrulama zinciri + istatistik fonksiyonları
 
-# VERİ
-Bireysel müşterilerin para transferi davranışları. Her satır bir müşteri.
-Target: müşterinin ilk ödemesini yapmaması (1=battı, 0=batmadı).
-Örneklem dengeli, base rate %50.
+LLM'den gelen her öneri iki katmandan geçer:
 
-Kolon haritası (JSON):
-{harita}
+**Doğrulama** (sırayla; ilk takılan yerde red): kolonlar şemada var mı →
+yasaklı kolon/kalıp içeriyor mu → söz dizimi geçerli mi (`ast.parse`) →
+örneklemde hatasız çalışıyor mu → çıktı sabit mi.
 
-Haritayı okuma kuralı:
-- Tam kolon adı = aileler'deki anahtar + '_' + o ailenin listesindeki bir metrik.
-  Örnek: aile "TXN_GDN_30D", metrik "AMT" ise kolon adı TXN_GDN_30D_AMT olur.
-- Kısaltmaların anlamı 'lejant' bölümündedir.
+**İstatistik** (kod hesaplar, LLM'e sorulmaz): feature train'de hesaplanır,
+decile bazlı bad-rate eğrisi çıkarılır, en riskli decile'ın pp-gap ve lift'i
+bulunur, LLM'in iddia ettiği yön eğrinin gerçek yönüyle karşılaştırılır,
+mevcut tüm feature'larla maksimum korelasyon ölçülür.
 
-# BU TURUN TEMASI
-Feature'ını şu temadan türet: {tema}
 
-# NE İSTİYORUM
-Davranışsal, bariz olmayan bir sinyal: oran, dengesizlik, pencereler arası
-karşılaştırma veya konsantrasyon. Tek bir ham kolonun kopyası ya da basit
-ölçeklemesi KABUL EDİLMEZ.
 
-Önemli: bu veride oran/aktivite kolonları, o kanalı hiç kullanmamış müşteride 0'dır.
-"Kolon > 0" gibi bir yapı sadece "bu kanalda aktivite var mı" demektir ve keşif
-sayılmaz. Feature aktif müşteriler arasında da ayrıştırmalı.
 
-# TEKRARLAMA
-Daha önce önerilenler (bunların pencere/kolon değişmiş varyantları da yasak):
-{yasak_liste}
 
-# FORMÜL KURALLARI
-1. Sadece haritadaki gerçek kolon adlarını kullan; kolon adı uydurma.
-2. Şu kolonlar formülde geçemez: {yasakli_kolonlar}
-3. Formül tek satırlık pandas ifadesidir; atama yok, sadece sağ taraf.
-4. Her bölmede paydaya .replace(0, np.nan) ekle (zero-safe).
-5. İzinli: aritmetik, df['...'], np.where, np.log1p, .clip, .replace, .abs()
-6. Yasak: import, eval, exec, lambda, atama.
-Söz dizimi örneği (içeriğini kopyalama): df['A_AMT'] / df['A_CNT'].replace(0, np.nan)
 
-# CEVAP FORMATI
-Sadece aşağıdaki JSON'u döndür. Öncesinde/sonrasında metin veya markdown fence yazma.
-{{"ad_soneki": "<KISA_AD_BUYUK_HARF_SNAKE>",
-  "gerekce": "<neden batmayı öngörür, 1-2 cümle Türkçe>",
-  "mekanizma": "<finansal sezgi, 1 cümle Türkçe>",
-  "beklenen_yon": "<yuksek_riskli | dusuk_riskli>",
-  "kullanilan_kolonlar": ["<kolon1>", "<kolon2>"],
-  "formul": "<tek satır pandas ifadesi>"}}"""
+
+YASAK_KALIPLAR = ["import", "eval", "exec", "lambda", "__", "os.", "open(", "=", ";"]
+
+def oneri_dogrula(oneri, target_df):
+    """Öneriyi doğrular. Dönüş: (True, seri) veya (False, red_nedeni)."""
+    formul = str(oneri.get("formul", "")).strip()
+    kolonlar = oneri.get("kullanilan_kolonlar", [])
+
+    # 1) Kolonlar şemada var mı?
+    yok = [k for k in kolonlar if k not in target_df.columns]
+    if yok:
+        return False, f"şemada olmayan kolon: {yok}"
+    # 2) Yasaklı kolon geçiyor mu? (listede değil, formülün kendisinde ara)
+    gecen = [k for k in YASAKLI_KOLONLAR if k in formul]
+    if gecen:
+        return False, f"yasaklı kolon formülde: {gecen}"
+    # 3) Yasaklı kalıp var mı? ('=' atamayı engeller; '==' de yakalanır, sorun değil)
+    kalip = [k for k in YASAK_KALIPLAR if k in formul]
+    if kalip:
+        return False, f"yasaklı kalıp: {kalip}"
+    # 4) Söz dizimi geçerli mi?
+    try:
+        ast.parse(formul, mode="eval")
+    except SyntaxError as e:
+        return False, f"söz dizimi hatası: {e}"
+    # 5) Küçük örneklemde çalışıyor mu?
+    try:
+        ornek = target_df.head(1000)
+        seri_ornek = eval(formul, {"__builtins__": {}}, {"df": ornek, "np": np, "pd": pd})
+    except Exception as e:
+        return False, f"çalıştırma hatası: {e}"
+    # 6) Tam df'te hesapla, sabitlik kontrolü
+    seri = eval(formul, {"__builtins__": {}}, {"df": target_df, "np": np, "pd": pd})
+    seri = pd.Series(seri, index=target_df.index).astype(float)
+    if seri.replace([np.inf, -np.inf], np.nan).nunique(dropna=True) <= 1:
+        return False, "çıktı sabit (ayrıştırma gücü yok)"
+    return True, seri
+
+def istatistik_hesapla(seri, target_df):
+    """Decile bazlı bad-rate analizi + korelasyon. LLM'e sorulmaz, kod ölçer."""
+    t = target_df[TARGET_COL].to_numpy()
+    s = seri.replace([np.inf, -np.inf], np.nan)
+    base_rate = t.mean()
+
+    # Decile'lara böl (bağ/tekrar eden değer olursa daha az dilim kabul)
+    try:
+        dilim = pd.qcut(s, 10, labels=False, duplicates="drop")
+    except Exception:
+        return None
+    tablo = (pd.DataFrame({"dilim": dilim, "t": t})
+             .dropna().groupby("dilim")["t"].agg(["mean", "size"]))
+    if len(tablo) < 3:
+        return None   # feature neredeyse tamamen tek değerli
+
+    en_riskli = tablo["mean"].idxmax()
+    seg_rate  = tablo.loc[en_riskli, "mean"]
+    pp_gap = (seg_rate - base_rate) * 100
+    lift   = seg_rate / base_rate if base_rate > 0 else np.nan
+
+    # Yön: son dilim ile ilk dilimin bad-rate karşılaştırması
+    yon = "yuksek_riskli" if tablo["mean"].iloc[-1] >= tablo["mean"].iloc[0] else "dusuk_riskli"
+
+    return {
+        "base_rate": round(float(base_rate), 4),
+        "en_riskli_dilim_rate": round(float(seg_rate), 4),
+        "pp_gap": round(float(pp_gap), 2),
+        "lift": round(float(lift), 3),
+        "gozlenen_yon": yon,
+        "sifir_orani": round(float((s == 0).mean()), 3),
+        "decile_egrisi": [round(float(x), 3) for x in tablo["mean"].tolist()],
+    }
+
+def max_korelasyon(seri, target_df, mevcut_llm_features):
+    """Yeni serinin mevcut LLM feature'larıyla maksimum |korelasyon|u."""
+    if not mevcut_llm_features:
+        return 0.0
+    en_yuksek = 0.0
+    s = seri.replace([np.inf, -np.inf], np.nan)
+    for ad in mevcut_llm_features:
+        c = s.corr(target_df[ad].replace([np.inf, -np.inf], np.nan))
+        if pd.notna(c):
+            en_yuksek = max(en_yuksek, abs(float(c)))
+    return round(en_yuksek, 3)
+
+print("Doğrulama + istatistik fonksiyonları hazır.")
