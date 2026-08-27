@@ -1,90 +1,91 @@
-def guncel_harita():
-    """Base compact + registry'deki feature'lar → prompta gömülecek kompakt JSON."""
-    harita = dict(base_compact)  # sığ kopya yeterli, base'i değiştirmiyoruz
-    if registry:
-        harita["uretilen_featurelar"] = {
-            k["ad"]: {"gerekce": k["gerekce"], "formul": k["formul"]}
-            for k in registry
-        }
-    return json.dumps(harita, ensure_ascii=False, separators=(",", ":"))
+YASAK_KALIPLAR = ["import", "eval", "exec", "lambda", "__", "os.", "open(", "=", ";"]
 
-def tekrar_yasak_listesi():
-    satirlar  = [f"- {k['ad']}: {k['gerekce']}" for k in registry]
-    satirlar += [f"- (REDDEDİLDİ — {r.get('neden','')}) {r.get('ad_soneki','?')}: {r.get('gerekce','')}"
-                 for r in red_registry]
-    return "\n".join(satirlar) if satirlar else "(henüz yok)"
+def oneri_dogrula(oneri, target_df):
+    """Öneriyi doğrular. Dönüş: (True, seri) veya (False, red_nedeni)."""
+    formul = str(oneri.get("formul", "")).strip()
+    kolonlar = oneri.get("kullanilan_kolonlar", [])
 
-TEMA_HAVUZU = [
-    "gelen-giden dengesizliği (nakit sıkışması sinyalleri)",
-    "karşı taraf konsantrasyonu (tek yere yoğunlaşan para akışı)",
-    "riskli kategori ağırlığı (kripto/bahis/ödeme kuruluşu payları)",
-    "kısa vade ile uzun vadenin ayrışması (trend kırılması, X2 önceki pencere karşılaştırması)",
-    "gece / hafta sonu / anormal saat davranışı",
-    "işlem büyüklüğü profili (ortalama, maksimum, oynaklık, CV)",
-    "aktivite kesilmesi veya yeni başlayan hareketlilik (TMSNCFRST/TMSNCLST, aktif ay)",
-    "çeşitlilik ve dağılım (farklı banka/karşı taraf sayısı, HHI, entropi)",
-]
+    yok = [k for k in kolonlar if k not in target_df.columns]
+    if yok:
+        return False, f"şemada olmayan kolon: {yok}"
+    gecen = [k for k in YASAKLI_KOLONLAR if k in formul]
+    if gecen:
+        return False, f"yasaklı kolon formülde: {gecen}"
+    kalip = [k for k in YASAK_KALIPLAR if k in formul]
+    if kalip:
+        return False, f"yasaklı kalıp: {kalip}"
+    try:
+        ast.parse(formul, mode="eval")
+    except SyntaxError as e:
+        return False, f"söz dizimi hatası: {e}"
+    try:
+        ornek = target_df.head(1000)
+        seri_ornek = eval(formul, {"__builtins__": {}}, {"df": ornek, "np": np, "pd": pd})
+    except Exception as e:
+        return False, f"çalıştırma hatası: {e}"
+    seri = eval(formul, {"__builtins__": {}}, {"df": target_df, "np": np, "pd": pd})
+    seri = pd.Series(seri, index=target_df.index).astype(float)
+    if seri.replace([np.inf, -np.inf], np.nan).nunique(dropna=True) <= 1:
+        return False, "çıktı sabit (ayrıştırma gücü yok)"
+    return True, seri
 
-PROMPT_SABLON = """# ROL
-Kıdemli bir kredi riski analistisin. Görevin: aşağıdaki veriden batma riskini
-öngören YENİ bir feature tasarlamak.
+def egri_sekli_bul(rates):
+    """Decile eğrisinin şeklini sınıflandırır. Dönüş: (sekil, yon_guvenilir)."""
+    r = pd.Series(rates, dtype=float)
+    rho = r.corr(pd.Series(np.arange(len(r)), dtype=float), method="spearman")
+    if pd.notna(rho) and abs(rho) >= 0.7:
+        return ("monoton_artan" if rho > 0 else "monoton_azalan"), True
+    tepe, dip = int(r.idxmax()), int(r.idxmin())
+    ic = range(1, len(r) - 1)
+    if tepe in ic and r.iloc[0] < r.iloc[tepe] and r.iloc[-1] < r.iloc[tepe]:
+        return "ters_U_orta_dilimler_riskli", False
+    if dip in ic and r.iloc[0] > r.iloc[dip] and r.iloc[-1] > r.iloc[dip]:
+        return "U_uclar_riskli", False
+    return "karisik", False
 
-# VERİ
-Bireysel müşterilerin para transferi davranışları. Her satır bir müşteri.
-Target: müşterinin ilk ödemesini yapmaması (1=battı, 0=batmadı).
-Örneklem dengeli, base rate %50.
+def istatistik_hesapla(seri, target_df):
+    """Decile bazlı bad-rate analizi + eğri şekli. LLM'e sorulmaz, kod ölçer."""
+    t = target_df[TARGET_COL].to_numpy()
+    s = seri.replace([np.inf, -np.inf], np.nan)
+    base_rate = t.mean()
+    try:
+        dilim = pd.qcut(s, 10, labels=False, duplicates="drop")
+    except Exception:
+        return None
+    tablo = (pd.DataFrame({"dilim": dilim, "t": t})
+             .dropna().groupby("dilim")["t"].agg(["mean", "size"]))
+    if len(tablo) < 3:
+        return None
 
-Kolon haritası (JSON):
-{harita}
+    en_riskli = tablo["mean"].idxmax()
+    seg_rate  = tablo.loc[en_riskli, "mean"]
+    pp_gap = (seg_rate - base_rate) * 100
+    lift   = seg_rate / base_rate if base_rate > 0 else np.nan
+    yon = "yuksek_riskli" if tablo["mean"].iloc[-1] >= tablo["mean"].iloc[0] else "dusuk_riskli"
+    sekil, yon_guvenilir = egri_sekli_bul(tablo["mean"].tolist())
 
-Haritayı okuma kuralı:
-- Tam kolon adı = aileler'deki anahtar + '_' + o ailenin listesindeki bir metrik.
-  Örnek: aile "TXN_GDN_30D", metrik "AMT" ise kolon adı TXN_GDN_30D_AMT olur.
-- Kısaltmaların anlamı 'lejant' bölümündedir.
+    return {
+        "base_rate": round(float(base_rate), 4),
+        "en_riskli_dilim_rate": round(float(seg_rate), 4),
+        "pp_gap": round(float(pp_gap), 2),
+        "lift": round(float(lift), 3),
+        "gozlenen_yon": yon,
+        "egri_sekli": sekil,
+        "yon_guvenilir": yon_guvenilir,
+        "sifir_orani": round(float((s == 0).mean()), 3),
+        "decile_egrisi": [round(float(x), 3) for x in tablo["mean"].tolist()],
+    }
 
-# BU TURUN TEMASI
-Feature'ını şu temadan türet: {tema}
+def max_korelasyon(seri, target_df, mevcut_llm_features):
+    """Yeni serinin mevcut LLM feature'larıyla maksimum |korelasyon|u."""
+    if not mevcut_llm_features:
+        return 0.0
+    en_yuksek = 0.0
+    s = seri.replace([np.inf, -np.inf], np.nan)
+    for ad in mevcut_llm_features:
+        c = s.corr(target_df[ad].replace([np.inf, -np.inf], np.nan))
+        if pd.notna(c):
+            en_yuksek = max(en_yuksek, abs(float(c)))
+    return round(en_yuksek, 3)
 
-# NE İSTİYORUM
-Davranışsal, bariz olmayan bir sinyal: oran, dengesizlik, pencereler arası
-karşılaştırma veya konsantrasyon. Tek bir ham kolonun kopyası ya da basit
-ölçeklemesi KABUL EDİLMEZ.
-
-Önemli: bu veride oran/aktivite kolonları, o kanalı hiç kullanmamış müşteride 0'dır.
-"Kolon > 0" gibi bir yapı sadece "bu kanalda aktivite var mı" demektir ve keşif
-sayılmaz. Feature aktif müşteriler arasında da ayrıştırmalı.
-
-# TEKRARLAMA
-Daha önce önerilenler ve reddedilenler (bunların pencere/kolon değişmiş
-varyantları da yasak; reddedilme nedenleri parantez içinde):
-{yasak_liste}
-
-# FORMÜL KURALLARI
-1. Sadece haritadaki gerçek kolon adlarını kullan; kolon adı uydurma.
-2. Şu kolonlar formülde geçemez: {yasakli_kolonlar}
-3. Formül tek satırlık pandas ifadesidir; atama yok, sadece sağ taraf.
-4. Her bölmede paydaya .replace(0, np.nan) ekle (zero-safe).
-5. İzinli: aritmetik, df['...'], np.where, np.log1p, .clip, .replace, .abs()
-6. Yasak: import, eval, exec, lambda, atama.
-Söz dizimi örneği (içeriğini kopyalama): df['A_AMT'] / df['A_CNT'].replace(0, np.nan)
-
-# CEVAP FORMATI
-Sadece aşağıdaki JSON'u döndür. Öncesinde/sonrasında metin veya markdown fence yazma.
-{{"ad_soneki": "<KISA_AD_BUYUK_HARF_SNAKE>",
-  "gerekce": "<neden batmayı öngörür, 1-2 cümle Türkçe>",
-  "mekanizma": "<finansal sezgi, 1 cümle Türkçe>",
-  "beklenen_yon": "<yuksek_riskli | dusuk_riskli>",
-  "kullanilan_kolonlar": ["<kolon1>", "<kolon2>"],
-  "formul": "<tek satır pandas ifadesi>"}}"""
-
-def prompt_kur(tema):
-    return PROMPT_SABLON.format(
-        harita=guncel_harita(),
-        tema=tema,
-        yasak_liste=tekrar_yasak_listesi(),
-        yasakli_kolonlar=", ".join(sorted(YASAKLI_KOLONLAR)),
-    )
-
-rng_tema = np.random.RandomState()   # zaman tabanlı: her koşuda farklı tema sırası
-p = prompt_kur(TEMA_HAVUZU[0])
-print(f"Prompt uzunluğu: {len(p)} karakter (~{len(p)//3} token)")
+print("Doğrulama + istatistik fonksiyonları hazır.")
