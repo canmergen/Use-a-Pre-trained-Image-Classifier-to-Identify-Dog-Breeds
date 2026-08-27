@@ -1,22 +1,78 @@
-ESKI, YENI = "ters_U_orta_dilimler_riskli", "∩_orta_dilimler_riskli"
+# -*- coding: utf-8 -*-
+# ============ MATERIALIZE: base + registry -> ENRICHED + compact v2 ============
+# Deterministik derleme: LLM yok. Registry'deki tüm formüller base'e uygulanır,
+# split manifest'ten SPLIT kolonu eklenir, sözlüğün v2'si yazılır.
+import dataiku
+import pandas as pd
+import numpy as np
+import json, time
 
-# Bellekteki + diskteki registry ve red arşivi
+TARGET_COL   = "TGT_CS_ALL_TKP_ST_5M90"
+ID_COL       = "SM_ID"
+DROP_COLS    = ["rn", "PERIOD"]
+REGISTRY_FILE = "feature_registry.json"
+SPLIT_FILE    = "split_manifest.json"
+COMPACT_FILE  = "degiskenler_compact.json"
+V2_FILE       = "degiskenler_compact_v2.json"
+
+# ---- Girdiler ----
+FEATURE_STATE = dataiku.Folder("FEATURE_STATE")
+COMPACT_JSON  = dataiku.Folder("COMPACT_JSON")
+df = dataiku.Dataset("HAVALE_EFT_NTT").get_dataframe(infer_with_pandas=True)
+df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
+
+def state_json(name):
+    with FEATURE_STATE.get_download_stream(name) as f:
+        return json.load(f)
+
+registry = state_json(REGISTRY_FILE)
+manifest = state_json(SPLIT_FILE)
+with COMPACT_JSON.get_download_stream(COMPACT_FILE) as f:
+    base_compact = json.load(f)
+print(f"Base: {len(df):,} satır x {df.shape[1]} kolon | Registry: {len(registry)} feature")
+
+# ---- 1) Registry formüllerini uygula (keşifteki sırayla) ----
+basarili, atlanan = [], []
 for k in registry:
-    i = k["istatistikler"]
-    if i.get("egri_sekli") == ESKI:
-        i["egri_sekli"] = YENI
-    if ESKI in k.get("yon_notu", ""):
-        k["yon_notu"] = k["yon_notu"].replace(ESKI, YENI)
-for r in red_registry:
-    i = r.get("istatistikler")
-    if i and i.get("egri_sekli") == ESKI:
-        i["egri_sekli"] = YENI
+    try:
+        env = {"df": df, "np": np, "pd": pd}
+        exec(f"df['{k['ad']}'] = {k['formul']}", {"__builtins__": {}}, env)
+        basarili.append(k["ad"])
+    except Exception as e:
+        atlanan.append((k["ad"], str(e)))
+        print(f"UYARI: {k['ad']} uygulanamadı: {e}")
+assert not atlanan, f"{len(atlanan)} formül uygulanamadı — registry tutarsız: {atlanan}"
 
-state_write_text(REGISTRY_FILE, json.dumps(registry, ensure_ascii=False, indent=2))
-state_write_text(REJECTS_FILE, json.dumps(red_registry, ensure_ascii=False, indent=2))
+# ---- 2) SPLIT kolonu (keşifle birebir aynı bölme) ----
+val_ids = set(manifest["val_ids"])
+df["SPLIT"] = np.where(df[ID_COL].astype(str).isin(val_ids), "val", "train")
+print(df["SPLIT"].value_counts().to_string())
+print(f"Target — train: {df.loc[df.SPLIT=='train', TARGET_COL].mean():.2%} | "
+      f"val: {df.loc[df.SPLIT=='val', TARGET_COL].mean():.2%}")
 
-# feature_log.md: düz metin değişimi
-log = state_read_text(LOG_FILE)
-state_write_text(LOG_FILE, log.replace(ESKI, YENI))
+# ---- 3) ENRICHED dataset'i yaz ----
+dataiku.Dataset("HAVALE_EFT_NTT_ENRICHED").write_with_schema(df)
+print(f"ENRICHED yazıldı: {len(df):,} satır x {df.shape[1]} kolon "
+      f"(+{len(basarili)} LLM feature, +SPLIT)")
 
-print("Migrasyon tamam: registry + rejects + log güncellendi.")
+# ---- 4) Sözlük v2: base + üretilen feature'lar ----
+v2 = dict(base_compact)
+v2["uretilen_featurelar"] = {
+    k["ad"]: {
+        "aciklama": k["gerekce"],
+        "mekanizma": k["mekanizma"],
+        "formul": k["formul"],
+        "kaynak_kolonlar": k["kaynak_kolonlar"],
+        "zayif_sinyal": k.get("zayif_sinyal", False),
+        "istatistikler_train": {kk: k["istatistikler"][kk]
+                                for kk in ("lift", "pp_gap", "gozlenen_yon", "egri_sekli")},
+    } for k in registry
+}
+v2["ozel_kolonlar"] = dict(v2.get("ozel_kolonlar", {}))
+v2["ozel_kolonlar"]["SPLIT"] = "train/val ayrımı (donmuş 80/20 stratified, split_manifest.json)"
+v2["v2_bilgi"] = {"olusturulma": time.strftime("%Y-%m-%d %H:%M"),
+                  "feature_sayisi": len(registry)}
+
+with FEATURE_STATE.get_writer(V2_FILE) as w:
+    w.write(json.dumps(v2, ensure_ascii=False, indent=2).encode("utf-8"))
+print(f"{V2_FILE} yazıldı: {len(v2['aileler'])} aile + {len(registry)} üretilen feature")
