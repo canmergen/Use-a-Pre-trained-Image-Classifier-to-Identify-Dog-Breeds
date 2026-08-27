@@ -1,43 +1,134 @@
+## 1.4 Feature elemesi (train üzerinde, iki sete aynı prosedür)
+
+Raw pipeline'daki eleme mantığı uygulanır: (a) sabit / neredeyse sabit
+değişkenler (%99+ tek değer) atılır; (b) Spearman |r| > 0.90 korelasyonlu
+çiftlerde hedefle ilişkisi (rank-korelasyon) daha güçlü olan tutulur.
+PSI adımı bilinçli olarak atlanır: PSI train-vs-OOT karşılaştırmasıdır ve
+veride tek dönem vardır; OOT dönemi geldiğinde eklenecektir.
+
+Eleme yalnızca TRAIN ile hesaplanır (val'e bakılmaz) ve aynı prosedür
+base sete ve base+LLM setine ayrı ayrı uygulanır: LLM feature'ları
+base kolonlarla aynı kurallara tabidir.
+
+
+CORR_ESIK = 0.90
+
+def feature_ele(kolonlar, etiket):
+    """Sabit + korelasyon elemesi. Train'de hesaplanır; kalan kolon listesi döner."""
+    X = train[kolonlar]
+
+    # a) Sabit / neredeyse sabit
+    sabit = [c for c in kolonlar
+             if X[c].nunique(dropna=False) <= 1
+             or X[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
+    kalan = [c for c in kolonlar if c not in sabit]
+
+    # b) Hedef ilişkisi (rank korelasyon, mutlak) — korelasyon çiftinde kimi tutacağımızın anahtarı
+    R = X[kalan].rank().to_numpy(dtype="float64")
+    R = (R - R.mean(0)) / np.maximum(R.std(0), 1e-9)
+    R = np.nan_to_num(R)
+    yr = pd.Series(y_train).rank().to_numpy(dtype="float64")
+    yr = (yr - yr.mean()) / max(yr.std(), 1e-9)
+    tgt_assoc = dict(zip(kalan, np.abs(R.T @ yr / len(yr))))
+
+    # c) Korelasyon elemesi: hedefi iyi açıklayan önce gelir, ona >esik benzeyen elenir
+    C = np.abs(R.T @ R / len(R))
+    pos = {c: i for i, c in enumerate(kalan)}
+    tutulan_idx, dusen = [], set()
+    for c in sorted(kalan, key=lambda k: -tgt_assoc[k]):
+        i = pos[c]
+        if tutulan_idx and (C[i, tutulan_idx] > CORR_ESIK).any():
+            dusen.add(c)
+        else:
+            tutulan_idx.append(i)
+    final = [c for c in kalan if c not in dusen]
+
+    print(f"{etiket:<10} {len(kolonlar)} → sabit -{len(sabit)} → korelasyon -{len(dusen)} → kalan {len(final)}")
+    return final
+
+base_final = feature_ele(base_cols, "BASE")
+enr_final  = feature_ele(base_cols + llm_cols, "ENRICHED")
+llm_hayatta = [c for c in enr_final if c.startswith(LLM_PREFIX)]
+print(f"\nElemeden sağ çıkan LLM feature: {len(llm_hayatta)}/{len(llm_cols)}")
+print("  " + ", ".join(llm_hayatta[:8]) + (" ..." if len(llm_hayatta) > 8 else ""))
+
+
+
+
+## 1.5 Model eğitimi (3-fold CV + final val)
+
+Train üzerinde 3-katlı stratified CV yapılır: her katta model 2/3 ile eğitilir
+(erken durdurma katın kendi doğrulama parçasıyla), kalan 1/3'te ölçülür.
+CV ortalaması ± std, karşılaştırmanın gürültü bandını verir. Ardından final
+model tüm train ile (ağaç sayısı = CV'nin bulduğu ortalama) eğitilir ve
+dokunulmamış VAL setinde skorlanır. Val yalnızca bu final ölçümde kullanılır.
+
+
+
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+
+LGB_PARAMS = dict(
+    objective="binary", metric="auc", n_estimators=2000, learning_rate=0.03,
+    num_leaves=15, max_depth=5, min_child_samples=100,
+    colsample_bytree=0.5, subsample=0.8, subsample_freq=1,
+    reg_lambda=10.0, reg_alpha=1.0, n_jobs=4, verbose=-1, random_state=42,
+)
+
+def capture_at(y_true, prob, pct=0.10):
+    y, p = np.asarray(y_true), np.asarray(prob)
+    k = max(1, int(pct * len(y)))
+    idx = np.argsort(-p)[:k]
+    return float(y[idx].sum() / max(y.sum(), 1))
+
 def egit_ve_olc(kolonlar, etiket):
-    """Verilen kolon setiyle SEEDS kadar model eğitir; train + val metriklerini döndürür."""
-    sonuclar, son_model = [], None
-    for s in SEEDS:
-        m = lgb.LGBMClassifier(**LGB_PARAMS, random_state=s)
-        m.fit(train[kolonlar], y_train)
-        p_tr  = m.predict_proba(train[kolonlar])[:, 1]
-        p_val = m.predict_proba(val[kolonlar])[:, 1]
-        sonuclar.append({
-            "tr_auc":   roc_auc_score(y_train, p_tr),
-            "val_auc":  roc_auc_score(y_val, p_val),
-            "tr_gini":  2 * roc_auc_score(y_train, p_tr) - 1,
-            "val_gini": 2 * roc_auc_score(y_val, p_val) - 1,
-            "val_cap10": capture_at(y_val, p_val),
-        })
-        son_model = m
-    r = pd.DataFrame(sonuclar)
-    print(f"{etiket:<10} train AUC={r.tr_auc.mean():.4f}  val AUC={r.val_auc.mean():.4f}±{r.val_auc.std():.4f}  "
-          f"val gini={r.val_gini.mean():.4f}  cap@10={r.val_cap10.mean():.4f}  "
-          f"makas={r.tr_auc.mean()-r.val_auc.mean():.4f}")
-    return r, son_model
+    """3-fold CV (train) + final model (tüm train) + val skoru."""
+    X, y = train[kolonlar], y_train
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    fold_auc, fold_agac = [], []
+    for tr_i, te_i in cv.split(X, y):
+        m = lgb.LGBMClassifier(**LGB_PARAMS)
+        m.fit(X.iloc[tr_i], y[tr_i],
+              eval_set=[(X.iloc[te_i], y[te_i])],
+              callbacks=[lgb.early_stopping(50, verbose=False)])
+        fold_auc.append(roc_auc_score(y[te_i], m.predict_proba(X.iloc[te_i])[:, 1]))
+        fold_agac.append(m.best_iteration_ or LGB_PARAMS["n_estimators"])
+
+    n_final = int(np.mean(fold_agac))
+    final = lgb.LGBMClassifier(**{**LGB_PARAMS, "n_estimators": n_final})
+    final.fit(X, y)
+
+    p_tr, p_val = final.predict_proba(X)[:, 1], final.predict_proba(val[kolonlar])[:, 1]
+    r = {"cv_auc": float(np.mean(fold_auc)), "cv_std": float(np.std(fold_auc)),
+         "tr_auc": roc_auc_score(y, p_tr), "val_auc": roc_auc_score(y_val, p_val),
+         "val_gini": 2 * roc_auc_score(y_val, p_val) - 1,
+         "val_cap10": capture_at(y_val, p_val), "n_agac": n_final}
+    print(f"{etiket:<10} CV AUC={r['cv_auc']:.4f}±{r['cv_std']:.4f}  train AUC={r['tr_auc']:.4f}  "
+          f"val AUC={r['val_auc']:.4f}  cap@10={r['val_cap10']:.4f}  "
+          f"makas={r['tr_auc']-r['val_auc']:.4f}  ağaç={r['n_agac']}")
+    return r, final
+
+sonuc_base, model_base = egit_ve_olc(base_final, "BASE")
+sonuc_enr,  model_enr  = egit_ve_olc(enr_final,  "ENRICHED")
 
 
 
 
-ozet = pd.DataFrame({
-    "BASE":     sonuc_base.mean().round(4),
-    "ENRICHED": sonuc_enr.mean().round(4),
-})
+ozet = pd.DataFrame({"BASE": sonuc_base, "ENRICHED": sonuc_enr}).round(4)
 ozet["DELTA"] = (ozet["ENRICHED"] - ozet["BASE"]).round(4)
 print(ozet.to_string())
 
-gurultu = float(np.sqrt(sonuc_base.val_auc.std()**2 + sonuc_enr.val_auc.std()**2))
-delta_auc = float(sonuc_enr.val_auc.mean() - sonuc_base.val_auc.mean())
-print(f"\nDelta val AUC = {delta_auc:+.4f} | seed gürültüsü ≈ ±{gurultu:.4f}")
+gurultu = float(np.sqrt(sonuc_base["cv_std"]**2 + sonuc_enr["cv_std"]**2))
+delta_cv  = sonuc_enr["cv_auc"] - sonuc_base["cv_auc"]
+delta_val = sonuc_enr["val_auc"] - sonuc_base["val_auc"]
+print(f"\nDelta CV AUC = {delta_cv:+.4f} | Delta val AUC = {delta_val:+.4f} | CV gürültüsü ≈ ±{gurultu:.4f}")
 print("SONUÇ:", "LLM feature'ları ANLAMLI katkı sağladı."
-      if abs(delta_auc) > gurultu else
-      "Fark seed gürültüsü seviyesinde — anlamlı katkı YOK.")
+      if (delta_cv > gurultu and delta_val > 0) else
+      "Anlamlı katkı YOK (fark gürültü bandında veya negatif).")
 
 
 
-
-
+imp = (pd.DataFrame({"feature": enr_final,
+                     "importance": model_enr.feature_importances_})
+       .sort_values("importance", ascending=False).reset_index(drop=True))
