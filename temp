@@ -1,114 +1,21 @@
-### Hipotez turları (LLM çağrısı + kabul/red)
+TARGET_COL       = "TGT_CS_ALL_TKP_ST_5M90"
+ID_COL           = "SM_ID"
+DROP_COLS        = ["rn", "PERIOD"]                       # anlamsız → dataset'ten düşülecek
+YASAKLI_KOLONLAR = {TARGET_COL, ID_COL, "rn", "PERIOD"}   # LLM formülünde geçemez
 
-Her turda: tema seç → prompt kur → LLM'i çağır → JSON parse et (bozuksa 1 kez
-düzeltme iste) → doğrulama zinciri → istatistik → karar.
+VAL_RATIO = 0.20
+SEED      = 42
 
-Kabul koşulu: `lift ≥ LIFT_ESIK` VEYA `|pp_gap| ≥ PPGAP_ESIK`, VE mevcut LLM
-feature'larıyla korelasyon `< KORELASYON_ESIK`.
+N_TURNS         = 3      # koşu başına hipotez turu
+LIFT_ESIK       = 1.3
+PPGAP_ESIK      = 8.0    # yüzde puan
+KORELASYON_ESIK = 0.90
 
-Yön kontrolü: LLM'in iddia ettiği yön decile eğrisinin gerçek yönüyle uyuşmazsa
-feature reddedilmez; kayda "yön uyuşmazlığı" notu düşülür ve gerekçe gözlenen
-yöne göre işaretlenir (sayılar zaten koddan geliyor, iddia değil ölçüm esas).
+LLM_ID        = "openai:dataiku-qwen36-27b:qwen36-27b"
+REGISTRY_FILE = "feature_registry.json"
+REJECTS_FILE  = "feature_rejects.json"
+LOG_FILE      = "feature_log.md"
+SPLIT_FILE    = "split_manifest.json"
+COMPACT_FILE  = "degiskenler_compact.json"
 
-Kabul edilen feature train_df'e hemen eklenir ki sonraki turun korelasyon
-kontrolü ve tekrar yasağı onu da görsün.
-
-
-
-
-
-llm = dataiku.api_client().get_default_project().get_llm(LLM_ID)
-
-def llm_sor(prompt_text):
-    comp = llm.new_completion()
-    comp.with_message(prompt_text)
-    return comp.execute().text
-
-def json_parse(cevap):
-    """LLM cevabından JSON çıkarır; fence'leri soyar. Bozuksa None."""
-    t = cevap.strip()
-    t = re.sub(r"^```(json)?", "", t).strip()
-    t = re.sub(r"```$", "", t).strip()
-    m = re.search(r"\{.*\}", t, re.S)     # ilk { ile son } arası
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-def sonraki_feature_no():
-    mevcut = [int(re.match(r"LLM_F(\d+)", k["ad"]).group(1)) for k in registry]
-    return (max(mevcut) + 1) if mevcut else 1
-
-kosu_kabul, kosu_red = [], []
-temalar = list(TEMA_HAVUZU)
-rng_tema.shuffle(temalar)
-
-for tur in range(1, N_TURNS + 1):
-    tema = temalar[(tur - 1) % len(temalar)]
-    print(f"\n--- Tur {tur}/{N_TURNS} — tema: {tema} ---")
-
-    # 1) LLM çağrısı + parse (bozuksa 1 düzeltme hakkı)
-    cevap = llm_sor(prompt_kur(tema))
-    oneri = json_parse(cevap)
-    if oneri is None:
-        print("  JSON bozuk, düzeltme isteniyor...")
-        cevap = llm_sor("Cevabın geçerli JSON değildi. SADECE istenen JSON'u döndür:\n" + cevap)
-        oneri = json_parse(cevap)
-    if oneri is None:
-        kosu_red.append({"tur": tur, "tema": tema, "neden": "JSON parse edilemedi"})
-        print("  RED: JSON parse edilemedi"); continue
-
-    # 2) Doğrulama
-    ok, sonuc = oneri_dogrula(oneri, train_df)
-    if not ok:
-        kosu_red.append({"tur": tur, "tema": tema, "oneri": oneri, "neden": sonuc})
-        print(f"  RED: {sonuc}"); continue
-    seri = sonuc
-
-    # 3) İstatistik
-    ist = istatistik_hesapla(seri, train_df)
-    if ist is None:
-        kosu_red.append({"tur": tur, "tema": tema, "oneri": oneri, "neden": "decile kurulamadı (tek değerli)"})
-        print("  RED: decile kurulamadı"); continue
-    kor = max_korelasyon(seri, train_df, llm_features)
-
-    # 4) Karar
-    esik_ok = (ist["lift"] >= LIFT_ESIK) or (abs(ist["pp_gap"]) >= PPGAP_ESIK)
-    kor_ok  = kor < KORELASYON_ESIK
-    print(f"  lift={ist['lift']} pp_gap={ist['pp_gap']} kor={kor} sıfır%={ist['sifir_orani']}")
-
-    if not esik_ok:
-        kosu_red.append({"tur": tur, "tema": tema, "oneri": oneri, "ist": ist,
-                         "neden": f"zayıf sinyal (lift<{LIFT_ESIK} ve |pp_gap|<{PPGAP_ESIK})"})
-        print("  RED: zayıf sinyal"); continue
-    if not kor_ok:
-        kosu_red.append({"tur": tur, "tema": tema, "oneri": oneri, "ist": ist,
-                         "neden": f"mevcut feature ile korelasyon {kor} >= {KORELASYON_ESIK}"})
-        print("  RED: tekrar (yüksek korelasyon)"); continue
-
-    # 5) Kabul → registry + train_df + isim
-    ad = f"LLM_F{sonraki_feature_no():03d}_{oneri['ad_soneki'].strip().upper()[:40]}"
-    yon_notu = ("" if oneri.get("beklenen_yon") == ist["gozlenen_yon"]
-                else f"YÖN UYUŞMAZLIĞI: iddia={oneri.get('beklenen_yon')}, gözlenen={ist['gozlenen_yon']}")
-    kayit = {
-        "ad": ad,
-        "formul": oneri["formul"].strip(),
-        "kaynak_kolonlar": oneri["kullanilan_kolonlar"],
-        "gerekce": oneri["gerekce"],
-        "mekanizma": oneri.get("mekanizma", ""),
-        "beklenen_yon": oneri.get("beklenen_yon", ""),
-        "tema": tema,
-        "istatistikler": {**ist, "mevcutlarla_max_korelasyon": kor},
-        "yon_notu": yon_notu,
-        "iterasyon": len(registry) + 1,
-        "tarih": time.strftime("%Y-%m-%d %H:%M"),
-    }
-    registry.append(kayit)
-    train_df[ad] = seri
-    llm_features.append(ad)
-    kosu_kabul.append(kayit)
-    print(f"  KABUL: {ad}" + (f"  ({yon_notu})" if yon_notu else ""))
-
-print(f"\nKoşu özeti: {len(kosu_kabul)} kabul, {len(kosu_red)} red | Registry toplam: {len(registry)}")
+print("Config hazır.")
