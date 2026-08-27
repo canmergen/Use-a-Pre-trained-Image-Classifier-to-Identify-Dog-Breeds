@@ -1,12 +1,119 @@
-## 1.10 State'e yazma (registry + red arşivi + log)
+llm = dataiku.api_client().get_default_project().get_llm(LLM_ID)
 
-Koşu bu hücrede kalıcı hale gelir. FEATURE_STATE içinde üç dosya güncellenir.
+def llm_sor(prompt_text):
+    comp = llm.new_completion()
+    comp.with_message(prompt_text)
+    return comp.execute().text
 
-`feature_registry.json`, kabul edilen tüm feature'ların birikimli listesidir ve
-tek gerçek kaynaktır: enriched dataset ve güncel harita her zaman bu dosyadan
-türetilir. `feature_rejects.json` reddedilen önerileri biriktirir; sonraki
-koşuların yasak listesine girerek aynı fikrin tekrar denenmesini engeller.
-`feature_log.md` insan için tutulan dokümandır: her koşu, kabul edilen
-feature'ların ne olduğunu (formül), nasıl kurulduğunu (kaynak kolonlar), neden
-önerildiğini (gerekçe ve mekanizma) ve target bazlı ölçümlerini içeren bir bölüm
-ekler. Döngüye "tamam" denildiğinde elde olması istenen doküman budur.
+def json_parse(cevap):
+    """LLM cevabından JSON çıkarır; fence'leri soyar. Bozuksa None."""
+    t = cevap.strip()
+    t = re.sub(r"^```(json)?", "", t).strip()
+    t = re.sub(r"```$", "", t).strip()
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+def sonraki_feature_no():
+    mevcut = [int(re.match(r"LLM_F(\d+)", k["ad"]).group(1)) for k in registry]
+    return (max(mevcut) + 1) if mevcut else 1
+
+def red_kaydi(tur, tema, neden, oneri=None, ist=None):
+    """Red'i hem koşu listesine hem kalıcı red_registry'ye ekler (yasak listesi görsün)."""
+    r = {"tur": tur, "tema": tema, "neden": neden, "tarih": time.strftime("%Y-%m-%d %H:%M")}
+    if oneri:
+        r.update({"ad_soneki": oneri.get("ad_soneki", "?"), "gerekce": oneri.get("gerekce", ""),
+                  "kolonlar": oneri.get("kullanilan_kolonlar", []), "formul": oneri.get("formul", "")})
+    if ist:
+        r["istatistikler"] = ist
+    kosu_red.append(r)
+    red_registry.append(r)
+
+kosu_kabul, kosu_red = [], []
+temalar = list(TEMA_HAVUZU)
+rng_tema.shuffle(temalar)
+
+for tur in range(1, N_TURNS + 1):
+    tema = temalar[(tur - 1) % len(temalar)]
+    print(f"\n--- Tur {tur}/{N_TURNS} — tema: {tema} ---")
+
+    # 1) LLM çağrısı + parse (bozuksa 1 düzeltme hakkı)
+    cevap = llm_sor(prompt_kur(tema))
+    oneri = json_parse(cevap)
+    if oneri is None:
+        print("  JSON bozuk, düzeltme isteniyor...")
+        cevap = llm_sor("Cevabın geçerli JSON değildi. SADECE istenen JSON'u döndür:\n" + cevap)
+        oneri = json_parse(cevap)
+    if oneri is None:
+        red_kaydi(tur, tema, "JSON parse edilemedi")
+        print("  RED: JSON parse edilemedi"); continue
+
+    # 1b) Eksik alan sigortası: LLM alan atlarsa KeyError yerine varsayılan
+    for alan, varsayilan in [("ad_soneki", "FEATURE"), ("gerekce", ""), ("mekanizma", ""),
+                             ("beklenen_yon", ""), ("kullanilan_kolonlar", []), ("formul", "")]:
+        oneri.setdefault(alan, varsayilan)
+
+    # 2) Doğrulama
+    ok, sonuc = oneri_dogrula(oneri, train_df)
+    if not ok:
+        red_kaydi(tur, tema, sonuc, oneri)
+        print(f"  RED: {sonuc}"); continue
+    seri = sonuc
+
+    # 3) İstatistik
+    ist = istatistik_hesapla(seri, train_df)
+    if ist is None:
+        red_kaydi(tur, tema, "decile kurulamadı (tek değerli)", oneri)
+        print("  RED: decile kurulamadı"); continue
+    kor = max_korelasyon(seri, train_df, llm_features)
+
+    # 4) Karar
+    esik_ok = (ist["lift"] >= LIFT_ESIK) or (abs(ist["pp_gap"]) >= PPGAP_ESIK)
+    kor_ok  = kor < KORELASYON_ESIK
+    print(f"  lift={ist['lift']} pp_gap={ist['pp_gap']} kor={kor} "
+          f"sıfır%={ist['sifir_orani']} eğri={ist['egri_sekli']}")
+
+    if not esik_ok:
+        red_kaydi(tur, tema, f"zayıf sinyal (lift<{LIFT_ESIK} ve |pp_gap|<{PPGAP_ESIK})", oneri, ist)
+        print("  RED: zayıf sinyal"); continue
+    if not kor_ok:
+        red_kaydi(tur, tema, f"mevcut feature ile korelasyon {kor} >= {KORELASYON_ESIK}", oneri, ist)
+        print("  RED: tekrar (yüksek korelasyon)"); continue
+
+    # 5) Kabul → registry + train_df + isim
+    ad = f"LLM_F{sonraki_feature_no():03d}_{oneri['ad_soneki'].strip().upper()[:40]}"
+    if not ist["yon_guvenilir"]:
+        yon_notu = f"EĞRİ {ist['egri_sekli']}: yön çıkarımı güvenilmez"
+    elif oneri.get("beklenen_yon") != ist["gozlenen_yon"]:
+        yon_notu = f"YÖN UYUŞMAZLIĞI: iddia={oneri.get('beklenen_yon')}, gözlenen={ist['gozlenen_yon']}"
+    else:
+        yon_notu = ""
+    zayif = (ist["lift"] < 1.5) and (abs(ist["pp_gap"]) < 10)
+
+    kayit = {
+        "ad": ad,
+        "formul": oneri["formul"].strip(),
+        "kaynak_kolonlar": oneri["kullanilan_kolonlar"],
+        "gerekce": oneri["gerekce"],
+        "mekanizma": oneri.get("mekanizma", ""),
+        "beklenen_yon": oneri.get("beklenen_yon", ""),
+        "tema": tema,
+        "istatistikler": {**ist, "mevcutlarla_max_korelasyon": kor},
+        "yon_notu": yon_notu,
+        "zayif_sinyal": zayif,
+        "iterasyon": len(registry) + 1,
+        "tarih": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    registry.append(kayit)
+    train_df[ad] = seri
+    llm_features.append(ad)
+    kosu_kabul.append(kayit)
+    etiket = " [ZAYIF SİNYAL]" if zayif else ""
+    print(f"  KABUL: {ad}{etiket}" + (f"  ({yon_notu})" if yon_notu else ""))
+
+print(f"\nKoşu özeti: {len(kosu_kabul)} kabul, {len(kosu_red)} red | "
+      f"Registry: {len(registry)} | Red arşivi: {len(red_registry)}")
