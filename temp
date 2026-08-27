@@ -1,23 +1,90 @@
-registry = state_read_json(REGISTRY_FILE) or []
-red_registry = state_read_json(REJECTS_FILE) or []
-print(f"Registry: {len(registry)} kayıtlı feature")
-print(f"Red kayıtları: {len(red_registry)} (bunlar da tekrar yasağına girer)")
+def guncel_harita():
+    """Base compact + registry'deki feature'lar → prompta gömülecek kompakt JSON."""
+    harita = dict(base_compact)  # sığ kopya yeterli, base'i değiştirmiyoruz
+    if registry:
+        harita["uretilen_featurelar"] = {
+            k["ad"]: {"gerekce": k["gerekce"], "formul": k["formul"]}
+            for k in registry
+        }
+    return json.dumps(harita, ensure_ascii=False, separators=(",", ":"))
 
-def formul_uygula(target_df, kayit):
-    """Registry kaydındaki formülü df'e uygular. Başarı: True/False."""
-    local_env = {"df": target_df, "np": np, "pd": pd}
-    try:
-        exec(f"df['{kayit['ad']}'] = {kayit['formul']}", {"__builtins__": {}}, local_env)
-        return True
-    except Exception as e:
-        print(f"  UYARI: {kayit['ad']} uygulanamadı: {e}")
-        return False
+def tekrar_yasak_listesi():
+    satirlar  = [f"- {k['ad']}: {k['gerekce']}" for k in registry]
+    satirlar += [f"- (REDDEDİLDİ — {r.get('neden','')}) {r.get('ad_soneki','?')}: {r.get('gerekce','')}"
+                 for r in red_registry]
+    return "\n".join(satirlar) if satirlar else "(henüz yok)"
 
-llm_features = []          # bu koşuda df'te var olan LLM feature adları
-for kayit in registry:
-    if formul_uygula(train_df, kayit):
-        llm_features.append(kayit["ad"])
+TEMA_HAVUZU = [
+    "gelen-giden dengesizliği (nakit sıkışması sinyalleri)",
+    "karşı taraf konsantrasyonu (tek yere yoğunlaşan para akışı)",
+    "riskli kategori ağırlığı (kripto/bahis/ödeme kuruluşu payları)",
+    "kısa vade ile uzun vadenin ayrışması (trend kırılması, X2 önceki pencere karşılaştırması)",
+    "gece / hafta sonu / anormal saat davranışı",
+    "işlem büyüklüğü profili (ortalama, maksimum, oynaklık, CV)",
+    "aktivite kesilmesi veya yeni başlayan hareketlilik (TMSNCFRST/TMSNCLST, aktif ay)",
+    "çeşitlilik ve dağılım (farklı banka/karşı taraf sayısı, HHI, entropi)",
+]
 
-print(f"Train'e uygulanan mevcut feature: {len(llm_features)}")
-if llm_features:
-    print("  " + ", ".join(llm_features[:10]) + (" ..." if len(llm_features) > 10 else ""))
+PROMPT_SABLON = """# ROL
+Kıdemli bir kredi riski analistisin. Görevin: aşağıdaki veriden batma riskini
+öngören YENİ bir feature tasarlamak.
+
+# VERİ
+Bireysel müşterilerin para transferi davranışları. Her satır bir müşteri.
+Target: müşterinin ilk ödemesini yapmaması (1=battı, 0=batmadı).
+Örneklem dengeli, base rate %50.
+
+Kolon haritası (JSON):
+{harita}
+
+Haritayı okuma kuralı:
+- Tam kolon adı = aileler'deki anahtar + '_' + o ailenin listesindeki bir metrik.
+  Örnek: aile "TXN_GDN_30D", metrik "AMT" ise kolon adı TXN_GDN_30D_AMT olur.
+- Kısaltmaların anlamı 'lejant' bölümündedir.
+
+# BU TURUN TEMASI
+Feature'ını şu temadan türet: {tema}
+
+# NE İSTİYORUM
+Davranışsal, bariz olmayan bir sinyal: oran, dengesizlik, pencereler arası
+karşılaştırma veya konsantrasyon. Tek bir ham kolonun kopyası ya da basit
+ölçeklemesi KABUL EDİLMEZ.
+
+Önemli: bu veride oran/aktivite kolonları, o kanalı hiç kullanmamış müşteride 0'dır.
+"Kolon > 0" gibi bir yapı sadece "bu kanalda aktivite var mı" demektir ve keşif
+sayılmaz. Feature aktif müşteriler arasında da ayrıştırmalı.
+
+# TEKRARLAMA
+Daha önce önerilenler ve reddedilenler (bunların pencere/kolon değişmiş
+varyantları da yasak; reddedilme nedenleri parantez içinde):
+{yasak_liste}
+
+# FORMÜL KURALLARI
+1. Sadece haritadaki gerçek kolon adlarını kullan; kolon adı uydurma.
+2. Şu kolonlar formülde geçemez: {yasakli_kolonlar}
+3. Formül tek satırlık pandas ifadesidir; atama yok, sadece sağ taraf.
+4. Her bölmede paydaya .replace(0, np.nan) ekle (zero-safe).
+5. İzinli: aritmetik, df['...'], np.where, np.log1p, .clip, .replace, .abs()
+6. Yasak: import, eval, exec, lambda, atama.
+Söz dizimi örneği (içeriğini kopyalama): df['A_AMT'] / df['A_CNT'].replace(0, np.nan)
+
+# CEVAP FORMATI
+Sadece aşağıdaki JSON'u döndür. Öncesinde/sonrasında metin veya markdown fence yazma.
+{{"ad_soneki": "<KISA_AD_BUYUK_HARF_SNAKE>",
+  "gerekce": "<neden batmayı öngörür, 1-2 cümle Türkçe>",
+  "mekanizma": "<finansal sezgi, 1 cümle Türkçe>",
+  "beklenen_yon": "<yuksek_riskli | dusuk_riskli>",
+  "kullanilan_kolonlar": ["<kolon1>", "<kolon2>"],
+  "formul": "<tek satır pandas ifadesi>"}}"""
+
+def prompt_kur(tema):
+    return PROMPT_SABLON.format(
+        harita=guncel_harita(),
+        tema=tema,
+        yasak_liste=tekrar_yasak_listesi(),
+        yasakli_kolonlar=", ".join(sorted(YASAKLI_KOLONLAR)),
+    )
+
+rng_tema = np.random.RandomState()   # zaman tabanlı: her koşuda farklı tema sırası
+p = prompt_kur(TEMA_HAVUZU[0])
+print(f"Prompt uzunluğu: {len(p)} karakter (~{len(p)//3} token)")
