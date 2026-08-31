@@ -1,1 +1,162 @@
-LLM keşfi, insan analistin bulacağı türden gerçek davranışsal sinyalleri otomatik ve belgeli üretti; tam feature setli GBM’de ek AUC getirmedi çünkü bilgi mevcut kolonlarca kapsanıyor. Katma değeri: (a) az-kolonlu/açıklanabilir model senaryoları, (b) her feature’ın gerekçeli otomatik dokümantasyonu, (c) OOT dönem gelince asıl test.” Ayrıca yapısal sınırı da not et: %50’ye dengelenmiş tek dönemlik 10k satırda sinyal tavanı zaten düşük (AUC ~0.61); gerçek popülasyon + çok dönem veride tablo değişebilir.
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.metrics import roc_auc_score
+
+# ---------- 1. Veri ----------
+df = pd.read_excel("veri.xlsx", sheet_name=0)      # sayfa adı farklıysa sheet_name="Sayfa1"
+
+TARGET_FLAG  = "KAYNAK_ANALIZ_FINAL"
+TARGET_TUTAR = "RISK_TUTAR_ANALIZ_FINAL"
+
+# Battı/batmadı → 0/1; null olanlar düşer
+df[TARGET_FLAG] = df[TARGET_FLAG].map({"KREDIKARTI": 0, "KREDIKARTITAKIP": 1})
+print("Null KAYNAK satırı (atılıyor):", df[TARGET_FLAG].isna().sum())
+df = df[df[TARGET_FLAG].notna()].copy()
+df[TARGET_FLAG] = df[TARGET_FLAG].astype(int)
+
+y     = df[TARGET_FLAG].values
+tutar = df[TARGET_TUTAR].fillna(0).values          # tutar null'ları 0 sayıldı, istersen değiştir
+X     = df.drop(columns=[TARGET_FLAG, TARGET_TUTAR]).copy()
+
+cat_cols = X.select_dtypes(include=["object", "category", "bool"]).columns
+for c in cat_cols:
+    X[c] = X[c].astype("category").cat.codes.replace(-1, np.nan)
+
+feature_names = list(X.columns)
+n = len(X)
+pd.set_option("display.max_colwidth", None)
+pd.options.display.float_format = "{:,.2f}".format
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# ---------- 2. Yardımcılar ----------
+def agac_auc(model, X_fit, y_fit, X_eval, y_eval):
+    oran = pd.Series(np.asarray(y_fit)).groupby(model.apply(X_fit)).mean()
+    skor = pd.Series(model.apply(X_eval)).map(oran).fillna(oran.mean())
+    return roc_auc_score(y_eval, skor)
+
+def yeni_agac(max_depth=None, max_leaf_nodes=None, min_leaf_pct=0.03, ccp_alpha=0.0):
+    return DecisionTreeClassifier(
+        max_depth=max_depth, max_leaf_nodes=max_leaf_nodes,
+        min_samples_leaf=int(min_leaf_pct * n), ccp_alpha=ccp_alpha, random_state=42)
+
+def cv_auc(**params):
+    skorlar = []
+    for tr, te in cv.split(X, y):
+        m = yeni_agac(**params).fit(X.iloc[tr], y[tr])
+        skorlar.append(agac_auc(m, X.iloc[tr], y[tr], X.iloc[te], y[te]))
+    return np.mean(skorlar), np.std(skorlar)
+
+def _dugum_kurallari(model):
+    """Her düğüm için kök'ten oraya gelen kural metni."""
+    t = model.tree_
+    kural = {}
+    def rec(node, conds):
+        kural[node] = " VE ".join(conds) if conds else "(kök)"
+        if t.children_left[node] == -1:
+            return
+        f, thr = feature_names[t.feature[node]], t.threshold[node]
+        rec(t.children_left[node],  conds + [f"{f} <= {thr:g}"])
+        rec(t.children_right[node], conds + [f"{f} > {thr:g}"])
+    rec(0, [])
+    return kural
+
+def dugum_tablosu(model, sadece_yaprak=False):
+    """
+    Yaprak + ara düğümlerin hepsi: müşteri sayısı, batan sayısı, batma oranı,
+    toplam tutar, batan tutar, batan tutar oranı.
+    """
+    t = model.tree_
+    yol = model.decision_path(X).toarray().astype(bool)      # satır x düğüm: geçti mi?
+    kural = _dugum_kurallari(model)
+    rows = []
+    for node in range(t.node_count):
+        yaprak = t.children_left[node] == -1
+        if sadece_yaprak and not yaprak:
+            continue
+        mask = yol[:, node]
+        batan = mask & (y == 1)
+        rows.append({
+            "node_id": node,
+            "tip": "yaprak" if yaprak else "dal",
+            "derinlik": kural[node].count(" VE ") + (0 if node == 0 else 1),
+            "kural": kural[node],
+            "bolen_degisken": "" if yaprak else feature_names[t.feature[node]],
+            "esik": np.nan if yaprak else t.threshold[node],
+            "musteri_n": int(mask.sum()),
+            "batan_n": int(batan.sum()),
+            "batma_orani": batan.sum() / mask.sum() if mask.sum() else np.nan,
+            "toplam_tutar": float(tutar[mask].sum()),
+            "batan_tutar": float(tutar[batan].sum()),
+            "batan_tutar_orani": tutar[batan].sum() / tutar[mask].sum() if tutar[mask].sum() else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+def yaprak_tablosu(model):
+    return dugum_tablosu(model, sadece_yaprak=True).sort_values("batma_orani", ascending=False)
+
+# ---------- 3. Derinlik kararı ----------
+def derinlik_tara(derinlikler=range(2, 8), min_leaf_pct=0.03):
+    rows = []
+    for d in derinlikler:
+        m = yeni_agac(max_depth=d, min_leaf_pct=min_leaf_pct).fit(X, y)
+        ort, std = cv_auc(max_depth=d, min_leaf_pct=min_leaf_pct)
+        rows.append({"max_depth": d, "yaprak": m.get_n_leaves(),
+                     "tum_veri_auc": agac_auc(m, X, y, X, y), "cv_auc": ort, "cv_std": std})
+    tb = pd.DataFrame(rows)
+    tb["cv_kazanc"] = tb["cv_auc"].diff()
+    return tb
+
+print(derinlik_tara())
+
+# ---------- 4. Nihai ağaç ----------
+def agac_kur(**params):
+    m = yeni_agac(**params).fit(X, y)
+    print(f"derinlik={m.get_depth()} yaprak={m.get_n_leaves()} AUC={agac_auc(m, X, y, X, y):.4f}")
+    print(export_text(m, feature_names=feature_names, show_weights=True))
+    return m
+
+# ---------- 5. Eşik yuvarlama / elle ayar ----------
+ADIMLAR = [1000, 500, 100, 50, 10, 5, 1, 0.5, 0.1]
+
+def esikleri_yuvarla(model, tolerans=0.002, min_leaf_pct=0.03, yon="<="):
+    t = model.tree_
+    min_leaf = int(min_leaf_pct * n)
+    taban = agac_auc(model, X, y, X, y)
+    rapor = []
+    for node in range(t.node_count):
+        if t.children_left[node] == -1:
+            continue
+        orijinal = t.threshold[node]
+        secilen, secilen_auc = orijinal, taban
+        for adim in ADIMLAR:
+            aday = round(orijinal / adim) * adim
+            aday_kayit = aday - 1e-9 if yon == "<" else aday
+            t.threshold[node] = aday_kayit
+            yaprak_n = pd.Series(model.apply(X)).value_counts()
+            auc = agac_auc(model, X, y, X, y)
+            if auc >= taban - tolerans and yaprak_n.min() >= min_leaf:
+                secilen, secilen_auc = aday_kayit, auc
+                break
+        t.threshold[node] = secilen
+        rapor.append({"node_id": node, "degisken": feature_names[t.feature[node]],
+                      "orijinal": orijinal, "yeni": round(secilen, 6), "auc": secilen_auc})
+    return pd.DataFrame(rapor)
+
+def esik_ayarla(model, node_id, yeni_esik, yon="<="):
+    model.tree_.threshold[node_id] = yeni_esik - (1e-9 if yon == "<" else 0)
+
+# ---------- Kullanım ----------
+agac = agac_kur(max_depth=4)
+print(esikleri_yuvarla(agac, tolerans=0.002, yon="<"))
+
+tum_dugumler = dugum_tablosu(agac)          # ara düğümler dahil, tutarlarla
+yapraklar    = yaprak_tablosu(agac)
+print(tum_dugumler)
+print(yapraklar)
+
+# Müdüre gidecek Excel
+with pd.ExcelWriter("karar_agaci_sonuc.xlsx") as w:
+    tum_dugumler.to_excel(w, sheet_name="tum_dugumler", index=False)
+    yapraklar.to_excel(w, sheet_name="yapraklar", index=False)
