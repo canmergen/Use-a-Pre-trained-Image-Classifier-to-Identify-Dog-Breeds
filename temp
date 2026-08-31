@@ -4,25 +4,70 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.metrics import roc_auc_score
 
-# ---------- 1. Veri ----------
-df = pd.read_excel("veri.xlsx", sheet_name=0)      # sayfa adı farklıysa sheet_name="Sayfa1"
+# ---------- 0. Metin kalmış sayısal kolonları numeric'e çevir ----------
+def _temizle(s: pd.Series) -> pd.Series:
+    """'1.234,56' / '1 234,56' / ' 400 ' / '%12,5' gibi metinleri sayıya çevrilecek hale getirir."""
+    s = s.astype(str).str.strip()
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "NULL": np.nan, "-": np.nan})
+    s = s.str.replace(r"[\s%₺TL]", "", regex=True)
+    hem_nokta_hem_virgul = s.str.contains(r"\.", na=False) & s.str.contains(",", na=False)
+    s = s.where(~hem_nokta_hem_virgul, s.str.replace(".", "", regex=False))   # 1.234,56 → 1234,56
+    s = s.str.replace(",", ".", regex=False)                                   # 1234,56 → 1234.56
+    return s
 
+def numerige_cevir(df: pd.DataFrame, haric=(), esik=0.95) -> pd.DataFrame:
+    """
+    object/metin kolonları dener: dolu değerlerin en az %esik'i sayıya dönüşüyorsa kolonu numeric yapar,
+    dönüşemeyen tekil değerleri NaN'a çevirir. Altında kalanlar kategorik olarak bırakılır.
+    """
+    df = df.copy()
+    rapor = []
+    for c in df.columns:
+        if c in haric or pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        ham = df[c]
+        dolu = ham.notna() & (ham.astype(str).str.strip() != "")
+        if dolu.sum() == 0:
+            continue
+        aday = pd.to_numeric(_temizle(ham), errors="coerce")
+        basari = aday[dolu].notna().mean()
+        if basari >= esik:
+            kayip = int((aday.isna() & dolu).sum())
+            df[c] = aday
+            rapor.append({"kolon": c, "durum": "numeric yapıldı", "basari": basari, "NaN_olan": kayip})
+        else:
+            rapor.append({"kolon": c, "durum": "kategorik bırakıldı", "basari": basari, "NaN_olan": 0})
+    print(pd.DataFrame(rapor).to_string(index=False))
+    return df
+
+# ---------- 1. Veri ----------
+df = pd.read_excel("veri.xlsx", sheet_name=0)
+
+FILTRE_KOLON = "ANALIZ_DATA_F"
 TARGET_FLAG  = "KAYNAK_ANALIZ_FINAL"
 TARGET_TUTAR = "RISK_TUTAR_ANALIZ_FINAL"
 
-# Battı/batmadı → 0/1; null olanlar düşer
-df[TARGET_FLAG] = df[TARGET_FLAG].map({"KREDIKARTI": 0, "KREDIKARTITAKIP": 1})
+df = numerige_cevir(df, haric=[TARGET_FLAG])       # KAYNAK metin kalmalı, gerisi denenir
+
+print("Toplam satır:", len(df))
+df = df[df[FILTRE_KOLON] == 1].copy()
+print("ANALIZ_DATA_F=1 satır:", len(df))
+
+df[TARGET_FLAG] = df[TARGET_FLAG].astype(str).str.strip().str.upper().map(
+    {"KREDIKARTI": 0, "KREDIKARTITAKIP": 1})
 print("Null KAYNAK satırı (atılıyor):", df[TARGET_FLAG].isna().sum())
 df = df[df[TARGET_FLAG].notna()].copy()
 df[TARGET_FLAG] = df[TARGET_FLAG].astype(int)
+print("Analize giren satır:", len(df))
 
 y     = df[TARGET_FLAG].values
-tutar = df[TARGET_TUTAR].fillna(0).values          # tutar null'ları 0 sayıldı, istersen değiştir
-X     = df.drop(columns=[TARGET_FLAG, TARGET_TUTAR]).copy()
+tutar = df[TARGET_TUTAR].fillna(0).values
+X     = df.drop(columns=[TARGET_FLAG, TARGET_TUTAR, FILTRE_KOLON]).copy()
 
 cat_cols = X.select_dtypes(include=["object", "category", "bool"]).columns
 for c in cat_cols:
     X[c] = X[c].astype("category").cat.codes.replace(-1, np.nan)
+X = X.astype(float)                                # ağaca girmeden son garanti
 
 feature_names = list(X.columns)
 n = len(X)
@@ -49,7 +94,6 @@ def cv_auc(**params):
     return np.mean(skorlar), np.std(skorlar)
 
 def _dugum_kurallari(model):
-    """Her düğüm için kök'ten oraya gelen kural metni."""
     t = model.tree_
     kural = {}
     def rec(node, conds):
@@ -63,12 +107,8 @@ def _dugum_kurallari(model):
     return kural
 
 def dugum_tablosu(model, sadece_yaprak=False):
-    """
-    Yaprak + ara düğümlerin hepsi: müşteri sayısı, batan sayısı, batma oranı,
-    toplam tutar, batan tutar, batan tutar oranı.
-    """
     t = model.tree_
-    yol = model.decision_path(X).toarray().astype(bool)      # satır x düğüm: geçti mi?
+    yol = model.decision_path(X).toarray().astype(bool)
     kural = _dugum_kurallari(model)
     rows = []
     for node in range(t.node_count):
@@ -80,7 +120,7 @@ def dugum_tablosu(model, sadece_yaprak=False):
         rows.append({
             "node_id": node,
             "tip": "yaprak" if yaprak else "dal",
-            "derinlik": kural[node].count(" VE ") + (0 if node == 0 else 1),
+            "derinlik": 0 if node == 0 else kural[node].count(" VE ") + 1,
             "kural": kural[node],
             "bolen_degisken": "" if yaprak else feature_names[t.feature[node]],
             "esik": np.nan if yaprak else t.threshold[node],
@@ -151,12 +191,11 @@ def esik_ayarla(model, node_id, yeni_esik, yon="<="):
 agac = agac_kur(max_depth=4)
 print(esikleri_yuvarla(agac, tolerans=0.002, yon="<"))
 
-tum_dugumler = dugum_tablosu(agac)          # ara düğümler dahil, tutarlarla
+tum_dugumler = dugum_tablosu(agac)
 yapraklar    = yaprak_tablosu(agac)
 print(tum_dugumler)
 print(yapraklar)
 
-# Müdüre gidecek Excel
 with pd.ExcelWriter("karar_agaci_sonuc.xlsx") as w:
     tum_dugumler.to_excel(w, sheet_name="tum_dugumler", index=False)
     yapraklar.to_excel(w, sheet_name="yapraklar", index=False)
