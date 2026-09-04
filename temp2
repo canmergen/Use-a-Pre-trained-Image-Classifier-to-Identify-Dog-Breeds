@@ -1,32 +1,932 @@
-import os, tempfile
-import numpy as np
+# ============================================================
+# RENK BAZLI MODELLER — her renk: eleme → Optuna → DOSYA (renk renk)
+# ============================================================
+#
+# ------------------------------------------------------------------
+# NEDEN "val" GERİ GELDİ? (CV yerine train/val)
+#   1) Her trial'da CV_FOLDS kadar fit yerine TEK fit var → süre CV_FOLDS
+#      katı azalıyor; 40 trial x 6 renk bu ölçekte asıl maliyet kalemiydi.
+#   2) SIZINTI RİSKİ KAPALI TUTULUYOR: bölme feature elemesinden ÖNCE
+#      yapılıyor. Tüm elemeler (sabit, hedef ilişkisi, korelasyon, PSI)
+#      SADECE train üzerinde hesaplanıyor; val'e yalnızca hayatta kalan
+#      feature listesi uygulanıyor. Val hiçbir eleme kararına girmiyor.
+#   3) TUTARLILIK: seçilen model = train'de eğitilip val'de değerlendirilen
+#      modelin ta kendisi. Final fit yeniden yapılmıyor, val'i eğitime
+#      katmıyoruz; aksi halde doğruladığımızdan FARKLI bir model kaydedilirdi.
+#   4) Eşik (threshold) artık OOF yerine val'den seçiliyor — val, modelin
+#      hiç görmediği bir küme olduğu için eşik iyimser çıkmıyor.
+#
+# NEDEN IV ELEMESİ KALDIRILDI?
+#   1) IV tek değişkenli ve MONOTON ilişki ölçer; LightGBM ikisini de
+#      aramaz. Etkileşimde güçlü ama tek başına zayıf feature'lar atılıyordu.
+#   2) 0.02 sabit eşiği renkten renge çok farklı davranıyordu — elenen:
+#      Turuncu 144, Açık yeşil 132, Sarı 114, Yeşil 85, Kırmızı 70,
+#      Koyu yeşil 15.
+#   3) Seyreltmeyi model zaten yapıyor (colsample_bytree 0.4-0.7).
+#   IV hesabı DURUYOR ama sadece rapor amaçlı.
+#
+# NEDEN SPEARMAN?
+#   Çift tespiti: feature'lar çarpık + sentinel yığınları var (0, -1);
+#   Pearson gerçek bağımlılığı düşük gösteriyordu. Maliyet yok — rank+matmul
+#   pandas'ın Pearson corr()'undan bile hızlı (400k x 200: 25.6s vs 33.3s).
+#   Tie-breaker: |Spearman(feature,target)| — binleme yok, kardinalite
+#   şişmesi yok.
+# ------------------------------------------------------------------
 
-OUT_NAME = "model_data.parquet"
-hedef    = f"{PATH}/{OUT_NAME}"
+# --- HIZ AYARLARI -------------------------------------------------
+# CV kaldırıldı → her trial'da TEK fit var.
+#
+# KRİTİK: os.cpu_count() Kubernetes pod'unda NODE'un çekirdek sayısını
+# döndürüyor, pod'a AYRILAN kotayı değil. LGB n_jobs=256 çıkıyordu; pod'a
+# 8-16 CPU verilmişse 256 thread o çekirdeklerde boğuşuyor (thrashing) ve
+# fit hızlanmak yerine YAVAŞLIYOR. sched_getaffinity gerçek kotayı vermez.
+# Ayrıca 241 feature'a 256 thread zaten anlamsız — thread başına bir
+# feature bile düşmüyor, kalanı senkronizasyon maliyeti.
+# os.cpu_count() ve sched_getaffinity ikisi de NODE'un çekirdeğini verir
+# (256). Kubernetes CPU limitini CFS QUOTA ile uygular; gerçek kota
+# /sys/fs/cgroup'ta yazar (bu pod'da 72).
+# KRİTİK: kotadan fazla thread açmak sadece "faydasız" değil, ZARARLI —
+# kota dolunca Linux thread'leri periyodun geri kalanı boyunca DONDURUR
+# (CFS throttling). 256 thread / 72 kota bu yüzden trial başına 9.6 dk
+# yapıyordu. Kotanın altında kalmak throttling'i tamamen kapatır.
+# 48 tavanı: LightGBM 241 feature'da ~32-48 thread'den sonra doyuma
+# ulaşıyor; daha fazlası senkronizasyon maliyeti ve kotaya yaklaşma riski.
+def _cpu_kotasi(tavan=48):
+    _q = None
+    try:                                                    # cgroup v2
+        _v = open('/sys/fs/cgroup/cpu.max').read().split()
+        if _v[0] != 'max':
+            _q = int(_v[0]) / int(_v[1])
+    except Exception:
+        try:                                                # cgroup v1
+            _qq = int(open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us').read())
+            _pp = int(open('/sys/fs/cgroup/cpu/cpu.cfs_period_us').read())
+            if _qq > 0:
+                _q = _qq / _pp
+        except Exception:
+            pass
+    _n = int(_q) if _q else (os.cpu_count() or 8)
+    return max(1, min(_n, tavan))
 
-out = df.copy()
 
-# val_index eşleşmesi için ham satır sırası
-if "SRC_INDEX" not in out.columns:
-    out = out.reset_index(drop=True)
-    out["SRC_INDEX"] = np.arange(len(out), dtype=np.int64)
+LGB_JOBS = _cpu_kotasi()
+print(f"[HIZ] cgroup kotası={_cpu_kotasi(10**9)} → LGB n_jobs={LGB_JOBS}")
 
-# dosya boyutunu yarıya indirir
-korunacak = {"SRC_INDEX", "MBB_NO", "DONEM"}
-for c in out.columns:
-    if c not in korunacak and out[c].dtype == np.float64:
-        out[c] = out[c].astype(np.float32)
+# 0.95 -> 0.90: |Spearman|>0.90 çiftte ikisini birden tutmanın katkısı çok
+# sınırlı. Daha fazla feature elenir; LightGBM'in split araması feature
+# sayısıyla doğru orantılı olduğu için doğrudan süre kazancı.
+CORR_ESIK = 0.90
 
-tmp = os.path.join(tempfile.gettempdir(), OUT_NAME)
-out.to_parquet(tmp, engine="pyarrow", compression="snappy", index=False)
+# --- TRAIN / VAL AYARLARI -----------------------------------------
+# TRAIN_DONEM içi stratified bölme. OOT'ye HİÇ dokunulmuyor.
+VAL_ORAN = 0.20
 
-with open(tmp, "rb") as f:
-    mf.upload_stream(hedef, f)
+# --- OPTIMIZE EDILEN METRIK: CAPTURE@10% --------------------------
+# Objective artık val_gini DEĞİL, val üzerinde capture@10%:
+#    "en riskli %10'a bakarsam batanların yüzde kaçını yakalarım"
+#
+# NEDEN GINI DEĞİL: gini GLOBAL sıralamayı ölçer, dağılımın ortasındaki
+# sıralamayı da eşit ağırlıkla ödüllendirir. Bizi ilgilendiren üst
+# bucket'ların ayrımı. Model kapasitesini oraya harcasın istiyoruz.
+#
+# NEDEN bucket-1 bad_rate DEĞİL:
+#   1) Kararlılık: %5'lik tek dilim, koyu yeşil gibi az batanlı renklerde
+#      trial'dan trial'a zıplar; Optuna gürültüyü optimize etmeye başlar.
+#   2) Base rate'e dayanıklı: capture bir ORAN (0-1), altı renkte de
+#      karşılaştırılabilir. bad_rate mutlak — Kırmızı'da 0.90, koyu
+#      yeşilde 0.05 çıkar, tek eşikle yönetilemez.
+#   3) Tek nokta yerine eğri: bucket 1'de tepe yapıp 2'de çöken modeli
+#      cezalandırır, üst kuyruğun ŞEKLİNİ korur.
+CAPTURE_PCT = 0.10
 
-print(f"{hedef} | {out.shape[0]:,} satır x {out.shape[1]} kolon | "
-      f"{round(os.path.getsize(tmp)/1024**2, 1)} MB")
-if "DONEM" in out.columns:
-    print(out["DONEM"].value_counts().sort_index().to_string())
+# --- KURAL: train - val gini farkı (DEĞİŞTİ) ----------------------
+# ESKİDEN train - oot idi. Sorun: train-oot İKİ farklı şeyi topluyor —
+#    train - val = AŞIRI ÖĞRENME (modelin suçu, regularizasyonla düzelir)
+#    val   - oot = ZAMANSAL BOZULMA (popülasyon kayması, modelle düzelmez)
+# Kırmızı/Turuncu/Sarı'da train-val ~0.000 iken train-oot ~0.023 çıkmıştı:
+# gap'in TAMAMI zamansaldı, ama kural bunu "model fazla öğrenmiş" diye
+# cezalandırıyordu. Optimizer'ın elindeki tek kaldıraç train_gini'yi
+# düşürmek olduğu için gerçek sinyali atıp kuralı sağlıyordu — tüm
+# renklerin tam 0.02 sınırında toplanması bunun kanıtıydı.
+#
+# Artık kural aşırı öğrenmeyi GERÇEKTEN ölçen büyüklüğe bağlı.
+# val-oot ve train-oot hâlâ hesaplanıp loglanıyor ama SADECE İZLEME —
+# objective'e girmiyor, model seçimini kısıtlamıyor. Böylece OOT tekrar
+# temiz bir test kümesi oluyor.
+GAP_TR_VAL_ESIK = 0.02
+# Az pozitifli renkler (<=10.000 pozitif) için gevşek eşik. 0.02 orada
+# sadece underfit trial'ları geçiriyordu: koyu yeşilde kuralı sağlayan
+# model OOT capture 0.2202 verirken, gap 0.099 olan model 0.4156 veriyordu.
+GAP_TR_VAL_ESIK_KUCUK = 0.12
+# Ceza 10.0 -> 1.5: 10.0'da 0.01'lik aşım 0.1 skor kaybı demekti, bu da
+# gerçek capture farklarını tamamen bastırıyor ve 40 trial'ın hepsi
+# "kuralı sağla" bölgesinde harcanıyordu.
+GAP_CEZA = 1.5
 
-os.remove(tmp)
-del out
+# Bucket izleme (objective'e GİRMEZ, sadece loglanır)
+N_BUCKET_IZLEME = 20
+
+# Canlı izleme: her trial'da capture/gini/bucket + params basılır.
+TRIAL_LOG = True
+# Her trial'da OOT de skorlansın mı? Model seçimine GİRMEZ, sadece log.
+# 1.46M satırlık ekstra predict demek — kapalı tutmak trial süresini
+# ~%25 düşürüyor. OOT nihai modelde her hâlükârda hesaplanıyor.
+TRIAL_OOT = False
+
+MODEL_RENKLER = [1, 2, 3, 4, 5, 6]   # kırmızı, turuncu, sarı, açık yeşil, yeşil, koyu yeşil
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+renk_sonuclari, ozet_satirlari = {}, []
+
+for RENK_KOD in MODEL_RENKLER:
+    renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+    etiket   = f"{RENK_KOD}-{renk_adi}"
+    print(f"\n=== {etiket} ===")
+
+    # 1) Popülasyon: KK + renk + dönemler
+    print("  ▶ 1) Popülasyon filtreleniyor...")
+    mask = ((df['KK_URUN_FLG'] == 'KK') &
+            (df['RENK'] == RENK_KOD) &
+            (df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM])))
+    df_r = df.loc[mask].copy()
+    if df_r.empty or (df_r['DONEM'] == TRAIN_DONEM).sum() == 0:
+        print("  veri yok, atlandı"); continue
+    print(f"  ✓ Popülasyon: {df_r.shape[0]} satır")
+
+    # 2) Feature engineering + feature listesi
+    print("  ▶ 2) Feature engineering başladı...")
+    df_eng_r, eng_cols_r = feature_engineering(df_r)
+    FEATURES = [c for c in (RAW_FEATURES + eng_cols_r)
+                if c in df_eng_r.columns and c not in LEAK_COLS]
+    FEATURES = list(dict.fromkeys(FEATURES))
+    _id_col  = 'MBB_NO' if 'MBB_NO' in df_eng_r.columns else None
+    if _id_col is None:
+        print("  ⚠ MBB_NO kolonu bulunamadı; skor datasetinde müşteri numarası yerine indeks yazılacak.")
+    print(f"  ✓ Feature engineering bitti ({len(FEATURES)} feature)")
+
+    # 3) Zaman bazlı bölme (TRAIN_DONEM / OOT)
+    print("  ▶ 3) Zaman bazlı bölme (train / OOT)...")
+    train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
+    oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+
+    for c in CAT_COLS:
+        if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            _once = oot[c].isna().sum()
+            oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+            _yeni = oot[c].isna().sum() - _once
+            if _yeni:
+                print(f"    ⚠ {c}: {_yeni:,} OOT satırı train'de olmayan kategoriye "
+                      f"sahip → NaN ({_yeni/len(oot)*100:.2f}%)")
+
+    if train_full[TARGET].nunique() < 2:
+        print("  train tek sınıf, atlandı"); continue
+    print(f"  ✓ Bölme bitti (train_full {len(train_full)} / oot {len(oot)})")
+
+    # 3b) TRAIN_DONEM içi train / val bölmesi — ELEMEDEN ÖNCE
+    #     Sıra kritik: önce böl, sonra ele. Böylece val hiçbir eleme
+    #     istatistiğine katkı vermiyor (sızıntı yok).
+    print("  ▶ 3b) train / val bölmesi (eleme ÖNCESİ)...")
+    train, val = train_test_split(train_full,
+                                  test_size=VAL_ORAN,
+                                  stratify=train_full[TARGET],
+                                  shuffle=True,
+                                  random_state=RANDOM_STATE)
+    # SATIR SIRASINI SABİTLE (kritik): train_test_split satırları karışık
+    # döndürüyor. subsample (bagging) satırları POZİSYONA göre örneklediği
+    # için satır sırası değişince başka bir model çıkıyor. Sonraki bloklar
+    # bölmeyi indeksten kurduğu için oradaki sıra artan; ikisini eşitlemek
+    # adına burada da artan indekse çeviriyoruz.
+    train, val = train.sort_index(), val.sort_index()
+    if train[TARGET].nunique() < 2 or val[TARGET].nunique() < 2:
+        print("  train veya val tek sınıf, atlandı"); continue
+    print(f"  ✓ train {len(train)} / val {len(val)} "
+          f"(target_rate train={train[TARGET].mean():.4f} val={val[TARGET].mean():.4f})")
+
+    # --- VAL İNDEKSİNİ DOSYAYA YAZ (KRİTİK) ---------------------------
+    # Sonraki bloklar bölmeyi train_test_split ile YENİDEN ÜRETMEYE
+    # çalışırsa, preprocess'in satır sayısı en ufak değişse (burada eleme
+    # ÖNCESİ feature listesiyle, sonraki bloklarda eleme SONRASI listeyle
+    # çağrılıyor) bölme kayar. O zaman raporlanan model ile kaydedilen
+    # model farklı olur ve scored tabloda 'VAL' dediğimiz satırların bir
+    # kısmı aslında modelin eğitim setine girer. Hata fırlatmaz, sessizce
+    # yanlış çalışır. Bölmeyi üretmek yerine TAŞIYORUZ.
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_val_index.csv",
+         pd.DataFrame({'idx': val.index}))
+    _VAL_IDX = set(val.index)             # ← eleme sonrası yeniden kurulacak
+    print(f"  ✓ val indeksi yazıldı (renk_{RENK_KOD}_{renk_adi}_val_index.csv)")
+
+    # 4) FEATURE ELEME — SADECE train üzerinde. val ve OOT'ye dokunulmuyor;
+    #    onlara yalnızca hayatta kalan liste uygulanıyor.
+    _before = len(FEATURES)
+    y  = train[TARGET]
+    Xf = train[FEATURES]
+
+    # 4a) Sabit / neredeyse sabit
+    print("  ▶ 4a) Sabit / neredeyse sabit değişken elemesi başladı...")
+    drop_const = [c for c in FEATURES
+                  if Xf[c].nunique(dropna=False) <= 1
+                  or Xf[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
+    FEATURES = [c for c in FEATURES if c not in drop_const]
+    del Xf
+    print(f"  ✓ Sabit eleme bitti (elenen {len(drop_const)})")
+
+    # 4b) HEDEF İLİŞKİSİ — sayısal: |Spearman|, kategorik: Cramér's V
+    print("  ▶ 4b) Hedef ilişkisi hesaplanıyor (Spearman / Cramér's V)...")
+    num   = train[FEATURES].select_dtypes(include=np.number)
+    _cols = np.asarray(num.columns)
+
+    # Rank matrisi TEK kez: hem feature-feature Spearman hem hedef-Spearman
+    # buradan çıkıyor (standartlaştırılmış rank'lerin iç çarpımı = Spearman).
+    _R  = num.rank().to_numpy(dtype="float64")
+    _R  = (_R - _R.mean(0)) / np.maximum(_R.std(0), 1e-9)
+    _R  = np.nan_to_num(_R)
+    _yr = y.rank().to_numpy(dtype="float64")
+    _yr = (_yr - _yr.mean()) / max(_yr.std(), 1e-9)
+
+    tgt_assoc = dict(zip(_cols, np.abs(_R.T @ _yr / len(_yr))))
+    for c in FEATURES:                                   # kategorikler
+        if c not in tgt_assoc:
+            tgt_assoc[c] = _cramers_v(train[c], y)
+
+    iv_scores = {c: _quick_iv(train[c], y) for c in FEATURES}   # rapor
+    print("  ✓ Hedef ilişkisi + IV (rapor) bitti.")
+
+    # 4c) Yüksek korelasyon — çiftte hedefi DAHA İYİ AÇIKLAYAN tutulur
+    print(f"  ▶ 4c) Korelasyon elemesi başladı (Spearman |r|>{CORR_ESIK})...")
+    _C   = np.abs(_R.T @ _R / len(_R))
+    _pos = {c: i for i, c in enumerate(_cols)}
+
+    _kept, drop_corr = [], set()
+    for c in sorted(_cols, key=lambda k: -tgt_assoc.get(k, 0.0)):
+        i = _pos[c]
+        if _kept and (_C[i, _kept] > CORR_ESIK).any():
+            drop_corr.add(c)
+        else:
+            _kept.append(i)
+
+    drop_corr = [c for c in FEATURES if c in drop_corr]
+    FEATURES  = [c for c in FEATURES if c not in drop_corr]
+    print(f"  ✓ Korelasyon elemesi bitti (elenen {len(drop_corr)})")
+    print(f"    eleme: const-{len(drop_const)} corr-{len(drop_corr)}"
+          f"  →  {_before}→{len(FEATURES)}   (IV elemesi YOK)")
+
+    _tgt_sirali = sorted(((c, tgt_assoc.get(c, 0.0)) for c in FEATURES),
+                         key=lambda kv: kv[1], reverse=True)
+    print("    --- Hedef ilişkisi ilk 20 ---")
+    for c, v in _tgt_sirali[:20]:
+        print(f"      {v:7.4f}  {c}")
+
+    if len(FEATURES) == 0:
+        print("  tüm feature elendi, atlandı"); continue
+
+    # 4d) PSI — hem KAYMIŞ hem ZAYIF olanları eliyor
+    # Tek başına PSI eleme kriteri değil; kayma ve veri kalitesi
+    # sorunudur ya da gerçek davranış değişimidir (modellemek
+    # istediğimiz kısım). İkisini ayırt edemez.
+    # Baz artık train_full değil, train (val ayrıldıktan sonrası).
+    print("  ▶ 4d) PSI hesaplanıyor (train vs OOT)...")
+    psi_scores  = {c: _psi(train[c], oot[c]) for c in FEATURES}
+    _psi_sirali = sorted(psi_scores.items(), key=lambda kv: kv[1], reverse=True)
+    _kaymis = [c for c, v in psi_scores.items() if v > 0.25]
+    _dikkat = [c for c, v in psi_scores.items() if 0.10 < v <= 0.25]
+    print(f"  ✓ PSI bitti — kaymış(>0.25): {len(_kaymis)}, "
+          f"dikkat(0.10-0.25): {len(_dikkat)}, stabil: "
+          f"{len(FEATURES) - len(_kaymis) - len(_dikkat)}")
+    if _psi_sirali[0][1] > 0.10:
+        print("    --- PSI en yüksek 10 ---")
+        for c, v in _psi_sirali[:10]:
+            print(f"      {v:7.4f}  {c}")
+
+    # --- PSI ELEMESİ: hem kaymış HEM zayıf olanlar --------------------
+    # Tek başına PSI yetmez: kayma ya veri kalitesi sorunudur ya da gerçek
+    # davranış değişimidir (modellemek istediğimiz şey). Ama hedefi de
+    # açıklamıyorsa ikinci ihtimal kalmıyor — sarıda elenen ikisinin
+    # tgt_assoc'ı 0.019/0.021, listenin dibi; tutulanlar 0.049 ve üstü.
+    _once = len(FEATURES)
+    _ele  = [c for c in FEATURES
+             if psi_scores[c] > 0.25 and tgt_assoc.get(c, 0.0) < 0.05]
+    FEATURES = [c for c in FEATURES if c not in _ele]
+    if _ele:
+        print(f"  ✓ PSI elemesi: {len(_ele)} feature elendi "
+              f"(PSI>0.25 ve tgt_assoc<0.05)  →  {_once}→{len(FEATURES)}")
+        for c in _ele:
+            print(f"      psi={psi_scores[c]:.4f} tgt={tgt_assoc[c]:.4f}  {c}")
+    else:
+        print("  ✓ PSI elemesi: eleyecek feature yok")
+
+    if len(FEATURES) == 0:
+        print("  tüm feature elendi, atlandı"); continue
+
+    print("  ▶ Kalan feature'lar hazırlanıyor...")
+    # 'sira' = modelin gördüğü KOLON SIRASI. Kritik: colsample_bytree
+    # feature'ları kolon sırasına göre örneklüyor, yani sıra değişirse her
+    # ağaçta farklı alt küme seçilir ve BAŞKA bir model çıkar. CSV
+    # tgt_assoc'a göre sıralı yazılıyor (rapor okunaklı olsun diye), o
+    # yüzden sırayı ayrı kolonda saklıyoruz; sonraki bloklar
+    # _features_oku'da 'sira'ya göre geri diziyor.
+    #
+    # DEĞİŞTİ: dosya BURADA YAZILMIYOR. Model henüz eğitilmedi, dolayısıyla
+    # feat_imp_gain / feat_imp_split hesaplanamaz. feat_df blok 8a'da
+    # importance ile birleştirilip tek seferde yazılıyor.
+    feat_df = pd.DataFrame(
+        [{'feature':   c,
+          'sira':      i,
+          'tgt_assoc': round(tgt_assoc.get(c, np.nan), 4),
+          'iv':        round(iv_scores.get(c, np.nan), 4),
+          'psi':       round(psi_scores.get(c, np.nan), 4)} for i, c in enumerate(FEATURES)]
+    ).sort_values('tgt_assoc', ascending=False)
+
+    # 4e) FİNAL PREPROCESS — ELEME SONRASI KOLON LİSTESİYLE (KRİTİK)
+    # Yukarıdaki train_full/oot, eleme ÖNCESİ feature listesiyle üretildi.
+    # Sonraki bloklar ise preprocess'i eleme SONRASI listeyle çağırıyor.
+    # preprocess kolon setine bağlı bir şey yapıyorsa (satır bazlı dropna
+    # en tipiği) iki tarafın satır kümesi ayrışır ve ana pipeline'ın
+    # eğittiği model ile sonraki blokların kurduğu model FARKLI olur.
+    # Çözüm: burada da final listeyle bir kez daha preprocess'ten geçiyoruz,
+    # böylece altı blok da BİREBİR aynı girdiyle çalışıyor.
+    #
+    # Bölme YENİ seed ile yapılmıyor: _VAL_IDX taşınıyor. Aksi halde
+    # elemede kullanılmış satırlar val'e düşebilir → sızıntı. Bu haliyle
+    # val'e giren hiçbir satır eleme istatistiklerine katılmamış oluyor.
+    print("  ▶ 4e) Final preprocess (eleme sonrası liste) + bölme kuruluyor...")
+    _idx_once  = set(train_full.index)
+    train_full = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]])
+    oot        = preprocess(df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM,   FEATURES + [TARGET]])
+    for c in CAT_COLS:
+        if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            oot[c] = pd.Categorical(oot[c], categories=train_full[c].cat.categories)
+    # Satır SAYISI aynı kalıp satır KÜMESİ değişebiliyor — uzunluk kontrolü
+    # bunu göremez, o yüzden indeks kümesini karşılaştırıyoruz.
+    _fark = len(_idx_once ^ set(train_full.index))
+    if _fark:
+        print(f"    ⚠ preprocess kolon setine duyarlı: {_fark} satır farklı "
+              f"({len(_idx_once)} → {len(train_full)}). Final liste esas alındı — "
+              f"bu yeniden kurulum olmasaydı sonraki bloklar BAŞKA bir model eğitirdi.")
+
+    _m = train_full.index.isin(_VAL_IDX)
+    train, val = train_full.loc[~_m].sort_index(), train_full.loc[_m].sort_index()
+    if train[TARGET].nunique() < 2 or val[TARGET].nunique() < 2:
+        print("  final bölmede train veya val tek sınıf, atlandı"); continue
+    print(f"  ✓ Final bölme: train {len(train)} / val {len(val)} / oot {len(oot)}")
+
+    # 5) Eğitim / doğrulama / test matrisleri
+    #    val ve OOT, train'de hayatta kalan feature listesiyle KESİLİYOR.
+    X_tr,  y_tr  = train[FEATURES], train[TARGET]
+    X_val, y_val = val[FEATURES],   val[TARGET]
+    X_oot, y_oot = oot[FEATURES],   oot[TARGET]
+    print(f"  ✓ Matrisler hazır — train {X_tr.shape} / val {X_val.shape} / oot {X_oot.shape}")
+
+    # 6) Model + Optuna
+    print(f"  ▶ 6) Model denemeye başlandı (Optuna, {N_ITER} trial, "
+          f"train/val tek fit, LGB n_jobs={LGB_JOBS})...")
+    spw = (len(y_tr) - y_tr.sum()) / max(y_tr.sum(), 1)
+
+    # --- ARAMA UZAYI, POZİTİF SAYISINA GÖRE DARALTILIYOR --------------
+    # Kırmızı'da ~1.09M pozitif var; derinlik 7 / 63 yaprak rahat taşınır.
+    # Koyu yeşilde ~1,200 pozitif; 63 yaprak demek yaprak başına ~19 pozitif
+    # demek — ezberleme riski. Sabit bir uzay altı renge birden uymuyor.
+    # min_child_samples da bağlanıyor: 1,200 pozitifte mcs=1500 demek, bir
+    # yaprakta ortalama 1 pozitif demek; model hiçbir şey öğrenemez.
+    # KAPASİTE KATMANLI — hepsini birden açmak YANLIŞ olurdu.
+    # Gözlenen train-val gap'leri (blok 2, ilk koşu):
+    #    Kırmızı  0.0001 | Turuncu 0.0006 | Sarı  -0.0040  → UNDERFIT, yer var
+    #    Yeşil    0.0169                                    → sınırda
+    #    Açık yşl 0.0432 | Koyu yşl 0.0772                  → ZATEN AŞIRI ÖĞRENİYOR
+    # Bu yüzden kapasite SADECE üst katmanda (pozitif > 100k: Kırmızı,
+    # Turuncu) artırıldı. Alt katmanlar eski sınırlarında bırakıldı —
+    # oralarda yaprak sayısını artırmak overfit'i büyütür ve yeni
+    # train-val kuralı yüzünden trial'ların çoğu boşa giderdi.
+    # --- KATMANLAR: pozitif sayısına göre 3 kademe --------------------
+    # ÖNEMLİ DERS (deneyle bulundu): train-val gap'ini kovalamak
+    # performansı ÖLDÜRÜYOR. Koyu yeşilde üç ayar denendi (OOT capture@10%):
+    #    leaves<=15, mcs>=50   → gap +0.099, OOT 0.4156   ← EN İYİ
+    #    leaves<=7,  mcs>=200  → gap +0.073, OOT 0.4048
+    #    leaves<=4,  mcs>=400  → gap -0.030, OOT 0.2202   ← underfit, yarı yarıya
+    # Gap kapandı ama model işe yaramaz hale geldi. Gap TEK BAŞINA kötü
+    # performans göstergesi DEĞİL; az pozitifli renklerde bir miktar gap
+    # kaçınılmaz ve zararsız. Bu yüzden "ÇOK KÜÇÜK" katmanı KALDIRILDI.
+    # Eşik de 15.000 -> 10.000'e geri alındı: açık yeşil 31 yaprakla
+    # OOT 0.2696 veriyordu, 15 yaprakta 0.2670'e düşmüştü.
+    _npos  = int(y_tr.sum())
+    _orta  = _npos > 10_000
+    _buyuk = _npos > 100_000
+
+    _maxd    = 8   if _buyuk else (5  if _orta else 4)
+    _maxl    = 127 if _buyuk else (31 if _orta else 15)
+    _mcs_min = 50
+    _mcs_max = min(1500, max(100, _npos // 10))
+
+    # --- KURAL EŞİĞİ RENK BÜYÜKLÜĞÜNE GÖRE ---------------------------
+    # 0.02 sabit eşiği az pozitifli renklerde SADECE underfit trial'ları
+    # geçiriyordu. Az pozitifte gap'in bir kısmı örneklem gürültüsüdür;
+    # bunu aşırı öğrenme sanıp cezalandırmak performansı yok ediyor.
+    _gap_esik = GAP_TR_VAL_ESIK if _orta else GAP_TR_VAL_ESIK_KUCUK
+
+    _katman = 'BÜYÜK' if _buyuk else ('ORTA' if _orta else 'KÜÇÜK')
+    print(f"    pozitif={_npos:,} [{_katman}] → max_depth<={_maxd}, "
+          f"num_leaves<={_maxl}, min_child_samples {_mcs_min}-{_mcs_max}, "
+          f"gap eşiği={_gap_esik}")
+
+    # --- scale_pos_weight ARANIYOR (sabit değil) ----------------------
+    # spw = (neg/poz) altı renkte TAMAMEN farklı iş yapıyor:
+    #    Kırmızı (%75.97 poz) → 0.30   pozitifleri AŞAĞI ağırlıklandırır
+    #    Koyu yeşil (%0.07)   → 1332   pozitifleri 1332 kat YUKARI
+    # Tek sabit değer bu aralığa uymuyor. 1.0 (ağırlıksız) ile tam
+    # dengeleyen spw arasını log ölçekte tarıyoruz; 1.0 her zaman içeride.
+    _spw_lo, _spw_hi = min(1.0, spw), max(1.0, spw)
+    if not (_spw_hi > _spw_lo * 1.001):          # oran ~1.0 ise aralık dejenere
+        _spw_lo, _spw_hi = 0.8, 1.25
+    print(f"    scale_pos_weight aralığı: {_spw_lo:.3f} - {_spw_hi:.3f} "
+          f"(dengeleyen değer {spw:.3f})")
+
+    base = lgb.LGBMClassifier(objective='binary', metric='auc', max_bin=63,
+                              random_state=RANDOM_STATE, n_jobs=LGB_JOBS, verbose=-1)
+
+    # subsample_freq suggest_* ile önerilmiyor → best_params'ta YER ALMAZ.
+    # Elle geri konmazsa LightGBM varsayılanı 0'a düşer ve bagging tamamen
+    # kapanır; doğrulamada değerlendirilenden FARKLI bir model eğitilmiş olur.
+    SABIT_PARAMS = {'subsample_freq': 1}
+    _t0 = time.time()
+
+    # Her trial'ın TAM kaydı burada birikiyor (params dahil) → dosyaya yazılıyor.
+    trial_kayitlari = []
+
+    def objective(trial):
+        params = {
+            'max_depth':         trial.suggest_int('max_depth', 2, _maxd),
+            'num_leaves':        trial.suggest_int('num_leaves', 4, _maxl),
+            # Ağaç sayısı/lr sadece BÜYÜK renklerde açıldı. Küçük renklerde
+            # 1500 ağaç = daha fazla ezberleme, zaten overfit ediyorlar.
+            'n_estimators':      trial.suggest_int('n_estimators',
+                                                   300 if _buyuk else 200,
+                                                   800 if _buyuk else 400),
+            'learning_rate':     trial.suggest_float('learning_rate',
+                                                     0.02 if _buyuk else 0.01,
+                                                     0.10 if _buyuk else 0.05, log=True),
+            'min_child_samples': trial.suggest_int('min_child_samples', _mcs_min, _mcs_max),
+            # Alt sınır: büyük renklerde 0.1 (hafif regularize kalabilsin),
+            # küçük renklerde 5 (aşırı öğrenmeye karşı taban).
+            'reg_lambda':        trial.suggest_float('reg_lambda',
+                                                     0.1 if _buyuk else 5.0, 50, log=True),
+            # Sınıf ağırlığı da aranıyor — renkler arası oran 0.32 ile 1332
+            # arasında değişiyor, sabit bir değer altısına birden uymuyor.
+            'scale_pos_weight':  trial.suggest_float('scale_pos_weight',
+                                                     _spw_lo, _spw_hi, log=True),
+            'reg_alpha':         trial.suggest_float('reg_alpha', 0.0, 10.0),
+            'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.4, 0.7),
+            'subsample':         trial.suggest_float('subsample', 0.6, 0.8),
+            **SABIT_PARAMS,
+        }
+
+        model = clone(base).set_params(**params)
+        model.fit(X_tr, y_tr)
+
+        _ptr  = model.predict_proba(X_tr)[:, 1]
+        _pval = model.predict_proba(X_val)[:, 1]
+        train_gini = 2 * roc_auc_score(y_tr,  _ptr)  - 1
+        val_gini   = 2 * roc_auc_score(y_val, _pval) - 1
+
+        # --- OPTIMIZE EDILEN: val capture@10% ---
+        cap_tr  = _capture_at(y_tr,  _ptr,  CAPTURE_PCT)
+        cap_val = _capture_at(y_val, _pval, CAPTURE_PCT)
+
+        # Bucket izleme (objective'e GİRMEZ)
+        lift1, tavan_pct, mono = _bucket_metrik(y_val, _pval, N_BUCKET_IZLEME)
+
+        # OOT SKORLAMASI TRIAL'DAN ÇIKARILDI.
+        # Kural artık train-val; OOT model seçimine GİRMİYOR. Sadece log
+        # için her trial'da 1.46M satır tahmin etmek trial süresinin
+        # ~%25'ini yiyordu. OOT nihai modelde zaten hesaplanıyor.
+        # İzlemek isterseniz TRIAL_OOT=True yapın.
+        oot_g, cap_oot = np.nan, np.nan
+        if TRIAL_OOT and y_oot.nunique() >= 2:
+            _poot   = model.predict_proba(X_oot)[:, 1]
+            oot_g   = 2 * roc_auc_score(y_oot, _poot) - 1
+            cap_oot = _capture_at(y_oot, _poot, CAPTURE_PCT)
+
+        gap_tr_val  = train_gini - val_gini
+        gap_tr_oot  = (train_gini - oot_g) if np.isfinite(oot_g) else np.nan
+        gap_val_oot = (val_gini   - oot_g) if np.isfinite(oot_g) else np.nan
+
+        # --- KURAL: train_gini - val_gini <= GAP_TR_VAL_ESIK ---
+        # (train-oot DEĞİL: o zamansal bozulmayı da içeriyordu ve modelin
+        #  düzeltemeyeceği bir şey için modeli cezalandırıyordu.)
+        kural_ok = bool(gap_tr_val <= _gap_esik)
+
+        # Skor ve ceza AYNI ölçekte (capture, 0-1).
+        skor = cap_val - GAP_CEZA * max(0.0, gap_tr_val - _gap_esik)
+
+        trial.set_user_attr('capture_val', float(cap_val))
+        trial.set_user_attr('capture_tr',  float(cap_tr))
+        trial.set_user_attr('capture_oot', float(cap_oot) if np.isfinite(cap_oot) else None)
+        trial.set_user_attr('train_gini', float(train_gini))
+        trial.set_user_attr('val_gini',   float(val_gini))
+        trial.set_user_attr('oot_gini',   float(oot_g) if np.isfinite(oot_g) else None)
+        trial.set_user_attr('gap_tr_val', float(gap_tr_val))
+        trial.set_user_attr('gap_tr_oot', float(gap_tr_oot) if np.isfinite(gap_tr_oot) else None)
+        trial.set_user_attr('kural_ok',   kural_ok)
+
+        # --- HER TRIAL'IN TÜM PARAMETRELERİ AYRI SÜTUN OLARAK KAYDA GİRİYOR ---
+        kayit = {
+            'renk':        etiket,
+            'trial':       trial.number,
+            'objective':   round(float(skor), 6),
+            'capture_val': round(float(cap_val), 6),
+            'capture_tr':  round(float(cap_tr), 6),
+            'capture_oot': round(float(cap_oot), 6) if np.isfinite(cap_oot) else None,
+            'capture_pct': CAPTURE_PCT,
+            'val_lift1':   round(float(lift1), 4) if np.isfinite(lift1) else None,
+            'val_lift1_tavan_pct': round(float(tavan_pct), 4) if np.isfinite(tavan_pct) else None,
+            'val_monoton': round(float(mono), 4) if np.isfinite(mono) else None,
+            'train_gini':  round(float(train_gini), 6),
+            'val_gini':    round(float(val_gini), 6),
+            'oot_gini':    round(float(oot_g), 6) if np.isfinite(oot_g) else None,
+            'gap_tr_val':  round(float(gap_tr_val), 6),
+            'gap_val_oot': round(float(gap_val_oot), 6) if np.isfinite(gap_val_oot) else None,
+            'gap_tr_oot':  round(float(gap_tr_oot), 6) if np.isfinite(gap_tr_oot) else None,
+            'gap_esik':    _gap_esik,
+            'kural_ok':    int(kural_ok),
+            'n_feature':   len(FEATURES),
+            'sure_dk':     round((time.time() - _t0) / 60, 3),
+        }
+        kayit.update({f"p_{k}": v for k, v in params.items()})   # tüm hiperparametreler
+        kayit['params_json'] = json.dumps(params)                # tek sütunda tam kopya
+        trial_kayitlari.append(kayit)
+
+        if TRIAL_LOG:
+            _dk = (time.time() - _t0) / 60
+            _o  = f"{cap_oot:.4f}" if np.isfinite(cap_oot) else "-"
+            _og = f"oot={oot_g:.4f} " if np.isfinite(oot_g) else ""
+            print(f"    [{trial.number+1:>3}/{N_ITER}] {_dk:5.1f}dk | "
+                  f"CAP10 val={cap_val:.4f} oot={_o} | "
+                  f"lift1={lift1:.2f}({tavan_pct:.0%} tavan) mono={mono:.0%} | "
+                  f"gini tr={train_gini:.4f} val={val_gini:.4f} {_og}| "
+                  f"gap_tv={gap_tr_val:+.4f} {'OK ' if kural_ok else 'RED'} "
+                  f"skor={skor:.4f} | "
+                  f"d={params['max_depth']} lv={params['num_leaves']:>2} "
+                  f"n={params['n_estimators']:>3} lr={params['learning_rate']:.3f} "
+                  f"mcs={params['min_child_samples']:>4} "
+                  f"spw={params['scale_pos_weight']:.2f} "
+                  f"l2={params['reg_lambda']:5.1f} l1={params['reg_alpha']:4.1f} "
+                  f"col={params['colsample_bytree']:.2f} sub={params['subsample']:.2f}",
+                  flush=True)
+
+        return skor
+
+    study = optuna.create_study(direction='maximize',
+                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+    study.optimize(objective, n_trials=N_ITER)
+    print(f"  ✓ Model denemesi bitti (Optuna, {(time.time()-_t0)/60:.1f} dk).")
+
+    # --- EN İYİ TRIAL: KURALI SAĞLAYANLAR ARASINDAN ------------------
+    _uygun = [t for t in study.trials
+              if t.value is not None and t.user_attrs.get('kural_ok')]
+    if _uygun:
+        best_trial = max(_uygun, key=lambda t: t.user_attrs.get('capture_val', -1))
+        print(f"    kural (train-val gini <= {_gap_esik}) sağlayan trial: "
+              f"{len(_uygun)}/{len([t for t in study.trials if t.value is not None])}")
+    else:
+        best_trial = study.best_trial
+        print(f"    ⚠ UYARI: hiçbir trial train-val gini farkı <= {_gap_esik} "
+              f"kuralını sağlamadı. Cezalı skorun en iyisi seçildi.")
+
+    print(f"    en iyi trial: #{best_trial.number} "
+          f"capture@{CAPTURE_PCT:.0%} val={best_trial.user_attrs.get('capture_val', np.nan):.4f} "
+          f"| gini val={best_trial.user_attrs.get('val_gini', np.nan):.4f} "
+          f"train={best_trial.user_attrs.get('train_gini', np.nan):.4f} "
+          f"oot={best_trial.user_attrs.get('oot_gini') if best_trial.user_attrs.get('oot_gini') is not None else float('nan'):.4f} "
+          f"| gap_tr_val={best_trial.user_attrs.get('gap_tr_val', np.nan):+.4f}")
+
+    BEST_PARAMS = {**best_trial.params, **SABIT_PARAMS}
+
+    # Final model: SADECE train ile eğitiliyor — val'i eğitime katmıyoruz ki
+    # kaydedilen model, doğrulanan modelin ta kendisi olsun.
+    best = clone(base).set_params(n_jobs=LGB_JOBS, **BEST_PARAMS).fit(X_tr, y_tr)
+
+    # — Bu rengin DENENEN modellerini kendi dosyasına yaz (params dahil)
+    print("  ▶ Denenen modeller dosyaya yazılıyor...")
+    trial_df = pd.DataFrame(trial_kayitlari)
+    if not trial_df.empty:
+        trial_df['is_best'] = (trial_df['trial'] == best_trial.number).astype(int)
+        trial_df = trial_df.sort_values('trial')
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv", trial_df)
+
+    # 7) Threshold — VAL tahminlerinden.
+    #    Val eğitime hiç girmediği için eşik iyimser çıkmıyor.
+    print("  ▶ 7) Threshold seçimi (val) + metrik hesabı...")
+    val_prob = best.predict_proba(X_val)[:, 1]
+    thr      = find_thresholds(y_val, val_prob)['youden_j']
+    if not np.isfinite(thr):
+        # val olasılıkları dejenere ise (ör. sabit skor) Youden inf döner;
+        # o durumda evaluate alert_rate=0 üretir ve CSV'ye "inf" yazılır.
+        print(f"    ⚠ eşik dejenere (thr={thr}), 0.5'e sabitlendi")
+        thr = 0.5
+    val_gini = 2 * roc_auc_score(y_val, val_prob) - 1
+
+    tr_prob     = best.predict_proba(X_tr)[:, 1]
+    tr_gini     = 2 * roc_auc_score(y_tr, tr_prob) - 1
+    oot_prob    = best.predict_proba(X_oot)[:, 1]
+    oot_metrics = evaluate(y_oot, oot_prob, thr) if y_oot.nunique() >= 2 else None
+    val_metrics = evaluate(y_val, val_prob, thr)
+
+    # --- Müşteri bazlı skor dataseti (model bazında) ---
+    def _skor_df(idx, y_true, prob, set_adi):
+        _meta  = df_eng_r.reindex(idx)
+        _mbb   = _meta[_id_col].astype(str) if _id_col else pd.Series(idx, index=idx).astype(str)
+        _donem = _meta['DONEM'] if 'DONEM' in _meta.columns else pd.Series([np.nan] * len(_meta), index=idx)
+        _p = np.asarray(prob, dtype='float64')
+        return pd.DataFrame({
+            'model_renk_kod': RENK_KOD,
+            'model_renk':     renk_adi,
+            'set_adi':        set_adi,
+            'mbb_no':         _mbb.to_numpy(),
+            'donem':          _donem.to_numpy(),
+            'target_actual':  np.asarray(y_true, dtype='int64'),
+            'target_pred':    (_p >= thr).astype('int64'),
+            'target_score':   _p,
+            'threshold':      float(thr),
+        })
+
+    skor_train = _skor_df(X_tr.index,  y_tr,  tr_prob,  'train')
+    skor_val   = _skor_df(X_val.index, y_val, val_prob, 'val')
+    skor_oot   = _skor_df(X_oot.index, y_oot, oot_prob, 'oot')
+    skor_all   = pd.concat([skor_train, skor_val, skor_oot], ignore_index=True)
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_musteri_skorlari.csv", skor_all)
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_musteri_skorlari_oot.csv", skor_oot)
+
+    # TRAIN_DONEM ve OOT_DONEM'de ortak müşteriler için karşılaştırmalı skor dataseti
+    if _id_col is not None:
+        tr_full_prob  = best.predict_proba(train_full[FEATURES])[:, 1]
+        oot_full_prob = best.predict_proba(oot[FEATURES])[:, 1]
+
+        tr_full_mbb  = df_eng_r.reindex(train_full.index)[_id_col].astype(str)
+        oot_full_mbb = df_eng_r.reindex(oot.index)[_id_col].astype(str)
+
+        tr_full_df = pd.DataFrame({
+            'mbb_no':             tr_full_mbb.to_numpy(),
+            'donem_train':        train_full['DONEM'].to_numpy() if 'DONEM' in train_full.columns else TRAIN_DONEM,
+            'target_actual_train': np.asarray(train_full[TARGET], dtype='int64'),
+            'target_pred_train':  (tr_full_prob >= thr).astype('int64'),
+            'target_score_train': tr_full_prob,
+        })
+
+        oot_full_df = pd.DataFrame({
+            'mbb_no':            oot_full_mbb.to_numpy(),
+            'donem_oot':         oot['DONEM'].to_numpy() if 'DONEM' in oot.columns else OOT_DONEM,
+            'target_actual_oot': np.asarray(oot[TARGET], dtype='int64'),
+            'target_pred_oot':   (oot_full_prob >= thr).astype('int64'),
+            'target_score_oot':  oot_full_prob,
+        })
+
+        ortak_df = tr_full_df.merge(oot_full_df, on='mbb_no', how='inner')
+        ortak_df['model_renk_kod'] = RENK_KOD
+        ortak_df['model_renk']     = renk_adi
+        ortak_df['threshold']      = float(thr)
+        _yaz(f"renk_{RENK_KOD}_{renk_adi}_musteri_skorlari_train_oot_ortak.csv", ortak_df)
+        print(f"    ortak müşteri (train vs oot): {len(ortak_df):,}")
+    else:
+        print("    ⚠ ortak müşteri train/oot dataseti atlandı (MBB_NO bulunamadı).")
+
+    _gap_tr_oot = (tr_gini - oot_metrics['Gini']) if oot_metrics else np.nan
+    _gap_tr_val = tr_gini - val_gini
+    if _gap_tr_val > _gap_esik:
+        print(f"    ⚠ KURAL İHLALİ (final): train-val gini = {_gap_tr_val:+.4f} "
+              f"> {_gap_esik} (aşırı öğrenme)")
+
+    # --- CAPTURE + BUCKET (nihai model) ---
+    _cap_val = _capture_at(y_val, val_prob, CAPTURE_PCT)
+    _cap_oot = _capture_at(y_oot, oot_prob, CAPTURE_PCT) if oot_metrics else np.nan
+    _l1v, _tpv, _mv = _bucket_metrik(y_val, val_prob, N_BUCKET_IZLEME)
+    _l1o, _tpo, _mo = (_bucket_metrik(y_oot, oot_prob, N_BUCKET_IZLEME)
+                       if oot_metrics else (np.nan, np.nan, np.nan))
+    _base_oot  = float(np.mean(y_oot)) if len(y_oot) else np.nan
+    _cap_tavan = (min(1.0, CAPTURE_PCT / _base_oot)
+                  if np.isfinite(_base_oot) and _base_oot > 0 else np.nan)
+    print(f"    capture@{CAPTURE_PCT:.0%}: val={_cap_val:.4f} oot={_cap_oot:.4f} "
+          f"(tavan {_cap_tavan:.4f} → tavanın "
+          f"{_cap_oot/_cap_tavan:.0%}'i)" if np.isfinite(_cap_tavan) and _cap_tavan > 0
+          else f"    capture@{CAPTURE_PCT:.0%}: val={_cap_val:.4f} oot={_cap_oot:.4f}")
+    print(f"    bucket-1 lift: val={_l1v:.2f} ({_tpv:.0%} tavan) "
+          f"oot={_l1o:.2f} ({_tpo:.0%} tavan) | oot monotonluk={_mo:.0%}")
+
+    # ==================================================================
+    # 8a) FEATURE IMPORTANCE + MODEL PICKLE   [YENİ]
+    # ------------------------------------------------------------------
+    # Importance ağaç yapısının içinde duruyor; veri görmez, ek fit yok,
+    # maliyeti saniyeler. Kaynak model 'best' — X_tr/y_tr (val ayrıldıktan
+    # sonraki train) ile eğitilmiş nihai model. val ve OOT importance'a
+    # HİÇ girmiyor, girmemeli de.
+    #
+    # gain  = feature'ın açtığı split'lerdeki TOPLAM kazanç (LightGBM'de
+    #         toplam; XGBoost'taki ortalama gain ile karıştırma)
+    # split = feature'ın kaç split'te kullanıldığı
+    # İkisi birlikte anlamlı: yüksek kardinaliteli feature'lar split'te
+    # şişer, tek güçlü split yapan feature ise sadece gain'de öne çıkar.
+    # gain_per_split ikisinin arasını gösterir.
+    # ==================================================================
+    print("  ▶ 8a) Feature importance hesaplanıyor...")
+    _bst       = best.booster_
+    _bst_feats = list(_bst.feature_name())
+
+    # Kolon sırası sessizce kaymasın — booster'ın gördüğü sıra FEATURES olmalı
+    if _bst_feats != list(FEATURES):
+        print(f"    ⚠ KOLON SIRASI UYUŞMUYOR: booster {len(_bst_feats)} / "
+              f"FEATURES {len(FEATURES)} — eşleştirme merge ile yapılıyor")
+
+    _imp = pd.DataFrame({
+        'feature':        _bst_feats,
+        'feat_imp_gain':  _bst.feature_importance(importance_type='gain'),
+        'feat_imp_split': _bst.feature_importance(importance_type='split'),
+    })
+
+    _g_tot = _imp['feat_imp_gain'].sum()
+    _s_tot = _imp['feat_imp_split'].sum()
+    _imp['feat_imp_gain_pct']  = np.where(_g_tot > 0, _imp['feat_imp_gain']  / _g_tot, 0.0).round(6)
+    _imp['feat_imp_split_pct'] = np.where(_s_tot > 0, _imp['feat_imp_split'] / _s_tot, 0.0).round(6)
+    _imp['gain_per_split']     = np.where(_imp['feat_imp_split'] > 0,
+                                          _imp['feat_imp_gain'] / _imp['feat_imp_split'],
+                                          0.0).round(4)
+    _imp['feat_imp_gain']      = _imp['feat_imp_gain'].round(4)
+    _imp['rank_gain']          = _imp['feat_imp_gain'].rank(ascending=False, method='min').astype(int)
+    _imp['rank_split']         = _imp['feat_imp_split'].rank(ascending=False, method='min').astype(int)
+    _imp['kullanilmadi_flg']   = (_imp['feat_imp_split'] == 0).astype(int)
+
+    feat_df = feat_df.merge(_imp, on='feature', how='left')
+
+    _eksik = int(feat_df['feat_imp_gain'].isna().sum())
+    if _eksik:
+        print(f"    ⚠ {_eksik} feature importance ile eşleşmedi "
+              f"(feat_df'te var, modelde yok) — 'sira' ile FEATURES arasında kayma olabilir")
+
+    _kullanilmayan = int(feat_df['kullanilmadi_flg'].fillna(0).sum())
+    print(f"    importance: {len(feat_df)} feature, model hiç kullanmamış: {_kullanilmayan}")
+    print("    --- gain ilk 10 ---")
+    for _, _r in feat_df.nlargest(10, 'feat_imp_gain').iterrows():
+        print(f"      {_r['feat_imp_gain_pct']:7.4f}  "
+              f"(split {int(_r['feat_imp_split']):>4})  {_r['feature']}")
+
+    # kalan_featurelar.csv artık BURADA yazılıyor (4d'de değil)
+    print("  ▶ Kalan feature'lar dosyaya yazılıyor (importance dahil)...")
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_kalan_featurelar.csv",
+         feat_df.sort_values('tgt_assoc', ascending=False))
+
+    # ------------------------------------------------------------------
+    # MODEL PICKLE — sadece clf değil, skorlamak için gereken her şey.
+    # KRİTİK: CAT_COLS kategorileri. Model 'category' dtype ile eğitildiyse
+    # kategori SIRASI kodlamayı belirler; ileride farklı sırayla kurulan bir
+    # kategoriyle skorlarsan model hata VERMEZ, sessizce yanlış tahmin eder.
+    # FEATURES de fit sırasıyla saklanıyor (colsample_bytree kolon sırasına
+    # duyarlı).
+    # ------------------------------------------------------------------
+    _cat_kategoriler = {}
+    for c in CAT_COLS:
+        if c in train_full.columns and str(train_full[c].dtype) == 'category':
+            _cat_kategoriler[c] = list(train_full[c].cat.categories)
+
+    _paket = {
+        'model':           best,
+        'features':        list(FEATURES),          # fit sırası — sıra kritik
+        'threshold':       float(thr),
+        'best_params':     BEST_PARAMS,
+        'cat_kategoriler': _cat_kategoriler,
+        'renk_kod':        RENK_KOD,
+        'renk_adi':        renk_adi,
+        'etiket':          etiket,
+        'folder':          FOLDER,
+        'path':            PATH,
+        'target':          TARGET,
+        'train_donem':     TRAIN_DONEM,
+        'oot_donem':       OOT_DONEM,
+        'random_state':    RANDOM_STATE,
+        'lgb_jobs':        LGB_JOBS,
+        'val_oran':        VAL_ORAN,
+        'n_train':         int(len(X_tr)),
+        'n_val':           int(len(X_val)),
+        'n_oot':           int(len(X_oot)),
+        'n_pozitif':       _npos,
+        'train_gini':      float(tr_gini),
+        'val_gini':        float(val_gini),
+        'capture_val':     float(_cap_val),
+        'best_trial':      int(best_trial.number),
+        'surumler': {
+            'lightgbm': lgb.__version__,
+            'sklearn':  sklearn.__version__,
+            'pandas':   pd.__version__,
+            'numpy':    np.__version__,
+        },
+    }
+    _yaz_pkl(f"renk_{RENK_KOD}_{renk_adi}_model.pkl", _paket)
+
+    # 8) Sakla + ÖZET
+    print("  ▶ 8) Özet dosyaya yazılıyor...")
+    renk_sonuclari[RENK_KOD] = {'model': best, 'features': FEATURES,
+                                'best_params': BEST_PARAMS, 'threshold': thr,
+                                'psi': psi_scores, 'tgt_assoc': tgt_assoc,
+                                'importance': _imp}
+    ozet_row = {
+        'renk': etiket,
+        'n_train': len(X_tr), 'n_val': len(X_val), 'n_oot': len(X_oot),
+        'n_pozitif': _npos,
+        'n_feature': len(FEATURES),
+        'target_rate':      round(y_tr.mean(), 4),
+        'val_target_rate':  round(y_val.mean(), 4),
+        'oot_target_rate':  round(y_oot.mean(), 4),
+        'train_gini':       round(tr_gini, 4),
+        'val_gini':         round(val_gini, 4),
+        'oot_gini':         oot_metrics['Gini'] if oot_metrics else None,
+        'val_ks':           val_metrics['KS'],
+        'oot_ks':           oot_metrics['KS'] if oot_metrics else None,
+        'oot_alert_rate':   oot_metrics['alert_rate'] if oot_metrics else None,
+        'oot_precision':    oot_metrics['precision'] if oot_metrics else None,
+        'oot_recall':       oot_metrics['recall'] if oot_metrics else None,
+        'capture_val':      round(_cap_val, 4),
+        'capture_oot':      round(_cap_oot, 4) if np.isfinite(_cap_oot) else None,
+        'capture_pct':      CAPTURE_PCT,
+        # capture tavanı = min(1, pct/base_rate). Kırmızı'da 0.132 —
+        # capture 0.126 ise tavanın %95'i, orada yapacak şey kalmamış.
+        'capture_tavan':    round(_cap_tavan, 4) if np.isfinite(_cap_tavan) else None,
+        'capture_tavan_pct': (round(_cap_oot / _cap_tavan, 4)
+                              if np.isfinite(_cap_oot) and np.isfinite(_cap_tavan)
+                              and _cap_tavan > 0 else None),
+        'val_lift1':        round(_l1v, 4) if np.isfinite(_l1v) else None,
+        'oot_lift1':        round(_l1o, 4) if np.isfinite(_l1o) else None,
+        'oot_lift1_tavan_pct': round(_tpo, 4) if np.isfinite(_tpo) else None,
+        'oot_monoton':      round(_mo, 4) if np.isfinite(_mo) else None,
+        'gini_gap_tr_val':  round(tr_gini - val_gini, 4),
+        'gini_gap_val_oot': round(val_gini - oot_metrics['Gini'], 4) if oot_metrics else None,
+        'gini_gap_tr_oot':  round(_gap_tr_oot, 4) if oot_metrics else None,
+        'gap_esik':         _gap_esik,
+        'kural_ok':         int((tr_gini - val_gini) <= _gap_esik),
+        'psi_max':          round(max(psi_scores.values()), 4) if psi_scores else None,
+        'psi_kaymis_n':     len(_kaymis),
+        'psi_dikkat_n':     len(_dikkat),
+        'threshold':        round(thr, 4),
+        'best_trial':       best_trial.number,
+        'best_params':      json.dumps(BEST_PARAMS),
+        # --- YENİ: importance özeti ---
+        'n_feature_kullanilmayan': _kullanilmayan,
+        'lgb_surum':               lgb.__version__,
+    }
+    ozet_satirlari.append(ozet_row)
+    _yaz(f"renk_{RENK_KOD}_{renk_adi}_ozet.csv", pd.DataFrame([ozet_row]))
+
+    print(f"  ✓ {etiket} bitti → capture@{CAPTURE_PCT:.0%} oot={_cap_oot:.4f} | "
+          f"gini tr={tr_gini:.4f} val={val_gini:.4f} "
+          f"oot={oot_metrics['Gini'] if oot_metrics else 'NA'} | "
+          f"gap_tr_val={_gap_tr_val:+.4f} "
+          f"psi_max={max(psi_scores.values()):.3f}  "
+          f"(kullanılmayan feature {_kullanilmayan})")
+
+# — Tüm renkler tek birleşik özet
+print("\n▶ Tüm renklerin birleşik özeti yazılıyor...")
+ozet = pd.DataFrame(ozet_satirlari)
+print("\n===== ÖZET (tüm renkler) =====")
+print(ozet.drop(columns='best_params').to_string(index=False))
+_yaz("renk_bazli_TUM_ozet.csv", ozet)
+print("✓ Tüm işlem tamamlandı.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ======================================================================
+# BLOK 3'E EKLENECEK — _yaz fonksiyonunun HEMEN ALTINA
+# ======================================================================
+# _yaz DataFrame/CSV içindir, byte yazamaz. Model pickle'ı için ayrı bir
+# binary yazıcı gerekiyor. Hedef yol mantığı _yaz ile AYNI olmalı:
+# PATH + "/" + dosya adı.
+# ======================================================================
+import pickle
+import sklearn          # pickle'a sürüm yazmak için (blok 11'de kullanılıyor)
+
+
+def _yaz_pkl(fname, obj):
+    """Python nesnesini pickle olarak PATH alt klasörüne yazar.
+
+    protocol=4: 4 GB üzeri nesneleri destekler ve Python 3.4+ ile uyumlu.
+    Model + feature listesi + kategori haritası tek dosyada taşınıyor.
+    """
+    hedef = PATH + "/" + str(fname).lstrip("/")
+    mf.upload_stream(hedef, pickle.dumps(obj, protocol=4))
+    print(f"      ✓ {hedef}")
+    return hedef
+
+
+def _oku_pkl(fname, alt_yol=None):
+    """_yaz_pkl ile yazılmış paketi geri okur.
+
+    alt_yol verilmezse mevcut PATH'ten okur; başka bir model klasöründen
+    okumak için alt_yol="/3M_KIRMIZI_RENGE_GOC_OOT202511" gibi geç.
+    """
+    kok   = alt_yol if alt_yol else PATH
+    hedef = kok + "/" + str(fname).lstrip("/")
+    with mf.get_download_stream(hedef) as s:
+        return pickle.loads(s.read())
