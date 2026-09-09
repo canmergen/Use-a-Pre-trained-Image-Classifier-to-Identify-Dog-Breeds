@@ -1,3 +1,362 @@
+Konuşmadan kullanıcının verdiği bilgileri çıkar ve SADECE JSON döndür.
+Açıklama yazma, önsöz yazma, markdown kod bloğu kullanma. Yanıtın { ile
+başlayıp } ile bitsin.
+
+{
+  "veri_seti": null,
+  "sozluk": null,
+  "target": null,
+  "id_kolonu": null,
+  "donem_kolonu": null,
+  "bolme_kolonu": null,
+  "dataset_var": false,
+  "sozluk_var": false,
+  "config_var": false,
+  "niyet": "bilgi",
+  "kolonlar": [],
+  "kolon_aciklamasi": null
+}
+
+Alan kuralları:
+
+veri_seti, sozluk: Dataset adları. Kullanıcı bir dosya veya klasör adı
+söylerse (sema.json, PROJE_HAFIZASI gibi) bunları veri_seti veya sozluk
+alanına YAZMA, null bırak.
+
+niyet şu değerlerden biri olur:
+  "onay"        - kullanıcı ilerlemeyi onaylıyor (tamam, evet, devam, geç,
+                  onaylıyorum, başla)
+  "red"         - kullanıcı sıfırdan başlamak istiyor (yeni, baştan,
+                  vazgeçtim yenisiyle)
+  "kolon_sorgu" - kullanıcı bir veya birden çok kolonun ne anlama geldiğini
+                  soruyor ("rn nedir", "SM_ID ne demek", "şu kolonu açıkla")
+  "kolon_tanim" - kullanıcı bir kolonun açıklamasını kendisi veriyor veya
+                  mevcut açıklamayı düzeltiyor ("rn satır numarası demek",
+                  "şu kolonun açıklaması yanlış, doğrusu ...")
+  "bilgi"       - yukarıdakilerin hiçbiri
+
+kolonlar: niyet "kolon_sorgu" veya "kolon_tanim" ise, kullanıcının bahsettiği
+kolon adlarını liste olarak yaz. Kullanıcının yazdığı haliyle al, düzeltme
+yapma, büyük/küçük harfini değiştirme. Kolon adı geçmiyorsa boş liste.
+
+kolon_aciklamasi: niyet "kolon_tanim" ise kullanıcının verdiği açıklama
+metni. Diğer durumlarda null.
+
+Kullanıcının açıkça yazmadığı hiçbir değeri uydurma. Bir kolonun ne anlama
+geldiğini sen tahmin etme; sadece kullanıcının söylediğini aktar.
+
+
+
+
+
+
+
+
+
+# =============================================================================
+# FEATURE_DISCOVERY_AGENT / kolon_sorgu
+# -----------------------------------------------------------------------------
+# Sorumluluk : Kolon adi bazinda soru-cevap ve sozluk duzeltmesi.
+#              Aciklamalar sozluk dataset'inden ve kullanici eklerinden
+#              DETERMINISTIK olarak okunur; LLM tahmini kullanilmaz.
+# Girdi      : state["kolonlar"]           -> sorulan kolon adlari (liste)
+#              state["kolon_aciklamasi"]   -> kullanicinin verdigi tanim
+#              state["niyet"]              -> kolon_sorgu | kolon_tanim
+#              state["sozluk"]             -> sozluk dataset adi
+# Cikti      : Kullaniciya metin (yield)
+# Kalici     : PROJE_HAFIZASI/sozluk_ek.json  (kullanici tanimlari)
+# =============================================================================
+
+import difflib
+import json
+
+import dataiku
+from dataiku.llm.python.blocks_graph import NextBlock
+
+
+# -----------------------------------------------------------------------------
+# Sabitler
+# -----------------------------------------------------------------------------
+
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
+
+# Tek seferde cevaplanacak azami kolon sayisi. Fazlasi sohbeti bogar.
+AZAMI_KOLON = 10
+
+# Benzer kolon onerisi icin esik ve azami oneri sayisi.
+BENZERLIK_ESIGI = 0.6
+AZAMI_ONERI = 5
+
+
+class S:
+    """state anahtarlari."""
+    NIYET = "niyet"
+    SOZLUK = "sozluk"
+    VERI_SETI = "veri_seti"
+    KOLONLAR = "kolonlar"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
+    BEKLEYEN_KOLON = "bekleyen_kolon"
+
+
+# -----------------------------------------------------------------------------
+# Yardimci fonksiyonlar
+# -----------------------------------------------------------------------------
+
+def _logla(mesaj):
+    print("[kolon_sorgu] {}".format(mesaj))
+
+
+def _sozlugu_oku(sozluk_adi):
+    """Sozluk dataset'ini {kolon_adi: aciklama} sozlugune cevirir.
+
+    Kolonlar POZISYONA gore alinir (birinci kolon ad, ikinci aciklama);
+    sozluk dataset'inin kolon basliklari projeden projeye degisebiliyor.
+    Okunamazsa bos dict doner.
+    """
+    if not sozluk_adi:
+        return {}
+    try:
+        df = dataiku.Dataset(sozluk_adi).get_dataframe()
+    except Exception as hata:
+        _logla("sozluk okunamadi ({}): {}".format(sozluk_adi, hata))
+        return {}
+
+    if df.shape[1] < 2:
+        _logla("sozlukte en az 2 kolon bekleniyordu, {} bulundu".format(df.shape[1]))
+        return {}
+
+    ad_kolonu = df.columns[0]
+    aciklama_kolonu = df.columns[1]
+
+    sonuc = {}
+    for _, satir in df.iterrows():
+        ad = str(satir[ad_kolonu]).strip()
+        aciklama = str(satir[aciklama_kolonu]).strip()
+        if ad and ad.lower() != "nan":
+            sonuc[ad] = aciklama
+    return sonuc
+
+
+def _veri_seti_kolonlari(veri_seti_adi):
+    """Veri setindeki kolon adlarini dondurur. Okunamazsa bos liste."""
+    if not veri_seti_adi:
+        return []
+    try:
+        sema = dataiku.Dataset(veri_seti_adi).read_schema()
+        return [alan["name"] for alan in sema]
+    except Exception as hata:
+        _logla("veri seti semasi okunamadi ({}): {}".format(veri_seti_adi, hata))
+        return []
+
+
+def _ek_sozlugu_oku():
+    """Kullanicinin daha once verdigi tanimlari dondurur."""
+    try:
+        folder = dataiku.Folder(HAFIZA_FOLDER)
+        if EK_SOZLUK_DOSYASI not in folder.list_paths_in_partition():
+            return {}
+        with folder.get_download_stream(EK_SOZLUK_DOSYASI) as akis:
+            veri = json.loads(akis.read().decode("utf-8"))
+        return veri if isinstance(veri, dict) else {}
+    except Exception as hata:
+        _logla("ek sozluk okunamadi: {}".format(hata))
+        return {}
+
+
+def _ek_sozluge_yaz(kolon, aciklama):
+    """Kullanici tanimini kalici dosyaya ekler. Basarisizsa False doner."""
+    try:
+        mevcut = _ek_sozlugu_oku()
+        mevcut[kolon] = aciklama
+        folder = dataiku.Folder(HAFIZA_FOLDER)
+        icerik = json.dumps(mevcut, ensure_ascii=False, indent=2)
+        folder.upload_data(EK_SOZLUK_DOSYASI, icerik.encode("utf-8"))
+        _logla("ek sozluge yazildi: {} = {}".format(kolon, aciklama[:60]))
+        return True
+    except Exception as hata:
+        _logla("ek sozluge yazilamadi: {}".format(hata))
+        return False
+
+
+def _kolonu_bul(aranan, mevcut_adlar):
+    """Kolon adini esler.
+
+    Once birebir, sonra buyuk/kucuk harf duyarsiz eslesme denenir.
+    Bulunursa gercek kolon adi, bulunamazsa None doner.
+    """
+    if aranan in mevcut_adlar:
+        return aranan
+    kucuk_harita = {ad.lower(): ad for ad in mevcut_adlar}
+    return kucuk_harita.get(aranan.strip().lower())
+
+
+def _benzer_kolonlar(aranan, mevcut_adlar):
+    """Yazim hatasi ihtimaline karsi benzer kolon adlari onerir."""
+    return difflib.get_close_matches(
+        aranan, list(mevcut_adlar), n=AZAMI_ONERI, cutoff=BENZERLIK_ESIGI
+    )
+
+
+def _kolon_satiri(kolon, aciklama, kaynak, tabloda_var):
+    """Tek bir kolonun cevabini bicimlendirir."""
+    konum = "tabloda var" if tabloda_var else "**tabloda yok**"
+    return "**{kolon}** ({konum}, kaynak: {kaynak})\n{aciklama}".format(
+        kolon=kolon, konum=konum, kaynak=kaynak, aciklama=aciklama
+    )
+
+
+# -----------------------------------------------------------------------------
+# Niyet isleyicileri
+# -----------------------------------------------------------------------------
+
+def _sorguyu_cevapla(kolonlar, sozluk, ek_sozluk, tablo_kolonlari):
+    """kolon_sorgu niyeti: sorulan kolonlarin aciklamalarini dondurur."""
+    tablo_kumesi = set(tablo_kolonlari)
+    bilinen_adlar = set(sozluk) | set(ek_sozluk) | tablo_kumesi
+
+    parcalar = []
+    bulunamayanlar = []
+
+    for aranan in kolonlar[:AZAMI_KOLON]:
+        gercek_ad = _kolonu_bul(str(aranan).strip(), bilinen_adlar)
+
+        if gercek_ad is None:
+            benzerler = _benzer_kolonlar(str(aranan).strip(), bilinen_adlar)
+            bulunamayanlar.append((aranan, benzerler))
+            continue
+
+        tabloda_var = gercek_ad in tablo_kumesi
+
+        if gercek_ad in ek_sozluk:
+            parcalar.append(_kolon_satiri(
+                gercek_ad, ek_sozluk[gercek_ad], "sizin tanımınız", tabloda_var))
+        elif gercek_ad in sozluk and sozluk[gercek_ad]:
+            parcalar.append(_kolon_satiri(
+                gercek_ad, sozluk[gercek_ad], "sözlük", tabloda_var))
+        else:
+            parcalar.append(
+                "**{kolon}** ({konum})\nSözlükte açıklaması yok. Ne anlama "
+                "geldiğini yazarsanız kaydederim.".format(
+                    kolon=gercek_ad,
+                    konum="tabloda var" if tabloda_var else "tabloda yok",
+                )
+            )
+
+    for aranan, benzerler in bulunamayanlar:
+        if benzerler:
+            parcalar.append(
+                "**{aranan}** ne tabloda ne sözlükte var. Şunu mu "
+                "kastettiniz: {oneri}".format(
+                    aranan=aranan, oneri=", ".join("`{}`".format(b) for b in benzerler))
+            )
+        else:
+            parcalar.append(
+                "**{aranan}** ne tabloda ne sözlükte bulundu.".format(aranan=aranan)
+            )
+
+    if len(kolonlar) > AZAMI_KOLON:
+        parcalar.append(
+            "_({} kolon sordunuz, ilk {} tanesini yanıtladım.)_".format(
+                len(kolonlar), AZAMI_KOLON)
+        )
+
+    return "\n\n".join(parcalar)
+
+
+def _tanimi_kaydet(kolonlar, aciklama, sozluk, ek_sozluk, tablo_kolonlari):
+    """kolon_tanim niyeti: kullanicinin verdigi aciklamayi kaydeder."""
+    bilinen_adlar = set(sozluk) | set(ek_sozluk) | set(tablo_kolonlari)
+
+    if not kolonlar:
+        return ("Açıklamayı hangi kolon için kaydedeceğimi anlayamadım. "
+                "Kolon adını yazar mısınız?")
+
+    if not aciklama:
+        return ("**{kolon}** için açıklamayı alamadım. Ne anlama geldiğini "
+                "yazar mısınız?".format(kolon=kolonlar[0]))
+
+    hedef = str(kolonlar[0]).strip()
+    gercek_ad = _kolonu_bul(hedef, bilinen_adlar) or hedef
+
+    onceki = ek_sozluk.get(gercek_ad) or sozluk.get(gercek_ad)
+
+    if not _ek_sozluge_yaz(gercek_ad, aciklama):
+        return ("**{kolon}** açıklamasını kaydedemedim; proje hafızasına "
+                "yazma başarısız oldu. Ayrıntı log'da.".format(kolon=gercek_ad))
+
+    if onceki:
+        return ("**{kolon}** açıklaması güncellendi.\n\n"
+                "Önceki: {onceki}\nYeni: {yeni}\n\n"
+                "Sözlük sıkıştırmasında yeni açıklama kullanılacak.").format(
+            kolon=gercek_ad, onceki=onceki, yeni=aciklama)
+
+    return ("**{kolon}** açıklaması kaydedildi: {yeni}\n\n"
+            "Sözlük sıkıştırmasında bu açıklama kullanılacak.").format(
+        kolon=gercek_ad, yeni=aciklama)
+
+
+# -----------------------------------------------------------------------------
+# Ana akis
+# -----------------------------------------------------------------------------
+
+def process(trace):
+    try:
+        niyet = (state.get(S.NIYET) or "").strip().lower()
+        kolonlar = state.get(S.KOLONLAR) or []
+        if not isinstance(kolonlar, list):
+            kolonlar = [kolonlar]
+
+        sozluk = _sozlugu_oku(state.get(S.SOZLUK))
+        ek_sozluk = _ek_sozlugu_oku()
+        tablo_kolonlari = _veri_seti_kolonlari(state.get(S.VERI_SETI))
+
+        if not sozluk and not tablo_kolonlari:
+            yield ("Sözlüğü ve veri setini şu an okuyamıyorum, bu yüzden kolon "
+                   "sorularını yanıtlayamıyorum. Ayrıntı agent log'unda.")
+            return
+
+        if niyet == "kolon_tanim":
+            aciklama = (state.get(S.KOLON_ACIKLAMASI) or "").strip()
+            # Onceki turda "hangi kolon" diye sorduysak, kolonu oradan al.
+            if not kolonlar and state.get(S.BEKLEYEN_KOLON):
+                kolonlar = [state[S.BEKLEYEN_KOLON]]
+            state[S.BEKLEYEN_KOLON] = None
+            yield _tanimi_kaydet(kolonlar, aciklama, sozluk, ek_sozluk,
+                                 tablo_kolonlari)
+            return
+
+        if not kolonlar:
+            yield ("Hangi kolonu sorduğunuzu anlayamadım. Kolon adını yazar "
+                   "mısınız? Örnek: `rn nedir`")
+            return
+
+        # Aciklamasi olmayan tek kolon sorulduysa, cevabi bekleyen kolon olarak
+        # isaretle; kullanici tanim yazarsa dogrudan ona kaydedilir.
+        if len(kolonlar) == 1:
+            state[S.BEKLEYEN_KOLON] = str(kolonlar[0]).strip()
+
+        yield _sorguyu_cevapla(kolonlar, sozluk, ek_sozluk, tablo_kolonlari)
+
+    except Exception as hata:
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        yield ("Kolon sorgusunu işlerken beklenmeyen bir hata oluştu. "
+               "Ayrıntı agent log'una yazıldı.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # =============================================================================
 # FEATURE_DISCOVERY_AGENT / durum_belirle
 # -----------------------------------------------------------------------------
@@ -9,6 +368,7 @@
 #
 # ONEMLI: Asama ilerletme yetkisi YALNIZCA bu blokta ve adim bloklarindadir.
 #         sohbet blogu bir adimi tamamlanmis ilan edemez.
+#         Kolon anlamlari sohbet bloguna sorulmaz; kolon_sorgu bloguna gider.
 # =============================================================================
 
 import json
@@ -22,7 +382,6 @@ from dataiku.llm.python.blocks_graph import NextBlock
 # -----------------------------------------------------------------------------
 
 class Folder:
-    """Managed folder ve dosya yollari."""
     HAFIZA = "PROJE_HAFIZASI"
     SEMA_DOSYASI = "/sema.json"
 
@@ -31,8 +390,8 @@ class Blok:
     """Agent blok kimlikleri. Blok adi degisirse SADECE burasi guncellenir."""
     SOHBET = "sohbet"
     SOZLUK_CALIS = "sozluk_calis"
-    # Henuz kurulmamis adim bloklari. Kurulunca adi buraya yazilir ve
-    # ASAMA_HARITASI'ndaki None degeri bu sabitle degistirilir.
+    KOLON_SORGU = "kolon_sorgu"
+    # Henuz kurulmamis adim bloklari. Kurulunca adi buraya yazilir.
     SOZLUK_SIKISTIR = None
     META_TANIMLA = None
     KURAL_BAZLI_URET = None
@@ -42,7 +401,6 @@ class Blok:
 
 
 class Asama:
-    """Surecin bulundugu adim. Sira ASAMA_SIRASI'nda tanimlidir."""
     BASLANGIC = "baslangic"
     SOZLUK = "sozluk"
     META = "meta"
@@ -52,7 +410,6 @@ class Asama:
     KARSILASTIRMA = "karsilastirma"
 
 
-# Kullaniciya gosterilen adim adlari.
 ASAMA_ADLARI = {
     Asama.BASLANGIC: "Başlangıç",
     Asama.SOZLUK: "1. Sözlük hazırlığı",
@@ -75,6 +432,18 @@ ASAMA_HARITASI = {
 }
 
 
+class Niyet:
+    ONAY = "onay"
+    RED = "red"
+    KOLON_SORGU = "kolon_sorgu"
+    KOLON_TANIM = "kolon_tanim"
+    BILGI = "bilgi"
+
+
+# Kolon islemleri veri seti okunmus olmasini gerektirir.
+KOLON_NIYETLERI = (Niyet.KOLON_SORGU, Niyet.KOLON_TANIM)
+
+
 class S:
     """state anahtarlari. Elle string yazmak yerine bunlar kullanilir."""
     GIRDI = "girdi"
@@ -91,6 +460,9 @@ class S:
     DATASET_VAR = "dataset_var"
     SOZLUK_VAR = "sozluk_var"
     CONFIG_VAR = "config_var"
+
+    KOLONLAR = "kolonlar"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
 
     KARSILANDI = "karsilandi"
     GECERSIZ_AD = "gecersiz_ad"
@@ -150,6 +522,11 @@ Veri seti adını yazdığınızda sözlük hazırlığına geçebiliriz."""
 
 SIFIRDAN_BASLA = "Anlaşıldı, sıfırdan başlıyoruz.\n\n" + BILGI_ISTEGI
 
+KOLON_ICIN_VERI_GEREKLI = """Kolon sorularını yanıtlayabilmem için önce veri \
+setinin okunmuş olması gerekiyor.
+
+Veri seti adını yazdığınızda sözlüğü okuyup kolon sorularınızı yanıtlayabilirim."""
+
 BEKLENMEYEN_HATA = """Beklenmeyen bir hata nedeniyle isteğinizi işleyemedim. \
 Ayrıntı agent log'una yazıldı.
 
@@ -194,7 +571,6 @@ def _gecersiz_ad_mesaji(ad):
 # -----------------------------------------------------------------------------
 
 def _logla(mesaj):
-    """Agent log'una yazar. Dataiku bu ciktiyi Logs sekmesinde gosterir."""
     print("[durum_belirle] {}".format(mesaj))
 
 
@@ -226,11 +602,7 @@ def _json_ayristir(ham):
 
 
 def _hafizayi_oku():
-    """PROJE_HAFIZASI/sema.json icerigini dondurur.
-
-    Dosya yoksa, bozuksa veya folder'a erisilemiyorsa None doner; bu durum
-    hata degildir (ilk calistirmada beklenen durumdur).
-    """
+    """PROJE_HAFIZASI/sema.json icerigini dondurur. Yoksa None."""
     try:
         folder = dataiku.Folder(Folder.HAFIZA)
         if Folder.SEMA_DOSYASI not in folder.list_paths_in_partition():
@@ -244,11 +616,7 @@ def _hafizayi_oku():
 
 
 def _proje_dataset_adlari():
-    """Projedeki dataset adlarini set olarak dondurur.
-
-    API'ye erisilemezse None doner. None, "dogrulama yapilamadi" anlamina
-    gelir ve cagiran taraf bu durumda adi reddetmez.
-    """
+    """Projedeki dataset adlarini set olarak dondurur. Erisilemezse None."""
     try:
         proje = dataiku.api_client().get_default_project()
         return {d["name"] for d in proje.list_datasets()}
@@ -276,13 +644,17 @@ def _niyet_coz(girdi_json):
     """Niyeti normalize eder.
 
     girdi_al bazen 'yeni baslayalim' ifadesini ONAY olarak siniflandirabiliyor.
-    Ham metinde sifirdan baslama ifadesi varsa YENI kazanir.
+    Ham metinde sifirdan baslama ifadesi varsa YENI kazanir. Kolon niyetleri
+    bu kontrolden muaftir; kolon adinda 'yeni' gecebilir.
     """
-    niyet = (girdi_json.get(S.NIYET) or "bilgi").strip().lower()
+    niyet = (girdi_json.get(S.NIYET) or Niyet.BILGI).strip().lower()
     ham_metin = str(state.get(S.GIRDI) or "").lower()
 
+    if niyet in KOLON_NIYETLERI:
+        return niyet, False
+
     yeni_isteniyor = (
-        niyet in ("red", "yeni")
+        niyet in (Niyet.RED, "yeni")
         or any(ifade in ham_metin for ifade in YENI_BASLAMA_IFADELERI)
     )
     return niyet, yeni_isteniyor
@@ -306,17 +678,18 @@ def _girdiyi_state_e_isle(girdi_json):
         if girdi_json.get(anahtar) is not None:
             state[anahtar] = girdi_json[anahtar]
 
+    # Kolon alanlari her turda tazelenir; onceki turdan sizmamalari gerekir.
+    kolonlar = girdi_json.get(S.KOLONLAR) or []
+    state[S.KOLONLAR] = kolonlar if isinstance(kolonlar, list) else [kolonlar]
+    state[S.KOLON_ACIKLAMASI] = girdi_json.get(S.KOLON_ACIKLAMASI)
+
     state[S.DATASET_VAR] = bool(girdi_json.get(S.DATASET_VAR)) or bool(state.get(S.VERI_SETI))
     state[S.SOZLUK_VAR] = bool(girdi_json.get(S.SOZLUK_VAR)) or bool(state.get(S.SOZLUK))
     state[S.CONFIG_VAR] = bool(girdi_json.get(S.CONFIG_VAR)) or bool(state.get(S.CONFIG_VAR))
 
 
 def _durum_ozetini_kur(asama):
-    """sohbet blogunun promptuna gidecek durum bildirimi.
-
-    Bu metin, LLM'in kendi erisim yetenegi hakkinda tahmin uretmesini ve
-    tamamlanmamis adimlari tamamlanmis gostermesini onler.
-    """
+    """sohbet blogunun promptuna gidecek durum bildirimi."""
     if state.get(S.GECERSIZ_AD):
         ozet = (
             "UYARI: Kullanicinin verdigi '{ad}' bir dataset degil (dosya/klasor "
@@ -407,7 +780,7 @@ def process(trace):
 
         # --- 2) "Devam mi, yeni mi?" sorusunun cevabi -------------------------
         if state.get(S.ONCEKI_BEKLIYOR):
-            if niyet == "onay" and not yeni_isteniyor:
+            if niyet == Niyet.ONAY and not yeni_isteniyor:
                 state[S.ONCEKI_BEKLIYOR] = False
                 state[S.VERI_SETI] = state[S.ONCEKI_VERI_SETI]
                 state[S.SOZLUK] = state.get(S.ONCEKI_SOZLUK)
@@ -421,20 +794,29 @@ def process(trace):
             yield SIFIRDAN_BASLA
             return
 
-        # --- 3) Gecersiz dataset adi -----------------------------------------
+        # --- 3) Kolon sorusu / kolon tanimi ------------------------------------
+        # Onaydan ONCE degerlendirilir: kullanici kolon sorarken surec ilerlemez.
+        if niyet in KOLON_NIYETLERI:
+            if not state.get(S.VERI_SETI):
+                yield KOLON_ICIN_VERI_GEREKLI
+                return
+            _logla("kolon niyeti '{}', kolonlar: {}".format(niyet, state[S.KOLONLAR]))
+            yield NextBlock(Blok.KOLON_SORGU)
+            return
+
+        # --- 4) Gecersiz dataset adi -----------------------------------------
         if state.get(S.GECERSIZ_AD):
             yield _gecersiz_ad_mesaji(state[S.GECERSIZ_AD])
             return
 
-        # --- 4) Baslangic: veri seti hazir ve onaylandi -----------------------
-        if asama == Asama.BASLANGIC and state[S.DATASET_VAR] and niyet == "onay":
+        # --- 5) Baslangic: veri seti hazir ve onaylandi -----------------------
+        if asama == Asama.BASLANGIC and state[S.DATASET_VAR] and niyet == Niyet.ONAY:
             _asamayi_ayarla(Asama.SOZLUK)
             yield NextBlock(Blok.SOZLUK_CALIS)
             return
 
-        # --- 5) Adim icinde onay: ilgili islem bloguna yonlendir --------------
-        # Bu dal olmadan onay sohbete duser ve LLM adimi tamamlanmis gibi anlatir.
-        if niyet == "onay" and asama in ASAMA_HARITASI:
+        # --- 6) Adim icinde onay: ilgili islem bloguna yonlendir --------------
+        if niyet == Niyet.ONAY and asama in ASAMA_HARITASI:
             hedef_blok = ASAMA_HARITASI[asama]
             if hedef_blok:
                 _logla("onay alindi, {} bloguna yonlendiriliyor".format(hedef_blok))
@@ -444,9 +826,23 @@ def process(trace):
             yield _adim_hazir_degil_mesaji(asama)
             return
 
-        # --- 6) Diger her sey: serbest sohbet --------------------------------
+        # --- 7) Diger her sey: serbest sohbet --------------------------------
         yield NextBlock(Blok.SOHBET)
 
     except Exception as hata:
         _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
         yield BEKLENMEYEN_HATA
+
+
+
+
+
+
+
+
+
+
+Kolon anlamları hakkında hiçbir şey söyleme. "rn nedir", "bu kolon ne demek"
+gibi sorular sana gelmez; sistem bunları sözlükten okuyup doğrudan cevaplar.
+Yanlışlıkla sana gelirse kolon adının anlamını tahmin etme, kullanıcıdan
+kolon adını net yazmasını iste.
