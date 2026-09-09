@@ -1,121 +1,424 @@
-Bir bankanın analitik ekibi için "Akıllı Değişken Üretimi" sürecini
-yürütüyorsun. Kullanıcının verdiği veri setinden yola çıkarak, hedef
-değişkeni daha iyi açıklayan yeni değişkenler üretilmesini sağlıyorsun.
+# =============================================================================
+# FEATURE_DISCOVERY_AGENT / kolon_sorgu
+# -----------------------------------------------------------------------------
+# Sorumluluk : Kolon adi bazinda soru-cevap ve sozluk duzeltmesi.
+#              Aciklamalar sema.json ve kullanici eklerinden DETERMINISTIK
+#              olarak okunur; LLM tahmini kullanilmaz.
+#
+# Veri kaynagi hiyerarsisi (oncelik sirasiyla):
+#   1. sozluk_ek.json          -> kullanicinin verdigi/duzelttigi tanimlar
+#   2. sema.json > sozluk      -> sozluk dataset'inden gelen orijinal tanimlar
+#   3. (yedek) sozluk dataset  -> sema.json okunamazsa dogrudan okunur
+#
+# Yazma politikasi: bir tanim kaydedilince UC yer guncellenir.
+#   - sozluk_ek.json  : denetim izi (hangi tanim kullanicidan geldi)
+#   - sema.json       : oturum kaynagi (sozluk + tabloda_var_sozlukte_yok)
+#   - DEGISKENLER_GUNCEL : Flow'da gorunur birlesik sozluk dataset'i
+#   Kaynak sozluk (DEGISKENLER) DEGISTIRILMEZ; bir recipe onu yeniden
+#   ureterek kullanici eklemelerini silebilir.
+#
+# Girdi      : state["kolonlar"], state["kolon_aciklamasi"], state["niyet"],
+#              state["sozluk"], state["veri_seti"]
+# Cikti      : Kullaniciya metin (yield)
+# =============================================================================
 
-Durum
+import difflib
+import json
 
-DURUM: {{ state.durum_ozeti }}
+import pandas as pd
 
-Yukarıdaki DURUM satırı tek doğruluk kaynağıdır. Veri seti, sözlük ve
-bulunulan adım hakkında yalnızca orada yazanı doğru kabul et; sohbet
-geçmişindeki eski bilgiler geçersiz olabilir.
+import dataiku
 
-Kendini tanıtma, "ben ... yapıyorum" gibi cümleler kurma. Ne yapıldığını
-söyle, kim olduğunu değil.
 
-Kendi erişim yeteneğin hakkında konuşma. "Erişimim var", "erişimim yok",
-"klasörü görebiliyorum", "henüz okumadım", "sistemin paylaşmasını
-bekliyorum" gibi cümleler kurma. Neyi bildiğin DURUM satırında yazar.
+# -----------------------------------------------------------------------------
+# Sabitler
+# -----------------------------------------------------------------------------
 
-Kullanıcının bahsettiği dosya ve klasör adlarını veri seti adı sanma.
-sema.json, meta.json, PROJE_HAFIZASI gibi adlar birer dataset değildir;
-bunları okuyacağını söyleme.
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+SEMA_DOSYASI = "/sema.json"
+EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
 
-Adım durumu yalnızca sistem tarafından değiştirilir. Bir adımı "tamamlandı"
-ilan etme, "şimdi şu adıma geçiyorum" deme, kendiliğinden sonraki adıma
-geçme. DURUM satırındaki adım, üzerinde çalışılan adımdır ve
-tamamlanmamıştır. Kullanıcı onay verdiğinde sen bir işlem başlatmazsın;
-onayı sistem alır ve ilgili adımı sistem çalıştırır.
+# Kaynak sozluk + kullanici eklerinin birlestirilmis hali.
+# Bu dataset'in projede onceden olusturulmus olmasi gerekir.
+GUNCEL_SOZLUK_DATASET = "DEGISKENLER_GUNCEL"
 
-Kolon anlamları hakkında hiçbir şey söyleme. "rn nedir", "bu kolon ne
-demek" gibi sorular sana gelmez; sistem bunları sözlükten okuyup doğrudan
-cevaplar. Yanlışlıkla sana gelirse kolon adının anlamını tahmin etme,
-kullanıcıdan kolon adını net yazmasını iste.
+VARSAYILAN_AD_KOLONU = "kolon"
+VARSAYILAN_ACIKLAMA_KOLONU = "aciklama"
 
-Karşılama, altı adımın listesi ve başlangıç bilgi isteği sistem tarafından
-zaten gösterildi. Bunları tekrarlama. Önceki mesajlarını da tekrar etme,
-sadece yeni cevabı yaz.
+AZAMI_KOLON = 10
+BENZERLIK_ESIGI = 0.6
+AZAMI_ONERI = 5
 
-Kurallar
 
-Her adımın başında ne yapacağını yaz ve onay bekle. Onay almadan hiçbir şey
-üretme.
+class Sema:
+    """sema.json icindeki anahtarlar."""
+    KOLONLAR = "kolonlar"
+    TIPLER = "tipler"
+    SOZLUK = "sozluk"
+    SOZLUKTE_VAR_TABLODA_YOK = "sozlukte_var_tabloda_yok"
+    TABLODA_VAR_SOZLUKTE_YOK = "tabloda_var_sozlukte_yok"
 
-Veri hakkında hiçbir sayı, kolon adı, oran veya sonuç üretme. Bu bilgiler
-sana sistem tarafından verilir. Verilmemişse bilmediğini söyle. Veriyi
-okumuş, hesaplamış veya analiz etmiş gibi konuşma.
 
-Sadece yeni değişken eklemeyi öner; mevcut bir değişkenin çıkarılmasını
-kendiliğinden gündeme getirme.
+class S:
+    """state anahtarlari."""
+    NIYET = "niyet"
+    SOZLUK = "sozluk"
+    VERI_SETI = "veri_seti"
+    KOLONLAR = "kolonlar"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
+    BEKLEYEN_KOLON = "bekleyen_kolon"
 
-Kullanıcı önceki bir adımda verdiği bilgiyi değiştirmek isterse itiraz etme.
-Değişikliği kabul et ve hangi adımdan itibaren yeniden çalışılacağını tek
-cümleyle söyle.
 
-Kullanıcının sorusu adımlardan biriyle ilgiliyse cevabı o adıma bağla:
-"Model kurulumu 6. adımda, önce değişkenleri üretiyoruz" gibi. Süreç dışı
-bir soruysa kısa cevapla ve sürece dön.
+# -----------------------------------------------------------------------------
+# Dosya okuma / yazma
+# -----------------------------------------------------------------------------
 
-Süreç şu altı adımdan oluşur; kullanıcı sorarsa buna göre cevapla:
-1. Sözlük hazırlığı — kolon açıklamalarını derler ve sıkıştırır
-2. Meta tanımı — hedef, kimlik, dönem ve bölme yapısını belirler
-3. Kural bazlı üretim — delta, oran, lag, momentum gibi türetmeler
-4. Model destekli üretim — hipotez kurar, test eder, kanıtlananı kaydeder
-5. Veri kalitesi kontrolü — eksik, sabit, tekrarlı, sızıntı riskli
-6. Model karşılaştırması — mevcut ve zenginleştirilmiş halin performansı
+def _logla(mesaj):
+    print("[kolon_sorgu] {}".format(mesaj))
 
-Kavramlar
 
-Kullanıcı bu kavramlardan birini sorarsa aşağıdaki tanımlarla açıkla.
-Bunların dışına çıkma, kendi tanımını uydurma.
+def _folder():
+    return dataiku.Folder(HAFIZA_FOLDER)
 
-Veri seti: Projedeki bir Dataiku dataset'i. Şu iki kolonu mutlaka içermeli:
-her satırı tekil tanımlayan bir kimlik kolonu ve tahmin edilecek hedef
-değişken. Dönem kolonu olabilir de olmayabilir de; varsa boş değerler
-içerebilir. Train, test ve validation ayrı dataset olarak verilmez; hepsi
-tek dataset'te olur, bölme sistem tarafından yapılır. Dönem kolonu varsa
-bölme döneme göre yapılabilir, yoksa rastgele yapılır.
 
-Sözlük: Projedeki iki kolonlu bir Dataiku dataset'i. Birinci kolon veri
-setindeki kolon adlarını, ikinci kolon bu kolonların açıklamalarını içerir.
-Veri setinden farklı bir dataset'tir. Verilmezse kolon adlarından anlam
-çıkarılmaya çalışılır, doğruluk düşer.
+def _json_oku(dosya_yolu, varsayilan):
+    """Managed folder icindeki bir JSON dosyasini okur."""
+    try:
+        folder = _folder()
+        if dosya_yolu not in folder.list_paths_in_partition():
+            return varsayilan
+        with folder.get_download_stream(dosya_yolu) as akis:
+            return json.loads(akis.read().decode("utf-8"))
+    except Exception as hata:
+        _logla("{} okunamadi: {}".format(dosya_yolu, hata))
+        return varsayilan
 
-Konfigürasyon: Hedef değişken, kimlik kolonu ve varsa dönem kolonunun
-adlarını içeren bir JSON. Kullanıcı hazır bir JSON verebilir. Vermezse
-2. adımda soru-cevap yoluyla birlikte oluşturulur; kullanıcı her alanı
-teyit eder.
 
-Veri seti ile değişken üretimi farklı şeylerdir: veri setini kullanıcı
-sağlar, sen ondan yeni değişkenler üretirsin. Kullanıcı "veri üretimi"
-derse bu ayrımı kısaca yap.
+def _json_yaz(dosya_yolu, veri):
+    """Managed folder icine JSON yazar. Basarisizsa False doner."""
+    try:
+        icerik = json.dumps(veri, ensure_ascii=False, indent=2)
+        _folder().upload_data(dosya_yolu, icerik.encode("utf-8"))
+        return True
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(dosya_yolu, hata))
+        return False
 
-Bilgi toplama
 
-DURUM'da veri seti belirlenmemiş görünüyorsa kullanıcıdan dataset adını
-iste; zorunludur. Sözlük ve konfigürasyon opsiyoneldir, kullanıcı "yok"
-dediyse veya cevap vermediyse bir daha sorma.
+def _semayi_oku():
+    """sema.json icerigini dondurur. Yoksa bos dict."""
+    sema = _json_oku(SEMA_DOSYASI, {})
+    return sema if isinstance(sema, dict) else {}
 
-DURUM'da geçersiz bir ad uyarısı varsa kullanıcıya Flow'daki dataset adını
-yazmasını söyle; o adı okumaya çalışacağını ima etme.
 
-Veri seti belli olduğunda teyit et ve sözlük hazırlığı adımına geçmek için
-onay iste.
+def _ek_sozlugu_oku():
+    """Kullanicinin daha once verdigi tanimlari dondurur."""
+    ek = _json_oku(EK_SOZLUK_DOSYASI, {})
+    return ek if isinstance(ek, dict) else {}
 
-Üslup
 
-Yalın ve doğal Türkçe. Kurumsal ol ama bürokratik olma: "yürütmekteyim",
-"ele alınacaktır", "gerçekleştirilecektir" gibi kalıpları kullanma;
-"yürütüyorum", "ele alınacak", "yapılacak" de.
+def _kaynak_sozlugu_oku(sozluk_adi):
+    """sema.json okunamazsa kullanilan yedek yol: sozluk dataset'ini okur.
 
-Promptta olmayan hiçbir vaat, fayda veya süsleme cümlesi ekleme. Ne
-yaptığını söyle, ne kadar iyi yaptığını söyleme.
+    Doner: (aciklamalar, ad_kolonu, aciklama_kolonu)
+    Kolonlar POZISYONA gore alinir; sozluk dataset'inin basliklari
+    projeden projeye degisebiliyor.
+    """
+    varsayilan = ({}, VARSAYILAN_AD_KOLONU, VARSAYILAN_ACIKLAMA_KOLONU)
 
-Kısa yaz. Bir şeyi bir kere söyle. Kapanış tek cümle olsun ve her mesajda
-farklı kur; aynı kalıbı tekrarlama, mesajın içeriğine bağlı olsun.
+    if not sozluk_adi:
+        return varsayilan
+    try:
+        df = dataiku.Dataset(sozluk_adi).get_dataframe()
+    except Exception as hata:
+        _logla("kaynak sozluk okunamadi ({}): {}".format(sozluk_adi, hata))
+        return varsayilan
 
-Emoji kullanma. Markdown kullan: adım adları, bilgi adları, kolon ve dataset
-adları kalın.
+    if df.shape[1] < 2:
+        _logla("sozlukte en az 2 kolon bekleniyordu, {} bulundu".format(df.shape[1]))
+        return varsayilan
 
-Kullanıcı argo, küfür veya sert bir üslup kullanırsa aynı sakin dili koru.
-Taklit etme, yorum yapma, savunmaya geçme.
+    ad_kolonu = df.columns[0]
+    aciklama_kolonu = df.columns[1]
+
+    aciklamalar = {}
+    for _, satir in df.iterrows():
+        ad = str(satir[ad_kolonu]).strip()
+        aciklama = str(satir[aciklama_kolonu]).strip()
+        if ad and ad.lower() != "nan":
+            aciklamalar[ad] = aciklama
+
+    return aciklamalar, ad_kolonu, aciklama_kolonu
+
+
+# -----------------------------------------------------------------------------
+# Guncelleme
+# -----------------------------------------------------------------------------
+
+def _semayi_guncelle(kolon, aciklama):
+    """Tanimi sema.json'a isler.
+
+    - sozluk sozlugune ekler/gunceller
+    - tabloda_var_sozlukte_yok listesinden cikarir (artik aciklamasi var)
+    Basarisizsa False doner.
+    """
+    sema = _semayi_oku()
+    if not sema:
+        _logla("sema.json bos veya okunamadi, guncelleme atlandi")
+        return False
+
+    sozluk = sema.get(Sema.SOZLUK)
+    if not isinstance(sozluk, dict):
+        sozluk = {}
+    sozluk[kolon] = aciklama
+    sema[Sema.SOZLUK] = sozluk
+
+    eksikler = sema.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
+    if isinstance(eksikler, list) and kolon in eksikler:
+        sema[Sema.TABLODA_VAR_SOZLUKTE_YOK] = [k for k in eksikler if k != kolon]
+        _logla("{} tabloda_var_sozlukte_yok listesinden cikarildi".format(kolon))
+
+    if _json_yaz(SEMA_DOSYASI, sema):
+        _logla("sema.json guncellendi: {}".format(kolon))
+        return True
+    return False
+
+
+def _guncel_sozlugu_yaz(sozluk, ek_sozluk, ad_kolonu, aciklama_kolonu):
+    """Kaynak sozluk + kullanici eklerini DEGISKENLER_GUNCEL'e yazar.
+
+    Kaynak sozluk DEGISTIRILMEZ; birlesim ayri bir dataset'e yazilir.
+    Cakisan kolonlarda kullanici tanimi kazanir.
+    Doner: (basarili_mi, toplam_satir, kullanici_kaynakli_satir)
+    """
+    birlesik = dict(sozluk)
+    birlesik.update(ek_sozluk)
+
+    adlar = sorted(birlesik.keys())
+    df = pd.DataFrame({
+        ad_kolonu: adlar,
+        aciklama_kolonu: [birlesik[ad] for ad in adlar],
+        "kaynak": ["kullanici" if ad in ek_sozluk else "sozluk" for ad in adlar],
+    })
+
+    try:
+        dataiku.Dataset(GUNCEL_SOZLUK_DATASET).write_with_schema(df)
+        _logla("{} yazildi: {} satir ({} kullanici kaynakli)".format(
+            GUNCEL_SOZLUK_DATASET, len(df), len(ek_sozluk)))
+        return True, len(df), len(ek_sozluk)
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(GUNCEL_SOZLUK_DATASET, hata))
+        return False, len(df), len(ek_sozluk)
+
+
+# -----------------------------------------------------------------------------
+# Eslestirme
+# -----------------------------------------------------------------------------
+
+def _kolonu_bul(aranan, mevcut_adlar):
+    """Kolon adini esler.
+
+    Once birebir, sonra buyuk/kucuk harf duyarsiz eslesme denenir.
+    Bulunursa gercek kolon adi, bulunamazsa None doner.
+    """
+    if aranan in mevcut_adlar:
+        return aranan
+    kucuk_harita = {ad.lower(): ad for ad in mevcut_adlar}
+    return kucuk_harita.get(aranan.strip().lower())
+
+
+def _benzer_kolonlar(aranan, mevcut_adlar):
+    """Yazim hatasi ihtimaline karsi benzer kolon adlari onerir."""
+    return difflib.get_close_matches(
+        aranan, list(mevcut_adlar), n=AZAMI_ONERI, cutoff=BENZERLIK_ESIGI
+    )
+
+
+def _kolon_basligi(kolon, tip, tabloda_var):
+    """Kolon satirinin ust bilgisini kurar: konum ve tip."""
+    parcalar = ["tabloda var" if tabloda_var else "**tabloda yok**"]
+    if tip:
+        parcalar.append("tip: {}".format(tip))
+    return "**{kolon}** ({bilgi})".format(kolon=kolon, bilgi=", ".join(parcalar))
+
+
+# -----------------------------------------------------------------------------
+# Niyet isleyicileri
+# -----------------------------------------------------------------------------
+
+def _sorguyu_cevapla(kolonlar, sozluk, ek_sozluk, tablo_kolonlari, tipler):
+    """kolon_sorgu niyeti: sorulan kolonlarin aciklamalarini dondurur."""
+    tablo_kumesi = set(tablo_kolonlari)
+    bilinen_adlar = set(sozluk) | set(ek_sozluk) | tablo_kumesi
+
+    parcalar = []
+
+    for aranan in kolonlar[:AZAMI_KOLON]:
+        temiz = str(aranan).strip()
+        gercek_ad = _kolonu_bul(temiz, bilinen_adlar)
+
+        if gercek_ad is None:
+            benzerler = _benzer_kolonlar(temiz, bilinen_adlar)
+            if benzerler:
+                parcalar.append(
+                    "**{aranan}** ne tabloda ne sözlükte var. Şunu mu "
+                    "kastettiniz: {oneri}".format(
+                        aranan=temiz,
+                        oneri=", ".join("`{}`".format(b) for b in benzerler))
+                )
+            else:
+                parcalar.append(
+                    "**{aranan}** ne tabloda ne sözlükte bulundu.".format(
+                        aranan=temiz)
+                )
+            continue
+
+        baslik = _kolon_basligi(
+            gercek_ad, tipler.get(gercek_ad), gercek_ad in tablo_kumesi)
+
+        if gercek_ad in ek_sozluk:
+            parcalar.append("{}\n{}\n_Kaynak: sizin tanımınız._".format(
+                baslik, ek_sozluk[gercek_ad]))
+        elif sozluk.get(gercek_ad):
+            parcalar.append("{}\n{}".format(baslik, sozluk[gercek_ad]))
+        else:
+            parcalar.append(
+                "{}\nSözlükte açıklaması yok. Ne anlama geldiğini yazarsanız "
+                "kaydederim.".format(baslik))
+
+    if len(kolonlar) > AZAMI_KOLON:
+        parcalar.append(
+            "_({} kolon sordunuz, ilk {} tanesini yanıtladım.)_".format(
+                len(kolonlar), AZAMI_KOLON)
+        )
+
+    return "\n\n".join(parcalar)
+
+
+def _tanimi_kaydet(kolonlar, aciklama, sozluk, ek_sozluk, tablo_kolonlari,
+                   ad_kolonu, aciklama_kolonu):
+    """kolon_tanim niyeti: tanimi uc yere birden isler."""
+    bilinen_adlar = set(sozluk) | set(ek_sozluk) | set(tablo_kolonlari)
+
+    if not kolonlar:
+        return ("Açıklamayı hangi kolon için kaydedeceğimi anlayamadım. "
+                "Kolon adını yazar mısınız?")
+
+    if not aciklama:
+        return ("**{kolon}** için açıklamayı alamadım. Ne anlama geldiğini "
+                "yazar mısınız?".format(kolon=kolonlar[0]))
+
+    hedef = str(kolonlar[0]).strip()
+    gercek_ad = _kolonu_bul(hedef, bilinen_adlar) or hedef
+    onceki = ek_sozluk.get(gercek_ad) or sozluk.get(gercek_ad)
+
+    # 1) Denetim izi
+    ek_sozluk[gercek_ad] = aciklama
+    ek_yazildi = _json_yaz(EK_SOZLUK_DOSYASI, ek_sozluk)
+
+    # 2) Oturum kaynagi
+    sema_yazildi = _semayi_guncelle(gercek_ad, aciklama)
+
+    # 3) Flow'da gorunur birlesik sozluk
+    sozluk[gercek_ad] = aciklama
+    ds_yazildi, toplam, kullanici_sayisi = _guncel_sozlugu_yaz(
+        sozluk, ek_sozluk, ad_kolonu, aciklama_kolonu)
+
+    if onceki:
+        bas = ("**{kolon}** açıklaması güncellendi.\n\n"
+               "Önceki: {onceki}\nYeni: {yeni}").format(
+            kolon=gercek_ad, onceki=onceki, yeni=aciklama)
+    else:
+        bas = "**{kolon}** açıklaması kaydedildi: {yeni}".format(
+            kolon=gercek_ad, yeni=aciklama)
+
+    basarisizlar = []
+    if not ek_yazildi:
+        basarisizlar.append("kullanıcı tanımları dosyası")
+    if not sema_yazildi:
+        basarisizlar.append("oturum kaydı (sema.json)")
+    if not ds_yazildi:
+        basarisizlar.append(GUNCEL_SOZLUK_DATASET)
+
+    if basarisizlar:
+        return (bas + "\n\nAncak şuralara yazılamadı: {}. Ayrıntı agent "
+                "log'unda.").format(", ".join(basarisizlar))
+
+    return (bas + "\n\n**{ds}** güncellendi: {toplam:,} satır, {kullanici} "
+            "tanesi sizin eklemeniz. Kaynak **{kaynak}** değiştirilmedi.").format(
+        ds=GUNCEL_SOZLUK_DATASET,
+        toplam=toplam,
+        kullanici=kullanici_sayisi,
+        kaynak=state.get(S.SOZLUK) or "sözlük",
+    ).replace(",", ".")
+
+
+# -----------------------------------------------------------------------------
+# Ana akis
+# -----------------------------------------------------------------------------
+
+def process(trace):
+    try:
+        niyet = (state.get(S.NIYET) or "").strip().lower()
+        kolonlar = state.get(S.KOLONLAR) or []
+        if not isinstance(kolonlar, list):
+            kolonlar = [kolonlar]
+
+        sema = _semayi_oku()
+        ek_sozluk = _ek_sozlugu_oku()
+
+        sozluk = sema.get(Sema.SOZLUK)
+        tablo_kolonlari = sema.get(Sema.KOLONLAR)
+        tipler = sema.get(Sema.TIPLER)
+
+        # sema.json kolon adlarini korur; birlesik dataset ayni semayla yazilir.
+        ad_kolonu = VARSAYILAN_AD_KOLONU
+        aciklama_kolonu = VARSAYILAN_ACIKLAMA_KOLONU
+
+        if not isinstance(sozluk, dict) or not sozluk:
+            # Yedek yol: sema.json yok veya bozuk, sozlugu dogrudan oku.
+            _logla("sema.json'da sozluk yok, kaynak dataset okunuyor")
+            sozluk, ad_kolonu, aciklama_kolonu = _kaynak_sozlugu_oku(
+                state.get(S.SOZLUK))
+
+        if not isinstance(tablo_kolonlari, list):
+            tablo_kolonlari = []
+        if not isinstance(tipler, dict):
+            tipler = {}
+
+        if not sozluk and not tablo_kolonlari:
+            yield ("Sözlüğü ve veri setini şu an okuyamıyorum, bu yüzden kolon "
+                   "sorularını yanıtlayamıyorum. Ayrıntı agent log'unda.")
+            return
+
+        if niyet == "kolon_tanim":
+            kolon_aciklamasi = (state.get(S.KOLON_ACIKLAMASI) or "").strip()
+            # Onceki turda tek kolon sorulduysa, tanim ona yazilir.
+            if not kolonlar and state.get(S.BEKLEYEN_KOLON):
+                kolonlar = [state[S.BEKLEYEN_KOLON]]
+            state[S.BEKLEYEN_KOLON] = None
+            cevap = _tanimi_kaydet(kolonlar, kolon_aciklamasi, sozluk, ek_sozluk,
+                                   tablo_kolonlari, ad_kolonu, aciklama_kolonu)
+        elif not kolonlar:
+            cevap = ("Hangi kolonu sorduğunuzu anlayamadım. Kolon adını yazar "
+                     "mısınız? Örnek: `rn nedir`")
+        else:
+            # Tek kolon sorulduysa, sonraki mesajdaki tanim bu kolona yazilir.
+            if len(kolonlar) == 1:
+                state[S.BEKLEYEN_KOLON] = str(kolonlar[0]).strip()
+            cevap = _sorguyu_cevapla(
+                kolonlar, sozluk, ek_sozluk, tablo_kolonlari, tipler)
+
+        # Bos cevap sohbette bos balon olarak gorunur; asla bos gonderme.
+        if not (cevap or "").strip():
+            _logla("UYARI: bos cevap uretildi, niyet={} kolonlar={}".format(
+                niyet, kolonlar))
+            cevap = ("İsteğinizi işledim ama gösterilecek bir sonuç üretemedim. "
+                     "Kolon adını tekrar yazar mısınız?")
+
+        yield cevap
+
+    except Exception as hata:
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        yield ("Kolon sorgusunu işlerken beklenmeyen bir hata oluştu. "
+               "Ayrıntı agent log'una yazıldı.")
