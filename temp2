@@ -1,7 +1,452 @@
-Adım durumu yalnızca sistem tarafından değiştirilir. Bir adımı "tamamlandı"
-ilan etme, "şimdi şu adıma geçiyorum" deme, kendiliğinden sonraki adıma
-geçme. DURUM satırındaki adım, üzerinde çalışılan adımdır ve tamamlanmamıştır.
+# =============================================================================
+# FEATURE_DISCOVERY_AGENT / durum_belirle
+# -----------------------------------------------------------------------------
+# Sorumluluk : Kullanici girdisini dogrular, oturum durumunu gunceller ve
+#              akisi ilgili bloga yonlendirir.
+# Girdi      : state["girdi"]  -> girdi_al blogunun JSON ciktisi
+# Cikti      : Kullaniciya metin (yield) veya NextBlock(<blok_id>)
+# Bagimlilik : PROJE_HAFIZASI managed folder / sema.json
+#
+# ONEMLI: Asama ilerletme yetkisi YALNIZCA bu blokta ve adim bloklarindadir.
+#         sohbet blogu bir adimi tamamlanmis ilan edemez.
+# =============================================================================
 
-Kullanıcı onay verdiğinde sen bir işlem başlatmazsın; onayı sistem alır ve
-ilgili adımı sistem çalıştırır. Senin görevin adımı anlatmak ve soruları
-cevaplamaktır.
+import json
+
+import dataiku
+from dataiku.llm.python.blocks_graph import NextBlock
+
+
+# -----------------------------------------------------------------------------
+# Sabitler
+# -----------------------------------------------------------------------------
+
+class Folder:
+    """Managed folder ve dosya yollari."""
+    HAFIZA = "PROJE_HAFIZASI"
+    SEMA_DOSYASI = "/sema.json"
+
+
+class Blok:
+    """Agent blok kimlikleri. Blok adi degisirse SADECE burasi guncellenir."""
+    SOHBET = "sohbet"
+    SOZLUK_CALIS = "sozluk_calis"
+    # Henuz kurulmamis adim bloklari. Kurulunca adi buraya yazilir ve
+    # ASAMA_HARITASI'ndaki None degeri bu sabitle degistirilir.
+    SOZLUK_SIKISTIR = None
+    META_TANIMLA = None
+    KURAL_BAZLI_URET = None
+    MODEL_DESTEKLI_URET = None
+    KALITE_KONTROL = None
+    MODEL_KARSILASTIR = None
+
+
+class Asama:
+    """Surecin bulundugu adim. Sira ASAMA_SIRASI'nda tanimlidir."""
+    BASLANGIC = "baslangic"
+    SOZLUK = "sozluk"
+    META = "meta"
+    KURAL_BAZLI = "kural_bazli"
+    MODEL_DESTEKLI = "model_destekli"
+    KALITE = "kalite"
+    KARSILASTIRMA = "karsilastirma"
+
+
+# Kullaniciya gosterilen adim adlari.
+ASAMA_ADLARI = {
+    Asama.BASLANGIC: "Başlangıç",
+    Asama.SOZLUK: "1. Sözlük hazırlığı",
+    Asama.META: "2. Meta tanımı",
+    Asama.KURAL_BAZLI: "3. Kural bazlı değişken üretimi",
+    Asama.MODEL_DESTEKLI: "4. Model destekli değişken üretimi",
+    Asama.KALITE: "5. Veri kalitesi kontrolü",
+    Asama.KARSILASTIRMA: "6. Model karşılaştırması",
+}
+
+# Kullanici onay verdiginde her asamanin gidecegi blok.
+# None = o adimin blogu henuz kurulmadi.
+ASAMA_HARITASI = {
+    Asama.SOZLUK: Blok.SOZLUK_SIKISTIR,
+    Asama.META: Blok.META_TANIMLA,
+    Asama.KURAL_BAZLI: Blok.KURAL_BAZLI_URET,
+    Asama.MODEL_DESTEKLI: Blok.MODEL_DESTEKLI_URET,
+    Asama.KALITE: Blok.KALITE_KONTROL,
+    Asama.KARSILASTIRMA: Blok.MODEL_KARSILASTIR,
+}
+
+
+class S:
+    """state anahtarlari. Elle string yazmak yerine bunlar kullanilir."""
+    GIRDI = "girdi"
+    ASAMA = "asama"
+    NIYET = "niyet"
+
+    VERI_SETI = "veri_seti"
+    SOZLUK = "sozluk"
+    TARGET = "target"
+    ID_KOLONU = "id_kolonu"
+    DONEM_KOLONU = "donem_kolonu"
+    BOLME_KOLONU = "bolme_kolonu"
+
+    DATASET_VAR = "dataset_var"
+    SOZLUK_VAR = "sozluk_var"
+    CONFIG_VAR = "config_var"
+
+    KARSILANDI = "karsilandi"
+    GECERSIZ_AD = "gecersiz_ad"
+    DURUM_OZETI = "durum_ozeti"
+
+    ONCEKI_BEKLIYOR = "onceki_bekliyor"
+    ONCEKI_REDDEDILDI = "onceki_reddedildi"
+    ONCEKI_VERI_SETI = "onceki_veri_seti"
+    ONCEKI_SOZLUK = "onceki_sozluk"
+    ONCEKI_N_SATIR = "onceki_n_satir"
+    ONCEKI_N_KOLON = "onceki_n_kolon"
+
+
+GECERSIZ_DATASET_ADLARI = frozenset({
+    "sema.json", "sema", "meta.json", "meta",
+    "proje_hafizasi", "proje_hafızası", "hafiza", "hafıza",
+    "folder", "klasor", "klasör", "managed folder",
+})
+
+YENI_BASLAMA_IFADELERI = (
+    "yeni", "sifirdan", "sıfırdan", "bastan", "baştan",
+    "farkli", "farklı", "degistir", "değiştir",
+)
+
+ONCEKI_KAYIT_ANAHTARLARI = (
+    S.ONCEKI_VERI_SETI, S.ONCEKI_SOZLUK, S.ONCEKI_N_SATIR, S.ONCEKI_N_KOLON,
+)
+
+
+# -----------------------------------------------------------------------------
+# Kullaniciya gosterilen metinler
+# -----------------------------------------------------------------------------
+
+KARSILAMA = """Merhaba. Ben **Akıllı Değişken Üretimi** sürecini yürütüyorum. \
+Amacım, verdiğiniz veri setinden yola çıkarak hedef değişkeni daha iyi açıklayan \
+yeni değişkenler üretmek.
+
+Süreç altı adımdan oluşur. Her adımda önce plan sunulur ve onayınız beklenir; \
+istediğinizde önceki adıma dönebilirsiniz.
+
+1. **Sözlük hazırlığı** — kolonların ne anlama geldiğini çıkarır
+2. **Meta tanımı** — hedef, kimlik, dönem ve bölme yapısını belirler
+3. **Kural bazlı değişken üretimi** — delta, oran, lag gibi türetmeler
+4. **Model destekli değişken üretimi** — hipotez kurar, test eder, kaydeder
+5. **Veri kalitesi kontrolü** — eksik, sabit, tekrarlı, sızıntı riskli
+6. **Model karşılaştırması** — mevcut ve zenginleştirilmiş halin performansı"""
+
+BILGI_ISTEGI = """Başlamak için şunlara ihtiyacım var:
+
+**Veri seti** (zorunlu) — Kimlik ve hedef kolonlarını içeren dataset'in adı.
+**Sözlük** (opsiyonel) — Kolon adı ve açıklama olmak üzere iki kolonlu dataset'in \
+adı. Verilmezse kolon adlarından çıkarım yapılır.
+**Konfigürasyon** (opsiyonel) — Hedef, kimlik, dönem ve bölme kolonlarını belirten \
+JSON. Verilmezse 2. adımda birlikte oluştururuz.
+
+Veri seti adını yazdığınızda sözlük hazırlığına geçebiliriz."""
+
+SIFIRDAN_BASLA = "Anlaşıldı, sıfırdan başlıyoruz.\n\n" + BILGI_ISTEGI
+
+BEKLENMEYEN_HATA = """Beklenmeyen bir hata nedeniyle isteğinizi işleyemedim. \
+Ayrıntı agent log'una yazıldı.
+
+Lütfen veri seti adını tekrar paylaşın; kaldığımız yerden devam edelim."""
+
+
+def _adim_hazir_degil_mesaji(asama):
+    """Onay alindi ama o adimin blogu henuz kurulmadi."""
+    return (
+        "Onayınızı aldım, ancak **{ad}** adımının işlem bloğu henüz kurulmadı; "
+        "bu adımı şu an çalıştıramıyorum.\n\n"
+        "Süreç bu noktada duruyor. Bu adımın hiçbir çıktısı üretilmedi."
+    ).format(ad=ASAMA_ADLARI.get(asama, asama))
+
+
+def _onceki_kayit_mesaji(veri_seti, sozluk, n_satir, n_kolon):
+    """Hafizada bulunan onceki oturumu kullaniciya ozetler."""
+    sozluk_parcasi = " ve **{}** sözlüğü".format(sozluk) if sozluk else ""
+    return (
+        "Önceki oturumdan kayıt buldum: **{veri_seti}** veri seti{sozluk_parcasi} "
+        "({n_satir:,} satır, {n_kolon:,} kolon).\n\n"
+        "Bununla devam edeyim mi, yoksa yeni bir veri setiyle mi başlayalım?"
+    ).format(
+        veri_seti=veri_seti,
+        sozluk_parcasi=sozluk_parcasi,
+        n_satir=int(n_satir or 0),
+        n_kolon=int(n_kolon or 0),
+    ).replace(",", ".")
+
+
+def _gecersiz_ad_mesaji(ad):
+    """Dataset olmayan bir ad verildiginde kullaniciya aciklama."""
+    return (
+        "**{ad}** projede bir dataset olarak bulunmuyor; bu bir dosya veya klasör "
+        "adı gibi görünüyor. Ben dataset adıyla çalışıyorum.\n\n"
+        "Lütfen Flow'daki dataset adını yazın (örneğin `HAVALE_EFT_NTT`)."
+    ).format(ad=ad)
+
+
+# -----------------------------------------------------------------------------
+# Yardimci fonksiyonlar
+# -----------------------------------------------------------------------------
+
+def _logla(mesaj):
+    """Agent log'una yazar. Dataiku bu ciktiyi Logs sekmesinde gosterir."""
+    print("[durum_belirle] {}".format(mesaj))
+
+
+def _json_ayristir(ham):
+    """girdi_al ciktisini dict'e cevirir.
+
+    LLM JSON'u bazen ``` blogu icinde donduruyor; o durumu da temizler.
+    Ayristirilamayan girdi icin bos dict doner (akis sohbete duser).
+    """
+    if isinstance(ham, dict):
+        return ham
+
+    metin = str(ham or "").strip()
+    if not metin:
+        return {}
+
+    if metin.startswith("```"):
+        metin = metin.strip("`").strip()
+        if metin.lower().startswith("json"):
+            metin = metin[4:].strip()
+
+    try:
+        cozulen = json.loads(metin)
+    except (ValueError, TypeError):
+        _logla("girdi JSON olarak ayristirilamadi: {!r}".format(metin[:200]))
+        return {}
+
+    return cozulen if isinstance(cozulen, dict) else {}
+
+
+def _hafizayi_oku():
+    """PROJE_HAFIZASI/sema.json icerigini dondurur.
+
+    Dosya yoksa, bozuksa veya folder'a erisilemiyorsa None doner; bu durum
+    hata degildir (ilk calistirmada beklenen durumdur).
+    """
+    try:
+        folder = dataiku.Folder(Folder.HAFIZA)
+        if Folder.SEMA_DOSYASI not in folder.list_paths_in_partition():
+            _logla("hafiza dosyasi yok: {}".format(Folder.SEMA_DOSYASI))
+            return None
+        with folder.get_download_stream(Folder.SEMA_DOSYASI) as akis:
+            return json.loads(akis.read().decode("utf-8"))
+    except Exception as hata:
+        _logla("hafiza okunamadi: {}".format(hata))
+        return None
+
+
+def _proje_dataset_adlari():
+    """Projedeki dataset adlarini set olarak dondurur.
+
+    API'ye erisilemezse None doner. None, "dogrulama yapilamadi" anlamina
+    gelir ve cagiran taraf bu durumda adi reddetmez.
+    """
+    try:
+        proje = dataiku.api_client().get_default_project()
+        return {d["name"] for d in proje.list_datasets()}
+    except Exception as hata:
+        _logla("dataset listesi alinamadi: {}".format(hata))
+        return None
+
+
+def _dataset_gecerli_mi(ad):
+    """Verilen adin projede gercek bir dataset olup olmadigini soyler."""
+    if not ad:
+        return False
+
+    temiz = str(ad).strip()
+    if temiz.lower() in GECERSIZ_DATASET_ADLARI:
+        return False
+
+    mevcut = _proje_dataset_adlari()
+    if mevcut is None:
+        return True
+    return temiz in mevcut
+
+
+def _niyet_coz(girdi_json):
+    """Niyeti normalize eder.
+
+    girdi_al bazen 'yeni baslayalim' ifadesini ONAY olarak siniflandirabiliyor.
+    Ham metinde sifirdan baslama ifadesi varsa YENI kazanir.
+    """
+    niyet = (girdi_json.get(S.NIYET) or "bilgi").strip().lower()
+    ham_metin = str(state.get(S.GIRDI) or "").lower()
+
+    yeni_isteniyor = (
+        niyet in ("red", "yeni")
+        or any(ifade in ham_metin for ifade in YENI_BASLAMA_IFADELERI)
+    )
+    return niyet, yeni_isteniyor
+
+
+def _girdiyi_state_e_isle(girdi_json):
+    """girdi_al ciktisini dogrulayarak state'e yazar."""
+    state[S.GECERSIZ_AD] = ""
+
+    aday = girdi_json.get(S.VERI_SETI)
+    if aday:
+        if _dataset_gecerli_mi(aday):
+            state[S.VERI_SETI] = str(aday).strip()
+        else:
+            state[S.GECERSIZ_AD] = str(aday).strip()
+            girdi_json[S.VERI_SETI] = None
+            girdi_json[S.DATASET_VAR] = False
+            _logla("gecersiz dataset adi reddedildi: {}".format(aday))
+
+    for anahtar in (S.SOZLUK, S.TARGET, S.ID_KOLONU, S.DONEM_KOLONU, S.BOLME_KOLONU):
+        if girdi_json.get(anahtar) is not None:
+            state[anahtar] = girdi_json[anahtar]
+
+    state[S.DATASET_VAR] = bool(girdi_json.get(S.DATASET_VAR)) or bool(state.get(S.VERI_SETI))
+    state[S.SOZLUK_VAR] = bool(girdi_json.get(S.SOZLUK_VAR)) or bool(state.get(S.SOZLUK))
+    state[S.CONFIG_VAR] = bool(girdi_json.get(S.CONFIG_VAR)) or bool(state.get(S.CONFIG_VAR))
+
+
+def _durum_ozetini_kur(asama):
+    """sohbet blogunun promptuna gidecek durum bildirimi.
+
+    Bu metin, LLM'in kendi erisim yetenegi hakkinda tahmin uretmesini ve
+    tamamlanmamis adimlari tamamlanmis gostermesini onler.
+    """
+    if state.get(S.GECERSIZ_AD):
+        ozet = (
+            "UYARI: Kullanicinin verdigi '{ad}' bir dataset degil (dosya/klasor "
+            "adi). Onu okumaya CALISMA; kullanicidan gecerli bir dataset adi iste."
+        ).format(ad=state[S.GECERSIZ_AD])
+    elif state.get(S.VERI_SETI):
+        ozet = "Veri seti: {vs}. Sozluk: {sz}.".format(
+            vs=state[S.VERI_SETI],
+            sz=state.get(S.SOZLUK) or "belirlenmedi",
+        )
+    elif state.get(S.ONCEKI_REDDEDILDI):
+        ozet = (
+            "Kullanici onceki oturumu reddetti. Eski veri setinden veya eski "
+            "sozlukten ASLA bahsetme. Veri seti henuz belirlenmedi."
+        )
+    else:
+        ozet = "Veri seti henuz belirlenmedi."
+
+    ozet += " BULUNULAN ADIM: {ad} (tamamlanmadi, devam ediyor).".format(
+        ad=ASAMA_ADLARI.get(asama, asama)
+    )
+
+    if state.get(S.KARSILANDI):
+        ozet += " Karsilama metni zaten gosterildi, tekrar etme."
+
+    state[S.DURUM_OZETI] = ozet
+
+
+def _onceki_oturumu_state_e_yaz(kayit):
+    """sema.json icerigini onceki_* anahtarlarina tasir."""
+    state[S.ONCEKI_VERI_SETI] = kayit.get("veri_seti")
+    state[S.ONCEKI_SOZLUK] = kayit.get("sozluk_adi")
+    state[S.ONCEKI_N_SATIR] = kayit.get("n_satir")
+    state[S.ONCEKI_N_KOLON] = kayit.get("n_kolon")
+    state[S.ONCEKI_BEKLIYOR] = True
+
+
+def _onceki_oturumu_temizle():
+    """Reddedilen oturumun izlerini state'ten siler."""
+    for anahtar in ONCEKI_KAYIT_ANAHTARLARI:
+        state[anahtar] = None
+    state[S.ONCEKI_BEKLIYOR] = False
+    state[S.ONCEKI_REDDEDILDI] = True
+
+
+def _asamayi_ayarla(yeni_asama):
+    """Asama gecisini tek noktadan yapar ve loglar."""
+    eski = state.get(S.ASAMA) or Asama.BASLANGIC
+    state[S.ASAMA] = yeni_asama
+    _logla("asama gecisi: {} -> {}".format(eski, yeni_asama))
+
+
+# -----------------------------------------------------------------------------
+# Ana akis
+# -----------------------------------------------------------------------------
+
+def process(trace):
+    try:
+        girdi_json = _json_ayristir(state.get(S.GIRDI))
+
+        _girdiyi_state_e_isle(girdi_json)
+        niyet, yeni_isteniyor = _niyet_coz(girdi_json)
+        state[S.NIYET] = niyet
+
+        asama = state.get(S.ASAMA) or Asama.BASLANGIC
+        _durum_ozetini_kur(asama)
+
+        # --- 1) Ilk tur: karsilama (+ varsa hafiza sorusu) ---------------------
+        if not state.get(S.KARSILANDI):
+            state[S.KARSILANDI] = True
+            kayit = _hafizayi_oku()
+
+            if kayit and kayit.get("veri_seti") and not state.get(S.VERI_SETI):
+                _onceki_oturumu_state_e_yaz(kayit)
+                yield "{karsilama}\n\n---\n\n{soru}".format(
+                    karsilama=KARSILAMA,
+                    soru=_onceki_kayit_mesaji(
+                        state[S.ONCEKI_VERI_SETI],
+                        state[S.ONCEKI_SOZLUK],
+                        state[S.ONCEKI_N_SATIR],
+                        state[S.ONCEKI_N_KOLON],
+                    ),
+                )
+                return
+
+            yield "{}\n\n{}".format(KARSILAMA, BILGI_ISTEGI)
+            return
+
+        # --- 2) "Devam mi, yeni mi?" sorusunun cevabi -------------------------
+        if state.get(S.ONCEKI_BEKLIYOR):
+            if niyet == "onay" and not yeni_isteniyor:
+                state[S.ONCEKI_BEKLIYOR] = False
+                state[S.VERI_SETI] = state[S.ONCEKI_VERI_SETI]
+                state[S.SOZLUK] = state.get(S.ONCEKI_SOZLUK)
+                state[S.DATASET_VAR] = True
+                state[S.SOZLUK_VAR] = bool(state.get(S.ONCEKI_SOZLUK))
+                _asamayi_ayarla(Asama.SOZLUK)
+                yield NextBlock(Blok.SOZLUK_CALIS)
+                return
+
+            _onceki_oturumu_temizle()
+            yield SIFIRDAN_BASLA
+            return
+
+        # --- 3) Gecersiz dataset adi -----------------------------------------
+        if state.get(S.GECERSIZ_AD):
+            yield _gecersiz_ad_mesaji(state[S.GECERSIZ_AD])
+            return
+
+        # --- 4) Baslangic: veri seti hazir ve onaylandi -----------------------
+        if asama == Asama.BASLANGIC and state[S.DATASET_VAR] and niyet == "onay":
+            _asamayi_ayarla(Asama.SOZLUK)
+            yield NextBlock(Blok.SOZLUK_CALIS)
+            return
+
+        # --- 5) Adim icinde onay: ilgili islem bloguna yonlendir --------------
+        # Bu dal olmadan onay sohbete duser ve LLM adimi tamamlanmis gibi anlatir.
+        if niyet == "onay" and asama in ASAMA_HARITASI:
+            hedef_blok = ASAMA_HARITASI[asama]
+            if hedef_blok:
+                _logla("onay alindi, {} bloguna yonlendiriliyor".format(hedef_blok))
+                yield NextBlock(hedef_blok)
+                return
+            _logla("onay alindi ama '{}' adiminin blogu kurulmamis".format(asama))
+            yield _adim_hazir_degil_mesaji(asama)
+            return
+
+        # --- 6) Diger her sey: serbest sohbet --------------------------------
+        yield NextBlock(Blok.SOHBET)
+
+    except Exception as hata:
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        yield BEKLENMEYEN_HATA
