@@ -1,22 +1,96 @@
+import json
+import dataiku
+from dataiku.llm.python.blocks_graph import NextBlock
+
+FOLDER_ADI = "PROJE_HAFIZASI"
+SEMA = "/sema.json"
+
+# LLM'in veri seti adi diye uydurabilecegi, dataset OLMAYAN degerler
+GECERSIZ_ADLAR = {
+    "sema.json", "sema", "proje_hafizasi", "proje_hafızası",
+    "meta.json", "hafiza", "hafıza", "folder", "klasor", "klasör",
+}
+
+
+def _json_ayristir(ham):
+    """girdi_al ciktisini dict'e cevirir. Bozuksa bos dict doner."""
+    if isinstance(ham, dict):
+        return ham
+    try:
+        metin = str(ham or "").strip()
+        if metin.startswith("```"):
+            metin = metin.strip("`")
+            if metin.lower().startswith("json"):
+                metin = metin[4:]
+        return json.loads(metin)
+    except Exception:
+        return {}
+
+
+def _onceki_oturumu_oku():
+    """PROJE_HAFIZASI/sema.json'u okur. Yoksa/bozuksa None doner."""
+    try:
+        folder = dataiku.Folder(FOLDER_ADI)
+        if SEMA not in folder.list_paths_in_partition():
+            return None
+        with folder.get_download_stream(SEMA) as f:
+            return json.loads(f.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _dataset_var_mi(ad):
+    """Projede bu adda gercek bir dataset var mi?"""
+    if not ad:
+        return False
+    if str(ad).strip().lower() in GECERSIZ_ADLAR:
+        return False
+    try:
+        proje = dataiku.api_client().get_default_project()
+        adlar = [d["name"] for d in proje.list_datasets()]
+        return str(ad).strip() in adlar
+    except Exception:
+        # API erisilemezse adi reddetme, sadece bariz gecersizleri ele
+        return True
+
+
 def process(trace):
     g = _json_ayristir(state.get("girdi"))
 
-    for anahtar in ["veri_seti", "sozluk", "target", "id_kolonu", "donem_kolonu", "bolme_kolonu"]:
+    # --- girdi_al'in verdigi veri seti adini DOGRULA ---
+    aday = g.get("veri_seti")
+    state["gecersiz_ad"] = ""
+    if aday:
+        if _dataset_var_mi(aday):
+            state["veri_seti"] = aday
+        else:
+            state["gecersiz_ad"] = str(aday)
+            g["veri_seti"] = None
+            g["dataset_var"] = False
+
+    for anahtar in ["sozluk", "target", "id_kolonu", "donem_kolonu", "bolme_kolonu"]:
         if g.get(anahtar) is not None:
             state[anahtar] = g.get(anahtar)
+
     state["dataset_var"] = bool(g.get("dataset_var")) or bool(state.get("veri_seti"))
     state["sozluk_var"] = bool(g.get("sozluk_var")) or bool(state.get("sozluk"))
-    state["config_var"] = bool(g.get("config_var"))
+    state["config_var"] = bool(g.get("config_var")) or bool(state.get("config_var"))
     state["niyet"] = g.get("niyet") or "bilgi"
 
     asama = state.get("asama") or "baslangic"
 
-    # --- sohbet blogunun promptuna gidecek hafiza ozeti (her turda yenilenir) ---
-    if state.get("onceki_reddedildi") and not state.get("veri_seti"):
+    # --- sohbet blogunun promptuna gidecek durum ozeti ---
+    if state.get("gecersiz_ad"):
         state["hafiza_ozet"] = (
-            "Kullanici onceki oturumu REDDETTI ve sifirdan baslamak istiyor. "
-            "Onceki oturumdan, eski veri setinden veya eski sozlukten ASLA bahsetme. "
-            "Veri seti henuz belirlenmedi."
+            "UYARI: Kullanicinin bahsettigi '{ad}' bir dataset degil "
+            "(muhtemelen bir dosya veya klasor adi). Onu dataset gibi okumaya "
+            "CALISMA. Kullaniciya gecerli bir dataset adi sor. "
+            "Kayitli oturum: {kayit}"
+        ).format(ad=state["gecersiz_ad"], kayit=state.get("onceki_ozet") or "yok")
+    elif state.get("onceki_reddedildi") and not state.get("veri_seti"):
+        state["hafiza_ozet"] = (
+            "Kullanici onceki oturumu REDDETTI. Onceki oturumdan, eski veri "
+            "setinden veya eski sozlukten ASLA bahsetme. Veri seti belirlenmedi."
         )
     elif state.get("veri_seti"):
         state["hafiza_ozet"] = "Veri seti: {vs}. Sozluk: {sz}. Asama: {a}.".format(
@@ -36,6 +110,12 @@ def process(trace):
             state["onceki_sozluk"] = onceki.get("sozluk_adi")
             state["onceki_n_satir"] = onceki.get("n_satir")
             state["onceki_n_kolon"] = onceki.get("n_kolon")
+            state["onceki_ozet"] = "{vs} / {sz} ({ns} satir, {nk} kolon)".format(
+                vs=onceki.get("veri_seti"),
+                sz=onceki.get("sozluk_adi"),
+                ns=onceki.get("n_satir"),
+                nk=onceki.get("n_kolon"),
+            )
             state["onceki_bekliyor"] = True
             yield NextBlock("onceki_sor")
             return
@@ -44,10 +124,10 @@ def process(trace):
     if state.get("onceki_bekliyor"):
         state["onceki_bekliyor"] = False
 
-        ham = str(state.get("girdi_ham") or state.get("girdi") or "").lower()
+        ham = str(state.get("girdi") or "").lower()
         yeni_istegi = (
             state["niyet"] in ("red", "yeni")
-            or any(k in ham for k in ["yeni", "sifirdan", "sıfırdan", "bastan", "baştan", "farkli", "farklı"])
+            or any(k in ham for k in ["yeni", "sifirdan", "sıfırdan", "bastan", "baştan"])
         )
 
         if state["niyet"] == "onay" and not yeni_istegi:
@@ -59,13 +139,13 @@ def process(trace):
             yield NextBlock("sozluk_calis")
             return
 
-        # "yeni baslayalim" -> onceki oturumu tamamen unut
-        for k in ["onceki_veri_seti", "onceki_sozluk", "onceki_n_satir", "onceki_n_kolon"]:
+        for k in ["onceki_veri_seti", "onceki_sozluk", "onceki_n_satir",
+                  "onceki_n_kolon", "onceki_ozet"]:
             state[k] = None
         state["onceki_reddedildi"] = True
         state["hafiza_ozet"] = (
-            "Kullanici onceki oturumu REDDETTI ve sifirdan baslamak istiyor. "
-            "Onceki oturumdan ASLA bahsetme. Veri seti henuz belirlenmedi."
+            "Kullanici onceki oturumu REDDETTI. Onceki oturumdan ASLA bahsetme. "
+            "Veri seti henuz belirlenmedi."
         )
         yield NextBlock("sohbet")
         return
@@ -77,19 +157,3 @@ def process(trace):
         return
 
     yield NextBlock("sohbet")
-
-
-
-
-
-
-
-
-
-
-AŞAĞIDAKİ DURUM BİLGİSİ TEK DOĞRULUK KAYNAĞIDIR.
-Kendi erişim yeteneğin hakkında yorum yapma ("erişimim var/yok",
-"klasörü görüyorum", "okumadım" gibi cümleler kurma).
-Önceki mesajlarını tekrar etme; sadece yeni cevabı yaz.
-
-DURUM: {{ state.hafiza_ozet }}
