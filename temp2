@@ -1,33 +1,29 @@
 # =============================================================================
 # FEATURE_DISCOVERY_AGENT / sozluk_tamamla
 # -----------------------------------------------------------------------------
-# Sorumluluk : Sozluk hazirligi asamasinda aciklamasi olmayan kolonlari
-#              ornek degerleriyle birlikte gosterir, kullanicidan tanim
-#              toplar ve sikistirmaya gecis onayini bekler.
+# Sorumluluk : Aciklamasi olmayan kolonlari ornek degerleriyle gosterir,
+#              LLM'in oneri uretebilmesi icin baglami state'e yazar.
 #
 # NASIL CALISIR:
 #   Bu blok iki yerden zincirlenir (Default next block ayari ile):
 #     sozluk_calis -> sozluk_tamamla   (veri okunduktan sonra ilk rapor)
 #     kolon_sorgu  -> sozluk_tamamla   (her tanim kaydindan sonra kalan rapor)
-#   Boylece kullanici tanim yazdikca kalan eksik listesi guncellenir.
-#
-#   Asama "sozluk" degilse sessizce cikar; kolon_sorgu baska asamalarda da
-#   calisabildigi icin bu kontrol gerekli.
+#   Eksik varsa oneri_uret blogunu cagirir; yoksa turu bitirir.
 #
 # ORNEK DEGER OKUMA POLITIKASI:
 #   Yalnizca aciklamasi eksik kolonlar okunur (1042 degil, birkac kolon).
-#   Satir sayisi esigin altindaysa TAMAMI okunur; boylece farkli deger
-#   sayisi gercek deger olur. Esigin ustundeyse RASTGELE ornekleme yapilir
-#   ve mesajda bunun ornekleme oldugu belirtilir. Bas kisimdan okuma (head)
-#   kullanilmaz; veri sirali oldugunda yaniltici sonuc verir.
+#   Satir sayisi esigin altindaysa TAMAMI okunur; farkli deger sayisi gercek
+#   deger olur. Esigin ustundeyse RASTGELE ornekleme yapilir. Bas kisimdan
+#   okuma kullanilmaz; veri sirali oldugunda yaniltici sonuc verir.
 #
-# Girdi      : sema.json, sozluk_ek.json, veri seti (ornek degerler icin)
-# Cikti      : Kullaniciya metin (yield)
+# Girdi      : sema.json, sozluk_ek.json, veri seti
+# Cikti      : Kullaniciya metin + NextBlock(oneri_uret)
 # =============================================================================
 
 import json
 
 import dataiku
+from dataiku.llm.python.blocks_graph import NextBlock
 
 
 # -----------------------------------------------------------------------------
@@ -38,10 +34,12 @@ HAFIZA_FOLDER = "PROJE_HAFIZASI"
 SEMA_DOSYASI = "/sema.json"
 EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
 
+BLOK_ONERI_URET = "oneri_uret"
+
 # Bu blok yalnizca bu asamada konusur.
 ASAMA_SOZLUK = "sozluk"
 
-# Mesajda tek seferde listelenecek azami eksik kolon sayisi.
+# Mesajda ve oneri uretiminde ele alinacak azami eksik kolon sayisi.
 AZAMI_LISTELENEN = 15
 
 # Her kolon icin gosterilecek azami farkli deger.
@@ -57,11 +55,13 @@ ORNEKLEM_SATIR = 100000
 # Tek bir ornek degerin gosterilecek azami karakter sayisi.
 AZAMI_DEGER_UZUNLUGU = 30
 
+# LLM'e uslup ornegi olarak verilecek mevcut sozluk kaydi sayisi.
+USLUP_ORNEK_SAYISI = 6
+
 
 class Sema:
     """sema.json icindeki anahtarlar."""
     VERI_SETI = "veri_seti"
-    SOZLUK_ADI = "sozluk_adi"
     N_SATIR = "n_satir"
     KOLONLAR = "kolonlar"
     TIPLER = "tipler"
@@ -74,6 +74,9 @@ class S:
     ASAMA = "asama"
     BEKLENEN = "beklenen"
     VERI_SETI = "veri_seti"
+    EKSIK_KOLONLAR = "eksik_kolonlar"
+    EKSIK_BAGLAMI = "eksik_baglami"
+    ONERILER = "oneriler"
 
 
 class Beklenen:
@@ -108,13 +111,7 @@ def _sayi(deger):
 
 
 def _eksikleri_bul(sema, ek_sozluk):
-    """Aciklamasi olmayan kolon adlarini dondurur.
-
-    Iki kaynak birlestirilir:
-      - sozlukte yer alip degeri bos olan kolonlar
-      - sema.json'daki tabloda_var_sozlukte_yok listesi
-    Kullanicinin sozluk_ek.json'a girdigi tanimlar eksik SAYILMAZ.
-    """
+    """Aciklamasi olmayan kolon adlarini dondurur."""
     sozluk = sema.get(Sema.SOZLUK)
     sozluk = sozluk if isinstance(sozluk, dict) else {}
 
@@ -132,7 +129,6 @@ def _eksikleri_bul(sema, ek_sozluk):
 
     eksikler = [k for k in tablo_kolonlari if not _tanimli_mi(k)]
 
-    # sema.json'un bildirdigi ama tablo listesinde gozukmeyenleri de ekle.
     for kolon in bildirilen:
         if kolon not in eksikler and not _tanimli_mi(kolon):
             eksikler.append(kolon)
@@ -152,8 +148,6 @@ def _veriyi_oku(veri_seti_adi, kolonlar, n_satir):
     """Eksik kolonlari veri setinden okur.
 
     Doner: (dataframe veya None, ornekleme_yapildi_mi)
-    Satir sayisi esigin altindaysa tamami okunur. Ustundeyse rastgele
-    ornekleme denenir; ornekleme desteklenmiyorsa limitli okumaya duser.
     """
     dataset = dataiku.Dataset(veri_seti_adi)
     kolon_listesi = list(kolonlar)
@@ -187,10 +181,7 @@ def _veriyi_oku(veri_seti_adi, kolonlar, n_satir):
 
 
 def _ornek_degerleri_cikar(df, kolonlar):
-    """Her kolon icin farkli deger sayisi ve ornekleri cikarir.
-
-    Doner: {kolon: (farkli_deger_sayisi, [ornek degerler])}
-    """
+    """Her kolon icin farkli deger sayisi ve ornekleri cikarir."""
     if df is None:
         return {}
 
@@ -235,7 +226,7 @@ def _kolon_blogu(kolon, tipler, ornekler, orneklem_mi):
 
 
 def _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi):
-    """Eksik kolonlari ornekleriyle listeler ve kullanicidan tanim ister."""
+    """Eksik kolonlari ornekleriyle listeler."""
     if len(eksikler) == 1:
         giris = "Bir kolonun açıklaması yok:"
     else:
@@ -253,17 +244,10 @@ def _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi):
         parcalar.append("")
 
     if orneklem_mi:
-        parcalar.append("_Değerler {} satırlık rastgele örneklemden; gerçek "
-                        "farklı değer sayısı daha yüksek olabilir._".format(
-                            _sayi(ORNEKLEM_SATIR)))
+        parcalar.append("_Değerler {} satırlık rastgele örneklemden._".format(
+            _sayi(ORNEKLEM_SATIR)))
         parcalar.append("")
 
-    parcalar.append("Anlamlarını yazarsanız sözlüğe eklerim; örneğin "
-                    "`rn satır numarası`. Mevcut bir açıklamayı değiştirmek "
-                    "için de kolon adını ve yeni açıklamasını yazmanız yeterli.")
-    parcalar.append("")
-    parcalar.append("Bu haliyle devam etmek isterseniz sözlük sıkıştırmaya "
-                    "geçebiliriz.")
     return "\n".join(parcalar)
 
 
@@ -274,6 +258,49 @@ def _eksiksiz_mesaji():
         "Bir açıklamayı değiştirmek isterseniz kolon adını ve yeni açıklamasını "
         "yazın. Değişiklik yoksa sözlük sıkıştırmaya geçebiliriz."
     )
+
+
+def _baglami_kur(eksikler, tipler, ornekler, sozluk, orneklem_mi):
+    """LLM'in oneri uretebilmesi icin duz metin baglam hazirlar.
+
+    Kolon adi, tip, farkli deger sayisi ve ornek degerlerin yani sira
+    sozlukteki mevcut kayitlardan uslup ornekleri de verilir; boylece
+    onerilen aciklamalar mevcut sozlukle ayni dilde olur.
+    """
+    satirlar = []
+
+    if orneklem_mi:
+        satirlar.append("NOT: Ornek degerler rastgele orneklemden alindi.")
+        satirlar.append("")
+
+    satirlar.append("ACIKLAMASI EKSIK KOLONLAR:")
+    for kolon in eksikler:
+        parca = "- {}".format(kolon)
+        tip = tipler.get(kolon)
+        if tip:
+            parca += " | tip: {}".format(tip)
+        if kolon in ornekler:
+            farkli_sayi, degerler = ornekler[kolon]
+            parca += " | farkli deger: {}".format(farkli_sayi)
+            if degerler:
+                parca += " | ornekler: {}".format(", ".join(degerler))
+            else:
+                parca += " | tamami bos"
+        satirlar.append(parca)
+
+    if isinstance(sozluk, dict) and sozluk:
+        satirlar.append("")
+        satirlar.append("MEVCUT SOZLUKTEN USLUP ORNEKLERI:")
+        sayac = 0
+        for kolon, aciklama in sozluk.items():
+            if not str(aciklama or "").strip():
+                continue
+            satirlar.append("- {}: {}".format(kolon, aciklama))
+            sayac += 1
+            if sayac >= USLUP_ORNEK_SAYISI:
+                break
+
+    return "\n".join(satirlar)
 
 
 # -----------------------------------------------------------------------------
@@ -301,17 +328,22 @@ def process(trace):
         tipler = sema.get(Sema.TIPLER)
         tipler = tipler if isinstance(tipler, dict) else {}
 
+        sozluk = sema.get(Sema.SOZLUK)
+        sozluk = sozluk if isinstance(sozluk, dict) else {}
+
         eksikler = _eksikleri_bul(sema, ek_sozluk)
         _logla("eksik kolon sayisi: {}".format(len(eksikler)))
 
-        # Kullanicidan bir kolon aciklamasi bekliyoruz; girdi_al bunu bilmeli.
-        state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+        # Onceki turdan kalan onerileri temizle.
+        state[S.ONERILER] = None
 
         if not eksikler:
+            state[S.EKSIK_KOLONLAR] = []
+            state[S.EKSIK_BAGLAMI] = ""
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
             yield "\n\n" + _eksiksiz_mesaji()
             return
 
-        # Ornek degerler yalnizca listelenecek kolonlar icin okunur.
         listelenecek = eksikler[:AZAMI_LISTELENEN]
         veri_seti_adi = state.get(S.VERI_SETI) or sema.get(Sema.VERI_SETI)
 
@@ -322,10 +354,431 @@ def process(trace):
                 veri_seti_adi, listelenecek, sema.get(Sema.N_SATIR))
             ornekler = _ornek_degerleri_cikar(df, listelenecek)
 
+        state[S.EKSIK_KOLONLAR] = listelenecek
+        state[S.EKSIK_BAGLAMI] = _baglami_kur(
+            listelenecek, tipler, ornekler, sozluk, orneklem_mi)
+
         # Bastaki bos satir, onceki blogun mesajiyla yapismayi onler.
         yield "\n\n" + _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi)
+
+        # LLM oneri uretsin.
+        yield NextBlock(BLOK_ONERI_URET)
 
     except Exception as hata:
         _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
         yield ("\n\nSözlük durumunu çıkarırken beklenmeyen bir hata oluştu. "
                "Ayrıntı agent log'una yazıldı.")
+
+
+
+
+
+
+
+
+
+Aşağıda bir bankacılık veri setindeki, sözlükte açıklaması bulunmayan
+kolonlar listeleniyor. Her kolon için kısa bir açıklama öner.
+
+{{ state.eksik_baglami }}
+
+Kurallar:
+
+Kolon adındaki kısaltmaları ve örnek değerlerin biçimini birlikte
+değerlendir. Örneğin değerleri 1, 2, 3 diye giden bir int kolon büyük
+ihtimalle sıra numarasıdır; uzun ve benzersiz bir string kolon kimlik
+olabilir.
+
+MEVCUT SOZLUKTEN USLUP ORNEKLERI bölümü varsa aynı dili ve uzunluğu kullan.
+Sözlükteki açıklamalar nasıl yazılmışsa öyle yaz.
+
+Açıklama tek cümle olsun, nokta ile bitmesin, en fazla on iki kelime olsun.
+
+Emin olmadığın kolonlarda tahmin ettiğini belirt ve guven alanını "dusuk"
+yaz. Kesin olduğun yerlerde "yuksek", arada kaldığında "orta" yaz.
+
+Kolonun ne olduğuna dair hiçbir ipucu yoksa aciklama alanını boş bırak ve
+guven "dusuk" olsun. Uydurma açıklama yazma.
+
+Yanıtın yalnızca JSON olsun. Her eksik kolon için bir kayıt döndür; listede
+olmayan kolon ekleme.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+{
+  "type": "object",
+  "properties": {
+    "oneriler": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kolon": { "type": "string" },
+          "aciklama": { "type": "string" },
+          "guven": { "type": "string", "enum": ["yuksek", "orta", "dusuk"] },
+          "gerekce": { "type": "string" }
+        },
+        "required": ["kolon", "aciklama", "guven"]
+      }
+    }
+  },
+  "required": ["oneriler"]
+}
+
+
+
+
+
+
+
+
+
+
+
+# =============================================================================
+# FEATURE_DISCOVERY_AGENT / oneri_isle
+# -----------------------------------------------------------------------------
+# Sorumluluk : LLM'in urettigi kolon aciklamasi onerilerini kullaniciya sunar
+#              ve onay gelirse uc yere birden kaydeder.
+#
+# IKI MODDA CALISIR (state["beklenen"] degerine gore):
+#   SUNUM   : oneri_uret'ten gelinir. Onerileri listeler, onay ister ve
+#             beklenen'i "oneri_onayi" yapar.
+#   KAYIT   : durum_belirle'den gelinir (kullanici onay verdi). Onerileri
+#             sozluk_ek.json, sema.json ve DEGISKENLER_GUNCEL'e yazar.
+#
+# Kaynak sozluk (DEGISKENLER) DEGISTIRILMEZ.
+# =============================================================================
+
+import json
+
+import pandas as pd
+
+import dataiku
+
+
+# -----------------------------------------------------------------------------
+# Sabitler
+# -----------------------------------------------------------------------------
+
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+SEMA_DOSYASI = "/sema.json"
+EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
+GUNCEL_SOZLUK_DATASET = "DEGISKENLER_GUNCEL"
+
+VARSAYILAN_AD_KOLONU = "kolon"
+VARSAYILAN_ACIKLAMA_KOLONU = "aciklama"
+
+GUVEN_ETIKETLERI = {
+    "yuksek": "yüksek güven",
+    "orta": "orta güven",
+    "dusuk": "düşük güven",
+}
+
+
+class Sema:
+    """sema.json icindeki anahtarlar."""
+    SOZLUK = "sozluk"
+    TABLODA_VAR_SOZLUKTE_YOK = "tabloda_var_sozlukte_yok"
+
+
+class S:
+    """state anahtarlari."""
+    BEKLENEN = "beklenen"
+    ONERILER = "oneriler"
+    ONERI_LISTESI = "oneri_listesi"
+
+
+class Beklenen:
+    """durum_belirle ile ayni degerler."""
+    ONERI_ONAYI = "oneri_onayi"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
+
+
+# -----------------------------------------------------------------------------
+# Dosya islemleri
+# -----------------------------------------------------------------------------
+
+def _logla(mesaj):
+    print("[oneri_isle] {}".format(mesaj))
+
+
+def _folder():
+    return dataiku.Folder(HAFIZA_FOLDER)
+
+
+def _json_oku(dosya_yolu, varsayilan):
+    """Managed folder icindeki bir JSON dosyasini okur."""
+    try:
+        folder = _folder()
+        if dosya_yolu not in folder.list_paths_in_partition():
+            return varsayilan
+        with folder.get_download_stream(dosya_yolu) as akis:
+            return json.loads(akis.read().decode("utf-8"))
+    except Exception as hata:
+        _logla("{} okunamadi: {}".format(dosya_yolu, hata))
+        return varsayilan
+
+
+def _json_yaz(dosya_yolu, veri):
+    """Managed folder icine JSON yazar. Basarisizsa False doner."""
+    try:
+        icerik = json.dumps(veri, ensure_ascii=False, indent=2)
+        _folder().upload_data(dosya_yolu, icerik.encode("utf-8"))
+        return True
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(dosya_yolu, hata))
+        return False
+
+
+def _onerileri_coz(ham):
+    """oneri_uret ciktisini [{kolon, aciklama, guven, gerekce}] listesine cevirir."""
+    veri = ham
+    if isinstance(ham, str):
+        metin = ham.strip()
+        if metin.startswith("```"):
+            metin = metin.strip("`").strip()
+            if metin.lower().startswith("json"):
+                metin = metin[4:].strip()
+        bas = metin.find("{")
+        son = metin.rfind("}")
+        if bas != -1 and son > bas:
+            metin = metin[bas:son + 1]
+        try:
+            veri = json.loads(metin)
+        except (ValueError, TypeError):
+            _logla("oneri JSON'u cozulemedi: {!r}".format(str(ham)[:300]))
+            return []
+
+    if isinstance(veri, dict):
+        liste = veri.get("oneriler")
+    elif isinstance(veri, list):
+        liste = veri
+    else:
+        liste = None
+
+    if not isinstance(liste, list):
+        return []
+
+    temiz = []
+    for kayit in liste:
+        if not isinstance(kayit, dict):
+            continue
+        kolon = str(kayit.get("kolon") or "").strip()
+        aciklama = str(kayit.get("aciklama") or "").strip()
+        if not kolon:
+            continue
+        temiz.append({
+            "kolon": kolon,
+            "aciklama": aciklama,
+            "guven": str(kayit.get("guven") or "orta").strip().lower(),
+            "gerekce": str(kayit.get("gerekce") or "").strip(),
+        })
+    return temiz
+
+
+# -----------------------------------------------------------------------------
+# Sunum modu
+# -----------------------------------------------------------------------------
+
+def _sunum_mesaji(oneriler):
+    """Onerileri kullaniciya listeler ve onay ister."""
+    dolu = [o for o in oneriler if o["aciklama"]]
+    bos = [o for o in oneriler if not o["aciklama"]]
+
+    parcalar = ["\n\n**Önerilen açıklamalar**", ""]
+
+    for oneri in dolu:
+        etiket = GUVEN_ETIKETLERI.get(oneri["guven"], oneri["guven"])
+        satir = "**{kolon}** — {aciklama}  _({guven})_".format(
+            kolon=oneri["kolon"], aciklama=oneri["aciklama"], guven=etiket)
+        if oneri["gerekce"]:
+            satir += "\n{}".format(oneri["gerekce"])
+        parcalar.append(satir)
+        parcalar.append("")
+
+    if bos:
+        adlar = ", ".join("`{}`".format(o["kolon"]) for o in bos)
+        parcalar.append("Şu kolonlar için öneri üretemedim: {}".format(adlar))
+        parcalar.append("")
+
+    parcalar.append("Bunları onaylarsanız sözlüğe kaydederim. Bir tanesini "
+                    "değiştirmek isterseniz kolon adını ve kendi açıklamanızı "
+                    "yazın.")
+    return "\n".join(parcalar)
+
+
+# -----------------------------------------------------------------------------
+# Kayit modu
+# -----------------------------------------------------------------------------
+
+def _semayi_guncelle(yeni_tanimlar):
+    """Tanimlari sema.json'a isler ve eksik listesinden cikarir."""
+    sema = _json_oku(SEMA_DOSYASI, {})
+    if not isinstance(sema, dict) or not sema:
+        _logla("sema.json bos veya okunamadi")
+        return False
+
+    sozluk = sema.get(Sema.SOZLUK)
+    if not isinstance(sozluk, dict):
+        sozluk = {}
+    sozluk.update(yeni_tanimlar)
+    sema[Sema.SOZLUK] = sozluk
+
+    eksikler = sema.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
+    if isinstance(eksikler, list):
+        sema[Sema.TABLODA_VAR_SOZLUKTE_YOK] = [
+            k for k in eksikler if k not in yeni_tanimlar]
+
+    return _json_yaz(SEMA_DOSYASI, sema)
+
+
+def _guncel_sozlugu_yaz(ek_sozluk):
+    """Kaynak sozluk + kullanici/oneri tanimlarini DEGISKENLER_GUNCEL'e yazar.
+
+    Doner: (basarili_mi, toplam_satir)
+    """
+    sema = _json_oku(SEMA_DOSYASI, {})
+    sozluk = sema.get(Sema.SOZLUK) if isinstance(sema, dict) else {}
+    sozluk = sozluk if isinstance(sozluk, dict) else {}
+
+    birlesik = dict(sozluk)
+    birlesik.update(ek_sozluk)
+
+    adlar = sorted(birlesik.keys())
+    df = pd.DataFrame({
+        VARSAYILAN_AD_KOLONU: adlar,
+        VARSAYILAN_ACIKLAMA_KOLONU: [birlesik[ad] for ad in adlar],
+        "kaynak": ["kullanici" if ad in ek_sozluk else "sozluk" for ad in adlar],
+    })
+
+    try:
+        dataiku.Dataset(GUNCEL_SOZLUK_DATASET).write_with_schema(df)
+        _logla("{} yazildi: {} satir".format(GUNCEL_SOZLUK_DATASET, len(df)))
+        return True, len(df)
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(GUNCEL_SOZLUK_DATASET, hata))
+        return False, len(df)
+
+
+def _onerileri_kaydet(oneriler):
+    """Dolu onerileri uc yere birden yazar ve sonuc mesajini dondurur."""
+    yeni_tanimlar = {o["kolon"]: o["aciklama"] for o in oneriler if o["aciklama"]}
+
+    if not yeni_tanimlar:
+        return "\n\nKaydedilecek bir öneri yok."
+
+    ek_sozluk = _json_oku(EK_SOZLUK_DOSYASI, {})
+    ek_sozluk = ek_sozluk if isinstance(ek_sozluk, dict) else {}
+    ek_sozluk.update(yeni_tanimlar)
+
+    ek_yazildi = _json_yaz(EK_SOZLUK_DOSYASI, ek_sozluk)
+    sema_yazildi = _semayi_guncelle(yeni_tanimlar)
+    ds_yazildi, toplam = _guncel_sozlugu_yaz(ek_sozluk)
+
+    basarisizlar = []
+    if not ek_yazildi:
+        basarisizlar.append("kullanıcı tanımları dosyası")
+    if not sema_yazildi:
+        basarisizlar.append("oturum kaydı (sema.json)")
+    if not ds_yazildi:
+        basarisizlar.append(GUNCEL_SOZLUK_DATASET)
+
+    adlar = ", ".join("**{}**".format(k) for k in sorted(yeni_tanimlar))
+    bas = "\n\n{} kolonun açıklaması kaydedildi: {}".format(
+        len(yeni_tanimlar), adlar)
+
+    if basarisizlar:
+        return bas + "\n\nAncak şuralara yazılamadı: {}. Ayrıntı agent " \
+                     "log'unda.".format(", ".join(basarisizlar))
+
+    return (bas + "\n\n**{ds}** güncellendi: {toplam} satır. Kaynak sözlük "
+            "değiştirilmedi.\n\nSözlük sıkıştırmaya geçebiliriz.").format(
+        ds=GUNCEL_SOZLUK_DATASET, toplam="{:,}".format(toplam).replace(",", "."))
+
+
+# -----------------------------------------------------------------------------
+# Ana akis
+# -----------------------------------------------------------------------------
+
+def process(trace):
+    try:
+        # KAYIT MODU: kullanici onerileri onayladi.
+        if state.get(S.BEKLENEN) == Beklenen.ONERI_ONAYI:
+            saklanan = state.get(S.ONERI_LISTESI) or []
+            if not saklanan:
+                state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+                yield ("\n\nOnaylanacak bir öneri bulamadım; liste boşalmış "
+                       "görünüyor. Kolon adı ve açıklamasını yazarsanız "
+                       "doğrudan kaydederim.")
+                return
+
+            state[S.ONERI_LISTESI] = None
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+            yield _onerileri_kaydet(saklanan)
+            return
+
+        # SUNUM MODU: oneri_uret'ten yeni geldik.
+        oneriler = _onerileri_coz(state.get(S.ONERILER))
+        if not oneriler:
+            _logla("oneri uretilemedi veya cozulemedi")
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+            yield ("\n\nBu kolonlar için otomatik öneri üretemedim. Anlamlarını "
+                   "kendiniz yazarsanız sözlüğe eklerim.")
+            return
+
+        state[S.ONERI_LISTESI] = oneriler
+        state[S.BEKLENEN] = Beklenen.ONERI_ONAYI
+        _logla("{} oneri sunuldu".format(len(oneriler)))
+        yield _sunum_mesaji(oneriler)
+
+    except Exception as hata:
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+        yield ("\n\nÖnerileri işlerken beklenmeyen bir hata oluştu. Ayrıntı "
+               "agent log'una yazıldı.")
+
+
+
+
+
+
+
+    ONERI_ISLE = "oneri_isle"
+
+
+
+
+    ONERI_ONAYI = "oneri_onayi"
+
+
+
+
+
+        # --- 4b) Oneri onayi bekleniyor ---------------------------------------
+        # LLM kolon aciklamasi onerdi; kullanici onayladiysa oneri_isle kaydeder.
+        if state.get(S.BEKLENEN) == Beklenen.ONERI_ONAYI and aksiyon == Aksiyon.ONAY:
+            _logla("oneriler onaylandi, oneri_isle bloguna gidiliyor")
+            yield NextBlock(Blok.ONERI_ISLE)
+            return
+
+
+
+
+  oneri_onayi bekleniyorsa:
+    Kullanıcı önerilen açıklamaları kabul ediyorsa onay, reddediyorsa ret.
+    Bir tanesini değiştirmek istiyorsa kolon_tanimla seç ve kendi verdiği
+    metni kolon_aciklamasi alanına yaz.
