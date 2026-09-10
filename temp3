@@ -1,105 +1,76 @@
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
-
-llm_kolonlar = [c for c in enr_final if c not in base_final]
-
-
-def tekil_auc(seri, y):
-    """Tek kolonun AUC'si. NaN'lar medyanla doldurulur (LightGBM'siz olcum)."""
-    x = pd.to_numeric(seri, errors="coerce")
-    x = x.replace([np.inf, -np.inf], np.nan)
-    if x.notna().sum() < 50 or x.dropna().nunique() < 2:
-        return np.nan
-    x = x.fillna(x.median())
-    auc = roc_auc_score(y, x)
-    return max(auc, 1 - auc)      # yon fark etmez, ayirt edicilik olculuyor
-
-
-def veri_sagligi(seri):
-    x = pd.to_numeric(seri, errors="coerce")
-    n = len(x)
-    return {
-        "nan_%": 100.0 * x.isna().mean(),
-        "inf_%": 100.0 * np.isinf(x.replace(np.nan, 0)).mean(),
-        "sifir_%": 100.0 * (x == 0).mean(),
-        "tekil_deger": int(x.nunique(dropna=True)),
-        "maks_mutlak": float(np.nanmax(np.abs(x.replace([np.inf, -np.inf], np.nan)))
-                             ) if x.notna().any() else np.nan,
-    }
-
-
-def llm_teshis(llm_kolonlar, ust_n=10):
-    """Her LLM feature'i icin: train/val tekil AUC + veri sagligi + base ile korelasyon."""
-    satirlar = []
-    # Base kolonlarin tekil AUC'si (karsilastirma tabani icin)
-    base_auc = {c: tekil_auc(train[c], y_train) for c in base_final}
-    base_auc_ort = np.nanmean(list(base_auc.values()))
-    base_auc_p90 = np.nanpercentile(list(base_auc.values()), 90)
-
-    for c in llm_kolonlar:
-        s = veri_sagligi(train[c])
-        tr_auc = tekil_auc(train[c], y_train)
-        va_auc = tekil_auc(val[c], y_val)
-
-        # En yuksek korelasyonlu base kolonu (redundans gostergesi)
-        x = pd.to_numeric(train[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if x.notna().sum() > 50 and x.dropna().nunique() > 1:
-            korr = train[base_final].corrwith(x, method="spearman").abs()
-            en_yakin = korr.idxmax() if korr.notna().any() else None
-            en_yakin_korr = float(korr.max()) if korr.notna().any() else np.nan
-        else:
-            en_yakin, en_yakin_korr = None, np.nan
-
-        satirlar.append({
-            "feature": c, "tr_auc": tr_auc, "val_auc": va_auc,
-            "auc_kayip": tr_auc - va_auc if pd.notna(tr_auc) and pd.notna(va_auc) else np.nan,
-            "en_yakin_base": en_yakin, "korr": en_yakin_korr, **s,
-        })
-
-    t = pd.DataFrame(satirlar).sort_values("val_auc", ascending=False)
-
-    print(f"Base kolonlarin tekil AUC ortalamasi = {base_auc_ort:.4f}, "
-          f"%90 dilim = {base_auc_p90:.4f}  (n={len(base_final)})")
-    print(f"LLM kolonlarin tekil AUC ortalamasi  = {t['val_auc'].mean():.4f}  "
-          f"(n={len(llm_kolonlar)})\n")
-
-    print("--- En iyi %d LLM feature (val tekil AUC) ---" % ust_n)
-    print(t.head(ust_n)[["feature", "tr_auc", "val_auc", "auc_kayip",
-                         "korr", "nan_%", "sifir_%", "tekil_deger"]].to_string(index=False))
-
-    print("\n--- Sorunlu olanlar ---")
-    sorunlu = t[(t["nan_%"] > 20) | (t["inf_%"] > 0) |
-                (t["sifir_%"] > 80) | (t["tekil_deger"] < 20) |
-                (t["val_auc"] < 0.52) | (t["korr"] > 0.95)]
-    if len(sorunlu) == 0:
-        print("(veri sagligi acisindan sorunlu feature yok)")
-    else:
-        print(sorunlu[["feature", "val_auc", "korr", "nan_%", "inf_%",
-                       "sifir_%", "tekil_deger", "maks_mutlak"]].to_string(index=False))
-        print(f"\n{len(sorunlu)}/{len(llm_kolonlar)} feature en az bir sorun bayragi tasiyor.")
-
-    return t
-
-
-teshis = llm_teshis(llm_kolonlar)
-
 
 # ------------------------------------------------------------------
-# DUZELTILMIS KARSILASTIRMA RAPORU
-# Onceki surumdeki llm_tek_basina_test sadece "LLM ustun mu" diye
-# bakiyordu; altta kalma durumunu raporlamiyordu. Uc sonuclu hale getirildi.
+# SPLIT + GAIN ONEM SIRALAMASI
+# feature_importances_ varsayilan olarak "split" doner.
+# gain icin booster uzerinden ayrica cekilir.
 # ------------------------------------------------------------------
-def karsilastirma_yorumla(llm_auc, rastgele_skorlar):
-    ort, sd = float(np.mean(rastgele_skorlar)), float(np.std(rastgele_skorlar))
-    if llm_auc > ort + sd:
-        sonuc = "LLM USTUN"
-    elif llm_auc < ort - sd:
-        sonuc = "LLM ALTTA (feature'lar rastgele base kolonlarindan zayif)"
-    else:
-        sonuc = "ayirt edilemiyor"
-    print(f"LLM {llm_auc:.4f} vs rastgele {ort:.4f}±{sd:.4f}  ->  {sonuc}")
-    return sonuc
+def onem_tablosu(model, kolonlar, prefix=LLM_PREFIX, ust_n=15):
+    split = model.booster_.feature_importance(importance_type="split")
+    gain  = model.booster_.feature_importance(importance_type="gain")
+
+    imp = pd.DataFrame({"feature": kolonlar, "split": split, "gain": gain})
+
+    # Yuzde paylar: mutlak gain degeri olcek bagimli, pay yorumlanabilir
+    imp["split_%"] = 100.0 * imp["split"] / imp["split"].sum()
+    imp["gain_%"]  = 100.0 * imp["gain"]  / imp["gain"].sum()
+
+    # Kullanim basina kazanc: dusuk olan = cok kullanilip az kazandiran
+    imp["gain_per_split"] = imp["gain"] / imp["split"].replace(0, np.nan)
+
+    # Iki ayri siralama
+    imp["sira_split"] = imp["split"].rank(ascending=False, method="min").astype(int)
+    imp["sira_gain"]  = imp["gain"].rank(ascending=False, method="min").astype(int)
+    imp["llm_mi"] = imp["feature"].str.startswith(prefix)
+
+    llm = imp[imp["llm_mi"]]
+    n = len(imp)
+
+    print(f"LLM feature'larin siralamasi ({n} kolon icinde, {len(llm)} LLM kolonu):\n")
+    for etiket, sutun in [("SPLIT", "sira_split"), ("GAIN", "sira_gain")]:
+        print(f"  {etiket:<6} ilk 20'de: {(llm[sutun] <= 20).sum():>2} | "
+              f"ilk 50'de: {(llm[sutun] <= 50).sum():>2} | "
+              f"ilk 100'de: {(llm[sutun] <= 100).sum():>2} | "
+              f"medyan sira: {llm[sutun].median():.0f}")
+
+    # Tek sayilik ozet: toplam gain'in yuzde kaci LLM kolonlarindan geliyor?
+    # Adil kiyas icin kolon payi da yaninda: 32/279 = %11.5
+    print(f"\n  Toplam GAIN payi   : LLM %{llm['gain_%'].sum():.1f}  "
+          f"(kolon payi %{100.0*len(llm)/n:.1f})")
+    print(f"  Toplam SPLIT payi  : LLM %{llm['split_%'].sum():.1f}")
+    print("  -> gain payi kolon payindan dusukse, model bu kolonlari "
+          "ortalamanin altinda degerlendiriyor demektir.")
+
+    print(f"\n--- LLM feature'lar, GAIN sirasina gore (ilk {ust_n}) ---")
+    print(llm.sort_values("gain", ascending=False)
+             .head(ust_n)[["sira_gain", "sira_split", "feature",
+                           "gain_%", "split_%", "gain_per_split"]]
+             .to_string(index=False,
+                        formatters={"gain_%": "{:.2f}".format,
+                                    "split_%": "{:.2f}".format,
+                                    "gain_per_split": "{:.1f}".format}))
+
+    print(f"\n--- Karsilastirma: en iyi {ust_n} BASE feature (GAIN) ---")
+    print(imp[~imp["llm_mi"]].sort_values("gain", ascending=False)
+             .head(ust_n)[["sira_gain", "feature", "gain_%", "split_%"]]
+             .to_string(index=False,
+                        formatters={"gain_%": "{:.2f}".format,
+                                    "split_%": "{:.2f}".format}))
+
+    # Cok kullanilip az kazandiranlar: gurultu emici adaylari
+    kullanilan = imp[imp["split"] >= 10]
+    dusuk_verim = kullanilan.nsmallest(10, "gain_per_split")
+    print(f"\n--- Cok bolunup az kazandiranlar (split>=10, en dusuk gain/split) ---")
+    print(dusuk_verim[["feature", "split", "gain_per_split", "llm_mi"]]
+          .to_string(index=False, formatters={"gain_per_split": "{:.1f}".format}))
+
+    # Hic kullanilmayanlar
+    hic = imp[imp["split"] == 0]
+    print(f"\nHic kullanilmayan kolon: {len(hic)} "
+          f"(bunlarin {int(hic['llm_mi'].sum())} tanesi LLM)")
+
+    return imp
 
 
-karsilastirma_yorumla(0.5679, [0.6014, 0.5907, 0.5970, 0.5966, 0.5872])
+imp = onem_tablosu(model_enr, enr_final)
