@@ -1,19 +1,27 @@
 # =============================================================================
 # FEATURE_DISCOVERY_AGENT / sozluk_tamamla
 # -----------------------------------------------------------------------------
-# Sorumluluk : Sozluk hazirligi asamasinda eksik kolon aciklamalarini listeler,
-#              kullanicidan tanim toplar ve sikistirmaya gecis onayini alir.
+# Sorumluluk : Sozluk hazirligi asamasinda aciklamasi olmayan kolonlari
+#              ornek degerleriyle birlikte gosterir, kullanicidan tanim
+#              toplar ve sikistirmaya gecis onayini bekler.
 #
 # NASIL CALISIR:
 #   Bu blok iki yerden zincirlenir (Default next block ayari ile):
 #     sozluk_calis -> sozluk_tamamla   (veri okunduktan sonra ilk rapor)
 #     kolon_sorgu  -> sozluk_tamamla   (her tanim kaydindan sonra kalan rapor)
-#   Boylece kullanici tanim yazdikca kalan eksik sayisi guncellenir.
+#   Boylece kullanici tanim yazdikca kalan eksik listesi guncellenir.
 #
 #   Asama "sozluk" degilse sessizce cikar; kolon_sorgu baska asamalarda da
 #   calisabildigi icin bu kontrol gerekli.
 #
-# Girdi      : sema.json, sozluk_ek.json
+# ORNEK DEGER OKUMA POLITIKASI:
+#   Yalnizca aciklamasi eksik kolonlar okunur (1042 degil, birkac kolon).
+#   Satir sayisi esigin altindaysa TAMAMI okunur; boylece farkli deger
+#   sayisi gercek deger olur. Esigin ustundeyse RASTGELE ornekleme yapilir
+#   ve mesajda bunun ornekleme oldugu belirtilir. Bas kisimdan okuma (head)
+#   kullanilmaz; veri sirali oldugunda yaniltici sonuc verir.
+#
+# Girdi      : sema.json, sozluk_ek.json, veri seti (ornek degerler icin)
 # Cikti      : Kullaniciya metin (yield)
 # =============================================================================
 
@@ -36,11 +44,25 @@ ASAMA_SOZLUK = "sozluk"
 # Mesajda tek seferde listelenecek azami eksik kolon sayisi.
 AZAMI_LISTELENEN = 15
 
+# Her kolon icin gosterilecek azami farkli deger.
+AZAMI_ORNEK_DEGER = 10
+
+# Bu satir sayisina kadar veri setinin TAMAMI okunur (yalnizca eksik
+# kolonlar). Ustunde rastgele ornekleme yapilir.
+TAM_OKUMA_SATIR_ESIGI = 2000000
+
+# Esik asildiginda cekilecek rastgele ornek satir sayisi.
+ORNEKLEM_SATIR = 100000
+
+# Tek bir ornek degerin gosterilecek azami karakter sayisi.
+AZAMI_DEGER_UZUNLUGU = 30
+
 
 class Sema:
     """sema.json icindeki anahtarlar."""
     VERI_SETI = "veri_seti"
     SOZLUK_ADI = "sozluk_adi"
+    N_SATIR = "n_satir"
     KOLONLAR = "kolonlar"
     TIPLER = "tipler"
     SOZLUK = "sozluk"
@@ -52,7 +74,6 @@ class S:
     ASAMA = "asama"
     BEKLENEN = "beklenen"
     VERI_SETI = "veri_seti"
-    SOZLUK = "sozluk"
 
 
 class Beklenen:
@@ -90,8 +111,8 @@ def _eksikleri_bul(sema, ek_sozluk):
     """Aciklamasi olmayan kolon adlarini dondurur.
 
     Iki kaynak birlestirilir:
-      - sema.json'daki tabloda_var_sozlukte_yok listesi
       - sozlukte yer alip degeri bos olan kolonlar
+      - sema.json'daki tabloda_var_sozlukte_yok listesi
     Kullanicinin sozluk_ek.json'a girdigi tanimlar eksik SAYILMAZ.
     """
     sozluk = sema.get(Sema.SOZLUK)
@@ -103,68 +124,156 @@ def _eksikleri_bul(sema, ek_sozluk):
     bildirilen = sema.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
     bildirilen = bildirilen if isinstance(bildirilen, list) else []
 
-    eksikler = []
-    for kolon in tablo_kolonlari:
+    def _tanimli_mi(kolon):
         if kolon in ek_sozluk and str(ek_sozluk[kolon]).strip():
-            continue
+            return True
         aciklama = sozluk.get(kolon)
-        if aciklama is None or not str(aciklama).strip():
-            eksikler.append(kolon)
+        return aciklama is not None and bool(str(aciklama).strip())
+
+    eksikler = [k for k in tablo_kolonlari if not _tanimli_mi(k)]
 
     # sema.json'un bildirdigi ama tablo listesinde gozukmeyenleri de ekle.
     for kolon in bildirilen:
-        if kolon not in eksikler and kolon not in ek_sozluk:
+        if kolon not in eksikler and not _tanimli_mi(kolon):
             eksikler.append(kolon)
 
     return eksikler
 
 
-def _kolon_satiri(kolon, tipler):
-    """Eksik kolonu tipiyle birlikte yazar."""
+def _degeri_kisalt(deger):
+    """Uzun degerleri mesajda tasmayacak sekilde kirpar."""
+    metin = str(deger).strip()
+    if len(metin) > AZAMI_DEGER_UZUNLUGU:
+        return metin[:AZAMI_DEGER_UZUNLUGU] + "..."
+    return metin
+
+
+def _veriyi_oku(veri_seti_adi, kolonlar, n_satir):
+    """Eksik kolonlari veri setinden okur.
+
+    Doner: (dataframe veya None, ornekleme_yapildi_mi)
+    Satir sayisi esigin altindaysa tamami okunur. Ustundeyse rastgele
+    ornekleme denenir; ornekleme desteklenmiyorsa limitli okumaya duser.
+    """
+    dataset = dataiku.Dataset(veri_seti_adi)
+    kolon_listesi = list(kolonlar)
+
+    buyuk = bool(n_satir) and int(n_satir) > TAM_OKUMA_SATIR_ESIGI
+
+    if not buyuk:
+        try:
+            df = dataset.get_dataframe(columns=kolon_listesi)
+            _logla("tam okuma: {} kolon, {} satir".format(
+                len(kolon_listesi), len(df)))
+            return df, False
+        except Exception as hata:
+            _logla("tam okuma basarisiz, orneklemeye dusuluyor: {}".format(hata))
+
+    try:
+        df = dataset.get_dataframe(
+            columns=kolon_listesi, sampling="random", limit=ORNEKLEM_SATIR)
+        _logla("rastgele orneklem: {} satir".format(len(df)))
+        return df, True
+    except Exception as hata:
+        _logla("rastgele ornekleme basarisiz: {}".format(hata))
+
+    try:
+        df = dataset.get_dataframe(columns=kolon_listesi, limit=ORNEKLEM_SATIR)
+        _logla("limitli okuma: {} satir".format(len(df)))
+        return df, True
+    except Exception as hata:
+        _logla("ornek degerler hic okunamadi: {}".format(hata))
+        return None, False
+
+
+def _ornek_degerleri_cikar(df, kolonlar):
+    """Her kolon icin farkli deger sayisi ve ornekleri cikarir.
+
+    Doner: {kolon: (farkli_deger_sayisi, [ornek degerler])}
+    """
+    if df is None:
+        return {}
+
+    sonuc = {}
+    for kolon in kolonlar:
+        if kolon not in df.columns:
+            continue
+        try:
+            seri = df[kolon].dropna()
+            farkli = seri.unique()
+            ornekler = [_degeri_kisalt(d) for d in farkli[:AZAMI_ORNEK_DEGER]]
+            sonuc[kolon] = (len(farkli), ornekler)
+        except Exception as hata:
+            _logla("{} kolonu ozetlenemedi: {}".format(kolon, hata))
+
+    return sonuc
+
+
+def _kolon_blogu(kolon, tipler, ornekler, orneklem_mi):
+    """Tek bir eksik kolonu tipi ve ornek degerleriyle yazar."""
     tip = tipler.get(kolon)
+    baslik = "**{}**".format(kolon)
     if tip:
-        return "- `{kolon}` ({tip})".format(kolon=kolon, tip=tip)
-    return "- `{kolon}`".format(kolon=kolon)
+        baslik += " ({})".format(tip)
+
+    if kolon not in ornekler:
+        return baslik
+
+    farkli_sayi, degerler = ornekler[kolon]
+    if not degerler:
+        return baslik + " — tamamı boş"
+
+    if orneklem_mi:
+        baslik += " — örneklemde {} farklı değer".format(_sayi(farkli_sayi))
+    else:
+        baslik += " — {} farklı değer".format(_sayi(farkli_sayi))
+
+    listelenen = ", ".join("`{}`".format(d) for d in degerler)
+    if farkli_sayi > len(degerler):
+        listelenen += ", ..."
+    return "{}\n{}".format(baslik, listelenen)
 
 
-def _eksik_mesaji(eksikler, tipler, toplam_kolon, tanimli_sayi):
-    """Eksik kolonlari listeler ve kullanicidan tanim ister."""
-    satirlar = ["**Sözlük durumu**", ""]
-    satirlar.append("{} kolondan {} tanesinin açıklaması var, {} tanesi "
-                    "eksik.".format(
-                        _sayi(toplam_kolon),
-                        _sayi(tanimli_sayi),
-                        _sayi(len(eksikler))))
-    satirlar.append("")
-    satirlar.append("**Açıklaması olmayan kolonlar**")
+def _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi):
+    """Eksik kolonlari ornekleriyle listeler ve kullanicidan tanim ister."""
+    if len(eksikler) == 1:
+        giris = "Bir kolonun açıklaması yok:"
+    else:
+        giris = "{} kolonun açıklaması yok:".format(_sayi(len(eksikler)))
+
+    parcalar = [giris, ""]
 
     for kolon in eksikler[:AZAMI_LISTELENEN]:
-        satirlar.append(_kolon_satiri(kolon, tipler))
+        parcalar.append(_kolon_blogu(kolon, tipler, ornekler, orneklem_mi))
+        parcalar.append("")
 
     kalan = len(eksikler) - AZAMI_LISTELENEN
     if kalan > 0:
-        satirlar.append("- _ve {} kolon daha_".format(_sayi(kalan)))
+        parcalar.append("_ve {} kolon daha._".format(_sayi(kalan)))
+        parcalar.append("")
 
-    satirlar.append("")
-    satirlar.append("Bu kolonların anlamını yazarsanız sözlüğe eklerim. "
-                    "Örnek: `rn satır numarası`")
-    satirlar.append("")
-    satirlar.append("Mevcut bir açıklamayı değiştirmek isterseniz kolon adını "
-                    "ve yeni açıklamasını yazmanız yeterli.")
-    satirlar.append("")
-    satirlar.append("Eksikleri boş bırakıp devam etmek isterseniz sözlük "
-                    "sıkıştırmaya geçebiliriz.")
-    return "\n".join(satirlar)
+    if orneklem_mi:
+        parcalar.append("_Değerler {} satırlık rastgele örneklemden; gerçek "
+                        "farklı değer sayısı daha yüksek olabilir._".format(
+                            _sayi(ORNEKLEM_SATIR)))
+        parcalar.append("")
+
+    parcalar.append("Anlamlarını yazarsanız sözlüğe eklerim; örneğin "
+                    "`rn satır numarası`. Mevcut bir açıklamayı değiştirmek "
+                    "için de kolon adını ve yeni açıklamasını yazmanız yeterli.")
+    parcalar.append("")
+    parcalar.append("Bu haliyle devam etmek isterseniz sözlük sıkıştırmaya "
+                    "geçebiliriz.")
+    return "\n".join(parcalar)
 
 
-def _eksiksiz_mesaji(toplam_kolon):
+def _eksiksiz_mesaji():
     """Tum kolonlarin aciklamasi var."""
     return (
-        "**Sözlük durumu**\n\n"
-        "{} kolonun tamamının açıklaması var; eksik kalan yok.\n\n"
+        "Açıklaması eksik kolon kalmadı.\n\n"
         "Bir açıklamayı değiştirmek isterseniz kolon adını ve yeni açıklamasını "
         "yazın. Değişiklik yoksa sözlük sıkıştırmaya geçebiliriz."
-    ).format(_sayi(toplam_kolon))
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -182,7 +291,7 @@ def process(trace):
         sema = _json_oku(SEMA_DOSYASI, {})
         if not isinstance(sema, dict) or not sema:
             _logla("sema.json okunamadi veya bos")
-            yield ("Sözlük durumunu çıkaramadım; oturum kaydı okunamıyor. "
+            yield ("\n\nSözlük durumunu çıkaramadım; oturum kaydı okunamıyor. "
                    "Ayrıntı agent log'unda.")
             return
 
@@ -192,24 +301,31 @@ def process(trace):
         tipler = sema.get(Sema.TIPLER)
         tipler = tipler if isinstance(tipler, dict) else {}
 
-        tablo_kolonlari = sema.get(Sema.KOLONLAR)
-        toplam_kolon = len(tablo_kolonlari) if isinstance(tablo_kolonlari, list) else 0
-
         eksikler = _eksikleri_bul(sema, ek_sozluk)
-        tanimli_sayi = max(toplam_kolon - len(eksikler), 0)
-
-        _logla("toplam={} tanimli={} eksik={}".format(
-            toplam_kolon, tanimli_sayi, len(eksikler)))
+        _logla("eksik kolon sayisi: {}".format(len(eksikler)))
 
         # Kullanicidan bir kolon aciklamasi bekliyoruz; girdi_al bunu bilmeli.
         state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
 
-        if eksikler:
-            yield _eksik_mesaji(eksikler, tipler, toplam_kolon, tanimli_sayi)
-        else:
-            yield _eksiksiz_mesaji(toplam_kolon)
+        if not eksikler:
+            yield "\n\n" + _eksiksiz_mesaji()
+            return
+
+        # Ornek degerler yalnizca listelenecek kolonlar icin okunur.
+        listelenecek = eksikler[:AZAMI_LISTELENEN]
+        veri_seti_adi = state.get(S.VERI_SETI) or sema.get(Sema.VERI_SETI)
+
+        ornekler = {}
+        orneklem_mi = False
+        if veri_seti_adi:
+            df, orneklem_mi = _veriyi_oku(
+                veri_seti_adi, listelenecek, sema.get(Sema.N_SATIR))
+            ornekler = _ornek_degerleri_cikar(df, listelenecek)
+
+        # Bastaki bos satir, onceki blogun mesajiyla yapismayi onler.
+        yield "\n\n" + _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi)
 
     except Exception as hata:
         _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
-        yield ("Sözlük durumunu çıkarırken beklenmeyen bir hata oluştu. "
+        yield ("\n\nSözlük durumunu çıkarırken beklenmeyen bir hata oluştu. "
                "Ayrıntı agent log'una yazıldı.")
