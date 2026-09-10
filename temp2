@@ -1,15 +1,19 @@
 # =============================================================================
-# FEATURE_DISCOVERY_AGENT / durum_belirle
+# FEATURE_DISCOVERY_AGENT / sozluk_tamamla
 # -----------------------------------------------------------------------------
-# girdi_al'in ciktisina gore oturum durumunu gunceller ve akisi ilgili bloga
-# yonlendirir.
+# Aciklamasi olmayan kolonlari ornek degerleriyle gosterir, LLM'in oneri
+# uretebilmesi icin baglami state'e yazar.
 #
-# ILKELER:
-#   1. Anlam cozumlemesi girdi_al'da (LLM) yapilir. Bu blok ham metne BAKMAZ.
-#   2. Kayitli oturum sorulur; ret ACIK olmalidir, kayit asla kendiliginden
-#      silinmez.
-#   3. Kullaniciya soru soran her dal _beklenen_ayarla() cagirir.
-#   4. Tanimsiz durumda akis sohbete duser, asla tikanmaz.
+# Iki yerden zincirlenir (Default next block ayari ile):
+#   sozluk_calis -> sozluk_tamamla   (veri okunduktan sonra ilk rapor)
+#   kolon_sorgu  -> sozluk_tamamla   (her islemden sonra kalan rapor)
+#
+# ORNEK DEGER OKUMA: yalnizca eksik kolonlar okunur. Satir sayisi esigin
+# altindaysa TAMAMI okunur (farkli deger sayisi gercek olur). Ustundeyse
+# rastgele ornekleme yapilir. Bas kisimdan okuma kullanilmaz; veri sirali
+# oldugunda yaniltici sonuc verir.
+#
+# Surec disi birakilan kolonlar (sema.json > haric_kolonlar) eksik sayilmaz.
 # =============================================================================
 
 import json
@@ -18,772 +22,304 @@ import dataiku
 from dataiku.llm.python.blocks_graph import NextBlock
 
 
-# -----------------------------------------------------------------------------
-# Sabitler
-# -----------------------------------------------------------------------------
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+SEMA_DOSYASI = "/sema.json"
+EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
 
-class Folder:
-    HAFIZA = "PROJE_HAFIZASI"
-    SEMA_DOSYASI = "/sema.json"
+BLOK_ONERI_URET = "oneri_uret"
+
+ASAMA_SOZLUK = "sozluk"
+
+AZAMI_LISTELENEN = 15
+AZAMI_ORNEK_DEGER = 10
+TAM_OKUMA_SATIR_ESIGI = 2000000
+ORNEKLEM_SATIR = 100000
+AZAMI_DEGER_UZUNLUGU = 30
+USLUP_ORNEK_SAYISI = 6
 
 
 class Sema:
-    """sema.json icindeki anahtarlar."""
     VERI_SETI = "veri_seti"
-    SOZLUK_ADI = "sozluk_adi"
     N_SATIR = "n_satir"
-    N_KOLON = "n_kolon"
     KOLONLAR = "kolonlar"
     TIPLER = "tipler"
     SOZLUK = "sozluk"
-    SOZLUKTE_VAR_TABLODA_YOK = "sozlukte_var_tabloda_yok"
     TABLODA_VAR_SOZLUKTE_YOK = "tabloda_var_sozlukte_yok"
     HARIC_KOLONLAR = "haric_kolonlar"
 
 
-class Blok:
-    """Blok adi degisirse SADECE burasi guncellenir."""
-    SOHBET = "sohbet"
-    SOZLUK_CALIS = "sozluk_calis"
-    KOLON_SORGU = "kolon_sorgu"
-    ONERI_ISLE = "oneri_isle"
-    # Henuz kurulmamis adim bloklari.
-    SOZLUK_SIKISTIR = None
-    META_TANIMLA = None
-    KURAL_BAZLI_URET = None
-    MODEL_DESTEKLI_URET = None
-    KALITE_KONTROL = None
-    MODEL_KARSILASTIR = None
-
-
-class Asama:
-    BASLANGIC = "baslangic"
-    SOZLUK = "sozluk"
-    META = "meta"
-    KURAL_BAZLI = "kural_bazli"
-    MODEL_DESTEKLI = "model_destekli"
-    KALITE = "kalite"
-    KARSILASTIRMA = "karsilastirma"
-
-
-ASAMA_ADLARI = {
-    Asama.BASLANGIC: "Başlangıç",
-    Asama.SOZLUK: "1. Sözlük hazırlığı",
-    Asama.META: "2. Meta tanımı",
-    Asama.KURAL_BAZLI: "3. Kural bazlı değişken üretimi",
-    Asama.MODEL_DESTEKLI: "4. Model destekli değişken üretimi",
-    Asama.KALITE: "5. Veri kalitesi kontrolü",
-    Asama.KARSILASTIRMA: "6. Model karşılaştırması",
-}
-
-# Onay geldiginde her asamanin gidecegi blok. None = blok henuz kurulmadi.
-ASAMA_HARITASI = {
-    Asama.SOZLUK: Blok.SOZLUK_SIKISTIR,
-    Asama.META: Blok.META_TANIMLA,
-    Asama.KURAL_BAZLI: Blok.KURAL_BAZLI_URET,
-    Asama.MODEL_DESTEKLI: Blok.MODEL_DESTEKLI_URET,
-    Asama.KALITE: Blok.KALITE_KONTROL,
-    Asama.KARSILASTIRMA: Blok.MODEL_KARSILASTIR,
-}
-
-
-class Aksiyon:
-    KAYIT_DEVAM = "kayit_devam"
-    KAYIT_YENI = "kayit_yeni"
-    ONAY = "onay"
-    RET = "ret"
-    KOLON_SOR = "kolon_sor"
-    KOLON_TANIMLA = "kolon_tanimla"
-    KOLON_CIKAR = "kolon_cikar"
-    GORUS_ISTE = "gorus_iste"
-    BILGI = "bilgi"
-
-
-KOLON_AKSIYONLARI = (Aksiyon.KOLON_SOR, Aksiyon.KOLON_TANIMLA,
-                     Aksiyon.KOLON_CIKAR)
-
-# Eski sema veya farkli adlandirmalari karsilar; sema uyusmazligi akisi
-# kilitlemesin diye tolerans birakildi.
-AKSIYON_ESLEME = {
-    "kayit_devam": Aksiyon.KAYIT_DEVAM,
-    "devam": Aksiyon.KAYIT_DEVAM,
-    "kayit_yeni": Aksiyon.KAYIT_YENI,
-    "yeni": Aksiyon.KAYIT_YENI,
-    "onay": Aksiyon.ONAY,
-    "kabul": Aksiyon.ONAY,
-    "ret": Aksiyon.RET,
-    "red": Aksiyon.RET,
-    "kolon_sor": Aksiyon.KOLON_SOR,
-    "kolon_sorgu": Aksiyon.KOLON_SOR,
-    "kolon_tanimla": Aksiyon.KOLON_TANIMLA,
-    "kolon_tanim": Aksiyon.KOLON_TANIMLA,
-    "kolon_cikar": Aksiyon.KOLON_CIKAR,
-    "cikar": Aksiyon.KOLON_CIKAR,
-    "drop": Aksiyon.KOLON_CIKAR,
-    "gorus_iste": Aksiyon.GORUS_ISTE,
-    "gorus": Aksiyon.GORUS_ISTE,
-    "bilgi": Aksiyon.BILGI,
-}
+class S:
+    ASAMA = "asama"
+    BEKLENEN = "beklenen"
+    VERI_SETI = "veri_seti"
+    EKSIK_KOLONLAR = "eksik_kolonlar"
+    EKSIK_BAGLAMI = "eksik_baglami"
+    ONERILER = "oneriler"
 
 
 class Beklenen:
-    """girdi_al'a Jinja ile enjekte edilir."""
-    KAYIT_KARARI = "kayit_karari"
-    VERI_SETI = "veri_seti"
-    ADIM_ONAYI = "adim_onayi"
     KOLON_ACIKLAMASI = "kolon_aciklamasi"
-    ONERI_ONAYI = "oneri_onayi"
-    YOK = "yok"
 
 
-class G:
-    """girdi_al ciktisindaki alan adlari."""
-    AKSIYON = "aksiyon"
-    NIYET = "niyet"          # eski sema karsiligi
-    VERI_SETI = "veri_seti"
-    SOZLUK = "sozluk"
-    TARGET = "target"
-    ID_KOLONU = "id_kolonu"
-    DONEM_KOLONU = "donem_kolonu"
-    BOLME_KOLONU = "bolme_kolonu"
-    KOLONLAR = "kolonlar"
-    KOLON_ACIKLAMASI = "kolon_aciklamasi"
-    DUZELTMELER = "duzeltmeler"
-    CIKARILACAK = "cikarilacak_kolonlar"
+def _logla(mesaj):
+    print("[sozluk_tamamla] {}".format(mesaj))
 
 
-class S:
-    """state anahtarlari."""
-    GIRDI = "girdi"
-    ASAMA = "asama"
-    AKSIYON = "aksiyon"
-    BEKLENEN = "beklenen"
-
-    VERI_SETI = "veri_seti"
-    SOZLUK = "sozluk"
-    TARGET = "target"
-    ID_KOLONU = "id_kolonu"
-    DONEM_KOLONU = "donem_kolonu"
-    BOLME_KOLONU = "bolme_kolonu"
-
-    DATASET_VAR = "dataset_var"
-    SOZLUK_VAR = "sozluk_var"
-
-    KOLONLAR = "kolonlar"
-    KOLON_ACIKLAMASI = "kolon_aciklamasi"
-    DUZELTMELER = "duzeltmeler"
-    CIKARILACAK = "cikarilacak_kolonlar"
-
-    KARSILANDI = "karsilandi"
-    GECERSIZ_AD = "gecersiz_ad"
-    DURUM_OZETI = "durum_ozeti"
-
-    ONCEKI_BEKLIYOR = "onceki_bekliyor"
-    ONCEKI_REDDEDILDI = "onceki_reddedildi"
-    ONCEKI_VERI_SETI = "onceki_veri_seti"
-    ONCEKI_SOZLUK = "onceki_sozluk"
-    ONCEKI_N_SATIR = "onceki_n_satir"
-    ONCEKI_N_KOLON = "onceki_n_kolon"
-    ONCEKI_N_ACIKLAMA = "onceki_n_aciklama"
-    ONCEKI_ESLESEN = "onceki_eslesen"
-    ONCEKI_ACIKLAMASIZ = "onceki_aciklamasiz"
-    ONCEKI_FAZLA = "onceki_fazla"
-
-
-# girdi_al'in veri seti adi saniyp gonderebilecegi, dataset OLMAYAN degerler.
-GECERSIZ_DATASET_ADLARI = frozenset({
-    "sema.json", "sema", "meta.json", "meta",
-    "proje_hafizasi", "proje_hafızası", "hafiza", "hafıza",
-    "folder", "klasor", "klasör", "managed folder",
-})
-
-ONCEKI_KAYIT_ANAHTARLARI = (
-    S.ONCEKI_VERI_SETI, S.ONCEKI_SOZLUK, S.ONCEKI_N_SATIR, S.ONCEKI_N_KOLON,
-    S.ONCEKI_N_ACIKLAMA, S.ONCEKI_ESLESEN, S.ONCEKI_ACIKLAMASIZ, S.ONCEKI_FAZLA,
-)
-
-AZAMI_LISTELENEN_KOLON = 5
-
-
-# -----------------------------------------------------------------------------
-# Kullaniciya gosterilen metinler
-# -----------------------------------------------------------------------------
-
-KARSILAMA = """**Akıllı Değişken Üretimi**
-
-Bir veri setinden, hedef değişkeni daha iyi açıklayan yeni değişkenler türetir \
-ve her birinin katkısını ölçer.
-
-Süreç altı adımdan oluşur. Her adım önce ne yapacağını bildirir ve onayınızı \
-bekler; onay verilmeden hiçbir çıktı üretilmez. İstediğiniz anda önceki bir \
-adıma dönebilir, verdiğiniz bilgileri değiştirebilirsiniz.
-
-1. **Sözlük hazırlığı** — Kolon açıklamalarını derler, eksik kalanları size \
-sorar, açıklamaları makine tarafından okunabilir bir yapıya indirger.
-2. **Meta tanımı** — Hedef, kimlik, dönem ve bölme kolonlarını belirler; \
-eğitim-test ayrımının kuralını sabitler.
-3. **Kural bazlı üretim** — Delta, oran, lag, momentum gibi mekanik türetmeleri \
-kolon anlamlarına göre üretir.
-4. **Model destekli üretim** — Hipotez kurar, veri üzerinde test eder, katkısı \
-kanıtlananları kaydeder, reddedilenleri bir daha önermez.
-5. **Veri kalitesi kontrolü** — Eksik, sabit, tekrarlı ve hedef sızıntısı \
-riski taşıyan değişkenleri işaretler.
-6. **Model karşılaştırması** — Mevcut ve zenginleştirilmiş veri setiyle kurulan \
-modellerin performansını karşılaştırır.
-
-Sözlük hazırlığı ve kolon açıklamaları üzerinde serbestçe konuşabilirsiniz; \
-istediğiniz kolonun ne anlama geldiğini sorabilir, açıklamasını düzeltebilir, \
-gereksiz gördüğünüz kolonları süreç dışı bırakabilirsiniz."""
-
-BILGI_ISTEGI = """**Başlangıç için gerekenler**
-
-**Veri seti** (zorunlu) — Kimlik ve hedef kolonlarını içeren dataset'in adı.
-**Sözlük** (opsiyonel) — Kolon adı ve açıklaması olmak üzere iki kolonlu \
-dataset'in adı. Verilmezse açıklamalar kolon adlarından çıkarılır ve doğruluk \
-düşer.
-**Konfigürasyon** (opsiyonel) — Hedef, kimlik, dönem ve bölme kolonlarını \
-belirten JSON. Verilmezse 2. adımda soru-cevapla birlikte oluşturulur.
-
-Dataset adını yazdığınızda sözlük hazırlığına geçilir."""
-
-SIFIRDAN_BASLA = """Tamam, kayıtlı oturumu kullanmıyoruz. Kayıt proje \
-hafızasında duruyor ve silinmedi; fikrinizi değiştirirseniz kayıtlı oturuma \
-dönmek istediğinizi söylemeniz yeterli.
-
-""" + BILGI_ISTEGI
-
-KAYIT_BULUNAMADI = """Proje hafızasında kayıtlı bir oturum bulamadım; \
-görünüşe göre henüz hiç kayıt oluşmamış.
-
-Kullanmak istediğiniz dataset adını yazarsanız buradan başlayabiliriz."""
-
-KOLON_ICIN_VERI_GEREKLI = """Kolon işlemleri için önce veri setinin \
-belirlenmiş olması gerekiyor; şu an tanımlı bir dataset yok.
-
-Dataset adını yazdığınızda sözlüğü okuyup devam edebiliriz."""
-
-BEKLENMEYEN_HATA = """İsteği işlerken beklenmeyen bir hata oluştu; ayrıntı \
-agent log'una yazıldı. Süreç burada durdu, hiçbir çıktı üretilmedi.
-
-Dataset adını tekrar yazarsanız kaldığımız yerden devam ederiz."""
+def _json_oku(dosya_yolu, varsayilan):
+    try:
+        folder = dataiku.Folder(HAFIZA_FOLDER)
+        if dosya_yolu not in folder.list_paths_in_partition():
+            return varsayilan
+        with folder.get_download_stream(dosya_yolu) as akis:
+            return json.loads(akis.read().decode("utf-8"))
+    except Exception as hata:
+        _logla("{} okunamadi: {}".format(dosya_yolu, hata))
+        return varsayilan
 
 
 def _sayi(deger):
     return "{:,}".format(int(deger or 0)).replace(",", ".")
 
 
-def _kolon_listesi(kolonlar):
-    if not kolonlar:
-        return ""
-    gosterilen = kolonlar[:AZAMI_LISTELENEN_KOLON]
-    metin = ", ".join("`{}`".format(k) for k in gosterilen)
-    kalan = len(kolonlar) - len(gosterilen)
-    if kalan > 0:
-        metin += " ve {} tane daha".format(kalan)
+def _eksikleri_bul(sema, ek_sozluk):
+    """Aciklamasi olmayan ve surec disi BIRAKILMAMIS kolonlari dondurur."""
+    sozluk = sema.get(Sema.SOZLUK)
+    sozluk = sozluk if isinstance(sozluk, dict) else {}
+
+    tablo_kolonlari = sema.get(Sema.KOLONLAR)
+    tablo_kolonlari = tablo_kolonlari if isinstance(tablo_kolonlari, list) else []
+
+    bildirilen = sema.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
+    bildirilen = bildirilen if isinstance(bildirilen, list) else []
+
+    haric = sema.get(Sema.HARIC_KOLONLAR)
+    haric = set(haric) if isinstance(haric, list) else set()
+
+    def _tanimli_mi(kolon):
+        if kolon in ek_sozluk and str(ek_sozluk[kolon]).strip():
+            return True
+        aciklama = sozluk.get(kolon)
+        return aciklama is not None and bool(str(aciklama).strip())
+
+    eksikler = [k for k in tablo_kolonlari
+                if k not in haric and not _tanimli_mi(k)]
+
+    for kolon in bildirilen:
+        if kolon in haric or kolon in eksikler:
+            continue
+        if not _tanimli_mi(kolon):
+            eksikler.append(kolon)
+
+    return eksikler, sorted(haric)
+
+
+def _degeri_kisalt(deger):
+    metin = str(deger).strip()
+    if len(metin) > AZAMI_DEGER_UZUNLUGU:
+        return metin[:AZAMI_DEGER_UZUNLUGU] + "..."
     return metin
 
 
-def _adim_hazir_degil_mesaji(asama):
-    return (
-        "Onayınızı aldım, ancak **{ad}** adımının işlem bloğu henüz kurulmadı; "
-        "bu adımı çalıştıramıyorum.\n\n"
-        "Süreç burada duruyor ve bu adıma ait hiçbir çıktı üretilmedi. Bu arada "
-        "kolon açıklamaları üzerinde konuşmaya devam edebiliriz."
-    ).format(ad=ASAMA_ADLARI.get(asama, asama))
+def _veriyi_oku(veri_seti_adi, kolonlar, n_satir):
+    """Doner: (dataframe veya None, ornekleme_yapildi_mi)"""
+    dataset = dataiku.Dataset(veri_seti_adi)
+    kolon_listesi = list(kolonlar)
+    buyuk = bool(n_satir) and int(n_satir) > TAM_OKUMA_SATIR_ESIGI
+
+    if not buyuk:
+        try:
+            df = dataset.get_dataframe(columns=kolon_listesi)
+            _logla("tam okuma: {} kolon, {} satir".format(
+                len(kolon_listesi), len(df)))
+            return df, False
+        except Exception as hata:
+            _logla("tam okuma basarisiz: {}".format(hata))
+
+    try:
+        df = dataset.get_dataframe(
+            columns=kolon_listesi, sampling="random", limit=ORNEKLEM_SATIR)
+        _logla("rastgele orneklem: {} satir".format(len(df)))
+        return df, True
+    except Exception as hata:
+        _logla("rastgele ornekleme basarisiz: {}".format(hata))
+
+    try:
+        df = dataset.get_dataframe(columns=kolon_listesi, limit=ORNEKLEM_SATIR)
+        return df, True
+    except Exception as hata:
+        _logla("ornek degerler okunamadi: {}".format(hata))
+        return None, False
 
 
-def _onceki_kayit_mesaji():
-    satirlar = ["**Kayıtlı oturum**", ""]
-    satirlar.append("**Veri seti — {}**".format(state.get(S.ONCEKI_VERI_SETI)))
-    satirlar.append("{} satır, {} kolon".format(
-        _sayi(state.get(S.ONCEKI_N_SATIR)),
-        _sayi(state.get(S.ONCEKI_N_KOLON))))
+def _ornek_degerleri_cikar(df, kolonlar):
+    if df is None:
+        return {}
+    sonuc = {}
+    for kolon in kolonlar:
+        if kolon not in df.columns:
+            continue
+        try:
+            seri = df[kolon].dropna()
+            farkli = seri.unique()
+            sonuc[kolon] = (len(farkli),
+                            [_degeri_kisalt(d) for d in farkli[:AZAMI_ORNEK_DEGER]])
+        except Exception as hata:
+            _logla("{} ozetlenemedi: {}".format(kolon, hata))
+    return sonuc
 
-    if state.get(S.ONCEKI_SOZLUK):
-        satirlar.append("")
-        satirlar.append("**Sözlük — {}**".format(state.get(S.ONCEKI_SOZLUK)))
-        satirlar.append("{} kolon açıklaması".format(
-            _sayi(state.get(S.ONCEKI_N_ACIKLAMA))))
-        satirlar.append("")
-        satirlar.append("**Eşleşme**")
-        satirlar.append("{} kolonun açıklaması var.".format(
-            _sayi(state.get(S.ONCEKI_ESLESEN))))
-        aciklamasiz = state.get(S.ONCEKI_ACIKLAMASIZ) or []
-        fazla = state.get(S.ONCEKI_FAZLA) or []
-        if aciklamasiz:
-            satirlar.append("Açıklaması olmayan {} kolon: {}".format(
-                len(aciklamasiz), _kolon_listesi(aciklamasiz)))
-        if fazla:
-            satirlar.append("Sözlükte olup tabloda bulunmayan {} kolon: {}".format(
-                len(fazla), _kolon_listesi(fazla)))
+
+def _kolon_blogu(kolon, tipler, ornekler, orneklem_mi):
+    tip = tipler.get(kolon)
+    baslik = "**{}**".format(kolon)
+    if tip:
+        baslik += " ({})".format(tip)
+
+    if kolon not in ornekler:
+        return baslik
+
+    farkli_sayi, degerler = ornekler[kolon]
+    if not degerler:
+        return baslik + " — tamamı boş"
+
+    if orneklem_mi:
+        baslik += " — örneklemde {} farklı değer".format(_sayi(farkli_sayi))
     else:
-        satirlar.append("")
-        satirlar.append("**Sözlük** — verilmemiş; açıklamalar kolon adlarından "
-                        "çıkarılacak.")
+        baslik += " — {} farklı değer".format(_sayi(farkli_sayi))
 
-    satirlar.append("")
-    satirlar.append("Bu kayıtla devam edebilir ya da yeni bir veri setiyle "
-                    "baştan başlayabiliriz. Hangisi olsun?")
+    listelenen = ", ".join("`{}`".format(d) for d in degerler)
+    if farkli_sayi > len(degerler):
+        listelenen += ", ..."
+    return "{}\n{}".format(baslik, listelenen)
+
+
+def _eksik_mesaji(eksikler, tipler, ornekler, orneklem_mi, haric):
+    if len(eksikler) == 1:
+        giris = "Bir kolonun açıklaması yok:"
+    else:
+        giris = "{} kolonun açıklaması yok:".format(_sayi(len(eksikler)))
+
+    parcalar = [giris, ""]
+    for kolon in eksikler[:AZAMI_LISTELENEN]:
+        parcalar.append(_kolon_blogu(kolon, tipler, ornekler, orneklem_mi))
+        parcalar.append("")
+
+    kalan = len(eksikler) - AZAMI_LISTELENEN
+    if kalan > 0:
+        parcalar.append("_ve {} kolon daha._".format(_sayi(kalan)))
+        parcalar.append("")
+
+    if orneklem_mi:
+        parcalar.append("_Değerler {} satırlık rastgele örneklemden._".format(
+            _sayi(ORNEKLEM_SATIR)))
+        parcalar.append("")
+
+    if haric:
+        parcalar.append("_Süreç dışı bırakılan {} kolon var._".format(
+            _sayi(len(haric))))
+        parcalar.append("")
+
+    return "\n".join(parcalar)
+
+
+def _eksiksiz_mesaji(haric):
+    parcalar = ["Açıklaması eksik kolon kalmadı.", ""]
+    if haric:
+        parcalar.append("Süreç dışı bırakılan {} kolon var.".format(
+            _sayi(len(haric))))
+        parcalar.append("")
+    parcalar.append("Bir açıklamayı değiştirmek veya bir kolonu çıkarmak "
+                    "isterseniz söyleyin. Değişiklik yoksa sözlük sıkıştırmaya "
+                    "geçebiliriz.")
+    return "\n".join(parcalar)
+
+
+def _baglami_kur(eksikler, tipler, ornekler, sozluk, orneklem_mi):
+    """LLM'in oneri uretebilmesi icin duz metin baglam hazirlar."""
+    satirlar = []
+    if orneklem_mi:
+        satirlar.append("NOT: Ornek degerler rastgele orneklemden alindi.")
+        satirlar.append("")
+
+    satirlar.append("ACIKLAMASI EKSIK KOLONLAR:")
+    for kolon in eksikler:
+        parca = "- {}".format(kolon)
+        tip = tipler.get(kolon)
+        if tip:
+            parca += " | tip: {}".format(tip)
+        if kolon in ornekler:
+            farkli_sayi, degerler = ornekler[kolon]
+            parca += " | farkli deger: {}".format(farkli_sayi)
+            parca += (" | ornekler: {}".format(", ".join(degerler))
+                      if degerler else " | tamami bos")
+        satirlar.append(parca)
+
+    if isinstance(sozluk, dict) and sozluk:
+        satirlar.append("")
+        satirlar.append("MEVCUT SOZLUKTEN USLUP ORNEKLERI:")
+        sayac = 0
+        for kolon, aciklama in sozluk.items():
+            if not str(aciklama or "").strip():
+                continue
+            satirlar.append("- {}: {}".format(kolon, aciklama))
+            sayac += 1
+            if sayac >= USLUP_ORNEK_SAYISI:
+                break
+
     return "\n".join(satirlar)
 
 
-def _karar_bekleniyor_mesaji():
-    return (
-        "Kayıtlı oturumla ilgili kararınızı henüz almadım.\n\n"
-        "**{vs}** veri setiyle devam mı edelim, yoksa yeni bir veri setiyle "
-        "baştan mı başlayalım?"
-    ).format(vs=state.get(S.ONCEKI_VERI_SETI))
-
-
-def _kayit_geri_alindi_mesaji(veri_seti, sozluk):
-    sozluk_parcasi = " ve **{}** sözlüğüyle".format(sozluk) if sozluk else ""
-    return ("Kayıtlı oturuma geri döndük. **{vs}** veri seti{sp} devam "
-            "ediyoruz.").format(vs=veri_seti, sp=sozluk_parcasi)
-
-
-def _gecersiz_ad_mesaji(ad):
-    return (
-        "**{ad}** projede bir dataset olarak görünmüyor; dosya veya klasör adı "
-        "gibi duruyor. Süreç dataset adıyla çalışıyor.\n\n"
-        "Flow'daki dataset adını yazar mısınız? Örneğin `HAVALE_EFT_NTT`."
-    ).format(ad=ad)
-
-
-# -----------------------------------------------------------------------------
-# Yardimci fonksiyonlar
-# -----------------------------------------------------------------------------
-
-def _logla(mesaj):
-    print("[durum_belirle] {}".format(mesaj))
-
-
-def _ham_girdiyi_al():
-    """girdi_al ciktisini iki kaynaktan dener. Doner: (ham, kaynak_adi)"""
-    ham = state.get(S.GIRDI)
-    if ham:
-        return ham, "state"
-    try:
-        if last_output:
-            return last_output, "last_output"
-    except NameError:
-        pass
-    return None, "yok"
-
-
-def _json_dene(metin):
-    try:
-        cozulen = json.loads(metin)
-    except (ValueError, TypeError):
-        return None
-    return cozulen if isinstance(cozulen, dict) else None
-
-
-def _json_ayristir(ham):
-    """girdi_al ciktisini dict'e cevirir.
-
-    Gozlenen bozukluklar sirayla onarilir: ``` sarmalayici, cift suslu
-    parantez ({{...}), metne gomulu JSON, dengesiz parantez.
-    """
-    if isinstance(ham, dict):
-        return ham
-
-    metin = str(ham or "").strip()
-    if not metin:
-        return {}
-
-    if metin.startswith("```"):
-        metin = metin.strip("`").strip()
-        if metin.lower().startswith("json"):
-            metin = metin[4:].strip()
-
-    adaylar = [metin]
-
-    if "{{" in metin or "}}" in metin:
-        adaylar.append(metin.replace("{{", "{").replace("}}", "}"))
-
-    bas = metin.find("{")
-    son = metin.rfind("}")
-    if bas != -1 and son > bas:
-        gomulu = metin[bas:son + 1]
-        adaylar.append(gomulu)
-        if "{{" in gomulu or "}}" in gomulu:
-            adaylar.append(gomulu.replace("{{", "{").replace("}}", "}"))
-
-    for aday in list(adaylar):
-        fark = aday.count("{") - aday.count("}")
-        if fark > 0:
-            adaylar.append(aday + ("}" * fark))
-        elif fark < 0:
-            adaylar.append(aday[:fark])
-
-    for sira, aday in enumerate(adaylar):
-        cozulen = _json_dene(aday)
-        if cozulen is not None:
-            if sira > 0:
-                _logla("JSON {}. onarim denemesinde cozuldu".format(sira))
-            return cozulen
-
-    _logla("girdi JSON'a cevrilemedi: {!r}".format(metin[:300]))
-    return {}
-
-
-def _hafizayi_oku():
-    """PROJE_HAFIZASI/sema.json icerigini dondurur. Yoksa None."""
-    try:
-        folder = dataiku.Folder(Folder.HAFIZA)
-        if Folder.SEMA_DOSYASI not in folder.list_paths_in_partition():
-            _logla("hafiza dosyasi yok")
-            return None
-        with folder.get_download_stream(Folder.SEMA_DOSYASI) as akis:
-            return json.loads(akis.read().decode("utf-8"))
-    except Exception as hata:
-        _logla("hafiza okunamadi: {}".format(hata))
-        return None
-
-
-def _proje_dataset_adlari():
-    try:
-        proje = dataiku.api_client().get_default_project()
-        return {d["name"] for d in proje.list_datasets()}
-    except Exception as hata:
-        _logla("dataset listesi alinamadi: {}".format(hata))
-        return None
-
-
-def _dataset_gecerli_mi(ad):
-    if not ad:
-        return False
-    temiz = str(ad).strip()
-    if temiz.lower() in GECERSIZ_DATASET_ADLARI:
-        return False
-    mevcut = _proje_dataset_adlari()
-    if mevcut is None:
-        return True
-    return temiz in mevcut
-
-
-def _liste_yap(deger):
-    if deger is None:
-        return []
-    if isinstance(deger, list):
-        return deger
-    return [deger]
-
-
-def _beklenen_ayarla(deger):
-    state[S.BEKLENEN] = deger
-    _logla("beklenen cevap: {}".format(deger))
-
-
-def _aksiyonu_coz(g):
-    """aksiyon alanini normalize eder; taninmayan deger BILGI'ye duser."""
-    ham = g.get(G.AKSIYON) or g.get(G.NIYET)
-    if ham is None:
-        _logla("UYARI: girdi_al aksiyon alani gondermedi")
-        return Aksiyon.BILGI
-    temiz = str(ham).strip().lower()
-    cozulen = AKSIYON_ESLEME.get(temiz)
-    if cozulen is None:
-        _logla("UYARI: taninmayan aksiyon {!r}".format(ham))
-        return Aksiyon.BILGI
-    return cozulen
-
-
-def _girdiyi_state_e_isle(g):
-    state[S.GECERSIZ_AD] = ""
-
-    aday = g.get(G.VERI_SETI)
-    if aday:
-        if _dataset_gecerli_mi(aday):
-            state[S.VERI_SETI] = str(aday).strip()
-        else:
-            state[S.GECERSIZ_AD] = str(aday).strip()
-            _logla("gecersiz dataset adi reddedildi: {}".format(aday))
-
-    for girdi_alan, state_alan in (
-        (G.SOZLUK, S.SOZLUK),
-        (G.TARGET, S.TARGET),
-        (G.ID_KOLONU, S.ID_KOLONU),
-        (G.DONEM_KOLONU, S.DONEM_KOLONU),
-        (G.BOLME_KOLONU, S.BOLME_KOLONU),
-    ):
-        if g.get(girdi_alan) is not None:
-            state[state_alan] = g[girdi_alan]
-
-    # Tura ozel alanlar: her turda tazelenir, onceki turdan sizmaz.
-    state[S.AKSIYON] = _aksiyonu_coz(g)
-    state[S.KOLONLAR] = _liste_yap(g.get(G.KOLONLAR))
-    state[S.KOLON_ACIKLAMASI] = g.get(G.KOLON_ACIKLAMASI) or ""
-    state[S.DUZELTMELER] = _liste_yap(g.get(G.DUZELTMELER))
-    state[S.CIKARILACAK] = _liste_yap(g.get(G.CIKARILACAK))
-
-    state[S.DATASET_VAR] = bool(state.get(S.VERI_SETI))
-    state[S.SOZLUK_VAR] = bool(state.get(S.SOZLUK))
-
-
-def _kolon_baglami(kolonlar):
-    """Sorulan kolonlarin mevcut aciklamalarini sema.json'dan okur."""
-    if not kolonlar:
-        return ""
-
-    kayit = _hafizayi_oku() or {}
-    sozluk = kayit.get(Sema.SOZLUK) or {}
-    tipler = kayit.get(Sema.TIPLER) or {}
-    tablo = set(kayit.get(Sema.KOLONLAR) or [])
-
-    parcalar = []
-    for kolon in kolonlar[:3]:
-        ad = str(kolon).strip()
-        gercek = ad if (ad in tablo or ad in sozluk) else None
-        if gercek is None:
-            kucuk = {k.lower(): k for k in (set(sozluk) | tablo)}
-            gercek = kucuk.get(ad.lower())
-        if gercek is None:
-            parcalar.append("{}: ne tabloda ne sozlukte var".format(ad))
-            continue
-        parcalar.append("{} (tip: {}): mevcut aciklama: {}".format(
-            gercek, tipler.get(gercek, "bilinmiyor"), sozluk.get(gercek) or "YOK"))
-    return " | ".join(parcalar)
-
-
-def _durum_ozetini_kur(asama):
-    """sohbet ve girdi_al promptlarina gidecek durum bildirimi."""
-    if state.get(S.GECERSIZ_AD):
-        ozet = ("UYARI: Kullanicinin verdigi '{ad}' bir dataset degil "
-                "(dosya/klasor adi). Onu okumaya CALISMA; gecerli bir dataset "
-                "adi iste.").format(ad=state[S.GECERSIZ_AD])
-    elif state.get(S.VERI_SETI):
-        ozet = "Veri seti: {vs}. Sozluk: {sz}.".format(
-            vs=state[S.VERI_SETI], sz=state.get(S.SOZLUK) or "belirlenmedi")
-    elif state.get(S.ONCEKI_BEKLIYOR):
-        ozet = ("Kayitli bir oturum bulundu ({vs}) ve kullaniciya bununla devam "
-                "mi edecegi soruldu. CEVAP BEKLENIYOR.").format(
-            vs=state.get(S.ONCEKI_VERI_SETI))
-    elif state.get(S.ONCEKI_REDDEDILDI):
-        ozet = ("Kullanici kayitli oturumu simdilik kullanmiyor. Kayit proje "
-                "hafizasinda duruyor ve istenirse geri alinabilir.")
-    else:
-        ozet = "Veri seti henuz belirlenmedi."
-
-    ozet += " BULUNULAN ADIM: {ad} (tamamlanmadi, devam ediyor).".format(
-        ad=ASAMA_ADLARI.get(asama, asama))
-
-    if state.get(S.KARSILANDI):
-        ozet += " Karsilama metni zaten gosterildi, tekrar etme."
-
-    if state.get(S.AKSIYON) == Aksiyon.GORUS_ISTE and state.get(S.KOLONLAR):
-        baglam = _kolon_baglami(state[S.KOLONLAR])
-        if baglam:
-            ozet += (" KOLON BAGLAMI: {}. Kullanici ifade onerisi istiyor. "
-                     "Sadece kullanicinin verdigi anlami daha duzgun ifade et; "
-                     "kolona yeni bir anlam atfetme. Onerdigin ifadeyi onaya "
-                     "sun.").format(baglam)
-
-    state[S.DURUM_OZETI] = ozet
-
-
-def _onceki_oturumu_state_e_yaz(kayit):
-    state[S.ONCEKI_VERI_SETI] = kayit.get(Sema.VERI_SETI)
-    state[S.ONCEKI_SOZLUK] = kayit.get(Sema.SOZLUK_ADI)
-    state[S.ONCEKI_N_SATIR] = kayit.get(Sema.N_SATIR)
-    state[S.ONCEKI_N_KOLON] = kayit.get(Sema.N_KOLON)
-
-    sozluk = kayit.get(Sema.SOZLUK)
-    state[S.ONCEKI_N_ACIKLAMA] = len(sozluk) if isinstance(sozluk, dict) else 0
-
-    aciklamasiz = kayit.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
-    fazla = kayit.get(Sema.SOZLUKTE_VAR_TABLODA_YOK)
-    state[S.ONCEKI_ACIKLAMASIZ] = aciklamasiz if isinstance(aciklamasiz, list) else []
-    state[S.ONCEKI_FAZLA] = fazla if isinstance(fazla, list) else []
-
-    state[S.ONCEKI_ESLESEN] = max(
-        int(kayit.get(Sema.N_KOLON) or 0) - len(state[S.ONCEKI_ACIKLAMASIZ]), 0)
-    state[S.ONCEKI_BEKLIYOR] = True
-
-
-def _onceki_oturumu_beklemeden_cikar():
-    """Kayit reddedildi: aktif oturumdan cikarilir ama SILINMEZ."""
-    for anahtar in ONCEKI_KAYIT_ANAHTARLARI:
-        state[anahtar] = None
-    state[S.ONCEKI_BEKLIYOR] = False
-    state[S.ONCEKI_REDDEDILDI] = True
-    _logla("kayitli oturum reddedildi (dosya korunuyor)")
-
-
-def _asamayi_ayarla(yeni_asama):
-    eski = state.get(S.ASAMA) or Asama.BASLANGIC
-    state[S.ASAMA] = yeni_asama
-    _logla("asama gecisi: {} -> {}".format(eski, yeni_asama))
-
-
-def _kayitla_devam_et(veri_seti, sozluk_adi):
-    state[S.VERI_SETI] = veri_seti
-    state[S.SOZLUK] = sozluk_adi
-    state[S.DATASET_VAR] = True
-    state[S.SOZLUK_VAR] = bool(sozluk_adi)
-    state[S.ONCEKI_BEKLIYOR] = False
-    state[S.ONCEKI_REDDEDILDI] = False
-    _asamayi_ayarla(Asama.SOZLUK)
-
-
-def _kolon_talebi_var_mi():
-    return state.get(S.AKSIYON) in KOLON_AKSIYONLARI
-
-
-# -----------------------------------------------------------------------------
-# Ana akis
-# -----------------------------------------------------------------------------
-
 def process(trace):
     try:
-        ham_girdi, kaynak = _ham_girdiyi_al()
-        g = _json_ayristir(ham_girdi)
-        _girdiyi_state_e_isle(g)
-
-        aksiyon = state.get(S.AKSIYON)
-        asama = state.get(S.ASAMA) or Asama.BASLANGIC
-        _durum_ozetini_kur(asama)
-
-        _logla("aksiyon={} beklenen={} kolonlar={} cikar={} kaynak={}".format(
-            aksiyon, state.get(S.BEKLENEN), state.get(S.KOLONLAR),
-            state.get(S.CIKARILACAK), kaynak))
-
-        if aksiyon == Aksiyon.BILGI:
-            _logla("TESHIS - ham cikti: {!r}".format(str(ham_girdi)[:400]))
-            _logla("TESHIS - anahtarlar: {}".format(
-                sorted(g.keys()) if g else "BOS"))
-
-        # --- 1) Ilk tur: karsilama (+ varsa kayit sorusu) ---------------------
-        if not state.get(S.KARSILANDI):
-            state[S.KARSILANDI] = True
-            kayit = _hafizayi_oku()
-
-            if kayit and kayit.get(Sema.VERI_SETI) and not state.get(S.VERI_SETI):
-                _onceki_oturumu_state_e_yaz(kayit)
-                _durum_ozetini_kur(asama)
-                _beklenen_ayarla(Beklenen.KAYIT_KARARI)
-                yield "{}\n\n---\n\n{}".format(KARSILAMA, _onceki_kayit_mesaji())
-                return
-
-            _beklenen_ayarla(Beklenen.VERI_SETI)
-            yield "{}\n\n{}".format(KARSILAMA, BILGI_ISTEGI)
+        if state.get(S.ASAMA) != ASAMA_SOZLUK:
+            _logla("asama '{}', sessizce cikiliyor".format(state.get(S.ASAMA)))
             return
 
-        # --- 2) Kayit karari bekleniyor ---------------------------------------
-        # RET ACIK OLMALIDIR: yalnizca kayit_yeni reddedilir.
-        if state.get(S.ONCEKI_BEKLIYOR):
-            if aksiyon == Aksiyon.KAYIT_YENI:
-                _onceki_oturumu_beklemeden_cikar()
-                _beklenen_ayarla(Beklenen.VERI_SETI)
-                yield SIFIRDAN_BASLA
-                return
-
-            kayitli_ad = state.get(S.ONCEKI_VERI_SETI)
-            adi_tekrarladi = (
-                kayitli_ad and state.get(S.VERI_SETI)
-                and str(state[S.VERI_SETI]).strip() == str(kayitli_ad).strip())
-
-            if aksiyon in (Aksiyon.KAYIT_DEVAM, Aksiyon.ONAY) or adi_tekrarladi:
-                _kayitla_devam_et(kayitli_ad, state.get(S.ONCEKI_SOZLUK))
-                if state.get(S.KOLONLAR):
-                    _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
-                    if state.get(S.KOLON_ACIKLAMASI) or state.get(S.CIKARILACAK):
-                        yield NextBlock(Blok.KOLON_SORGU)
-                        return
-                    yield NextBlock(Blok.SOHBET)
-                    return
-                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
-                yield NextBlock(Blok.SOZLUK_CALIS)
-                return
-
-            # Kullanici BASKA bir dataset adi yazdiysa ona geciyoruz.
-            if state.get(S.VERI_SETI):
-                _onceki_oturumu_beklemeden_cikar()
-                _asamayi_ayarla(Asama.SOZLUK)
-                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
-                yield NextBlock(Blok.SOZLUK_CALIS)
-                return
-
-            _beklenen_ayarla(Beklenen.KAYIT_KARARI)
-            if _kolon_talebi_var_mi():
-                yield NextBlock(Blok.KOLON_SORGU)
-                return
-            yield _karar_bekleniyor_mesaji()
+        sema = _json_oku(SEMA_DOSYASI, {})
+        if not isinstance(sema, dict) or not sema:
+            yield ("\n\nSözlük durumunu çıkaramadım; oturum kaydı okunamıyor. "
+                   "Ayrıntı agent log'unda.")
             return
 
-        # --- 3) Kayitli oturuma geri donus ------------------------------------
-        if not state.get(S.VERI_SETI) and aksiyon == Aksiyon.KAYIT_DEVAM:
-            kayit = _hafizayi_oku()
-            if kayit and kayit.get(Sema.VERI_SETI):
-                _kayitla_devam_et(kayit.get(Sema.VERI_SETI),
-                                  kayit.get(Sema.SOZLUK_ADI))
-                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
-                yield _kayit_geri_alindi_mesaji(
-                    state[S.VERI_SETI], state.get(S.SOZLUK))
-                yield NextBlock(Blok.SOZLUK_CALIS)
-                return
-            _beklenen_ayarla(Beklenen.VERI_SETI)
-            yield KAYIT_BULUNAMADI
+        ek_sozluk = _json_oku(EK_SOZLUK_DOSYASI, {})
+        ek_sozluk = ek_sozluk if isinstance(ek_sozluk, dict) else {}
+
+        tipler = sema.get(Sema.TIPLER)
+        tipler = tipler if isinstance(tipler, dict) else {}
+        sozluk = sema.get(Sema.SOZLUK)
+        sozluk = sozluk if isinstance(sozluk, dict) else {}
+
+        eksikler, haric = _eksikleri_bul(sema, ek_sozluk)
+        _logla("eksik={} haric={}".format(len(eksikler), len(haric)))
+
+        state[S.ONERILER] = None
+
+        if not eksikler:
+            state[S.EKSIK_KOLONLAR] = []
+            state[S.EKSIK_BAGLAMI] = ""
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+            yield "\n\n" + _eksiksiz_mesaji(haric)
             return
 
-        # --- 4) Oneri onayi bekleniyor ----------------------------------------
-        # Kullanici onayladi; duzeltme veya cikarma da olabilir. oneri_isle
-        # hepsini birlikte uygular.
-        if state.get(S.BEKLENEN) == Beklenen.ONERI_ONAYI and aksiyon == Aksiyon.ONAY:
-            _logla("oneriler onaylandi, oneri_isle bloguna gidiliyor")
-            yield NextBlock(Blok.ONERI_ISLE)
-            return
+        listelenecek = eksikler[:AZAMI_LISTELENEN]
+        veri_seti_adi = state.get(S.VERI_SETI) or sema.get(Sema.VERI_SETI)
 
-        # --- 5) Kolon islemi ---------------------------------------------------
-        # Onaydan ONCE: kullanici kolon sorarken surec ilerlemez.
-        if _kolon_talebi_var_mi() or (
-                aksiyon == Aksiyon.GORUS_ISTE and state.get(S.KOLONLAR)):
-            if not state.get(S.VERI_SETI):
-                _beklenen_ayarla(Beklenen.VERI_SETI)
-                yield KOLON_ICIN_VERI_GEREKLI
-                return
-            _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
-            # Sadece fikir isteniyorsa sohbet ifade onerir; kolon gercekleri
-            # durum_ozeti'ne zaten eklendi.
-            if (aksiyon == Aksiyon.GORUS_ISTE
-                    and not state.get(S.KOLON_ACIKLAMASI)
-                    and not state.get(S.CIKARILACAK)):
-                yield NextBlock(Blok.SOHBET)
-                return
-            yield NextBlock(Blok.KOLON_SORGU)
-            return
+        ornekler = {}
+        orneklem_mi = False
+        if veri_seti_adi:
+            df, orneklem_mi = _veriyi_oku(
+                veri_seti_adi, listelenecek, sema.get(Sema.N_SATIR))
+            ornekler = _ornek_degerleri_cikar(df, listelenecek)
 
-        # --- 6) Gecersiz dataset adi ------------------------------------------
-        if state.get(S.GECERSIZ_AD):
-            _beklenen_ayarla(Beklenen.VERI_SETI)
-            yield _gecersiz_ad_mesaji(state[S.GECERSIZ_AD])
-            return
+        state[S.EKSIK_KOLONLAR] = listelenecek
+        state[S.EKSIK_BAGLAMI] = _baglami_kur(
+            listelenecek, tipler, ornekler, sozluk, orneklem_mi)
 
-        # --- 7) Baslangic: veri seti belirlendi --------------------------------
-        if asama == Asama.BASLANGIC and state.get(S.DATASET_VAR):
-            _asamayi_ayarla(Asama.SOZLUK)
-            _beklenen_ayarla(Beklenen.ADIM_ONAYI)
-            yield NextBlock(Blok.SOZLUK_CALIS)
-            return
-
-        # --- 8) Adim icinde onay ----------------------------------------------
-        if aksiyon == Aksiyon.ONAY and asama in ASAMA_HARITASI:
-            hedef_blok = ASAMA_HARITASI[asama]
-            if hedef_blok:
-                _logla("onay alindi, {} bloguna gidiliyor".format(hedef_blok))
-                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
-                yield NextBlock(hedef_blok)
-                return
-            _logla("onay alindi ama '{}' adiminin blogu kurulmamis".format(asama))
-            _beklenen_ayarla(Beklenen.YOK)
-            yield _adim_hazir_degil_mesaji(asama)
-            return
-
-        # --- 9) Diger her sey: serbest sohbet ---------------------------------
-        _beklenen_ayarla(Beklenen.YOK)
-        yield NextBlock(Blok.SOHBET)
+        # Bastaki bos satir onceki blogun mesajiyla yapismayi onler.
+        yield "\n\n" + _eksik_mesaji(
+            eksikler, tipler, ornekler, orneklem_mi, haric)
+        yield NextBlock(BLOK_ONERI_URET)
 
     except Exception as hata:
         _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
-        _beklenen_ayarla(Beklenen.VERI_SETI)
-        yield BEKLENMEYEN_HATA
+        yield ("\n\nSözlük durumunu çıkarırken beklenmeyen bir hata oluştu. "
+               "Ayrıntı agent log'una yazıldı.")
