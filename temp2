@@ -1,44 +1,166 @@
-# =============================================================================
-# FEATURE_DISCOVERY_AGENT / baslat
-# -----------------------------------------------------------------------------
-# Sorumluluk : Prompt sablonlarinin okudugu state anahtarlarinin her zaman
-#              var olmasini garanti eder ve akisi girdi_al'a devreder.
-#
-# NEDEN GEREKLI:
-#   girdi_al ve sohbet bloklari promptlarinda {{ state.durum_ozeti }} ve
-#   {{ state.beklenen }} okuyor. Dataiku'nun Micro-CEL degerlendiricisi
-#   eksik anahtarda hata firlatiyor ve ilk turda state bos oluyor.
-#   Bu blok Starting block olarak calisip anahtarlari onceden doldurur.
-#
-# Her turda calisir ama yalnizca EKSIK anahtarlari doldurur; mevcut degerlere
-# dokunmaz.
-# =============================================================================
-
-from dataiku.llm.python.blocks_graph import NextBlock
-
-
-# Prompt sablonlarinin ve akisin bekledigi anahtarlar ile ilk degerleri.
-VARSAYILANLAR = {
-    "durum_ozeti": "Surec henuz baslamadi. Veri seti belirlenmedi.",
-    "beklenen": "yok",
-    "aksiyon": "bilgi",
-    "kolonlar": [],
-    "kolon_aciklamasi": "",
-    "asama": "baslangic",
+{
+  "type": "object",
+  "properties": {
+    "aksiyon": {
+      "type": "string",
+      "enum": ["kayit_devam", "kayit_yeni", "onay", "ret",
+               "kolon_sor", "kolon_tanimla", "gorus_iste", "bilgi"]
+    },
+    "veri_seti": {"type": ["string", "null"]},
+    "sozluk": {"type": ["string", "null"]},
+    "target": {"type": ["string", "null"]},
+    "id_kolonu": {"type": ["string", "null"]},
+    "donem_kolonu": {"type": ["string", "null"]},
+    "bolme_kolonu": {"type": ["string", "null"]},
+    "kolonlar": {"type": "array", "items": {"type": "string"}},
+    "kolon_aciklamasi": {"type": ["string", "null"]}
+  },
+  "required": ["aksiyon"]
 }
 
-SONRAKI_BLOK = "girdi_al"
+
+
+
+
+
+
+
 
 
 def process(trace):
-    eklenenler = []
-    for anahtar, ilk_deger in VARSAYILANLAR.items():
-        if state.get(anahtar) is None:
-            state[anahtar] = ilk_deger
-            eklenenler.append(anahtar)
+    try:
+        ham_girdi = state.get(S.GIRDI)
+        g = _json_ayristir(ham_girdi)
+        _girdiyi_state_e_isle(g)
 
-    if eklenenler:
-        print("[baslat] varsayilan atanan anahtarlar: {}".format(
-            ", ".join(eklenenler)))
+        aksiyon = state.get(S.AKSIYON)
+        asama = state.get(S.ASAMA) or Asama.BASLANGIC
+        _durum_ozetini_kur(asama)
 
-    yield NextBlock(SONRAKI_BLOK)
+        _logla("aksiyon={} beklenen={} kolonlar={}".format(
+            aksiyon, state.get(S.BEKLENEN), state.get(S.KOLONLAR)))
+
+        # aksiyon "bilgi"ye dustuyse girdi_al'in ham ciktisini gor.
+        # Ya JSON bozuk, ya sema eski, ya prompt guncellenmemis demektir.
+        if aksiyon == Aksiyon.BILGI:
+            _logla("TESHIS - girdi_al ham cikti: {!r}".format(
+                str(ham_girdi)[:500]))
+            _logla("TESHIS - ayristirilan anahtarlar: {}".format(
+                sorted(g.keys()) if g else "BOS"))
+
+        # --- 1) Ilk tur: karsilama (+ varsa kayit sorusu) ---------------------
+        if not state.get(S.KARSILANDI):
+            state[S.KARSILANDI] = True
+            kayit = _hafizayi_oku()
+
+            if kayit and kayit.get(Sema.VERI_SETI) and not state.get(S.VERI_SETI):
+                _onceki_oturumu_state_e_yaz(kayit)
+                _durum_ozetini_kur(asama)
+                _beklenen_ayarla(Beklenen.KAYIT_KARARI)
+                yield "{}\n\n---\n\n{}".format(KARSILAMA, _onceki_kayit_mesaji())
+                return
+
+            _beklenen_ayarla(Beklenen.VERI_SETI)
+            yield "{}\n\n{}".format(KARSILAMA, BILGI_ISTEGI)
+            return
+
+        # --- 2) Kayit karari bekleniyor ---------------------------------------
+        # RET ACIK OLMALIDIR: yalnizca kayit_yeni reddedilir. Karar verilmeden
+        # gelen soru veya kolon istegi kaydi silmez.
+        if state.get(S.ONCEKI_BEKLIYOR):
+            if aksiyon == Aksiyon.KAYIT_YENI:
+                _onceki_oturumu_beklemeden_cikar()
+                _beklenen_ayarla(Beklenen.VERI_SETI)
+                yield SIFIRDAN_BASLA
+                return
+
+            if aksiyon in (Aksiyon.KAYIT_DEVAM, Aksiyon.ONAY):
+                _kayitla_devam_et(
+                    state.get(S.ONCEKI_VERI_SETI), state.get(S.ONCEKI_SOZLUK))
+                # Ayni mesajda kolon talebi de varsa once ona cevap ver.
+                if state.get(S.KOLONLAR):
+                    _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
+                    if state.get(S.KOLON_ACIKLAMASI):
+                        yield NextBlock(Blok.KOLON_SORGU)
+                        return
+                    yield NextBlock(Blok.SOHBET)
+                    return
+                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
+                yield NextBlock(Blok.SOZLUK_CALIS)
+                return
+
+            # Karar yok: kaydi koru. Kolon sorusu varsa yine de cevapla.
+            _beklenen_ayarla(Beklenen.KAYIT_KARARI)
+            if _kolon_talebi_var_mi():
+                yield NextBlock(Blok.KOLON_SORGU)
+                return
+            yield _karar_bekleniyor_mesaji()
+            return
+
+        # --- 3) Kayitli oturuma geri donus ------------------------------------
+        if not state.get(S.VERI_SETI) and aksiyon == Aksiyon.KAYIT_DEVAM:
+            kayit = _hafizayi_oku()
+            if kayit and kayit.get(Sema.VERI_SETI):
+                _kayitla_devam_et(
+                    kayit.get(Sema.VERI_SETI), kayit.get(Sema.SOZLUK_ADI))
+                _logla("kayitli oturuma geri donuldu: {}".format(
+                    kayit.get(Sema.VERI_SETI)))
+                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
+                yield _kayit_geri_alindi_mesaji(
+                    state[S.VERI_SETI], state.get(S.SOZLUK))
+                yield NextBlock(Blok.SOZLUK_CALIS)
+                return
+            _beklenen_ayarla(Beklenen.VERI_SETI)
+            yield KAYIT_BULUNAMADI
+            return
+
+        # --- 4) Kolon islemi ---------------------------------------------------
+        # Onaydan ONCE: kullanici kolon sorarken surec ilerlemez.
+        if _kolon_talebi_var_mi() or (
+                aksiyon == Aksiyon.GORUS_ISTE and state.get(S.KOLONLAR)):
+            if not state.get(S.VERI_SETI):
+                _beklenen_ayarla(Beklenen.VERI_SETI)
+                yield KOLON_ICIN_VERI_GEREKLI
+                return
+            _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
+            # Aciklama verilmemis, sadece fikir isteniyorsa sohbet ifade onerir.
+            if not state.get(S.KOLON_ACIKLAMASI):
+                yield NextBlock(Blok.SOHBET)
+                return
+            yield NextBlock(Blok.KOLON_SORGU)
+            return
+
+        # --- 5) Gecersiz dataset adi ------------------------------------------
+        if state.get(S.GECERSIZ_AD):
+            _beklenen_ayarla(Beklenen.VERI_SETI)
+            yield _gecersiz_ad_mesaji(state[S.GECERSIZ_AD])
+            return
+
+        # --- 6) Baslangic: veri seti belirlendi --------------------------------
+        if asama == Asama.BASLANGIC and state.get(S.DATASET_VAR):
+            _asamayi_ayarla(Asama.SOZLUK)
+            _beklenen_ayarla(Beklenen.ADIM_ONAYI)
+            yield NextBlock(Blok.SOZLUK_CALIS)
+            return
+
+        # --- 7) Adim icinde onay: ilgili islem bloguna yonlendir ---------------
+        if aksiyon == Aksiyon.ONAY and asama in ASAMA_HARITASI:
+            hedef_blok = ASAMA_HARITASI[asama]
+            if hedef_blok:
+                _logla("onay alindi, {} bloguna yonlendiriliyor".format(hedef_blok))
+                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
+                yield NextBlock(hedef_blok)
+                return
+            _logla("onay alindi ama '{}' adiminin blogu kurulmamis".format(asama))
+            _beklenen_ayarla(Beklenen.YOK)
+            yield _adim_hazir_degil_mesaji(asama)
+            return
+
+        # --- 8) Diger her sey: serbest sohbet ---------------------------------
+        _beklenen_ayarla(Beklenen.YOK)
+        yield NextBlock(Blok.SOHBET)
+
+    except Exception as hata:
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        _beklenen_ayarla(Beklenen.VERI_SETI)
+        yield BEKLENMEYEN_HATA
