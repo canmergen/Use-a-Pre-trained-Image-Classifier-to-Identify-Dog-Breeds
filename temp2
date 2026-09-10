@@ -1,42 +1,76 @@
 # =============================================================================
-# FEATURE_DISCOVERY_AGENT / sozluk_calis
+# FEATURE_DISCOVERY_AGENT / oneri_isle
 # -----------------------------------------------------------------------------
-# Veri setinin semasini ve sozlugu okur, karsilastirir, sema.json'a yazar.
+# LLM'in urettigi kolon aciklamasi onerilerini sunar; onay gelince
+# kullanicinin duzeltmelerini ve cikarma isteklerini uygulayip kaydeder.
 #
-# ONEMLI: sema.json HER CALISMADA yeniden uretilir. Bu yuzden kullanicinin
-# elle girdigi tanimlar (sozluk_ek.json) ve surec disi biraktigi kolonlar
-# (onceki sema.json > haric_kolonlar) MUTLAKA korunur. Aksi halde kayitli
-# oturuma her donuste el emegi silinir.
+# IKI MOD (state["beklenen"] degerine gore):
+#   SUNUM : oneri_uret'ten gelinir. Onerileri listeler, beklenen'i
+#           "oneri_onayi" yapar.
+#   KAYIT : durum_belirle'den gelinir. Duzeltmeleri ve cikarmalari uygular,
+#           sonra sozluk_ek.json + sema.json + DEGISKENLER_GUNCEL'e yazar.
 #
-# Kaynak sozluk dataset'i DEGISTIRILMEZ; birlesim sadece sema.json'a yazilir.
+# Oneriler oncelikle state["oneriler"]'den okunur. oneri_uret blogunda
+# "Save to state" ayari eksikse last_output'tan okunur; boylece ayar hatasi
+# akisi kilitlemez.
 #
-# Girdi  : state["veri_seti"], state["sozluk"], state["sozluk_var"]
-# Cikti  : Kullaniciya ozet metin; sonrasinda sozluk_tamamla calisir
-# Kalici : PROJE_HAFIZASI/sema.json
+# Kaynak sozluk (DEGISKENLER) DEGISTIRILMEZ.
 # =============================================================================
 
 import json
 
+import pandas as pd
+
 import dataiku
-from dataiku.llm.python.blocks_graph import NextBlock
 
 
-FOLDER_ADI = "PROJE_HAFIZASI"
-SEMA_DOSYASI = "sema.json"
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+SEMA_DOSYASI = "/sema.json"
 EK_SOZLUK_DOSYASI = "/sozluk_ek.json"
+GUNCEL_SOZLUK_DATASET = "DEGISKENLER_GUNCEL"
 
-# Ozette listelenecek azami kolon adi.
-AZAMI_LISTELENEN = 10
+AD_KOLONU = "kolon"
+ACIKLAMA_KOLONU = "aciklama"
+
+GUVEN_ETIKETLERI = {
+    "yuksek": "yüksek güven",
+    "orta": "orta güven",
+    "dusuk": "düşük güven",
+}
+
+
+class Sema:
+    SOZLUK = "sozluk"
+    TABLODA_VAR_SOZLUKTE_YOK = "tabloda_var_sozlukte_yok"
+    HARIC_KOLONLAR = "haric_kolonlar"
+
+
+class S:
+    BEKLENEN = "beklenen"
+    ONERILER = "oneriler"
+    ONERI_LISTESI = "oneri_listesi"
+    DUZELTMELER = "duzeltmeler"
+    CIKARILACAK = "cikarilacak_kolonlar"
+    KOLONLAR = "kolonlar"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
+
+
+class Beklenen:
+    ONERI_ONAYI = "oneri_onayi"
+    KOLON_ACIKLAMASI = "kolon_aciklamasi"
 
 
 def _logla(mesaj):
-    print("[sozluk_calis] {}".format(mesaj))
+    print("[oneri_isle] {}".format(mesaj))
+
+
+def _folder():
+    return dataiku.Folder(HAFIZA_FOLDER)
 
 
 def _json_oku(dosya_yolu, varsayilan):
-    """Managed folder icindeki bir JSON dosyasini okur."""
     try:
-        folder = dataiku.Folder(FOLDER_ADI)
+        folder = _folder()
         if dosya_yolu not in folder.list_paths_in_partition():
             return varsayilan
         with folder.get_download_stream(dosya_yolu) as akis:
@@ -46,133 +80,349 @@ def _json_oku(dosya_yolu, varsayilan):
         return varsayilan
 
 
-def _onceki_semayi_oku():
-    """Bir onceki sema.json'u dondurur; korunacak alanlar oradan alinir."""
-    veri = _json_oku("/" + SEMA_DOSYASI, {})
-    return veri if isinstance(veri, dict) else {}
+def _json_yaz(dosya_yolu, veri):
+    try:
+        icerik = json.dumps(veri, ensure_ascii=False, indent=2)
+        _folder().upload_data(dosya_yolu, icerik.encode("utf-8"))
+        return True
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(dosya_yolu, hata))
+        return False
 
 
-def _ek_sozlugu_oku():
-    """Kullanicinin elle girdigi tanimlari dondurur."""
-    veri = _json_oku(EK_SOZLUK_DOSYASI, {})
-    return veri if isinstance(veri, dict) else {}
+def _sayi(deger):
+    return "{:,}".format(int(deger or 0)).replace(",", ".")
 
 
-def _kolon_ozeti(baslik, kolonlar):
-    """Kolon listesini kisaltarak tek satirda yazar."""
-    gosterilen = ", ".join(kolonlar[:AZAMI_LISTELENEN])
-    if len(kolonlar) > AZAMI_LISTELENEN:
-        gosterilen += " ..."
-    return "{} {} kolon: {}".format(baslik, len(kolonlar), gosterilen)
+def _ham_onerileri_al():
+    """Oneri ciktisini iki kaynaktan dener. Doner: (ham, kaynak_adi)
+
+    oneri_uret blogunda "Save to state" ayari eksikse state bos kalir;
+    o durumda onceki blogun ciktisi last_output'ta bulunur.
+    """
+    ham = state.get(S.ONERILER)
+    if ham:
+        return ham, "state"
+    try:
+        if last_output:
+            return last_output, "last_output"
+    except NameError:
+        pass
+    return None, "yok"
+
+
+def _onerileri_coz(ham):
+    """LLM ciktisini [{kolon, aciklama, guven, gerekce}] listesine cevirir."""
+    veri = ham
+    if isinstance(ham, str):
+        metin = ham.strip()
+        if metin.startswith("```"):
+            metin = metin.strip("`").strip()
+            if metin.lower().startswith("json"):
+                metin = metin[4:].strip()
+        bas = metin.find("{")
+        son = metin.rfind("}")
+        if bas != -1 and son > bas:
+            metin = metin[bas:son + 1]
+        try:
+            veri = json.loads(metin)
+        except (ValueError, TypeError):
+            _logla("oneri JSON'u cozulemedi: {!r}".format(str(ham)[:300]))
+            return []
+
+    liste = veri.get("oneriler") if isinstance(veri, dict) else veri
+    if not isinstance(liste, list):
+        return []
+
+    temiz = []
+    for kayit in liste:
+        if not isinstance(kayit, dict):
+            continue
+        kolon = str(kayit.get("kolon") or "").strip()
+        if not kolon:
+            continue
+        temiz.append({
+            "kolon": kolon,
+            "aciklama": str(kayit.get("aciklama") or "").strip(),
+            "guven": str(kayit.get("guven") or "orta").strip().lower(),
+            "gerekce": str(kayit.get("gerekce") or "").strip(),
+            "kaynak": "oneri",
+        })
+    return temiz
+
+
+def _duzeltmeleri_topla():
+    """Kullanicinin bu turda verdigi kolon duzeltmelerini dondurur."""
+    sonuc = {}
+
+    ham = state.get(S.DUZELTMELER)
+    if isinstance(ham, list):
+        for kayit in ham:
+            if not isinstance(kayit, dict):
+                continue
+            kolon = str(kayit.get("kolon") or "").strip()
+            aciklama = str(kayit.get("aciklama") or "").strip()
+            if kolon and aciklama:
+                sonuc[kolon] = aciklama
+
+    kolonlar = state.get(S.KOLONLAR) or []
+    aciklama = str(state.get(S.KOLON_ACIKLAMASI) or "").strip()
+    if isinstance(kolonlar, list) and kolonlar and aciklama:
+        kolon = str(kolonlar[0]).strip()
+        if kolon:
+            sonuc[kolon] = aciklama
+
+    return sonuc
+
+
+def _cikarilacaklari_topla():
+    ham = state.get(S.CIKARILACAK)
+    if not isinstance(ham, list):
+        return []
+    return [str(k).strip() for k in ham if str(k).strip()]
+
+
+def _duzeltmeleri_uygula(oneriler, duzeltmeler):
+    """Kullanici metnini onerinin uzerine yazar; yeni kolon da eklenebilir."""
+    if not duzeltmeler:
+        return oneriler
+
+    kalanlar = dict(duzeltmeler)
+
+    for oneri in oneriler:
+        yeni = kalanlar.pop(oneri["kolon"], None)
+        if yeni is None:
+            for anahtar in list(kalanlar):
+                if anahtar.lower() == oneri["kolon"].lower():
+                    yeni = kalanlar.pop(anahtar)
+                    break
+        if yeni is not None:
+            oneri["aciklama"] = yeni
+            oneri["kaynak"] = "kullanici"
+            oneri["guven"] = "yuksek"
+
+    for kolon, aciklama in kalanlar.items():
+        oneriler.append({
+            "kolon": kolon, "aciklama": aciklama, "guven": "yuksek",
+            "gerekce": "", "kaynak": "kullanici",
+        })
+
+    return oneriler
+
+
+def _cikarmalari_uygula(oneriler, cikarilacaklar):
+    """Cikarilacak kolonlari oneri listesinden duser.
+
+    Doner: (kalan_oneriler, gercekten_cikarilanlar)
+    """
+    if not cikarilacaklar:
+        return oneriler, []
+
+    kucuk = {c.lower() for c in cikarilacaklar}
+    kalan = [o for o in oneriler if o["kolon"].lower() not in kucuk]
+    cikanlar = [o["kolon"] for o in oneriler if o["kolon"].lower() in kucuk]
+
+    # Onerilerde olmayan ama cikarilmak istenen kolonlar da haric listesine
+    # girmeli; adlarini oldugu gibi tasi.
+    for ad in cikarilacaklar:
+        if ad not in cikanlar:
+            cikanlar.append(ad)
+
+    return kalan, cikanlar
+
+
+def _sunum_mesaji(oneriler):
+    dolu = [o for o in oneriler if o["aciklama"]]
+    bos = [o for o in oneriler if not o["aciklama"]]
+
+    parcalar = ["\n\n**Önerilen açıklamalar**", ""]
+    for oneri in dolu:
+        etiket = GUVEN_ETIKETLERI.get(oneri["guven"], oneri["guven"])
+        satir = "**{kolon}** — {aciklama}  _({guven})_".format(
+            kolon=oneri["kolon"], aciklama=oneri["aciklama"], guven=etiket)
+        if oneri["gerekce"]:
+            satir += "\n{}".format(oneri["gerekce"])
+        parcalar.append(satir)
+        parcalar.append("")
+
+    if bos:
+        adlar = ", ".join("`{}`".format(o["kolon"]) for o in bos)
+        parcalar.append("Şu kolonlar için öneri üretemedim: {}".format(adlar))
+        parcalar.append("")
+
+    parcalar.append("Onaylarsanız hepsini kaydederim. Bir kısmını değiştirmek "
+                    "isterseniz sadece onları yazın; bir kolonu süreç dışı "
+                    "bırakmak isterseniz çıkaralım demeniz yeterli.")
+    return "\n".join(parcalar)
+
+
+def _semayi_guncelle(yeni_tanimlar, cikarilanlar):
+    """Tanimlari ve haric listesini sema.json'a isler."""
+    sema = _json_oku(SEMA_DOSYASI, {})
+    if not isinstance(sema, dict) or not sema:
+        _logla("sema.json bos veya okunamadi")
+        return False
+
+    sozluk = sema.get(Sema.SOZLUK)
+    if not isinstance(sozluk, dict):
+        sozluk = {}
+    sozluk.update(yeni_tanimlar)
+    sema[Sema.SOZLUK] = sozluk
+
+    haric = sema.get(Sema.HARIC_KOLONLAR)
+    haric = haric if isinstance(haric, list) else []
+    for kolon in cikarilanlar:
+        if kolon not in haric:
+            haric.append(kolon)
+    sema[Sema.HARIC_KOLONLAR] = haric
+
+    eksikler = sema.get(Sema.TABLODA_VAR_SOZLUKTE_YOK)
+    if isinstance(eksikler, list):
+        sema[Sema.TABLODA_VAR_SOZLUKTE_YOK] = [
+            k for k in eksikler
+            if k not in yeni_tanimlar and k not in cikarilanlar]
+
+    return _json_yaz(SEMA_DOSYASI, sema)
+
+
+def _guncel_sozlugu_yaz(ek_sozluk):
+    """Kaynak sozluk + eklenenleri, haric kolonlari duserek yazar.
+
+    Doner: (basarili_mi, toplam_satir)
+    """
+    sema = _json_oku(SEMA_DOSYASI, {})
+    sozluk = sema.get(Sema.SOZLUK) if isinstance(sema, dict) else {}
+    sozluk = sozluk if isinstance(sozluk, dict) else {}
+
+    haric = sema.get(Sema.HARIC_KOLONLAR) if isinstance(sema, dict) else []
+    haric = set(haric) if isinstance(haric, list) else set()
+
+    birlesik = dict(sozluk)
+    birlesik.update(ek_sozluk)
+    adlar = sorted(k for k in birlesik if k not in haric)
+
+    df = pd.DataFrame({
+        AD_KOLONU: adlar,
+        ACIKLAMA_KOLONU: [birlesik[ad] for ad in adlar],
+        "kaynak": ["eklenen" if ad in ek_sozluk else "sozluk" for ad in adlar],
+    })
+
+    try:
+        dataiku.Dataset(GUNCEL_SOZLUK_DATASET).write_with_schema(df)
+        _logla("{} yazildi: {} satir".format(GUNCEL_SOZLUK_DATASET, len(df)))
+        return True, len(df)
+    except Exception as hata:
+        _logla("{} yazilamadi: {}".format(GUNCEL_SOZLUK_DATASET, hata))
+        return False, len(df)
+
+
+def _kayit_mesaji(oneriler, cikarilanlar, toplam, basarisizlar):
+    kullanici = [o["kolon"] for o in oneriler
+                 if o["aciklama"] and o.get("kaynak") == "kullanici"]
+    oneri = [o["kolon"] for o in oneriler
+             if o["aciklama"] and o.get("kaynak") != "kullanici"]
+
+    parcalar = ["\n\n**Sözlük güncellendi**", ""]
+    if oneri:
+        parcalar.append("Öneri olarak kaydedilen: {}".format(
+            ", ".join("**{}**".format(k) for k in sorted(oneri))))
+    if kullanici:
+        parcalar.append("Sizin yazdığınız: {}".format(
+            ", ".join("**{}**".format(k) for k in sorted(kullanici))))
+    if cikarilanlar:
+        parcalar.append("Süreç dışı bırakılan: {}".format(
+            ", ".join("**{}**".format(k) for k in sorted(cikarilanlar))))
+    parcalar.append("")
+
+    if basarisizlar:
+        parcalar.append("Şuralara yazılamadı: {}. Ayrıntı agent log'unda.".format(
+            ", ".join(basarisizlar)))
+        return "\n".join(parcalar)
+
+    parcalar.append("**{ds}** artık {toplam} satır. Kaynak sözlük "
+                    "değiştirilmedi; bundan sonraki adımlar güncel sözlüğü "
+                    "kullanacak.".format(
+                        ds=GUNCEL_SOZLUK_DATASET, toplam=_sayi(toplam)))
+    parcalar.append("")
+    parcalar.append("Sözlük sıkıştırmaya geçebiliriz.")
+    return "\n".join(parcalar)
+
+
+def _kaydet(oneriler, cikarilanlar):
+    yeni_tanimlar = {o["kolon"]: o["aciklama"] for o in oneriler if o["aciklama"]}
+
+    if not yeni_tanimlar and not cikarilanlar:
+        return "\n\nKaydedilecek bir değişiklik yok."
+
+    ek_sozluk = _json_oku(EK_SOZLUK_DOSYASI, {})
+    ek_sozluk = ek_sozluk if isinstance(ek_sozluk, dict) else {}
+    ek_sozluk.update(yeni_tanimlar)
+    for kolon in cikarilanlar:
+        ek_sozluk.pop(kolon, None)
+
+    ek_yazildi = _json_yaz(EK_SOZLUK_DOSYASI, ek_sozluk)
+    sema_yazildi = _semayi_guncelle(yeni_tanimlar, cikarilanlar)
+    ds_yazildi, toplam = _guncel_sozlugu_yaz(ek_sozluk)
+
+    basarisizlar = []
+    if not ek_yazildi:
+        basarisizlar.append("kullanıcı tanımları dosyası")
+    if not sema_yazildi:
+        basarisizlar.append("oturum kaydı (sema.json)")
+    if not ds_yazildi:
+        basarisizlar.append(GUNCEL_SOZLUK_DATASET)
+
+    return _kayit_mesaji(oneriler, cikarilanlar, toplam, basarisizlar)
 
 
 def process(trace):
-    veri_seti = state.get("veri_seti")
-    sozluk_adi = state.get("sozluk")
-    sozluk_var = bool(state.get("sozluk_var"))
-
-    if not veri_seti:
-        yield "Veri seti adı bulunamadı, sözlük hazırlığına başlayamıyorum."
-        yield NextBlock("sohbet")
-        return
-
-    # 1) Dataset semasi - veriyi bellege almadan
-    ds = dataiku.Dataset(veri_seti)
-    sema = ds.read_schema()
-    kolonlar = [c["name"] for c in sema]
-    tipler = {c["name"]: c["type"] for c in sema}
-
-    # 2) Satir sayisi - sadece ilk kolonu okuyarak
     try:
-        n_satir = int(ds.get_dataframe(columns=[kolonlar[0]]).shape[0])
+        # KAYIT MODU
+        if state.get(S.BEKLENEN) == Beklenen.ONERI_ONAYI:
+            saklanan = state.get(S.ONERI_LISTESI) or []
+            cikarilacaklar = _cikarilacaklari_topla()
+
+            if not saklanan and not cikarilacaklar:
+                state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+                yield ("\n\nOnaylanacak bir öneri bulamadım. Kolon adı ve "
+                       "açıklamasını yazarsanız doğrudan kaydederim.")
+                return
+
+            duzeltmeler = _duzeltmeleri_topla()
+            if duzeltmeler:
+                _logla("duzeltmeler: {}".format(list(duzeltmeler)))
+            if cikarilacaklar:
+                _logla("cikarilacaklar: {}".format(cikarilacaklar))
+
+            saklanan = _duzeltmeleri_uygula(saklanan, duzeltmeler)
+            saklanan, cikarilanlar = _cikarmalari_uygula(
+                saklanan, cikarilacaklar)
+
+            state[S.ONERI_LISTESI] = None
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+            yield _kaydet(saklanan, cikarilanlar)
+            return
+
+        # SUNUM MODU
+        ham, kaynak = _ham_onerileri_al()
+        _logla("oneri kaynagi: {}".format(kaynak))
+        oneriler = _onerileri_coz(ham)
+
+        if not oneriler:
+            _logla("oneri cozulemedi, ham: {!r}".format(str(ham)[:300]))
+            state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+            yield ("\n\nBu kolonlar için otomatik öneri üretemedim. Anlamlarını "
+                   "kendiniz yazarsanız sözlüğe eklerim; gereksiz görüyorsanız "
+                   "çıkaralım diyebilirsiniz.")
+            return
+
+        state[S.ONERI_LISTESI] = oneriler
+        state[S.BEKLENEN] = Beklenen.ONERI_ONAYI
+        _logla("{} oneri sunuldu".format(len(oneriler)))
+        yield _sunum_mesaji(oneriler)
+
     except Exception as hata:
-        _logla("satir sayisi okunamadi: {}".format(hata))
-        n_satir = None
-
-    # 3) Kaynak sozluk
-    sozluk_map = {}
-    if sozluk_var and sozluk_adi:
-        try:
-            sdf = dataiku.Dataset(sozluk_adi).get_dataframe()
-            ad_kol, acik_kol = sdf.columns[0], sdf.columns[1]
-            sozluk_map = dict(zip(sdf[ad_kol].astype(str),
-                                  sdf[acik_kol].astype(str)))
-        except Exception as hata:
-            _logla("kaynak sozluk okunamadi: {}".format(hata))
-
-    kaynak_sayisi = len(sozluk_map)
-
-    # 4) KORUNAN BILGILER - kullanicinin el emegi ezilmemeli
-    ek_sozluk = _ek_sozlugu_oku()
-    onceki_sema = _onceki_semayi_oku()
-
-    # Kullanici tanimlari kaynak sozlugun uzerine yazilir.
-    eklenen_sayisi = 0
-    for kolon, aciklama in ek_sozluk.items():
-        if str(aciklama or "").strip():
-            sozluk_map[kolon] = aciklama
-            eklenen_sayisi += 1
-
-    # Surec disi birakilan kolonlar korunur; artik var olmayanlar duser.
-    onceki_haric = onceki_sema.get("haric_kolonlar")
-    onceki_haric = onceki_haric if isinstance(onceki_haric, list) else []
-    haric_kolonlar = [k for k in onceki_haric if k in kolonlar]
-
-    # 5) Karsilastirma - kullanici tanimlari dahil edildikten SONRA
-    sozlukte_var_tabloda_yok = sorted(set(sozluk_map) - set(kolonlar))
-    tabloda_var_sozlukte_yok = sorted(
-        set(kolonlar) - set(sozluk_map) - set(haric_kolonlar))
-
-    # 6) Folder'a yaz
-    kayit = {
-        "veri_seti": veri_seti,
-        "sozluk_adi": sozluk_adi if sozluk_var else None,
-        "n_satir": n_satir,
-        "n_kolon": len(kolonlar),
-        "kolonlar": kolonlar,
-        "tipler": tipler,
-        "sozluk": sozluk_map,
-        "sozlukte_var_tabloda_yok": sozlukte_var_tabloda_yok,
-        "tabloda_var_sozlukte_yok": tabloda_var_sozlukte_yok,
-        "haric_kolonlar": haric_kolonlar,
-    }
-    folder = dataiku.Folder(FOLDER_ADI)
-    folder.upload_data(
-        SEMA_DOSYASI,
-        json.dumps(kayit, ensure_ascii=False, indent=2).encode("utf-8"),
-    )
-    _logla("sema.json yazildi: {} kolon, {} aciklama ({} kullanici), "
-           "{} haric".format(len(kolonlar), len(sozluk_map), eklenen_sayisi,
-                             len(haric_kolonlar)))
-
-    # 7) Ozet - state'e ve kullaniciya
-    satirlar = [
-        "**{}** okundu: {} satır, {} kolon.".format(
-            veri_seti,
-            n_satir if n_satir is not None else "?",
-            len(kolonlar)),
-    ]
-
-    if sozluk_var:
-        satirlar.append("**{}** sözlüğünde {} kolon açıklaması var.".format(
-            sozluk_adi, kaynak_sayisi))
-        if eklenen_sayisi:
-            satirlar.append(
-                "Daha önce sizin eklediğiniz {} açıklama korundu.".format(
-                    eklenen_sayisi))
-        if sozlukte_var_tabloda_yok:
-            satirlar.append(_kolon_ozeti(
-                "Sözlükte olup tabloda olmayan", sozlukte_var_tabloda_yok))
-        if tabloda_var_sozlukte_yok:
-            satirlar.append(_kolon_ozeti(
-                "Tabloda olup sözlükte olmayan", tabloda_var_sozlukte_yok))
-    else:
-        satirlar.append("Sözlük verilmedi; kolon adlarından çıkarım yapılacak.")
-
-    if haric_kolonlar:
-        satirlar.append(_kolon_ozeti(
-            "Daha önce süreç dışı bıraktığınız", haric_kolonlar))
-
-    ozet = "\n\n".join(satirlar)
-    state["sozluk_ozet"] = ozet
-    yield ozet
+        _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
+        state[S.BEKLENEN] = Beklenen.KOLON_ACIKLAMASI
+        yield ("\n\nÖnerileri işlerken beklenmeyen bir hata oluştu. Ayrıntı "
+               "agent log'una yazıldı.")
