@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-FEATURE_STATE/feature_registry.json  ->  ALL_GENERATED_FEATURES/feature_ozet.txt
+FEATURE_STATE/feature_registry.json -> ALL_GENERATED_FEATURES/feature_ozet.txt
+FEATURE_STATE/feature_rejects.json  -> ALL_GENERATED_FEATURES/feature_rejects_ozet.txt
 
-Cikti formati (her feature icin):
-
+Kabul formati (feature_ozet.txt):
     feature adi: LLM_F001_GDN_GLN_RATIO_ACCEL
     feature aciklamasi: Kisa vadeli (7 gun) giden/gelen oraninin...
     feature uretim formulu: LLM_F001_GDN_GLN_RATIO_ACCEL = (df['TXN_GDN_7D_AMT'] / ...)
 
-    feature adi: ...
+Red formati (feature_rejects_ozet.txt):
+    feature adi: CP_HHI_RATIO_7D_30D
+    feature aciklamasi: Likidite sikismasi yasayan musteriler...
+    feature uretim formulu: CP_HHI_RATIO_7D_30D = df['OUT_7D_CP_AMT_HHI'] / ...
+    red nedeni: zayif sinyal (lift<1.3 ve |pp_gap|<8.0)
+    tur: 2
+    tema: kisa vade ile uzun vadenin ayrismasi...
 """
 
 import json
@@ -21,20 +27,30 @@ import os
 KAYNAK = "dataiku"          # "dataiku" -> managed folder | "yerel" -> dosya sistemi
 
 # --- Dataiku modu ---
-GIRDI_FOLDER_ADI  = "FEATURE_STATE"             # JSON'un okundugu folder
-CIKTI_FOLDER_ADI  = "ALL_GENERATED_FEATURES"    # TXT'nin yazildigi folder
-JSON_YOLU         = "/feature_registry.json"    # girdi folder icindeki yol
+GIRDI_FOLDER_ADI = "FEATURE_STATE"             # JSON'larin okundugu folder
+CIKTI_FOLDER_ADI = "ALL_GENERATED_FEATURES"    # TXT'lerin yazildigi folder
+
+REGISTRY_YOLU = "/feature_registry.json"
+REJECTS_YOLU  = "/feature_rejects.json"
 
 # --- Yerel mod ---
-YEREL_JSON  = "feature_registry.json"
-YEREL_CIKTI = "."
+YEREL_REGISTRY = "feature_registry.json"
+YEREL_REJECTS  = "feature_rejects.json"
+YEREL_CIKTI    = "."
 
-CIKTI_ADI = "feature_ozet.txt"
+CIKTI_KABUL = "feature_ozet.txt"
+CIKTI_RED   = "feature_rejects_ozet.txt"
 
-# Alan adi varyasyonlari (JSON'da farkli yazilmis olabilir diye)
+REDLERI_YAZ = True          # False -> sadece kabul edilenler uretilir
+
+# Alan adi varyasyonlari
 AD_ANAHTARLARI      = ["ad", "isim", "name", "feature_adi"]
+RED_AD_ANAHTARLARI  = ["ad_soneki", "ad", "isim", "name"]   # redlerde tam ad yok, sonek var
 GEREKCE_ANAHTARLARI = ["gerekce", "gerekçe", "rationale", "aciklama", "açıklama"]
 FORMUL_ANAHTARLARI  = ["formul", "formül", "formula", "kod", "expression"]
+NEDEN_ANAHTARLARI   = ["neden", "red_nedeni", "reject_reason", "sebep"]
+TUR_ANAHTARLARI     = ["tur", "tur_no", "round"]
+TEMA_ANAHTARLARI    = ["tema", "theme"]
 
 
 def alan_getir(kayit, anahtarlar, varsayilan="(yok)"):
@@ -44,8 +60,10 @@ def alan_getir(kayit, anahtarlar, varsayilan="(yok)"):
     return varsayilan
 
 
+# ------------------------------------------------------------------
+# FOLDER / OKUMA
+# ------------------------------------------------------------------
 def folderlari_ac():
-    """Girdi ve cikti folder'larini ayri ayri acar."""
     import dataiku
     girdi = dataiku.Folder(GIRDI_FOLDER_ADI)
     try:
@@ -59,22 +77,23 @@ def folderlari_ac():
     return girdi, cikti
 
 
-def json_oku(girdi_folder):
+def json_oku(girdi_folder, folder_yolu, yerel_yol):
     if KAYNAK == "dataiku":
-        with girdi_folder.get_download_stream(JSON_YOLU) as s:
+        with girdi_folder.get_download_stream(folder_yolu) as s:
             return json.loads(s.read().decode("utf-8"))
     elif KAYNAK == "yerel":
-        with io.open(YEREL_JSON, "r", encoding="utf-8") as s:
+        with io.open(yerel_yol, "r", encoding="utf-8") as s:
             return json.load(s)
     raise ValueError("KAYNAK 'dataiku' veya 'yerel' olmali.")
 
 
 def kayitlari_normalize_et(veri):
-    """Registry duz liste, sarmalanmis liste veya ada gore sozluk olabilir."""
+    """Duz liste, sarmalanmis liste veya ada gore sozluk olabilir."""
     if isinstance(veri, list):
         return veri
     if isinstance(veri, dict):
-        for anahtar in ("features", "feature_registry", "kayitlar", "registry", "items"):
+        for anahtar in ("features", "feature_registry", "rejects", "feature_rejects",
+                        "kayitlar", "registry", "items"):
             if isinstance(veri.get(anahtar), list):
                 return veri[anahtar]
         degerler = list(veri.values())
@@ -88,17 +107,16 @@ def kayitlari_normalize_et(veri):
     raise ValueError("JSON yapisi taninamadi. Beklenen: liste veya feature sozlugu.")
 
 
+# ------------------------------------------------------------------
+# METIN URETIMI
+# ------------------------------------------------------------------
 def tek_satir(metin):
     """Cok satirli metni tek satira indirger; alt alta hizalama bozulmasin diye."""
     return " ".join(str(metin).split())
 
 
 def formul_satiri(ad, formul):
-    """
-    'ad = formul' formatina cevirir.
-    Formul zaten 'ad =' ile basliyorsa (registry bazen boyle yazabilir)
-    ikinci kez basa eklemez.
-    """
+    """'ad = formul' formatina cevirir; formul zaten 'ad =' ile basliyorsa tekrar etmez."""
     formul = tek_satir(formul)
     ad = tek_satir(ad)
     if formul.startswith(ad + " ="):
@@ -106,7 +124,7 @@ def formul_satiri(ad, formul):
     return "%s = %s" % (ad, formul)
 
 
-def metin_uret(kayitlar):
+def kabul_metni_uret(kayitlar):
     parcalar = []
     for k in kayitlar:
         ad      = alan_getir(k, AD_ANAHTARLARI)
@@ -116,45 +134,82 @@ def metin_uret(kayitlar):
         parcalar.append("feature adi: %s"            % tek_satir(ad))
         parcalar.append("feature aciklamasi: %s"     % tek_satir(gerekce))
         parcalar.append("feature uretim formulu: %s" % formul_satiri(ad, formul))
-        parcalar.append("")   # feature'lar arasi bos satir
-
+        parcalar.append("")
     return "\n".join(parcalar)
 
 
-def txt_yaz(cikti_folder, icerik):
+def red_metni_uret(kayitlar):
+    parcalar = []
+    for k in kayitlar:
+        ad      = alan_getir(k, RED_AD_ANAHTARLARI)
+        gerekce = alan_getir(k, GEREKCE_ANAHTARLARI)
+        formul  = alan_getir(k, FORMUL_ANAHTARLARI)
+        neden   = alan_getir(k, NEDEN_ANAHTARLARI)
+        tur     = alan_getir(k, TUR_ANAHTARLARI)
+        tema    = alan_getir(k, TEMA_ANAHTARLARI)
+
+        parcalar.append("feature adi: %s"            % tek_satir(ad))
+        parcalar.append("feature aciklamasi: %s"     % tek_satir(gerekce))
+        parcalar.append("feature uretim formulu: %s" % formul_satiri(ad, formul))
+        parcalar.append("red nedeni: %s"             % tek_satir(neden))
+        parcalar.append("tur: %s"                    % tek_satir(tur))
+        parcalar.append("tema: %s"                   % tek_satir(tema))
+        parcalar.append("")
+    return "\n".join(parcalar)
+
+
+# ------------------------------------------------------------------
+# YAZMA
+# ------------------------------------------------------------------
+def txt_yaz(cikti_folder, dosya_adi, icerik):
     if KAYNAK == "dataiku":
-        cikti_folder.upload_stream("/" + CIKTI_ADI, icerik.encode("utf-8"))
-        print("Yazildi: %s -> /%s" % (CIKTI_FOLDER_ADI, CIKTI_ADI))
+        cikti_folder.upload_stream("/" + dosya_adi, icerik.encode("utf-8"))
+        print("Yazildi: %s -> /%s  (%d karakter)" % (CIKTI_FOLDER_ADI, dosya_adi, len(icerik)))
     else:
-        yol = os.path.join(YEREL_CIKTI, CIKTI_ADI)
+        yol = os.path.join(YEREL_CIKTI, dosya_adi)
         with io.open(yol, "w", encoding="utf-8") as f:
             f.write(icerik)
-        print("Yazildi (yerel): %s" % yol)
+        print("Yazildi (yerel): %s  (%d karakter)" % (yol, len(icerik)))
 
 
+def eksik_uyar(kayitlar, etiket, ad_anahtarlari, ek_anahtarlar=None):
+    """Eksik alanlari sessizce '(yok)' yazip gecmemek icin konsola basar."""
+    kontroller = [("ad", ad_anahtarlari),
+                  ("gerekce", GEREKCE_ANAHTARLARI),
+                  ("formul", FORMUL_ANAHTARLARI)]
+    if ek_anahtarlar:
+        kontroller += ek_anahtarlar
+    for i, k in enumerate(kayitlar, start=1):
+        yok = [isim for isim, anah in kontroller if alan_getir(k, anah) == "(yok)"]
+        if yok:
+            print("UYARI [%s %d]: eksik alan -> %s" % (etiket, i, ", ".join(yok)))
+
+
+# ------------------------------------------------------------------
+# ANA AKIS
+# ------------------------------------------------------------------
 def main():
     if KAYNAK == "dataiku":
         girdi_folder, cikti_folder = folderlari_ac()
     else:
         girdi_folder, cikti_folder = None, None
 
-    veri = json_oku(girdi_folder)
-    kayitlar = kayitlari_normalize_et(veri)
-    print("Okunan feature sayisi: %d" % len(kayitlar))
+    # --- KABUL EDILENLER ---
+    kabuller = kayitlari_normalize_et(
+        json_oku(girdi_folder, REGISTRY_YOLU, YEREL_REGISTRY))
+    print("Kabul edilen feature sayisi: %d" % len(kabuller))
+    eksik_uyar(kabuller, "kabul", AD_ANAHTARLARI)
+    txt_yaz(cikti_folder, CIKTI_KABUL, kabul_metni_uret(kabuller))
 
-    # Eksik alan varsa sessizce "(yok)" yazip gecmesin, konsola bassin
-    for i, k in enumerate(kayitlar, start=1):
-        yok = []
-        if alan_getir(k, AD_ANAHTARLARI) == "(yok)":
-            yok.append("ad")
-        if alan_getir(k, GEREKCE_ANAHTARLARI) == "(yok)":
-            yok.append("gerekce")
-        if alan_getir(k, FORMUL_ANAHTARLARI) == "(yok)":
-            yok.append("formul")
-        if yok:
-            print("UYARI [%d]: eksik alan -> %s" % (i, ", ".join(yok)))
+    # --- REDDEDILENLER ---
+    if REDLERI_YAZ:
+        redler = kayitlari_normalize_et(
+            json_oku(girdi_folder, REJECTS_YOLU, YEREL_REJECTS))
+        print("Reddedilen feature sayisi: %d" % len(redler))
+        eksik_uyar(redler, "red", RED_AD_ANAHTARLARI,
+                   ek_anahtarlar=[("neden", NEDEN_ANAHTARLARI)])
+        txt_yaz(cikti_folder, CIKTI_RED, red_metni_uret(redler))
 
-    txt_yaz(cikti_folder, metin_uret(kayitlar))
     print("Bitti.")
 
 
