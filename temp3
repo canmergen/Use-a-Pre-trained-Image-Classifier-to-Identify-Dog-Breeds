@@ -1,216 +1,111 @@
-# -*- coding: utf-8 -*-
-"""
-FEATURE_STATE/feature_registry.json -> ALL_GENERATED_FEATURES/feature_ozet.txt
-FEATURE_STATE/feature_rejects.json  -> ALL_GENERATED_FEATURES/feature_rejects_ozet.txt
-
-Kabul formati (feature_ozet.txt):
-    feature adi: LLM_F001_GDN_GLN_RATIO_ACCEL
-    feature aciklamasi: Kisa vadeli (7 gun) giden/gelen oraninin...
-    feature uretim formulu: LLM_F001_GDN_GLN_RATIO_ACCEL = (df['TXN_GDN_7D_AMT'] / ...)
-
-Red formati (feature_rejects_ozet.txt):
-    feature adi: CP_HHI_RATIO_7D_30D
-    feature aciklamasi: Likidite sikismasi yasayan musteriler...
-    feature uretim formulu: CP_HHI_RATIO_7D_30D = df['OUT_7D_CP_AMT_HHI'] / ...
-    red nedeni: zayif sinyal (lift<1.3 ve |pp_gap|<8.0)
-    tur: 2
-    tema: kisa vade ile uzun vadenin ayrismasi...
-"""
-
-import json
-import io
-import os
+import lightgbm as lgb
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
 # ------------------------------------------------------------------
-# AYARLAR
+# PARAMETRELER
+# 10k satir + ~1000 kolon + zayif sinyal -> agresif duzenlilestirme gerekiyor
 # ------------------------------------------------------------------
-KAYNAK = "dataiku"          # "dataiku" -> managed folder | "yerel" -> dosya sistemi
+LGB_PARAMS = dict(
+    objective="binary", metric="auc",
+    n_estimators=3000,          # tavan yuksek; durmayi early stopping belirlesin
+    learning_rate=0.02,         # dusuk lr + yuksek tavan = daha kararli optimum
+    num_leaves=16, max_depth=4, # 2^4=16, ikisi tutarli; model kucultuldu
+    min_child_samples=300,      # 10k satirda %3; yaprak basina min ornek
+    colsample_bytree=0.15,      # ~150 kolon/agac; yuksek boyutta kritik
+    subsample=0.8, subsample_freq=1,
+    reg_lambda=10.0,            # L2
+    reg_alpha=1.0,              # L1
+    min_split_gain=0.01,        # gurultu split'lerini engeller
+    n_jobs=4, verbose=-1, random_state=42,
+)
 
-# --- Dataiku modu ---
-GIRDI_FOLDER_ADI = "FEATURE_STATE"             # JSON'larin okundugu folder
-CIKTI_FOLDER_ADI = "ALL_GENERATED_FEATURES"    # TXT'lerin yazildigi folder
-
-REGISTRY_YOLU = "/feature_registry.json"
-REJECTS_YOLU  = "/feature_rejects.json"
-
-# --- Yerel mod ---
-YEREL_REGISTRY = "feature_registry.json"
-YEREL_REJECTS  = "feature_rejects.json"
-YEREL_CIKTI    = "."
-
-CIKTI_KABUL = "feature_ozet.txt"
-CIKTI_RED   = "feature_rejects_ozet.txt"
-
-REDLERI_YAZ = True          # False -> sadece kabul edilenler uretilir
-
-# Alan adi varyasyonlari
-AD_ANAHTARLARI      = ["ad", "isim", "name", "feature_adi"]
-RED_AD_ANAHTARLARI  = ["ad_soneki", "ad", "isim", "name"]   # redlerde tam ad yok, sonek var
-GEREKCE_ANAHTARLARI = ["gerekce", "gerekçe", "rationale", "aciklama", "açıklama"]
-FORMUL_ANAHTARLARI  = ["formul", "formül", "formula", "kod", "expression"]
-NEDEN_ANAHTARLARI   = ["neden", "red_nedeni", "reject_reason", "sebep"]
-TUR_ANAHTARLARI     = ["tur", "tur_no", "round"]
-TEMA_ANAHTARLARI    = ["tema", "theme"]
+ERKEN_DURDURMA = 100   # lr dusurulunce sabir da artmali
 
 
-def alan_getir(kayit, anahtarlar, varsayilan="(yok)"):
-    for a in anahtarlar:
-        if a in kayit and kayit[a] not in (None, "", []):
-            return kayit[a]
-    return varsayilan
+def capture_at(y_true, prob, pct=0.10):
+    y, p = np.asarray(y_true), np.asarray(prob)
+    k = max(1, int(pct * len(y)))
+    idx = np.argsort(-p)[:k]
+    return float(y[idx].sum() / max(y.sum(), 1))
 
 
-# ------------------------------------------------------------------
-# FOLDER / OKUMA
-# ------------------------------------------------------------------
-def folderlari_ac():
-    import dataiku
-    girdi = dataiku.Folder(GIRDI_FOLDER_ADI)
-    try:
-        cikti = dataiku.Folder(CIKTI_FOLDER_ADI)
-    except Exception as e:
-        raise RuntimeError(
-            "Cikti folder'i acilamadi: '%s'. Projede bu isimde bir managed folder "
-            "var mi ve isim buyuk/kucuk harf dahil birebir ayni mi kontrol et. "
-            "Orijinal hata: %s" % (CIKTI_FOLDER_ADI, e)
-        )
-    return girdi, cikti
+def egit_ve_olc(kolonlar, etiket, seed=42, sessiz=False):
+    """3-fold CV (train) + final model (tum train) + val skoru."""
+    params = {**LGB_PARAMS, "random_state": seed}
+    X, y = train[kolonlar], y_train
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
 
+    fold_auc, fold_agac = [], []
+    for tr_i, te_i in cv.split(X, y):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X.iloc[tr_i], y[tr_i],
+              eval_set=[(X.iloc[te_i], y[te_i])],
+              callbacks=[lgb.early_stopping(ERKEN_DURDURMA, verbose=False)])
+        fold_auc.append(roc_auc_score(y[te_i], m.predict_proba(X.iloc[te_i])[:, 1]))
+        # best_iteration_ None ise erken durdurma calismamis demektir
+        fold_agac.append(m.best_iteration_ if m.best_iteration_ else params["n_estimators"])
 
-def json_oku(girdi_folder, folder_yolu, yerel_yol):
-    if KAYNAK == "dataiku":
-        with girdi_folder.get_download_stream(folder_yolu) as s:
-            return json.loads(s.read().decode("utf-8"))
-    elif KAYNAK == "yerel":
-        with io.open(yerel_yol, "r", encoding="utf-8") as s:
-            return json.load(s)
-    raise ValueError("KAYNAK 'dataiku' veya 'yerel' olmali.")
+    # Fold'lar 2/3 veriyle egitildi, final tum train ile egitilecek:
+    # agac sayisi veri orani kadar buyutulur (3-fold icin 1.5x)
+    n_final = int(np.mean(fold_agac) * 1.5)
 
+    final = lgb.LGBMClassifier(**{**params, "n_estimators": n_final})
+    final.fit(X, y)
 
-def kayitlari_normalize_et(veri):
-    """Duz liste, sarmalanmis liste veya ada gore sozluk olabilir."""
-    if isinstance(veri, list):
-        return veri
-    if isinstance(veri, dict):
-        for anahtar in ("features", "feature_registry", "rejects", "feature_rejects",
-                        "kayitlar", "registry", "items"):
-            if isinstance(veri.get(anahtar), list):
-                return veri[anahtar]
-        degerler = list(veri.values())
-        if degerler and all(isinstance(d, dict) for d in degerler):
-            kayitlar = []
-            for k, v in veri.items():
-                v = dict(v)
-                v.setdefault("ad", k)
-                kayitlar.append(v)
-            return kayitlar
-    raise ValueError("JSON yapisi taninamadi. Beklenen: liste veya feature sozlugu.")
+    p_tr = final.predict_proba(X)[:, 1]
+    p_val = final.predict_proba(val[kolonlar])[:, 1]
+    r = {"cv_auc": float(np.mean(fold_auc)), "cv_std": float(np.std(fold_auc)),
+         "tr_auc": roc_auc_score(y, p_tr), "val_auc": roc_auc_score(y_val, p_val),
+         "val_gini": 2 * roc_auc_score(y_val, p_val) - 1,
+         "val_cap10": capture_at(y_val, p_val), "n_agac": n_final}
+
+    if not sessiz:
+        print(f"{etiket:<10} CV AUC={r['cv_auc']:.4f}±{r['cv_std']:.4f}  "
+              f"train AUC={r['tr_auc']:.4f}  val AUC={r['val_auc']:.4f}  "
+              f"cap@10={r['val_cap10']:.4f}  "
+              f"makas={r['tr_auc']-r['val_auc']:.4f}  agac={r['n_agac']}")
+        # Erken durdurma teshisi: hepsi tavana dayaniyorsa parametre sorunu var
+        print(f"{'':<10} fold agac sayilari={fold_agac}  (tavan={params['n_estimators']})")
+    return r, final
 
 
 # ------------------------------------------------------------------
-# METIN URETIMI
+# TEK SEED (hizli bakis)
 # ------------------------------------------------------------------
-def tek_satir(metin):
-    """Cok satirli metni tek satira indirger; alt alta hizalama bozulmasin diye."""
-    return " ".join(str(metin).split())
-
-
-def formul_satiri(ad, formul):
-    """'ad = formul' formatina cevirir; formul zaten 'ad =' ile basliyorsa tekrar etmez."""
-    formul = tek_satir(formul)
-    ad = tek_satir(ad)
-    if formul.startswith(ad + " ="):
-        return formul
-    return "%s = %s" % (ad, formul)
-
-
-def kabul_metni_uret(kayitlar):
-    parcalar = []
-    for k in kayitlar:
-        ad      = alan_getir(k, AD_ANAHTARLARI)
-        gerekce = alan_getir(k, GEREKCE_ANAHTARLARI)
-        formul  = alan_getir(k, FORMUL_ANAHTARLARI)
-
-        parcalar.append("feature adi: %s"            % tek_satir(ad))
-        parcalar.append("feature aciklamasi: %s"     % tek_satir(gerekce))
-        parcalar.append("feature uretim formulu: %s" % formul_satiri(ad, formul))
-        parcalar.append("")
-    return "\n".join(parcalar)
-
-
-def red_metni_uret(kayitlar):
-    parcalar = []
-    for k in kayitlar:
-        ad      = alan_getir(k, RED_AD_ANAHTARLARI)
-        gerekce = alan_getir(k, GEREKCE_ANAHTARLARI)
-        formul  = alan_getir(k, FORMUL_ANAHTARLARI)
-        neden   = alan_getir(k, NEDEN_ANAHTARLARI)
-        tur     = alan_getir(k, TUR_ANAHTARLARI)
-        tema    = alan_getir(k, TEMA_ANAHTARLARI)
-
-        parcalar.append("feature adi: %s"            % tek_satir(ad))
-        parcalar.append("feature aciklamasi: %s"     % tek_satir(gerekce))
-        parcalar.append("feature uretim formulu: %s" % formul_satiri(ad, formul))
-        parcalar.append("red nedeni: %s"             % tek_satir(neden))
-        parcalar.append("tur: %s"                    % tek_satir(tur))
-        parcalar.append("tema: %s"                   % tek_satir(tema))
-        parcalar.append("")
-    return "\n".join(parcalar)
+sonuc_base, model_base = egit_ve_olc(base_final, "BASE")
+sonuc_enr,  model_enr  = egit_ve_olc(enr_final,  "ENRICHED")
 
 
 # ------------------------------------------------------------------
-# YAZMA
+# COK SEED KARSILASTIRMASI
+# Tek seed'in fold std'si, iki feature setini ayirt etmeye yetmiyor.
+# Ayni parametrelerle 5 farkli seed calistirip ortalamalari karsilastir.
 # ------------------------------------------------------------------
-def txt_yaz(cikti_folder, dosya_adi, icerik):
-    if KAYNAK == "dataiku":
-        cikti_folder.upload_stream("/" + dosya_adi, icerik.encode("utf-8"))
-        print("Yazildi: %s -> /%s  (%d karakter)" % (CIKTI_FOLDER_ADI, dosya_adi, len(icerik)))
-    else:
-        yol = os.path.join(YEREL_CIKTI, dosya_adi)
-        with io.open(yol, "w", encoding="utf-8") as f:
-            f.write(icerik)
-        print("Yazildi (yerel): %s  (%d karakter)" % (yol, len(icerik)))
+def cok_seed_karsilastir(kolon_setleri, seedler=(1, 7, 42, 99, 123)):
+    """kolon_setleri: {"BASE": base_final, "ENRICHED": enr_final}"""
+    tablo = {}
+    for etiket, kolonlar in kolon_setleri.items():
+        cv_list, val_list = [], []
+        for s in seedler:
+            r, _ = egit_ve_olc(kolonlar, etiket, seed=s, sessiz=True)
+            cv_list.append(r["cv_auc"])
+            val_list.append(r["val_auc"])
+        tablo[etiket] = {"cv_ort": np.mean(cv_list), "cv_sd": np.std(cv_list),
+                         "val_ort": np.mean(val_list), "val_sd": np.std(val_list)}
+        print(f"{etiket:<10} CV={tablo[etiket]['cv_ort']:.4f}±{tablo[etiket]['cv_sd']:.4f}  "
+              f"VAL={tablo[etiket]['val_ort']:.4f}±{tablo[etiket]['val_sd']:.4f}  "
+              f"(n_seed={len(seedler)})")
+
+    if len(tablo) == 2:
+        a, b = list(tablo.keys())
+        delta = tablo[b]["val_ort"] - tablo[a]["val_ort"]
+        gurultu = np.sqrt(tablo[a]["val_sd"]**2 + tablo[b]["val_sd"]**2)
+        print(f"\nDELTA (val) = {delta:+.4f}   gurultu bandi = ±{gurultu:.4f}")
+        print("SONUC: " + ("anlamli fark" if abs(delta) > gurultu
+                           else "fark gurultu icinde, ayirt edilemiyor"))
+    return tablo
 
 
-def eksik_uyar(kayitlar, etiket, ad_anahtarlari, ek_anahtarlar=None):
-    """Eksik alanlari sessizce '(yok)' yazip gecmemek icin konsola basar."""
-    kontroller = [("ad", ad_anahtarlari),
-                  ("gerekce", GEREKCE_ANAHTARLARI),
-                  ("formul", FORMUL_ANAHTARLARI)]
-    if ek_anahtarlar:
-        kontroller += ek_anahtarlar
-    for i, k in enumerate(kayitlar, start=1):
-        yok = [isim for isim, anah in kontroller if alan_getir(k, anah) == "(yok)"]
-        if yok:
-            print("UYARI [%s %d]: eksik alan -> %s" % (etiket, i, ", ".join(yok)))
-
-
-# ------------------------------------------------------------------
-# ANA AKIS
-# ------------------------------------------------------------------
-def main():
-    if KAYNAK == "dataiku":
-        girdi_folder, cikti_folder = folderlari_ac()
-    else:
-        girdi_folder, cikti_folder = None, None
-
-    # --- KABUL EDILENLER ---
-    kabuller = kayitlari_normalize_et(
-        json_oku(girdi_folder, REGISTRY_YOLU, YEREL_REGISTRY))
-    print("Kabul edilen feature sayisi: %d" % len(kabuller))
-    eksik_uyar(kabuller, "kabul", AD_ANAHTARLARI)
-    txt_yaz(cikti_folder, CIKTI_KABUL, kabul_metni_uret(kabuller))
-
-    # --- REDDEDILENLER ---
-    if REDLERI_YAZ:
-        redler = kayitlari_normalize_et(
-            json_oku(girdi_folder, REJECTS_YOLU, YEREL_REJECTS))
-        print("Reddedilen feature sayisi: %d" % len(redler))
-        eksik_uyar(redler, "red", RED_AD_ANAHTARLARI,
-                   ek_anahtarlar=[("neden", NEDEN_ANAHTARLARI)])
-        txt_yaz(cikti_folder, CIKTI_RED, red_metni_uret(redler))
-
-    print("Bitti.")
-
-
-main()
+cok_seed_karsilastir({"BASE": base_final, "ENRICHED": enr_final})
