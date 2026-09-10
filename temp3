@@ -3,19 +3,19 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
+print("LightGBM surumu:", lgb.__version__)
+
 # ------------------------------------------------------------------
 # PARAMETRELER
 # 8.000 train satiri, ~1038 base kolon, dengeli target.
-# colsample 0.5'ten dusuruldu ama 0.15'e degil: 33 LLM kolonu
-# seyreltilmesin diye orta yol secildi (~agac basina 300 kolon).
 # ------------------------------------------------------------------
 LGB_PARAMS = dict(
     objective="binary", metric="auc",
     n_estimators=3000,
     learning_rate=0.02,
     num_leaves=16, max_depth=4,
-    min_child_samples=200,      # 8.000 train / 3 fold -> ~5.300; %3.8
-    colsample_bytree=0.30,
+    min_child_samples=200,
+    colsample_bytree=0.30,      # 33 LLM kolonu seyrelmesin diye 0.15 degil
     subsample=0.8, subsample_freq=1,
     reg_lambda=10.0, reg_alpha=1.0,
     min_split_gain=0.01,
@@ -23,10 +23,48 @@ LGB_PARAMS = dict(
 )
 
 ERKEN_DURDURMA = 100
-CALLBACKS = [
-    lgb.early_stopping(ERKEN_DURDURMA, verbose=False),
-    lgb.log_evaluation(period=0),      # iterasyon logunu susturur
-]
+
+
+# ------------------------------------------------------------------
+# SURUM UYUMLU CALLBACK KURULUMU
+# lgb.log_evaluation 3.3+ ile geldi. Eski surumlerde ayni is
+# lgb.callback.print_evaluation ile ya da fit(verbose=False) ile yapilir.
+# ------------------------------------------------------------------
+def callback_listesi():
+    cbs = []
+
+    # 1) Erken durdurma
+    if hasattr(lgb, "early_stopping"):
+        cbs.append(lgb.early_stopping(ERKEN_DURDURMA, verbose=False))
+    else:
+        cbs.append(lgb.callback.early_stopping(ERKEN_DURDURMA, verbose=False))
+
+    # 2) Iterasyon logunu susturma (varsa)
+    if hasattr(lgb, "log_evaluation"):
+        cbs.append(lgb.log_evaluation(period=0))
+    elif hasattr(lgb.callback, "log_evaluation"):
+        cbs.append(lgb.callback.log_evaluation(period=0))
+    elif hasattr(lgb.callback, "print_evaluation"):
+        cbs.append(lgb.callback.print_evaluation(period=0))
+    # hicbiri yoksa: asagidaki fit_guvenli() verbose=False ile susturur
+
+    return cbs
+
+
+CALLBACKS = callback_listesi()
+
+
+def fit_guvenli(model, X, y, eval_set):
+    """
+    Eski surum: fit(verbose=False) desteklenir ve loglari susturur.
+    Yeni surum (4.x): verbose argumani kaldirildi, TypeError verir ->
+    callback'lerle devam edilir.
+    """
+    try:
+        model.fit(X, y, eval_set=eval_set, callbacks=CALLBACKS, verbose=False)
+    except TypeError:
+        model.fit(X, y, eval_set=eval_set, callbacks=CALLBACKS)
+    return model
 
 
 def capture_at(y_true, prob, pct=0.10):
@@ -37,12 +75,7 @@ def capture_at(y_true, prob, pct=0.10):
 
 
 def egit_ve_olc(kolonlar, etiket, seed=42, sessiz=False):
-    """
-    3-fold CV (train) + final model (tum train) + val skoru.
-    Doner: (ozet_dict, final_model)
-    ozet_dict icinde 'fold_auc' (liste) ve 'p_val' (val olasiliklari) da var;
-    esli karsilastirma bunlari kullanir.
-    """
+    """3-fold CV (train) + final model (tum train) + val skoru."""
     params = {**LGB_PARAMS, "random_state": seed}
     X, y = train[kolonlar], y_train
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
@@ -50,16 +83,14 @@ def egit_ve_olc(kolonlar, etiket, seed=42, sessiz=False):
     fold_auc, fold_agac = [], []
     for tr_i, te_i in cv.split(X, y):
         m = lgb.LGBMClassifier(**params)
-        m.fit(X.iloc[tr_i], y[tr_i],
-              eval_set=[(X.iloc[te_i], y[te_i])],
-              callbacks=CALLBACKS)
+        fit_guvenli(m, X.iloc[tr_i], y[tr_i], [(X.iloc[te_i], y[te_i])])
         fold_auc.append(roc_auc_score(y[te_i], m.predict_proba(X.iloc[te_i])[:, 1]))
         fold_agac.append(m.best_iteration_ if m.best_iteration_ else params["n_estimators"])
 
     # Fold modelleri verinin 2/3'u ile egitildi, final tamami ile egitilecek
     n_final = int(np.mean(fold_agac) * 1.5)
     final = lgb.LGBMClassifier(**{**params, "n_estimators": n_final})
-    final.fit(X, y)
+    final.fit(X, y)   # eval_set yok -> log basmaz
 
     p_tr = final.predict_proba(X)[:, 1]
     p_val = final.predict_proba(val[kolonlar])[:, 1]
@@ -70,7 +101,7 @@ def egit_ve_olc(kolonlar, etiket, seed=42, sessiz=False):
          "fold_auc": fold_auc, "p_val": p_val, "n_kolon": len(kolonlar)}
 
     if not sessiz:
-        print(f"{etiket:<10} kolon={r['n_kolon']:>4}  "
+        print(f"{etiket:<12} kolon={r['n_kolon']:>4}  "
               f"CV AUC={r['cv_auc']:.4f}±{r['cv_std']:.4f}  "
               f"train={r['tr_auc']:.4f}  val={r['val_auc']:.4f}  "
               f"cap@10={r['val_cap10']:.4f}  "
@@ -81,23 +112,21 @@ def egit_ve_olc(kolonlar, etiket, seed=42, sessiz=False):
 # ------------------------------------------------------------------
 # A) ESLI CV KARSILASTIRMASI
 # Ayni seed -> StratifiedKFold ayni fold'lari uretir (bolme sadece y'ye
-# ve seed'e bagli, kolon setine degil). Bu yuzden fold bazinda dogrudan
-# cikartma yapilabilir; ortak gurultu birbirini goturur.
+# ve seed'e bagli). Fold bazinda cikartma yapilir, ortak gurultu duser.
 # ------------------------------------------------------------------
 def esli_cv_karsilastir(base_kolon, enr_kolon, seedler=(1, 7, 42, 99, 123)):
     deltalar = []
     for s in seedler:
         rb, _ = egit_ve_olc(base_kolon, "BASE", seed=s, sessiz=True)
         re_, _ = egit_ve_olc(enr_kolon, "ENRICHED", seed=s, sessiz=True)
-        for i, (b, e) in enumerate(zip(rb["fold_auc"], re_["fold_auc"])):
-            deltalar.append(e - b)
+        deltalar.extend([e - b for b, e in zip(rb["fold_auc"], re_["fold_auc"])])
         print(f"  seed={s:<4} BASE CV={rb['cv_auc']:.4f}  "
-              f"ENR CV={re_['cv_auc']:.4f}  delta={re_['cv_auc']-rb['cv_auc']:+.4f}")
+              f"ENR CV={re_['cv_auc']:.4f}  delta={re_['cv_auc']-rb['cv_auc']:+.4f}",
+              flush=True)
 
     d = np.array(deltalar)
-    n = len(d)
-    ort, sh = float(d.mean()), float(d.std(ddof=1) / np.sqrt(n))
-    print(f"\nESLI CV DELTA = {ort:+.4f}  (std hata ±{sh:.4f}, n={n} fold)")
+    ort, sh = float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d)))
+    print(f"\nESLI CV DELTA = {ort:+.4f}  (std hata ±{sh:.4f}, n={len(d)} fold)")
     print(f"  yaklasik t = {ort/sh if sh > 0 else 0:.2f}   "
           f"(|t|>2 ise fark gurultuden ayrisiyor)")
     return d
@@ -105,9 +134,7 @@ def esli_cv_karsilastir(base_kolon, enr_kolon, seedler=(1, 7, 42, 99, 123)):
 
 # ------------------------------------------------------------------
 # B) ESLI VAL BOOTSTRAP
-# Ayni bootstrap satirlariyla iki modelin val AUC'si hesaplanir.
-# Val setinin kucuklugu (2.000) her iki modeli AYNI yonde etkiledigi icin
-# esli fark, bagimsiz ortalama farkindan cok daha dar bir bantta cikar.
+# Ayni bootstrap satirlariyla iki modelin val AUC farki.
 # ------------------------------------------------------------------
 def esli_val_bootstrap(p_val_base, p_val_enr, n_boot=2000, seed=42):
     rng = np.random.default_rng(seed)
@@ -130,10 +157,13 @@ def esli_val_bootstrap(p_val_base, p_val_enr, n_boot=2000, seed=42):
 
 # ------------------------------------------------------------------
 # C) LLM KOLONLARI TEK BASINA
-# 33 kolonun 1038'in yaninda kaybolup kaybolmadigini anlamanin en net yolu:
-# tek baslarina, ve ayni sayida rastgele base kolonuna karsi olcmek.
+# 33 kolon 1038'in icinde kayboluyor mu? Ayni sayida rastgele base
+# kolonuna karsi olcerek bak.
 # ------------------------------------------------------------------
 def llm_tek_basina_test(llm_kolon, base_kolon, n_tekrar=5, seed=42):
+    if len(llm_kolon) == 0:
+        print("UYARI: eleme sonrasi hic LLM kolonu kalmamis.")
+        return None, []
     r_llm, _ = egit_ve_olc(llm_kolon, "SADECE_LLM", seed=seed)
     rng = np.random.default_rng(seed)
     skorlar = []
@@ -141,17 +171,18 @@ def llm_tek_basina_test(llm_kolon, base_kolon, n_tekrar=5, seed=42):
         secim = list(rng.choice(base_kolon, size=len(llm_kolon), replace=False))
         r, _ = egit_ve_olc(secim, f"RASTGELE_{i}", seed=seed, sessiz=True)
         skorlar.append(r["cv_auc"])
-    print(f"RASTGELE  {len(llm_kolon)} base kolonu: "
-          f"CV AUC ort={np.mean(skorlar):.4f}±{np.std(skorlar):.4f}  ({n_tekrar} tekrar)")
+    print(f"RASTGELE {len(llm_kolon)} base kolonu: "
+          f"CV AUC ort={np.mean(skorlar):.4f}±{np.std(skorlar):.4f} ({n_tekrar} tekrar)")
+    ustun = r_llm["cv_auc"] > np.mean(skorlar) + np.std(skorlar)
     print(f"KARSILASTIRMA: LLM {r_llm['cv_auc']:.4f} vs rastgele {np.mean(skorlar):.4f} "
-          f"-> {'LLM ustun' if r_llm['cv_auc'] > np.mean(skorlar) + np.std(skorlar) else 'ayirt edilemiyor'}")
+          f"-> {'LLM ustun' if ustun else 'ayirt edilemiyor'}")
     return r_llm, skorlar
 
 
 # ------------------------------------------------------------------
 # CALISTIRMA
 # ------------------------------------------------------------------
-print("=== Tek seed bakis ===")
+print("\n=== Tek seed bakis ===")
 sonuc_base, model_base = egit_ve_olc(base_final, "BASE")
 sonuc_enr,  model_enr  = egit_ve_olc(enr_final,  "ENRICHED")
 
