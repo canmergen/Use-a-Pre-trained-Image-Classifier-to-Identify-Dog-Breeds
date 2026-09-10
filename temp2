@@ -4,17 +4,16 @@
 # Sorumluluk : girdi_al'in ciktisina gore oturum durumunu gunceller ve akisi
 #              ilgili bloga yonlendirir.
 #
-# TASARIM ILKESI:
-#   Anlam cozumlemesi girdi_al blogunda (LLM) yapilir. Bu blok kullanicinin
-#   ham metnine BAKMAZ; yalnizca girdi_al'in dondurdugu "aksiyon" alanina
-#   bakar. Boylece kullanicinin kelime secimi degistiginde akis kirilmaz.
+# TASARIM ILKELERI:
+#   1. Anlam cozumlemesi girdi_al blogunda (LLM) yapilir. Bu blok kullanicinin
+#      ham metnine BAKMAZ; yalnizca "aksiyon" alanina bakar.
+#   2. Kayitli oturum SORULUR ve kullanicinin karari beklenir. Kayit asla
+#      kendiliginden silinmez; kullanici her an geri donebilir.
+#   3. RET ACIK OLMALIDIR. Karar verilmeden gelen soru kaydi reddetmez.
+#   4. girdi_al ciktisi iki kaynaktan okunur (state["girdi"] ve last_output);
+#      blok ayari eksikse akis yine calisir.
 #
-#   Kullaniciya soru soran her dal _beklenen_ayarla() cagirir. Bu deger bir
-#   sonraki turda girdi_al'a Jinja ile enjekte edilir ve LLM'in cevabi dogru
-#   yorumlamasini saglar. "bununla devam edelim" cumlesi baglamsiz
-#   anlamsizdir; beklenti bilgisi onu anlamli kilar.
-#
-# Girdi      : state["girdi"]  -> girdi_al JSON ciktisi
+# Girdi      : state["girdi"] veya last_output -> girdi_al JSON ciktisi
 # Cikti      : Kullaniciya metin (yield) veya NextBlock(<blok_id>)
 # Bagimlilik : PROJE_HAFIZASI managed folder / sema.json
 # =============================================================================
@@ -109,20 +108,32 @@ class Aksiyon:
 
 KOLON_AKSIYONLARI = (Aksiyon.KOLON_SOR, Aksiyon.KOLON_TANIMLA)
 
-# girdi_al'in uretebilecegi gecerli aksiyonlar. Liste disi bir deger gelirse
-# BILGI'ye dusurulur ve teshis icin loglanir.
-GECERLI_AKSIYONLAR = frozenset({
-    Aksiyon.KAYIT_DEVAM, Aksiyon.KAYIT_YENI, Aksiyon.ONAY, Aksiyon.RET,
-    Aksiyon.KOLON_SOR, Aksiyon.KOLON_TANIMLA, Aksiyon.GORUS_ISTE,
-    Aksiyon.BILGI,
-})
+# Eski sema veya farkli adlandirma ile gelen degerleri karsilar.
+# Bir sema uyusmazligi akisi kilitlemesin diye tolerans birakildi.
+AKSIYON_ESLEME = {
+    "kayit_devam": Aksiyon.KAYIT_DEVAM,
+    "devam": Aksiyon.KAYIT_DEVAM,
+    "kayit_yeni": Aksiyon.KAYIT_YENI,
+    "yeni": Aksiyon.KAYIT_YENI,
+    "onay": Aksiyon.ONAY,
+    "kabul": Aksiyon.ONAY,
+    "ret": Aksiyon.RET,
+    "red": Aksiyon.RET,
+    "kolon_sor": Aksiyon.KOLON_SOR,
+    "kolon_sorgu": Aksiyon.KOLON_SOR,
+    "kolon_tanimla": Aksiyon.KOLON_TANIMLA,
+    "kolon_tanim": Aksiyon.KOLON_TANIMLA,
+    "gorus_iste": Aksiyon.GORUS_ISTE,
+    "gorus": Aksiyon.GORUS_ISTE,
+    "bilgi": Aksiyon.BILGI,
+}
 
 
 class Beklenen:
     """Sistemin kullanicidan bekledigi cevap turu.
 
     girdi_al'a Jinja ile enjekte edilir; kullanicinin mesajini dogru
-    yorumlamasini saglayan tek sey budur.
+    yorumlamasini saglayan sey budur.
     """
     KAYIT_KARARI = "kayit_karari"
     VERI_SETI = "veri_seti"
@@ -134,6 +145,7 @@ class Beklenen:
 class G:
     """girdi_al ciktisindaki alan adlari."""
     AKSIYON = "aksiyon"
+    NIYET = "niyet"          # eski sema karsiligi
     VERI_SETI = "veri_seti"
     SOZLUK = "sozluk"
     TARGET = "target"
@@ -181,7 +193,6 @@ class S:
 
 
 # girdi_al'in veri seti adi saniyp gonderebilecegi, dataset OLMAYAN degerler.
-# Bu anlam cozumlemesi degil; bilinen bir LLM hatasina karsi emniyet kemeri.
 GECERSIZ_DATASET_ADLARI = frozenset({
     "sema.json", "sema", "meta.json", "meta",
     "proje_hafizasi", "proje_hafızası", "hafiza", "hafıza",
@@ -239,8 +250,8 @@ belirten JSON. Verilmezse 2. adımda soru-cevapla birlikte oluşturulur.
 Dataset adını yazdığınızda sözlük hazırlığına geçilir."""
 
 SIFIRDAN_BASLA = """Tamam, kayıtlı oturumu kullanmıyoruz. Kayıt proje \
-hafızasında duruyor; fikrinizi değiştirirseniz kayıtlı oturuma dönmek \
-istediğinizi söylemeniz yeterli.
+hafızasında duruyor ve silinmedi; fikrinizi değiştirirseniz kayıtlı oturuma \
+dönmek istediğinizi söylemeniz yeterli.
 
 """ + BILGI_ISTEGI
 
@@ -366,6 +377,26 @@ def _logla(mesaj):
     print("[durum_belirle] {}".format(mesaj))
 
 
+def _ham_girdiyi_al():
+    """girdi_al ciktisini iki kaynaktan dener.
+
+    Blogun "Save response to state key" ayari eksikse state["girdi"] bos
+    kalir; bu durumda onceki blogun ciktisi last_output'ta bulunur.
+    Doner: (ham_deger, kaynak_adi)
+    """
+    ham = state.get(S.GIRDI)
+    if ham:
+        return ham, "state"
+
+    try:
+        if last_output:
+            return last_output, "last_output"
+    except NameError:
+        pass
+
+    return None, "yok"
+
+
 def _json_ayristir(ham):
     """girdi_al ciktisini dict'e cevirir.
 
@@ -383,6 +414,13 @@ def _json_ayristir(ham):
         metin = metin.strip("`").strip()
         if metin.lower().startswith("json"):
             metin = metin[4:].strip()
+
+    # Metnin icine gomulu JSON varsa ilk { ile son } arasini dene.
+    if not metin.startswith("{"):
+        bas = metin.find("{")
+        son = metin.rfind("}")
+        if bas != -1 and son > bas:
+            metin = metin[bas:son + 1]
 
     try:
         cozulen = json.loads(metin)
@@ -412,11 +450,7 @@ def _hafizayi_oku():
 
 
 def _proje_dataset_adlari():
-    """Projedeki dataset adlarini set olarak dondurur.
-
-    API'ye erisilemezse None doner. None, "dogrulama yapilamadi" anlamina
-    gelir ve cagiran taraf bu durumda adi reddetmez.
-    """
+    """Projedeki dataset adlarini set olarak dondurur. Erisilemezse None."""
     try:
         proje = dataiku.api_client().get_default_project()
         return {d["name"] for d in proje.list_datasets()}
@@ -461,21 +495,22 @@ def _beklenen_ayarla(deger):
 
 
 def _aksiyonu_coz(g):
-    """girdi_al'in aksiyon alanini dogrular.
+    """girdi_al'in aksiyon alanini normalize eder.
 
-    Liste disi veya eksik bir deger gelirse BILGI'ye duser ve teshis icin
-    loglanir; boylece sema/prompt uyumsuzlugu sessizce gizlenmez.
+    Once "aksiyon", yoksa eski semadaki "niyet" alanina bakar. Taninmayan
+    deger BILGI'ye duser ve teshis icin loglanir.
     """
-    ham = g.get(G.AKSIYON)
+    ham = g.get(G.AKSIYON) or g.get(G.NIYET)
     if ham is None:
-        _logla("UYARI: girdi_al 'aksiyon' alani gondermedi")
+        _logla("UYARI: girdi_al ne 'aksiyon' ne 'niyet' alani gonderdi")
         return Aksiyon.BILGI
 
     temiz = str(ham).strip().lower()
-    if temiz not in GECERLI_AKSIYONLAR:
+    cozulen = AKSIYON_ESLEME.get(temiz)
+    if cozulen is None:
         _logla("UYARI: taninmayan aksiyon {!r}, BILGI'ye dusuruldu".format(ham))
         return Aksiyon.BILGI
-    return temiz
+    return cozulen
 
 
 def _girdiyi_state_e_isle(g):
@@ -554,8 +589,8 @@ def _durum_ozetini_kur(asama):
         )
     elif state.get(S.ONCEKI_BEKLIYOR):
         ozet = (
-            "Kayitli bir oturum bulundu ({vs}) ve kullanicinin bununla devam "
-            "edip etmeyecegi soruldu; cevap bekleniyor."
+            "Kayitli bir oturum bulundu ({vs}) ve kullaniciya bununla devam mi "
+            "edecegi soruldu. CEVAP BEKLENIYOR."
         ).format(vs=state.get(S.ONCEKI_VERI_SETI))
     elif state.get(S.ONCEKI_REDDEDILDI):
         ozet = (
@@ -650,7 +685,7 @@ def _kolon_talebi_var_mi():
 
 def process(trace):
     try:
-        ham_girdi = state.get(S.GIRDI)
+        ham_girdi, kaynak = _ham_girdiyi_al()
         g = _json_ayristir(ham_girdi)
         _girdiyi_state_e_isle(g)
 
@@ -658,13 +693,14 @@ def process(trace):
         asama = state.get(S.ASAMA) or Asama.BASLANGIC
         _durum_ozetini_kur(asama)
 
-        _logla("aksiyon={} beklenen={} kolonlar={}".format(
-            aksiyon, state.get(S.BEKLENEN), state.get(S.KOLONLAR)))
+        _logla("aksiyon={} beklenen={} kolonlar={} girdi_kaynagi={}".format(
+            aksiyon, state.get(S.BEKLENEN), state.get(S.KOLONLAR), kaynak))
 
         # aksiyon BILGI'ye dustuyse girdi_al'in ham ciktisini gor.
-        # Ya JSON bozuk, ya sema eski, ya prompt guncellenmemis demektir.
+        # Ya JSON bozuk, ya sema eski, ya state anahtari yanlis demektir.
         if aksiyon == Aksiyon.BILGI:
-            _logla("TESHIS - ham cikti: {!r}".format(str(ham_girdi)[:500]))
+            _logla("TESHIS - ham cikti ({}): {!r}".format(
+                kaynak, str(ham_girdi)[:500]))
             _logla("TESHIS - ayristirilan anahtarlar: {}".format(
                 sorted(g.keys()) if g else "BOS"))
 
@@ -694,9 +730,16 @@ def process(trace):
                 yield SIFIRDAN_BASLA
                 return
 
-            if aksiyon in (Aksiyon.KAYIT_DEVAM, Aksiyon.ONAY):
-                _kayitla_devam_et(
-                    state.get(S.ONCEKI_VERI_SETI), state.get(S.ONCEKI_SOZLUK))
+            # Kullanici kayittaki dataset adini yazdiysa bu da devam demektir.
+            kayitli_ad = state.get(S.ONCEKI_VERI_SETI)
+            adi_tekrarladi = (
+                kayitli_ad
+                and state.get(S.VERI_SETI)
+                and str(state[S.VERI_SETI]).strip() == str(kayitli_ad).strip()
+            )
+
+            if aksiyon in (Aksiyon.KAYIT_DEVAM, Aksiyon.ONAY) or adi_tekrarladi:
+                _kayitla_devam_et(kayitli_ad, state.get(S.ONCEKI_SOZLUK))
                 # Ayni mesajda kolon talebi de varsa once ona cevap ver.
                 if state.get(S.KOLONLAR):
                     _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
@@ -705,6 +748,14 @@ def process(trace):
                         return
                     yield NextBlock(Blok.SOHBET)
                     return
+                _beklenen_ayarla(Beklenen.ADIM_ONAYI)
+                yield NextBlock(Blok.SOZLUK_CALIS)
+                return
+
+            # Kullanici BASKA bir dataset adi yazdiysa ona geciyoruz.
+            if state.get(S.VERI_SETI):
+                _onceki_oturumu_beklemeden_cikar()
+                _asamayi_ayarla(Asama.SOZLUK)
                 _beklenen_ayarla(Beklenen.ADIM_ONAYI)
                 yield NextBlock(Blok.SOZLUK_CALIS)
                 return
@@ -744,7 +795,6 @@ def process(trace):
                 return
             _beklenen_ayarla(Beklenen.KOLON_ACIKLAMASI)
             # Aciklama verilmemis, sadece fikir isteniyorsa sohbet ifade onerir.
-            # Kolon gercekleri durum_ozeti'ne zaten eklendi.
             if not state.get(S.KOLON_ACIKLAMASI):
                 yield NextBlock(Blok.SOHBET)
                 return
@@ -765,7 +815,6 @@ def process(trace):
             return
 
         # --- 7) Adim icinde onay: ilgili islem bloguna yonlendir ---------------
-        # Bu dal olmadan onay sohbete duser ve LLM adimi tamamlanmis gibi anlatir.
         if aksiyon == Aksiyon.ONAY and asama in ASAMA_HARITASI:
             hedef_blok = ASAMA_HARITASI[asama]
             if hedef_blok:
@@ -786,144 +835,3 @@ def process(trace):
         _logla("BEKLENMEYEN HATA: {}: {}".format(type(hata).__name__, hata))
         _beklenen_ayarla(Beklenen.VERI_SETI)
         yield BEKLENMEYEN_HATA
-
-
-
-
-
-
-
-
-
-
-
-Kullanıcının son mesajını, sürecin şu anki durumunu bilerek yorumla ve
-SADECE JSON döndür. Açıklama, önsöz, markdown kod bloğu yazma. Yanıtın {
-ile başlayıp } ile bitsin.
-
-MEVCUT DURUM: {{ state.durum_ozeti }}
-BEKLENEN CEVAP: {{ state.beklenen }}
-
-Döndüreceğin JSON'un yapısı:
-
-{
-  "aksiyon": "bilgi",
-  "veri_seti": null,
-  "sozluk": null,
-  "target": null,
-  "id_kolonu": null,
-  "donem_kolonu": null,
-  "bolme_kolonu": null,
-  "kolonlar": [],
-  "kolon_aciklamasi": null
-}
-
-aksiyon zorunludur ve kullanıcının bu mesajla ne yapmak istediğini söyler.
-Şu sekiz değerden birini seç, başka bir değer yazma:
-
-  "kayit_devam"    Kayıtlı oturumla ilerlemek istiyor
-  "kayit_yeni"     Kaydı bırakıp başka bir veri setiyle sıfırdan başlamak
-                   istiyor
-  "onay"           Sunulan planı veya adımı onaylıyor, ilerlenmesini istiyor
-  "ret"            Sunulan planı reddediyor veya durmak istiyor
-  "kolon_sor"      Bir kolonun ne anlama geldiğini soruyor
-  "kolon_tanimla"  Bir kolonun açıklamasını veriyor veya düzeltiyor
-  "gorus_iste"     Senden fikir, öneri, "sence ne olmalı" tarzı bir
-                   değerlendirme istiyor
-  "bilgi"          Yukarıdakilerin hiçbiri; soru soruyor veya sohbet ediyor
-
-BEKLENEN CEVAP alanı, sistemin kullanıcıdan ne beklediğini söyler.
-Kullanıcının mesajını ÖNCE bu beklentiye göre yorumla. Kullanıcının kelime
-seçimi tamamen serbesttir; kalıp arama, anlamı değerlendir.
-
-  BEKLENEN "kayit_karari" ise:
-    Kullanıcı kayıtlı oturumla devam etmeyi kabul ediyorsa "kayit_devam".
-    Başka bir veri setiyle sıfırdan başlamak istiyorsa "kayit_yeni".
-    Örnekler kayit_devam için: "bununla devam edelim", "bu veriyle devam",
-    "evet", "olsun", "kalsın", "tamam ilerleyelim", "onaylıyorum",
-    "öncekini kullan", "devam".
-    Örnekler kayit_yeni için: "yeni bir veri setiyle başlayalım", "sıfırdan",
-    "başka veri kullanacağım", "vazgeçtim yenisini açalım".
-    Kullanıcı bunun yanında başka bir şey de istiyorsa (kolon sorusu gibi)
-    yine kayıt kararını aksiyon olarak seç; diğer bilgileri ilgili alanlara
-    yaz.
-
-  BEKLENEN "veri_seti" ise:
-    Kullanıcı bir dataset adı yazdıysa veri_seti alanını doldur ve aksiyon
-    "bilgi" olsun.
-
-  BEKLENEN "adim_onayi" ise:
-    Kullanıcı ilerlenmesini kabul ediyorsa "onay", istemiyorsa "ret".
-
-  BEKLENEN "kolon_aciklamasi" ise:
-    Kullanıcı bir açıklama metni yazdıysa "kolon_tanimla" seç ve metni
-    kolon_aciklamasi alanına yaz. Sadece soru soruyorsa "kolon_sor".
-
-  BEKLENEN "yok" ise:
-    Mesajı kendi başına değerlendir.
-
-Bir mesaj birden çok şey içerebilir. aksiyon en baskın olanı taşır; diğer
-bilgiler alanlara yazılır. Örnek: "bu kayıtla devam edelim, sm_id için ne
-yazmak lazım sence" → aksiyon "kayit_devam", kolonlar ["sm_id"].
-
-Alan kuralları:
-
-veri_seti, sozluk: Dataset adları. Kullanıcı bir dosya veya klasör adı
-söylerse (sema.json, PROJE_HAFIZASI gibi) bu alanlara YAZMA, null bırak.
-
-target, id_kolonu, donem_kolonu, bolme_kolonu: Kullanıcı bu rolleri açıkça
-bir kolona atadıysa o kolonun adı.
-
-kolonlar: Bahsedilen kolon adları; kullanıcının yazdığı haliyle al,
-düzeltme yapma, büyük/küçük harfini değiştirme. Kolon adı geçmiyorsa boş
-liste.
-
-kolon_aciklamasi: Kullanıcının bir kolon için verdiği açıklama metni.
-Sadece kullanıcının söylediğini aktar; kendin anlam üretme. Kullanıcı
-anlamı söylemeden sadece soru soruyorsa null.
-
-Kullanıcının söylemediği hiçbir değeri uydurma.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-{
-  "type": "object",
-  "properties": {
-    "aksiyon": {
-      "type": "string",
-      "enum": [
-        "kayit_devam",
-        "kayit_yeni",
-        "onay",
-        "ret",
-        "kolon_sor",
-        "kolon_tanimla",
-        "gorus_iste",
-        "bilgi"
-      ]
-    },
-    "veri_seti": { "type": ["string", "null"] },
-    "sozluk": { "type": ["string", "null"] },
-    "target": { "type": ["string", "null"] },
-    "id_kolonu": { "type": ["string", "null"] },
-    "donem_kolonu": { "type": ["string", "null"] },
-    "bolme_kolonu": { "type": ["string", "null"] },
-    "kolonlar": {
-      "type": "array",
-      "items": { "type": "string" }
-    },
-    "kolon_aciklamasi": { "type": ["string", "null"] }
-  },
-  "required": ["aksiyon"]
-}
