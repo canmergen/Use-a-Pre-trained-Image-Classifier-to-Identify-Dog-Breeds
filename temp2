@@ -1,4 +1,153 @@
+# === RENK(t1) -> RENK(t2) ARDIŞIK AY ÇAPRAZI (gerçekleşme bazlı) + EXCEL ÇIKTI ===
+import io
+import numpy as np
+import pandas as pd
 import dataiku
-p = dataiku.api_client().get_default_project()
-for l in p.list_llms():
-    print(l["id"], "|", l["friendlyName"])
+
+# --- AYARLAR ---
+SADECE_KK       = True
+CIFTLER         = [(2, 3), (5, 6), (11, 12)]   # (t1, t2): t1'deki renk -> t2'deki renk
+KIRMIZI_ANAHTAR = "KIRMIZI"                    # etiket büyük harfe çevrilip 'içeriyor mu' diye bakılır
+
+CIKTI_KLASOR = "GOC_MODEL_RESULTS"
+CIKTI_DOSYA  = "renk_ardisik_ay_capraz.xlsx"
+KLASORE_YAZ  = True        # False -> notebook'un local diskine yazar
+
+_d = df[df['KK_URUN_FLG'] == 'KK'] if SADECE_KK else df
+
+
+def _renk_kolonu(k):
+    """1. ay kolonu 'RENK_SONRAKI_AY', diğerleri 'RENK_SONRAKI_{k}AY'."""
+    return 'RENK_SONRAKI_AY' if k == 1 else f'RENK_SONRAKI_{k}AY'
+
+
+def _metne_cevir(s):
+    """Renk sayısala çevrildiyse metne geri döndür (orijinal koddaki mantık)."""
+    if s.dtype != object:
+        try:
+            return s.map(renk_map_ters)
+        except NameError:
+            return s.astype('object')
+    return s
+
+
+def _kirmizi_mi(etiket):
+    return KIRMIZI_ANAHTAR in str(etiket).upper()
+
+
+# --- 1) Hangi çiftler çalışabilir? (kolon yoksa sessizce atlama, uyar) ---
+_gecerli, _eksik = [], []
+for k1, k2 in CIFTLER:
+    c1, c2 = _renk_kolonu(k1), _renk_kolonu(k2)
+    yok = [c for c in (c1, c2) if c not in _d.columns]
+    if yok:
+        _eksik.append(((k1, k2), yok))
+    else:
+        _gecerli.append((k1, k2, c1, c2))
+
+if _eksik:
+    print("UYARI - veri setinde olmayan kolonlar, bu çiftler atlanıyor:")
+    for cift, yok in _eksik:
+        print(f"   {cift[0]}AY -> {cift[1]}AY : {yok}")
+
+if not _gecerli:
+    raise ValueError("Hiçbir çift için gerekli RENK_SONRAKI_* kolonları bulunamadı.")
+
+_donemler = sorted(_d['DONEM'].dropna().astype(int).unique())
+
+_sheets = {}            # {sheet_adi: [(donem, adet_tablosu, yuzde_tablosu), ...]}
+_ozet_satirlar = []     # tüm çift x dönem tek uzun tablo
+
+# --- 2) Çift x dönem bazında çapraz tablo ---
+for k1, k2, c1, c2 in _gecerli:
+    _sh = f"{k1}AY_{k2}AY"
+    _sheets[_sh] = []
+
+    r1 = _metne_cevir(_d[c1])
+    r2 = _metne_cevir(_d[c2])
+
+    for _don in _donemler:
+        _m = (_d['DONEM'] == _don).to_numpy()
+        s1, s2 = r1[_m], r2[_m]
+
+        # iki ay da gözlenmiş olmalı; biri boşsa o müşteri kıyasa girmez
+        _gec = s1.notna() & s2.notna()
+        _eksik_gozlem = int((~_gec).sum())
+
+        if int(_gec.sum()) == 0:
+            print(f"\nDONEM {_don} | {k1}AY -> {k2}AY : gözlem yok (her iki ay da dolu satır yok), atlandı.")
+            continue
+
+        s1g, s2g = s1[_gec], s2[_gec]
+
+        ct = pd.crosstab(s1g, s2g, margins=True, margins_name='TOPLAM')
+        ct.index.name, ct.columns.name = f'RENK_{k1}AY', f'RENK_{k2}AY'
+
+        pct = (pd.crosstab(s1g, s2g, normalize='index') * 100).round(2)
+        pct.index.name, pct.columns.name = f'RENK_{k1}AY', f'RENK_{k2}AY (satır %)'
+
+        # --- ekrana bas ---
+        print("=" * 90)
+        print(f"DONEM {_don} - {k1} ay sonraki renk -> {k2} ay sonraki renk"
+              + (", sadece KK" if SADECE_KK else ", tüm portföy")
+              + f"  |  kıyasa giren: {int(_gec.sum()):,}  |  eksik gözlem: {_eksik_gozlem:,}")
+        print(ct.to_string())
+        print("\n--- SATIR % ---")
+        print(pct.to_string())
+
+        _sheets[_sh].append((_don, ct, pct))
+
+        # --- kırmızı -> kırmızı özeti ---
+        _k_satir = [i for i in ct.index if i != 'TOPLAM' and _kirmizi_mi(i)]
+        _k_kolon = [c for c in ct.columns if c != 'TOPLAM' and _kirmizi_mi(c)]
+
+        _t1_kirmizi = int(ct.loc[_k_satir, 'TOPLAM'].sum()) if _k_satir else 0
+        _kk = int(ct.loc[_k_satir, _k_kolon].to_numpy().sum()) if (_k_satir and _k_kolon) else 0
+
+        _ozet_satirlar.append({
+            'DONEM': _don,
+            'CIFT': f"{k1}AY->{k2}AY",
+            'KIYASA_GIREN': int(_gec.sum()),
+            'EKSIK_GOZLEM': _eksik_gozlem,
+            f'T1_{k1}AY_KIRMIZI': _t1_kirmizi,
+            f'T1_KIRMIZI_VE_T2_{k2}AY_KIRMIZI': _kk,
+            'KIRMIZI_KALMA_ORANI_%': round(_kk / _t1_kirmizi * 100, 2) if _t1_kirmizi else np.nan,
+            'KIRMIZIDAN_CIKIS_ORANI_%': round((_t1_kirmizi - _kk) / _t1_kirmizi * 100, 2) if _t1_kirmizi else np.nan,
+        })
+
+        print(f"\n>>> {k1}. ayda KIRMIZI: {_t1_kirmizi:,}  |  {k2}. ayda da KIRMIZI: {_kk:,}"
+              + (f"  ({_kk / _t1_kirmizi * 100:.2f}%)" if _t1_kirmizi else ""))
+
+ozet = pd.DataFrame(_ozet_satirlar)
+
+# --- 3) EXCEL'E YAZ ---
+_buf = io.BytesIO()
+with pd.ExcelWriter(_buf, engine='openpyxl') as _w:
+    ozet.to_excel(_w, sheet_name='OZET', index=False)
+
+    for _sh, _bloklar in _sheets.items():
+        if not _bloklar:
+            continue
+        _satir = 0
+        for _don, ct, pct in _bloklar:
+            ct.to_excel(_w, sheet_name=_sh, startrow=_satir + 1)
+            _ws = _w.sheets[_sh]
+            _ws.cell(row=_satir + 1, column=1,
+                     value=f"DONEM {_don} - {_sh.replace('_', ' -> ')} - adet"
+                           + (" (sadece KK)" if SADECE_KK else " (tüm portföy)"))
+            _satir += len(ct) + 4
+
+            pct.to_excel(_w, sheet_name=_sh, startrow=_satir + 1)
+            _ws.cell(row=_satir + 1, column=1, value=f"DONEM {_don} - satır %")
+            _satir += len(pct) + 5
+
+_buf.seek(0)
+
+if KLASORE_YAZ:
+    mf_out = dataiku.Folder(CIKTI_KLASOR)
+    mf_out.upload_stream("/" + CIKTI_DOSYA, _buf)
+    print(f"\nYazıldı -> folder '{CIKTI_KLASOR}' /{CIKTI_DOSYA}")
+else:
+    with open(CIKTI_DOSYA, "wb") as f:
+        f.write(_buf.getvalue())
+    print(f"\nYazıldı -> {CIKTI_DOSYA}")
