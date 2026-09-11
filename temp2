@@ -9,3 +9,816 @@ Tur akışı:
 İlke: LLM anlar ve anlatır; hesaplayan ve state'i değiştiren yalnızca Python'dur.
 """
 __version__ = "0.1.0"
+
+
+
+
+
+
+
+
+
+"""Agent state şeması. Yalnızca orkestrasyon bilgisi; büyük veriler PROJE_HAFIZASI'nda."""
+from . import asamalar, metin
+
+VARSAYILAN = {
+    "asama": "kurulum",
+    "asama_etiketi": "",
+    "tur": 0,
+    "ilk_tur_notu": "",
+    "mesaj": "",
+    # kurulum girdileri
+    "veri_seti": "",
+    "sozluk": "",
+    "sozluk_ad_kolonu": "",
+    "sozluk_acik_kolonu": "",
+    "haric_kolonlar": [],
+    "kurulum_dogrulandi": False,
+    # tur içi taşıyıcılar
+    "izinli_aksiyonlar": "",   # niyet promptu için aksiyon kataloğu (metin)
+    "niyet_ham": "",           # niyet bloğunun ham çıktısı
+    "aksiyonlar": [],          # doğrulanmış aksiyonlar
+    "sonuc_json": "",          # asama_isle sonucu, anlat için
+    "sohbet_baglam": "",       # sohbet_hazirla çıktısı
+    # özetler
+    "durum_ozeti": "",
+    "profil_ozeti": "",
+}
+
+
+def hazirla(state) -> None:
+    """Eksik anahtarları tamamlar, türetilmiş alanları günceller. Her turun başında çağrılır."""
+    for k, v in VARSAYILAN.items():
+        if k not in state:
+            state[k] = list(v) if isinstance(v, list) else v
+    if state["asama"] not in asamalar.KIMLIKLER:
+        state["asama"] = "kurulum"
+    guncelle_ozet(state)
+
+
+def guncelle_ozet(state) -> None:
+    state["asama_etiketi"] = asamalar.etiket(state["asama"])
+    sozluk = state["sozluk"]
+    if sozluk:
+        sozluk += f"  ({state['sozluk_ad_kolonu']} → {state['sozluk_acik_kolonu']})"
+    state["durum_ozeti"] = metin.anahtar_deger([
+        ("Aşama",       state["asama_etiketi"]),
+        ("Veri seti",   state["veri_seti"] or "tanımsız"),
+        ("Sözlük",      sozluk or "tanımsız"),
+        ("Kapsam dışı", ", ".join(state["haric_kolonlar"]) or "yok"),
+        ("Doğrulama",   "tamam" if state["kurulum_dogrulandi"] else "bekliyor"),
+    ])
+
+
+
+
+
+
+
+
+
+
+"""Kısayol komutlar ve kullanıcı mesajının çıkarılması.
+
+Tek kelimelik kısayollar LLM'e gitmeden doğrudan işlenir; diğer her şey niyet katmanına gider.
+"""
+from typing import Optional
+
+_TR = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+KISAYOLLAR = {"durum", "yardim", "onay", "ret", "geri", "gec"}
+
+
+def normalize(kelime: str) -> str:
+    return kelime.translate(_TR).lower().strip()
+
+
+def kisayol(mesaj: str) -> Optional[dict]:
+    parcalar = mesaj.strip().split()
+    if len(parcalar) == 1 and normalize(parcalar[0]) in KISAYOLLAR:
+        return {"aksiyon": normalize(parcalar[0]), "args": {}}
+    return None
+
+
+def _alan(m, ad):
+    return m.get(ad) if isinstance(m, dict) else getattr(m, ad, None)
+
+
+def _icerik(c) -> str:
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join((_alan(p, "text") or "") for p in c if _alan(p, "text"))
+    return ""
+
+
+def _son_kullanici(mesajlar) -> str:
+    if not isinstance(mesajlar, (list, tuple)):
+        return ""
+    for m in reversed(mesajlar):
+        if _alan(m, "role") == "user":
+            return _icerik(_alan(m, "content"))
+    return ""
+
+
+def kullanici_mesaji(ortam: dict) -> str:
+    """Python bloğu global alanından kullanıcının son mesajı (initial_messages / all_messages)."""
+    for ad in ("initial_messages", "all_messages"):
+        m = _son_kullanici(ortam.get(ad))
+        if m:
+            return m
+    lo = ortam.get("last_output")
+    return lo if isinstance(lo, str) else ""
+
+
+
+
+
+
+
+
+
+
+"""Niyet katmanı: LLM'in JSON çıktısının şemaya göre doğrulanması.
+
+LLM yalnızca 'kullanıcı ne istiyor' sorusuna yapısal cevap verir. Aşamada izinli olmayan,
+argümanı eksik veya biçimi bozuk aksiyonlar sessizce düşer; hiç aksiyon kalmazsa mesaj sohbettir.
+"""
+import json
+import re
+from typing import List
+
+GENEL = {
+    "onay":   {"aciklama": "Mevcut aşamanın sonucunu onaylar, sonraki aşamaya geçer", "args": {}},
+    "ret":    {"aciklama": "Mevcut aşamanın sonucunu reddeder", "args": {}},
+    "geri":   {"aciklama": "Önceki aşamaya döner", "args": {}},
+    "gec":    {"aciklama": "Mevcut aşamayı atlar", "args": {}},
+    "durum":  {"aciklama": "Mevcut durumu gösterir", "args": {}},
+    "yardim": {"aciklama": "Neler yapılabileceğini gösterir", "args": {}},
+}
+
+ASAMA = {
+    "kurulum": {
+        "veri_tanimla":   {"aciklama": "Ana veri setini tanımlar",
+                           "args": {"dataset": "str"}},
+        "sozluk_tanimla": {"aciklama": "Sözlük veri setini ve kolonlarını tanımlar",
+                           "args": {"dataset": "str", "ad_kolonu": "str", "aciklama_kolonu": "str"}},
+        "kapsam_disi":    {"aciklama": "Kolonları feature engineering kapsamı dışına alır",
+                           "args": {"kolonlar": "list[str]"}},
+        "kapsam_dahil":   {"aciklama": "Kapsam dışı bırakılmış kolonları geri alır",
+                           "args": {"kolonlar": "list[str]"}},
+    },
+}
+
+
+def izinli(asama: str) -> dict:
+    d = dict(GENEL)
+    d.update(ASAMA.get(asama, {}))
+    return d
+
+
+def katalog_metni(asama: str) -> str:
+    """Niyet promptuna gömülen aksiyon kataloğu."""
+    satirlar = []
+    for ad, t in izinli(asama).items():
+        args = ", ".join(f"{k}: {v}" for k, v in t["args"].items()) or "argüman yok"
+        satirlar.append(f"- {ad} — {t['aciklama']} ({args})")
+    return "\n".join(satirlar)
+
+
+def _json_yukle(ham):
+    if isinstance(ham, dict):
+        return ham
+    if not isinstance(ham, str):
+        return {}
+    metin = ham.strip()
+    metin = re.sub(r"^```(?:json)?\s*|\s*```$", "", metin, flags=re.S)
+    try:
+        return json.loads(metin)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", metin, flags=re.S)
+        if not m:
+            return {}
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+
+def _arg_gecerli(deger, tip: str) -> bool:
+    if tip == "str":
+        return isinstance(deger, str) and deger.strip() != ""
+    if tip == "list[str]":
+        return (isinstance(deger, list) and len(deger) > 0
+                and all(isinstance(x, str) and x.strip() for x in deger))
+    return False
+
+
+def dogrula(ham, asama: str) -> List[dict]:
+    """Ham LLM çıktısını doğrulanmış aksiyon listesine çevirir."""
+    obj = _json_yukle(ham)
+    adaylar = obj.get("aksiyonlar", []) if isinstance(obj, dict) else []
+    katalog = izinli(asama)
+    sonuc = []
+    for a in adaylar if isinstance(adaylar, list) else []:
+        if not isinstance(a, dict):
+            continue
+        ad = a.get("aksiyon")
+        args = a.get("args") or {}
+        if ad not in katalog or not isinstance(args, dict):
+            continue
+        sema = katalog[ad]["args"]
+        if any(k not in args or not _arg_gecerli(args[k], t) for k, t in sema.items()):
+            continue
+        temiz = {k: ([x.strip() for x in args[k]] if t == "list[str]" else args[k].strip())
+                 for k, t in sema.items()}
+        sonuc.append({"aksiyon": ad, "args": temiz})
+    return sonuc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Veri profili: anlatıcı LLM'in 'veriyi açıklayabilmesi' için Python'da üretilen somut bulgular."""
+import re
+from collections import Counter
+
+import pandas as pd
+
+TEKNIK_DESEN = re.compile(
+    r"(^rn$|_id$|^id_|_no$|musteri_no|tarih|date|load|etl|insert|update|timestamp|sira)",
+    re.IGNORECASE)
+ORNEKLEM = 20000
+
+
+def sablon(kolon: str) -> str:
+    """'TXN_GDN_A_3A_TUTAR' → 'TXN_GDN_A_{n}_TUTAR' — sayısal/pencere parçaları normalize edilir."""
+    parcalar = []
+    for t in kolon.split("_"):
+        parcalar.append("{n}" if re.fullmatch(r"\d+[A-Za-z]{0,2}|[A-Za-z]{0,2}\d+", t) else t)
+    return "_".join(parcalar)
+
+
+def _tur(seri: pd.Series, ad: str) -> str:
+    if pd.api.types.is_datetime64_any_dtype(seri):
+        return "tarih"
+    if pd.api.types.is_numeric_dtype(seri):
+        return "sayisal"
+    return "kategorik"
+
+
+def hesapla(df: pd.DataFrame, kapsam: list, aciklamalar: dict) -> dict:
+    """Kolon bazlı istatistik + özet bulgular. Döndürülen 'kolonlar' hafızaya, 'ozet' anlatıcıya gider."""
+    n = len(df)
+    kolonlar, tur_sayaci, teknik, sabit, cok_eksik = {}, Counter(), [], [], []
+    for k in kapsam:
+        s = df[k]
+        tur = _tur(s, k)
+        tur_sayaci[tur] += 1
+        eksik = float(s.isna().mean()) if n else 0.0
+        tekil = int(s.nunique(dropna=True))
+        kolonlar[k] = {"tur": tur, "eksik_oran": round(eksik, 4), "tekil": tekil}
+        if tekil <= 1:
+            sabit.append(k)
+        if eksik >= 0.5:
+            cok_eksik.append(k)
+        if TEKNIK_DESEN.search(k) or (n and tekil >= 0.98 * n and k not in aciklamalar):
+            teknik.append(k)
+
+    sablon_sayaci = Counter(sablon(k) for k in kapsam)
+    sablonlar = [{"sablon": s, "kolon_sayisi": c} for s, c in sablon_sayaci.most_common(5) if c >= 5]
+    sablonlu = sum(c for c in sablon_sayaci.values() if c >= 5)
+
+    ozet = {
+        "orneklem_satir": n,
+        "tur_dagilimi": dict(tur_sayaci),
+        "sablonlu_kolon_sayisi": sablonlu,
+        "en_yaygin_sablonlar": sablonlar,
+        "teknik_kolon_adaylari": teknik[:15],
+        "sabit_kolonlar": sabit[:15],
+        "yuzde50_ustu_eksik": cok_eksik[:15],
+        "sayilar": {"sabit": len(sabit), "yuzde50_ustu_eksik": len(cok_eksik), "teknik_aday": len(teknik)},
+    }
+    return {"kolonlar": kolonlar, "ozet": ozet}
+
+
+def ozet_metni(ozet: dict) -> str:
+    """Sohbet promptuna gömülecek kısa profil."""
+    t = ozet.get("tur_dagilimi", {})
+    sablonlar = "; ".join(f"{s['sablon']} ({s['kolon_sayisi']})" for s in ozet.get("en_yaygin_sablonlar", []))
+    return (f"Örneklem {ozet.get('orneklem_satir', 0)} satır. Kolon türleri: "
+            f"{t.get('sayisal', 0)} sayısal, {t.get('kategorik', 0)} kategorik, {t.get('tarih', 0)} tarih. "
+            f"Şablonlu kolon: {ozet.get('sablonlu_kolon_sayisi', 0)}. En yaygın şablonlar: {sablonlar or 'yok'}. "
+            f"Teknik kolon adayları: {', '.join(ozet.get('teknik_kolon_adaylari', [])) or 'yok'}.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Aşama 1 — Kurulum: veri seti ve sözlüğün tanımlanması; ikisi de tanımlanınca otomatik doğrulama
+ve profil; 'onay' ile sonraki aşamaya geçiş.
+
+Her işleyici (state, args) alır, anlatıcıya gidecek bir sonuç sözlüğü döndürür:
+    {"aksiyon": ..., "durum": "ok" | "hata", "mesaj": ..., "veri": {...}, "oneriler": [...]}
+"""
+import datetime
+
+import dataiku
+import pandas as pd
+
+from . import asamalar, hafiza, profil
+
+
+def _sema(dataset: str):
+    try:
+        sema = dataiku.Dataset(dataset).read_schema()
+        return [c["name"] for c in sema], {c["name"]: c["type"] for c in sema}
+    except Exception:
+        return None
+
+
+def _sonuc(aksiyon, durum, mesaj, veri=None, oneriler=None):
+    return {"aksiyon": aksiyon, "durum": durum, "mesaj": mesaj,
+            "veri": veri or {}, "oneriler": oneriler or []}
+
+
+# ---------- işleyiciler ----------
+def veri_tanimla(state, args):
+    ad = args["dataset"]
+    sema = _sema(ad)
+    if sema is None:
+        return _sonuc("veri_tanimla", "hata", f"'{ad}' adında bir dataset bu projede yok; adı kontrol etmesi gerekir.")
+    state["veri_seti"], state["kurulum_dogrulandi"] = ad, False
+    r = _sonuc("veri_tanimla", "ok", "Veri seti tanımlandı.", {"dataset": ad, "kolon_sayisi": len(sema[0])})
+    return _hazirsa_dogrula(state, r)
+
+
+def sozluk_tanimla(state, args):
+    ad, kol_ad, kol_acik = args["dataset"], args["ad_kolonu"], args["aciklama_kolonu"]
+    sema = _sema(ad)
+    if sema is None:
+        return _sonuc("sozluk_tanimla", "hata", f"'{ad}' adında bir dataset bu projede yok.")
+    eksik = [k for k in (kol_ad, kol_acik) if k not in sema[0]]
+    if eksik:
+        return _sonuc("sozluk_tanimla", "hata",
+                      f"'{ad}' içinde şu kolon(lar) yok: {', '.join(eksik)}.",
+                      {"mevcut_kolonlar": sema[0][:30]})
+    state["sozluk"], state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"] = ad, kol_ad, kol_acik
+    state["kurulum_dogrulandi"] = False
+    r = _sonuc("sozluk_tanimla", "ok", "Sözlük tanımlandı.",
+               {"dataset": ad, "ad_kolonu": kol_ad, "aciklama_kolonu": kol_acik})
+    return _hazirsa_dogrula(state, r)
+
+
+def kapsam_disi(state, args):
+    yeni = [k for k in args["kolonlar"] if k not in state["haric_kolonlar"]]
+    state["haric_kolonlar"] = state["haric_kolonlar"] + yeni
+    state["kurulum_dogrulandi"] = False
+    r = _sonuc("kapsam_disi", "ok", "Kolonlar kapsam dışına alındı.",
+               {"eklenen": yeni, "kapsam_disi": list(state["haric_kolonlar"])})
+    return _hazirsa_dogrula(state, r)
+
+
+def kapsam_dahil(state, args):
+    state["haric_kolonlar"] = [k for k in state["haric_kolonlar"] if k not in args["kolonlar"]]
+    state["kurulum_dogrulandi"] = False
+    r = _sonuc("kapsam_dahil", "ok", "Kolonlar kapsama geri alındı.",
+               {"kapsam_disi": list(state["haric_kolonlar"])})
+    return _hazirsa_dogrula(state, r)
+
+
+def onay(state, args):
+    if not state["kurulum_dogrulandi"]:
+        eksik = [x for x, v in (("veri seti", state["veri_seti"]), ("sözlük", state["sozluk"])) if not v]
+        return _sonuc("onay", "hata", "Kurulum henüz doğrulanmadı; " +
+                      (f"önce {', '.join(eksik)} tanımlanmalı." if eksik else "doğrulama çalıştırılmalı."))
+    state["asama"] = asamalar.sonraki(state["asama"])
+    return _sonuc("onay", "ok", "Kurulum onaylandı, sonraki aşamaya geçildi.",
+                  {"yeni_asama": asamalar.etiket(state["asama"])})
+
+
+ISLEYICILER = {"veri_tanimla": veri_tanimla, "sozluk_tanimla": sozluk_tanimla,
+               "kapsam_disi": kapsam_disi, "kapsam_dahil": kapsam_dahil, "onay": onay}
+
+
+# ---------- doğrulama + profil ----------
+def _hazirsa_dogrula(state, sonuc):
+    """Veri seti ve sözlük tanımlıysa doğrulamayı otomatik çalıştırır, bulguları sonuca ekler."""
+    if state["veri_seti"] and state["sozluk"]:
+        d = dogrula(state)
+        sonuc["veri"].update(d["veri"])
+        sonuc["oneriler"].extend(d["oneriler"])
+        sonuc["mesaj"] += " " + d["mesaj"]
+    return sonuc
+
+
+def dogrula(state) -> dict:
+    veri_ad, sz_ad = state["veri_seti"], state["sozluk"]
+    kol_ad, kol_acik = state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"]
+
+    kolonlar, tipler = _sema(veri_ad)
+    kapsam = [k for k in kolonlar if k not in state["haric_kolonlar"]]
+    df = dataiku.Dataset(veri_ad).get_dataframe(limit=profil.ORNEKLEM)
+
+    sz = dataiku.Dataset(sz_ad).get_dataframe(columns=[kol_ad, kol_acik])
+    sz[kol_ad] = sz[kol_ad].astype(str).str.strip()
+    aciklamalar = {r[kol_ad]: (None if pd.isna(r[kol_acik]) else str(r[kol_acik]).strip())
+                   for _, r in sz.drop_duplicates(kol_ad).iterrows() if r[kol_ad] in kolonlar}
+    sozlukte_yok = [k for k in kapsam if k not in aciklamalar]
+    bos_aciklama = [k for k in kapsam if k in aciklamalar and not aciklamalar[k]]
+    tabloda_yok = sorted(set(sz[kol_ad]) - set(kolonlar))
+    duplicate = int(sz[kol_ad].duplicated().sum())
+
+    p = profil.hesapla(df, kapsam, aciklamalar)
+
+    hafiza.yaz("sema.json", {
+        "veri_seti": veri_ad, "sozluk": sz_ad, "sozluk_ad_kolonu": kol_ad, "sozluk_acik_kolonu": kol_acik,
+        "n_kolon": len(kolonlar), "kolonlar": kolonlar, "tipler": tipler,
+        "haric_kolonlar": list(state["haric_kolonlar"]), "aciklamalar": aciklamalar,
+        "sozlukte_yok": sozlukte_yok, "tabloda_yok": tabloda_yok,
+        "guncelleme": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+    hafiza.yaz("profil.json", p)
+
+    state["kurulum_dogrulandi"] = True
+    state["profil_ozeti"] = profil.ozet_metni(p["ozet"])
+
+    oneriler = []
+    teknik = [k for k in p["ozet"]["teknik_kolon_adaylari"] if k not in state["haric_kolonlar"]]
+    if teknik:
+        oneriler.append({"tip": "kapsam_disi", "kolonlar": teknik,
+                         "gerekce": "isim/tekillik desenine göre teknik ya da kimlik kolonu görünüyor"})
+    if sozlukte_yok:
+        oneriler.append({"tip": "sozluk_eksik", "kolonlar": sozlukte_yok[:15],
+                         "gerekce": "sözlükte açıklaması yok; sözlük kontrolü aşamasında tamamlanabilir"})
+
+    return {
+        "mesaj": "Doğrulama ve profil tamamlandı.",
+        "veri": {
+            "dogrulama": {
+                "n_kolon": len(kolonlar), "kapsamdaki_kolon": len(kapsam),
+                "sozluk_kayit": int(len(sz)), "aciklamasi_olan": len(kapsam) - len(sozlukte_yok),
+                "sozlukte_yok": sozlukte_yok[:15], "sozlukte_yok_sayisi": len(sozlukte_yok),
+                "bos_aciklama_sayisi": len(bos_aciklama), "tabloda_yok_sayisi": len(tabloda_yok),
+                "duplicate_sozluk_kaydi": duplicate,
+            },
+            "profil": p["ozet"],
+            "kayit": ["PROJE_HAFIZASI/sema.json", "PROJE_HAFIZASI/profil.json"],
+        },
+        "oneriler": oneriler,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Doğrulanmış aksiyonları sırayla çalıştırır; aşama geçişleri yalnızca burada ve işleyicilerde olur."""
+from . import asamalar, kurulum, metin, niyet
+
+ASAMA_ISLEYICILERI = {"kurulum": kurulum.ISLEYICILERI}
+
+YARDIM = metin.bolum(
+    metin.baslik("Neler yapabilirim"),
+    "Doğal dille konuşman yeterli; örneğin:",
+    metin.kod("veri seti HAVALE_EFT_NTT, sözlük DEGISKENLER (ad SM_ID, açıklama aciklama)\n"
+              "rn ve LOAD_DATE kolonlarını kapsam dışı bırak\n"
+              "TXN_GDN kolonları ne anlatıyor?\n"
+              "tamam, sonraki aşamaya geçelim"),
+    "Kısayollar: `durum`, `onay`, `ret`, `geri`, `gec`, `yardim`.",
+)
+
+
+def _genel(state, aksiyon):
+    asama = state["asama"]
+    if aksiyon == "durum":
+        return {"dogrudan_metin": state["durum_ozeti"]}
+    if aksiyon == "yardim":
+        return {"dogrudan_metin": YARDIM}
+    if aksiyon == "geri":
+        o = asamalar.onceki(asama)
+        if o is None:
+            return {"aksiyon": "geri", "durum": "hata", "mesaj": "İlk aşamadayız; geri dönülecek aşama yok."}
+        state["asama"] = o
+        return {"aksiyon": "geri", "durum": "ok", "mesaj": "Önceki aşamaya dönüldü.",
+                "veri": {"yeni_asama": asamalar.etiket(o)}}
+    if aksiyon == "gec":
+        if asama in asamalar.ATLANAMAZ:
+            return {"aksiyon": "gec", "durum": "hata",
+                    "mesaj": f"'{asamalar.ETIKETLER[asama]}' zorunlu bir aşama, atlanamaz."}
+        s = asamalar.sonraki(asama)
+        state["asama"] = s
+        return {"aksiyon": "gec", "durum": "ok", "mesaj": "Aşama atlandı.",
+                "veri": {"yeni_asama": asamalar.etiket(s)}}
+    if aksiyon in ("onay", "ret"):
+        return {"aksiyon": aksiyon, "durum": "hata",
+                "mesaj": f"'{asamalar.ETIKETLER[asama]}' aşamasında onaylanacak/reddedilecek bir sonuç yok."}
+    return None
+
+
+def calistir(state, aksiyonlar) -> dict:
+    """Sonuç: anlat bloğuna verilecek JSON; 'dogrudan_metin' varsa LLM'e gitmeden basılır."""
+    asama = state["asama"]
+    sonuclar, oneriler = [], []
+    for a in aksiyonlar:
+        ad, args = a["aksiyon"], a.get("args", {})
+        islem = ASAMA_ISLEYICILERI.get(asama, {}).get(ad)
+        r = islem(state, args) if islem else _genel(state, ad)
+        if r is None:
+            r = {"aksiyon": ad, "durum": "hata", "mesaj": "Bu aşamada geçerli değil."}
+        if "dogrudan_metin" in r:
+            return r
+        oneriler.extend(r.pop("oneriler", []))
+        sonuclar.append(r)
+
+    sonraki = ""
+    if state["asama"] == "kurulum" and state["kurulum_dogrulandi"]:
+        sonraki = "Kullanıcı onaylarsa 'Sözlük kontrolü' aşamasına geçilecek."
+    elif state["asama"] != asama:
+        sonraki = f"Şimdi {asamalar.etiket(state['asama'])} aşamasındayız."
+    return {"asama": asamalar.etiket(state["asama"]), "sonuclar": sonuclar,
+            "oneriler": oneriler, "sonraki_adim": sonraki}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Sohbet bağlamı: kullanıcının mesajında geçen kolonların açıklama ve istatistiklerini
+hafızadan deterministik olarak çeker; LLM tool kullanmaz, sadece bu bağlamı görür."""
+import json
+import re
+
+from . import hafiza, metin
+
+
+def _yukle(ad):
+    try:
+        return hafiza.oku(ad)
+    except Exception:
+        return None
+
+
+def baglam(state, mesaj: str) -> str:
+    sema, prof = _yukle("sema.json"), _yukle("profil.json")
+    if not sema:
+        return "Henüz doğrulanmış bir veri seti yok; kullanıcı önce veri seti ve sözlüğü tanımlamalı."
+
+    kolonlar = sema["kolonlar"]
+    aciklamalar = sema.get("aciklamalar", {})
+    istat = (prof or {}).get("kolonlar", {})
+    kucuk = {k.lower(): k for k in kolonlar}
+
+    # mesajda birebir geçen kolonlar + önek eşleşmeleri (ör. 'TXN_GDN' → o önekle başlayan kolonlar)
+    tokenler = set(re.findall(r"[A-Za-z0-9_]{2,}", mesaj))
+    secili, onek = [], []
+    for t in tokenler:
+        tl = t.lower()
+        if tl in kucuk:
+            secili.append(kucuk[tl])
+        else:
+            eslesen = [k for k in kolonlar if k.lower().startswith(tl + "_")]
+            if 2 <= len(eslesen) <= 400:
+                onek.append((t, eslesen))
+
+    parcalar = [f"Veri seti: {sema['veri_seti']} ({sema['n_kolon']} kolon). {state['profil_ozeti']}"]
+    if secili:
+        satirlar = []
+        for k in secili[:10]:
+            s = istat.get(k, {})
+            satirlar.append((k, f"{aciklamalar.get(k) or 'sözlükte açıklama yok'} | tür {s.get('tur', '?')}, "
+                                f"eksik %{round(100 * s.get('eksik_oran', 0))}, tekil {s.get('tekil', '?')}"))
+        parcalar.append("Mesajda geçen kolonlar:\n" + metin.anahtar_deger(satirlar))
+    for t, es in onek[:3]:
+        ornek = "; ".join(f"{k}: {aciklamalar.get(k) or '-'}" for k in es[:6])
+        parcalar.append(f"'{t}' önekli {len(es)} kolon var. Örnekler: {ornek}")
+    if not secili and not onek:
+        parcalar.append("Mesajda belirli bir kolon adı geçmiyor.")
+    return "\n\n".join(parcalar)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from dataiku.llm.python.blocks_graph import NextBlock
+from fe_agent import durum, komut, niyet
+
+
+def process(trace):
+    durum.hazirla(state)
+    state["tur"] = state["tur"] + 1
+    state["ilk_tur_notu"] = (
+        "Bu, konuşmanın ilk mesajı: tek cümlelik doğal bir selamla başla ve ne yapabileceğini "
+        "bir cümleyle söyle (veri seti + sözlükten başlayıp aşama aşama feature üretimi)."
+        if state["tur"] == 1 else "")
+    mesaj = komut.kullanici_mesaji(globals()).strip()
+    state["mesaj"] = mesaj
+
+    kisayol = komut.kisayol(mesaj)
+    if kisayol:
+        state["aksiyonlar"] = [kisayol]
+        yield NextBlock("asama_isle")
+        return
+
+    state["izinli_aksiyonlar"] = niyet.katalog_metni(state["asama"])
+    yield NextBlock("niyet")
+
+
+
+
+
+
+
+
+Görevin: kullanıcının SON mesajını, aşağıdaki aksiyon kataloğuna göre yapısal isteğe çevirmek. Yalnızca JSON döndür, başka hiçbir şey yazma.
+
+Aşama: {{ state.asama_etiketi }}
+{{ state.durum_ozeti }}
+
+İzinli aksiyonlar:
+{{ state.izinli_aksiyonlar }}
+
+Çıktı biçimi:
+{"aksiyonlar": [{"aksiyon": "<ad>", "args": {...}}]}
+
+Kurallar:
+1. Kullanıcı soru soruyor, fikir istiyor, selamlaşıyor veya sadece yorum yapıyorsa: {"aksiyonlar": []}.
+2. Bir aksiyonu yalnızca kullanıcı açıkça istediyse ve gerekli tüm argümanlar mesajda geçiyorsa üret. Dataset ve kolon adlarını mesajdaki yazımıyla birebir kopyala; asla tahmin etme, tamamlama, uydurma.
+3. Tek mesajda birden fazla istek varsa hepsini sırayla listele.
+4. Kullanıcı bir önceki asistan önerisini "evet / olur / tamam / yapalım" gibi kabul ediyorsa, önerilen aksiyonu önerideki kolon/argümanlarla üret; öneri belirsizse boş liste.
+5. "devam / sonraki aşama / geçelim / onaylıyorum" → onay. "geri" → geri. "atla" → gec.
+6. Katalogda olmayan aksiyon üretme.
+
+
+
+
+
+
+
+
+
+
+
+
+from dataiku.llm.python.blocks_graph import NextBlock
+from fe_agent import niyet
+
+
+def process(trace):
+    aksiyonlar = niyet.dogrula(state["niyet_ham"], state["asama"])
+    state["aksiyonlar"] = aksiyonlar
+    yield NextBlock("asama_isle" if aksiyonlar else "sohbet_hazirla")
+
+
+
+
+
+
+
+
+
+
+
+
+import json
+from dataiku.llm.python.blocks_graph import NextBlock
+from fe_agent import durum, dispatcher
+
+
+def process(trace):
+    sonuc = dispatcher.calistir(state, list(state["aksiyonlar"]))
+    durum.guncelle_ozet(state)
+    if "dogrudan_metin" in sonuc:
+        yield sonuc["dogrudan_metin"]
+        return
+    state["sonuc_json"] = json.dumps(sonuc, ensure_ascii=False)
+    yield NextBlock("anlat")
+
+
+
+
+
+
+
+Sen bir feature engineering asistanısın; bankada bir data scientist ile birlikte çalışıyorsun. Türkçe, doğal, kısa ve somut konuş — bir meslektaş gibi, formalite yok.
+{{ state.ilk_tur_notu }}
+
+Aşama: {{ state.asama_etiketi }}
+Sistem az önce şu işlemleri yaptı; bu JSON tek doğru kaynaktır:
+{{ state.sonuc_json }}
+
+Görevin: bu sonucu kullanıcıya anlatmak ve doğal biçimde yol göstermek.
+
+Kurallar:
+1. Yalnızca JSON'daki sayıları ve isimleri kullan. JSON'da olmayan hiçbir sayı, kolon, dataset veya sonuç söyleme.
+2. "durum": "hata" olanları açıkça söyle ve ne gerektiğini sor.
+3. "veri.profil" varsa veriyi kısaca tarif et: kaç satır/kolon, tür dağılımı, en yaygın kolon şablonları ne anlatıyor, dikkat çeken şeyler (sabit kolonlar, çok eksik kolonlar).
+4. "oneriler" varsa her birini doğal bir soru olarak sor (örn. teknik görünen kolonları kapsam dışı bırakalım mı?). Onaylanmadan yapılmış gibi konuşma.
+5. "sonraki_adim" varsa son cümlede öner.
+6. Başlık, madde işareti, JSON, tablo yazma; 3–7 cümlelik akıcı paragraf(lar). Sayıları binlik ayraçlı yaz (10.000). Kolon ve dataset adlarını `kod` biçiminde yaz.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from dataiku.llm.python.blocks_graph import NextBlock
+from fe_agent import sohbet
+
+
+def process(trace):
+    state["sohbet_baglam"] = sohbet.baglam(state, state["mesaj"])
+    yield NextBlock("sohbet")
+
+
+
+
+
+
+
+
+
+
+
+
+
+Sen bir feature engineering asistanısın; bankada bir data scientist ile birlikte çalışıyorsun. Türkçe, doğal, kısa ve somut konuş — bir meslektaş gibi.
+{{ state.ilk_tur_notu }}
+
+Aşama: {{ state.asama_etiketi }}
+{{ state.durum_ozeti }}
+
+Veri bağlamı (sistem tarafından hafızadan çekildi; tek doğru kaynak):
+{{ state.sohbet_baglam }}
+
+Kurallar:
+1. Soruları bu bağlamla cevapla; bağlamda olmayan kolon, sayı veya sonuç uydurma. Bilmiyorsan söyle ve hangi kolonu kastettiğini sor.
+2. Kullanıcı bir işlem yaptırmak istiyor gibi görünüyorsa ne yapabileceğini söyle ve nasıl isteyeceğini bir örnek cümleyle göster; ama işlemi kendin yapmış gibi konuşma.
+3. Feature engineering fikri sorulursa somut öner: hangi kolonlar, hangi dönüşüm, hangi iş hipotezi.
+4. Başlık ve madde işareti kullanma; tablo gerekirse kod bloğu içinde düz metin. Kolon adlarını `kod` biçiminde yaz.
