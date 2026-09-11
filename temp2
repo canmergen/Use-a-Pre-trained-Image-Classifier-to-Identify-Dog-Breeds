@@ -1,72 +1,311 @@
-Sen “Akıllı Değişken Üretimi” sürecini yöneten Feature Discovery Agent’sın.
+import re
+from dataiku.llm.python.blocks_graph import NextBlock
 
-AMAÇ
+# --- Aşama sırası (dokümandaki 10 aşama) ---
+ASAMALAR = [
+    "kurulum", "veri_hazirligi", "sozluk_kontrol", "sozluk_sikistirma",
+    "meta", "geleneksel_plan", "geleneksel_uretim", "llm_kesif",
+    "yeni_feature_hesap", "kalite", "model_sinama", "bitti",
+]
 
-Kullanıcının sağladığı:
-- ana veri seti
-- değişken adları ve açıklamalarını içeren veri sözlüğü
+VARSAYILAN_STATE = {
+    "asama": "kurulum",
+    "veri_seti": "",
+    "sozluk": "",
+    "sozluk_ad_kolonu": "",
+    "sozluk_acik_kolonu": "",
+    "haric_kolonlar": [],
+    "durum_ozeti": "Henüz veri seti ve sözlük tanımlanmadı.",
+    "aksiyon": "sohbet",
+    "komut": "",
+    "komut_arg": [],
+    "karsilama_yapildi": False,
+}
 
-üzerinden yeni ve anlamlı feature adayları üretmek, bunları kalite ve model katkısı açısından değerlendirmek ve nihai feature setini oluşturmaktır.
+KOMUTLAR = {"yardim", "durum", "veri", "sozluk", "cikar", "onay", "ret", "geri", "gec"}
 
-Çalışma 6 aşamadan oluşur:
+KOMUT_LISTESI = """Komutlar (satır başına yazılır, gerisi serbest sohbettir):
 
-1. Sözlük Sıkıştırma
-Uzun değişken açıklamalarını anlam kaybı olmadan kompakt hale getir.
+  yardim                         bu listeyi göster
+  durum                          hangi aşamadayız, ne tanımlı
+  veri  <DATASET>                ana veri setini tanımla
+  sozluk <DATASET> <AD_KOL> <ACIKLAMA_KOL>
+                                 sözlük dataset'ini ve kolonlarını tanımla
+  cikar <KOLON>                  kolonu feature engineering dışında bırak
+  onay                           bu aşamanın işini çalıştır / sonucu kabul et
+  ret                            bu aşamanın sonucunu reddet
+  geri                           bir önceki aşamaya dön
+  gec                            bu aşamayı atla (zorunlu aşamalarda çalışmaz)
 
-2. Meta Tanımı
-Target, ID, tarih/dönem, veri seviyesi ve modelleme yapısını belirle.
+Komut dışı her mesaj sohbet asistanına gider; asistan hiçbir şeyi
+değiştiremez, sadece bilgi verir ve hangi komutu yazacağını söyler."""
 
-3. Geleneksel Değişken Üretimi
-Oran, fark, trend, değişim, frekans ve benzeri kural bazlı feature adaylarını oluştur.
+KARSILAMA = """Akıllı Feature Engineering Asistanı
 
-4. LLM Destekli Değişken Üretimi
-Değişkenlerin iş anlamlarından hareketle yeni feature hipotezleri geliştir.
+Akış: kurulum → veri hazırlığı → sözlük kontrolü → sözlük sıkıştırma → meta →
+geleneksel feature planı/üretimi → LLM keşif → hesaplama → kalite → model sınama.
 
-5. Veri Kalitesi
-Üretilen feature’ları eksiklik, sabitlik, geçersiz değer, tekrar ve leakage gibi riskler açısından kontrol et.
+Başlamak için iki komut yeter, örnek:
+  veri HAVALE_EFT_NTT
+  sozluk DEGISKENLER SM_ID aciklama
+sonra:
+  onay
+"""
 
-6. Model ile Karşılaştırma
-Yeni feature’ların mevcut yapıya ek katkısını aynı modelleme çerçevesinde ölç.
+def _ascii(s):
+    tablo = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+    return s.translate(tablo).lower()
 
-ÇALIŞMA KURALLARI
+def _son_kullanici_mesaji():
+    """Kullanıcının son mesajını bulur. Dataiku'nun bloğa verdiği değişken
+    adı sürüme göre değişebildiği için birkaç ihtimali sırayla dener."""
+    g = globals()
+    q = g.get("query")
+    if isinstance(q, dict) and q.get("messages"):
+        for m in reversed(q["messages"]):
+            if m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    lo = g.get("last_output")
+    if isinstance(lo, str):
+        return lo
+    return ""
 
-- Kullanıcıyla Türkçe iletişim kur.
-- Dataset veya kolon adı uydurma.
-- Değişkenlerin iş anlamını veri sözlüğüne göre değerlendir.
-- Bilgi eksikse varsayım yapmak yerine kullanıcıya sor.
-- Target leakage ve time leakage risklerine dikkat et.
-- Kullanıcı onayı gereken aşamalarda onay almadan sonraki ana aşamaya geçme.
-- Kullanıcıya her zaman hangi aşamada olduğunu ve sıradaki adımı açıkça belirt.
-- Daha önce reddedilmiş bir öneriyi aynı gerekçeyle tekrar sunma.
-- Detaylı hesaplama ve analizleri uygun tool veya bloklara bırak.
+def process(trace):
+    # 1) State'i her turda tamamla — Routing/Jinja tanımsız anahtar görmesin
+    for k, v in VARSAYILAN_STATE.items():
+        if k not in state:
+            state[k] = v
+    if state["asama"] not in ASAMALAR:
+        state["asama"] = "kurulum"
 
-YENİ ÇALIŞMA
+    # 2) İlk turda karşılama
+    if not state["karsilama_yapildi"]:
+        state["karsilama_yapildi"] = True
+        yield KARSILAMA + "\n" + KOMUT_LISTESI + "\n"
 
-Henüz veri kaynakları tanımlanmamışsa önce çalışmayı kısaca tanıt ve kullanıcıdan:
+    # 3) Komut mu, sohbet mi?
+    mesaj = _son_kullanici_mesaji().strip()
+    parcalar = mesaj.split()
+    ilk = _ascii(parcalar[0]) if parcalar else ""
 
-1. Ana veri setinin adı
-2. Veri sözlüğünün adı
-3. Sözlükte değişken adını içeren kolon
-4. Sözlükte değişken açıklamasını içeren kolon
+    if ilk in KOMUTLAR:
+        state["aksiyon"] = "komut"
+        state["komut"] = ilk
+        state["komut_arg"] = parcalar[1:]
+        if ilk == "yardim":
+            yield KOMUT_LISTESI
+            return                      # tur biter, başka bloğa gitmez
+        if ilk == "durum":
+            yield "Aşama: " + state["asama"] + "\n\n" + state["durum_ozeti"]
+            return
+        yield NextBlock("asama_isle")
+    else:
+        state["aksiyon"] = "sohbet"
+        state["komut"] = ""
+        state["komut_arg"] = []
+        yield NextBlock("sohbet")
 
-bilgilerini iste.
 
-Veri kaynakları doğrulandıktan sonra kullanıcıya kısa bir özet ver ve
-“Aşama 1/6 – Sözlük Sıkıştırma” ile başlamak için onay iste.
 
-YANIT BİÇİMİ
 
-Aktif çalışma sırasında önemli cevaplarda:
 
-Aşama X/6 – [Aşama Adı]
 
-formatını kullan.
 
-Kısa şekilde:
-- ne yapılacağını,
-- gerekiyorsa kullanıcıdan ne beklendiğini,
-- sıradaki adımı
 
-belirt.
 
-İlk mesajda sürecin 6 aşamasını kısa açıklamalarıyla göster; sonrasında gereksiz yere tekrar etme.
+
+import json
+import datetime
+import dataiku
+
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+
+ASAMALAR = [
+    "kurulum", "veri_hazirligi", "sozluk_kontrol", "sozluk_sikistirma",
+    "meta", "geleneksel_plan", "geleneksel_uretim", "llm_kesif",
+    "yeni_feature_hesap", "kalite", "model_sinama", "bitti",
+]
+ATLANAMAZ = {"kurulum", "meta", "kalite"}
+
+# ---------- yardımcılar ----------
+def _folder():
+    return dataiku.Folder(HAFIZA_FOLDER)
+
+def _json_yaz(ad, obj):
+    with _folder().get_writer(ad) as w:
+        w.write(json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"))
+
+def _sema(ad):
+    """Dataset varsa (True, [kolon adları], {kolon: tip}) yoksa (False, hata, {})."""
+    try:
+        ds = dataiku.Dataset(ad)
+        sema = ds.read_schema()
+        return True, [c["name"] for c in sema], {c["name"]: c["type"] for c in sema}
+    except Exception as e:
+        return False, str(e), {}
+
+def _satir_say(ad):
+    ds = dataiku.Dataset(ad)
+    return sum(len(c) for c in ds.iter_dataframes(chunksize=50000))
+
+def _durum_ozeti_guncelle():
+    s = state
+    satirlar = [
+        "Aşama            : " + s["asama"],
+        "Veri seti        : " + (s["veri_seti"] or "-"),
+        "Sözlük           : " + (s["sozluk"] or "-"),
+        "Sözlük kolonları : " + ((s["sozluk_ad_kolonu"] + " / " + s["sozluk_acik_kolonu"])
+                                 if s["sozluk_ad_kolonu"] else "-"),
+        "Hariç kolonlar   : " + (", ".join(s["haric_kolonlar"]) or "-"),
+    ]
+    s["durum_ozeti"] = "\n".join(satirlar)
+
+def _asama_ilerlet():
+    i = ASAMALAR.index(state["asama"])
+    state["asama"] = ASAMALAR[min(i + 1, len(ASAMALAR) - 1)]
+
+# ---------- aşama: kurulum ----------
+def _kurulum(komut, arg):
+    if komut == "veri":
+        if len(arg) != 1:
+            yield "Kullanım: veri <DATASET>"; return
+        ok, kolonlar, _ = _sema(arg[0])
+        if not ok:
+            yield "'" + arg[0] + "' dataset'i bulunamadı: " + kolonlar; return
+        state["veri_seti"] = arg[0]
+        yield "Veri seti tanımlandı: " + arg[0] + " (" + str(len(kolonlar)) + " kolon)"
+
+    elif komut == "sozluk":
+        if len(arg) != 3:
+            yield "Kullanım: sozluk <DATASET> <AD_KOL> <ACIKLAMA_KOL>"; return
+        ok, kolonlar, _ = _sema(arg[0])
+        if not ok:
+            yield "'" + arg[0] + "' dataset'i bulunamadı: " + kolonlar; return
+        eksik = [k for k in arg[1:] if k not in kolonlar]
+        if eksik:
+            yield ("Sözlükte bulunmayan kolon: " + ", ".join(eksik)
+                   + "\nMevcut kolonlar: " + ", ".join(kolonlar)); return
+        state["sozluk"], state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"] = arg
+        yield "Sözlük tanımlandı: " + arg[0] + " (" + arg[1] + " → " + arg[2] + ")"
+
+    elif komut == "cikar":
+        if len(arg) != 1:
+            yield "Kullanım: cikar <KOLON>"; return
+        if arg[0] not in state["haric_kolonlar"]:
+            state["haric_kolonlar"].append(arg[0])
+        yield "Hariç tutulacak: " + ", ".join(state["haric_kolonlar"])
+
+    elif komut == "onay":
+        if not state["veri_seti"] or not state["sozluk"]:
+            yield "Önce 'veri' ve 'sozluk' komutlarıyla iki dataset'i de tanımla."; return
+        yield "Doğrulama çalışıyor...\n"
+        _, v_kol, v_tip = _sema(state["veri_seti"])
+        n_satir = _satir_say(state["veri_seti"])
+        sz = dataiku.Dataset(state["sozluk"]).get_dataframe(
+            columns=[state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"]])
+        ad, ac = state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"]
+        sz[ad] = sz[ad].astype(str).str.strip()
+        aktif = [k for k in v_kol if k not in state["haric_kolonlar"]]
+        sozluk_adlar = set(sz[ad])
+        eslesen = [k for k in aktif if k in sozluk_adlar]
+        tabloda_var_sozlukte_yok = [k for k in aktif if k not in sozluk_adlar]
+        sozlukte_var_tabloda_yok = sorted(sozluk_adlar - set(v_kol))
+        duplicate = int(sz[ad].duplicated().sum())
+        bos_aciklama = int(sz[ac].isna().sum() + (sz[ac].astype(str).str.strip() == "").sum())
+
+        sema = {
+            "veri_seti": state["veri_seti"], "sozluk_adi": state["sozluk"],
+            "sozluk_ad_kolonu": ad, "sozluk_acik_kolonu": ac,
+            "n_satir": int(n_satir), "n_kolon": len(v_kol),
+            "kolonlar": v_kol, "tipler": v_tip,
+            "haric_kolonlar": state["haric_kolonlar"],
+            "sozluk": {r[ad]: (None if r[ac] != r[ac] else str(r[ac]))
+                       for _, r in sz.drop_duplicates(ad).iterrows() if r[ad] in v_kol},
+            "tabloda_var_sozlukte_yok": tabloda_var_sozlukte_yok,
+            "sozlukte_var_tabloda_yok": sozlukte_var_tabloda_yok,
+            "guncelleme": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        _json_yaz("sema.json", sema)
+
+        yield ("Kurulum tamamlandı.\n"
+               "Veri seti  : " + state["veri_seti"] + " — " + str(n_satir) + " satır, "
+               + str(len(v_kol)) + " kolon (" + str(len(aktif)) + " aktif)\n"
+               "Sözlük     : " + state["sozluk"] + " — " + str(len(sz)) + " kayıt\n"
+               "Eşleşen    : " + str(len(eslesen)) + "\n"
+               "Tabloda var, sözlükte yok : " + str(len(tabloda_var_sozlukte_yok))
+               + (" → " + ", ".join(tabloda_var_sozlukte_yok[:15]) if tabloda_var_sozlukte_yok else "") + "\n"
+               "Sözlükte var, tabloda yok : " + str(len(sozlukte_var_tabloda_yok)) + "\n"
+               "Duplicate sözlük kaydı    : " + str(duplicate) + "\n"
+               "Boş açıklama              : " + str(bos_aciklama) + "\n"
+               "sema.json → " + HAFIZA_FOLDER + "\n")
+        _asama_ilerlet()
+        yield "Sonraki aşama: " + state["asama"] + ". Devam için 'onay', atlamak için 'gec'."
+
+    elif komut in ("ret", "geri", "gec"):
+        yield "Kurulum aşamasında bu komut geçerli değil."
+
+# ---------- ana giriş ----------
+def process(trace):
+    komut, arg = state["komut"], state["komut_arg"]
+    asama = state["asama"]
+
+    if komut == "geri":
+        i = ASAMALAR.index(asama)
+        if i == 0:
+            yield "Zaten ilk aşamadasın."
+        else:
+            state["asama"] = ASAMALAR[i - 1]
+            yield "Geri dönüldü → " + state["asama"]
+    elif komut == "gec":
+        if asama in ATLANAMAZ:
+            yield "'" + asama + "' aşaması atlanamaz."
+        else:
+            _asama_ilerlet()
+            yield "Atlandı → " + state["asama"]
+    elif asama == "kurulum":
+        for m in _kurulum(komut, arg):
+            yield m
+    else:
+        yield ("'" + asama + "' aşamasının işlem kodu henüz eklenmedi. "
+               "'geri' ile dönebilir, 'gec' ile atlayabilirsin.")
+
+    _durum_ozeti_guncelle()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Sen Dataiku üzerinde çalışan bir feature engineering asistanısın. Türkçe yaz.
+
+Şu anki aşama: {{ state.asama }}
+Durum:
+{{ state.durum_ozeti }}
+
+KURALLAR
+1. Hiçbir şeyi değiştiremez, çalıştıramaz, kaydedemez, aşama ilerletemezsin. Sadece soru cevaplar, fikir verir, açıklarsın. "Yaptım", "kaydettim", "tamamlandı", "geçiyorum" gibi ifadeleri asla kullanma.
+2. Kullanıcı bir şey yaptırmak istiyorsa hangi komutu yazması gerektiğini söyle: veri <DATASET> / sozluk <DATASET> <AD_KOL> <ACIKLAMA_KOL> / cikar <KOLON> / onay / ret / geri / gec / durum / yardim.
+3. Yukarıdaki durumda olmayan dataset, kolon, sayı veya sonuç uydurma. Bilmiyorsan "bu bilgi bende yok, 'durum' komutuyla bakabilirsin" de.
+4. Kısa ve net yaz. Tablo gerekirse kod bloğu içinde düz metin tablo kullan; markdown tablo render edilmiyor.
