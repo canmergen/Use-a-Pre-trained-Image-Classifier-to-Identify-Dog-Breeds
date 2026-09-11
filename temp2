@@ -1,15 +1,72 @@
-"""fe_agent — Dataiku Structured Visual Agent için feature engineering akışı.
+"""Kullanıcı mesajının deterministik ayrıştırılması.
 
-Katmanlar:
-    asamalar  aşama kaydı ve sıralama
-    metin     kullanıcıya dönen tüm çıktıların biçimlendirilmesi
-    komut     kullanıcı mesajının deterministik ayrıştırılması
-    durum     agent state şeması ve erişim
-    hafiza    PROJE_HAFIZASI managed folder okuma/yazma
-    kurulum   aşama 1 işleyicisi
-    dispatcher komutu ilgili aşama işleyicisine yönlendirir
+İlk kelime tanımlı bir komutsa Komut nesnesi döner; aksi halde None
+(mesaj sohbet asistanına gider). LLM bu katmanda yer almaz.
 """
-__version__ = "0.1.0"
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+_TR = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+
+# ad → (kullanım, açıklama)
+KOMUTLAR = {
+    "veri":   ("veri <DATASET>",                              "Ana veri setini tanımlar"),
+    "sozluk": ("sozluk <DATASET> <ad_kolonu> <aciklama_kolonu>", "Sözlük veri setini tanımlar"),
+    "cikar":  ("cikar <KOLON> [KOLON ...]",                    "Kolonları kapsam dışı bırakır"),
+    "dahil":  ("dahil <KOLON> [KOLON ...]",                    "Kapsam dışı kolonu geri alır"),
+    "durum":  ("durum",                                        "Mevcut aşama ve tanımlı girdiler"),
+    "onay":   ("onay",                                         "Aşamayı çalıştırır / sonucu onaylar"),
+    "ret":    ("ret",                                          "Aşama sonucunu reddeder"),
+    "geri":   ("geri",                                         "Önceki aşamaya döner"),
+    "gec":    ("gec",                                          "Aşamayı atlar (zorunlu aşamalar hariç)"),
+    "yardim": ("yardim",                                       "Komut listesini gösterir"),
+}
+
+
+@dataclass
+class Komut:
+    ad: str
+    args: List[str] = field(default_factory=list)
+
+    @property
+    def kullanim(self) -> str:
+        return KOMUTLAR[self.ad][0]
+
+
+def normalize(kelime: str) -> str:
+    return kelime.translate(_TR).lower()
+
+
+def ayristir(mesaj: str) -> Optional[Komut]:
+    parcalar = mesaj.strip().split()
+    if not parcalar:
+        return None
+    ad = normalize(parcalar[0])
+    return Komut(ad, parcalar[1:]) if ad in KOMUTLAR else None
+
+
+def kullanici_mesaji(ortam: dict) -> str:
+    """Python bloğunun global alanından kullanıcının son mesajını çıkarır."""
+    def icerik(c):
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return ""
+
+    for ad in ("query", "input", "inputs", "request"):
+        q = ortam.get(ad)
+        if isinstance(q, dict) and isinstance(q.get("messages"), list):
+            for m in reversed(q["messages"]):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    return icerik(m.get("content"))
+    m = ortam.get("messages")
+    if isinstance(m, list):
+        for x in reversed(m):
+            if isinstance(x, dict) and x.get("role") == "user":
+                return icerik(x.get("content"))
+    lo = ortam.get("last_output")
+    return lo if isinstance(lo, str) else ""
 
 
 
@@ -17,88 +74,287 @@ __version__ = "0.1.0"
 
 
 
-"""Aşama kaydı. Sıra ve etiketler tek yerden yönetilir."""
-
-ASAMALAR = [
-    ("kurulum",            "Kurulum"),
-    ("veri_hazirligi",     "Veri hazırlığı"),
-    ("sozluk_kontrol",     "Sözlük kontrolü"),
-    ("sozluk_sikistirma",  "Sözlük sıkıştırma"),
-    ("meta",               "Meta tanımı"),
-    ("geleneksel_plan",    "Geleneksel feature planı"),
-    ("geleneksel_uretim",  "Geleneksel feature üretimi"),
-    ("llm_kesif",          "LLM feature keşfi"),
-    ("hesaplama",          "Feature hesaplama"),
-    ("kalite",             "Veri kalitesi ve eleme"),
-    ("model",              "Model sınaması"),
-]
-KIMLIKLER = [k for k, _ in ASAMALAR]
-ETIKETLER = dict(ASAMALAR)
-ATLANAMAZ = {"kurulum", "meta", "kalite", "model"}
-
-
-def etiket(kimlik: str) -> str:
-    """'3/11 · Sözlük kontrolü' biçiminde etiket."""
-    return f"{KIMLIKLER.index(kimlik) + 1}/{len(KIMLIKLER)} · {ETIKETLER[kimlik]}"
-
-
-def sonraki(kimlik: str):
-    i = KIMLIKLER.index(kimlik)
-    return KIMLIKLER[i + 1] if i + 1 < len(KIMLIKLER) else None
-
-
-def onceki(kimlik: str):
-    i = KIMLIKLER.index(kimlik)
-    return KIMLIKLER[i - 1] if i > 0 else None
 
 
 
 
+"""Agent state şeması. Büyük veriler state'te tutulmaz; yalnızca orkestrasyon bilgisi."""
+from . import asamalar, metin
+
+VARSAYILAN = {
+    "asama": "kurulum",
+    "asama_etiketi": "",
+    "veri_seti": "",
+    "sozluk": "",
+    "sozluk_ad_kolonu": "",
+    "sozluk_acik_kolonu": "",
+    "haric_kolonlar": [],
+    "karsilama_yapildi": False,
+    "komut": "",
+    "komut_args": [],
+    "durum_ozeti": "",
+}
+
+
+def hazirla(state) -> None:
+    """Eksik anahtarları tamamlar, türetilmiş alanları günceller. Her turda çağrılır."""
+    for k, v in VARSAYILAN.items():
+        if k not in state:
+            state[k] = list(v) if isinstance(v, list) else v
+    if state["asama"] not in asamalar.KIMLIKLER:
+        state["asama"] = "kurulum"
+    guncelle_ozet(state)
+
+
+def guncelle_ozet(state) -> None:
+    state["asama_etiketi"] = asamalar.etiket(state["asama"])
+    sozluk = state["sozluk"]
+    if sozluk:
+        sozluk += f"  ({state['sozluk_ad_kolonu']} → {state['sozluk_acik_kolonu']})"
+    state["durum_ozeti"] = metin.anahtar_deger([
+        ("Aşama",          state["asama_etiketi"]),
+        ("Veri seti",      state["veri_seti"] or "tanımsız"),
+        ("Sözlük",         sozluk or "tanımsız"),
+        ("Kapsam dışı",    ", ".join(state["haric_kolonlar"]) or "yok"),
+    ])
 
 
 
 
-"""Kullanıcıya dönen metinlerin biçimlendirilmesi.
-
-Dataiku chat markdown tablo çizmediği için hizalı tablolar kod bloğu içinde verilir.
-"""
 
 
-def sayi(n) -> str:
-    """10000 → '10.000'"""
-    return f"{int(n):,}".replace(",", ".")
 
 
-def baslik(metin: str) -> str:
-    return f"**{metin}**"
 
 
-def kod(metin: str) -> str:
-    return "```\n" + metin.rstrip() + "\n```"
+
+"""PROJE_HAFIZASI managed folder üzerinde JSON okuma/yazma."""
+import json
+import dataiku
+
+FOLDER = "PROJE_HAFIZASI"
 
 
-def anahtar_deger(satirlar) -> str:
-    """[(anahtar, değer), ...] → hizalı iki sütunlu kod bloğu."""
-    genislik = max(len(a) for a, _ in satirlar)
-    return kod("\n".join(f"{a.ljust(genislik)}   {d}" for a, d in satirlar))
+def yaz(ad: str, obj) -> str:
+    with dataiku.Folder(FOLDER).get_writer(ad) as w:
+        w.write(json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"))
+    return f"{FOLDER}/{ad}"
 
 
-def tablo(basliklar, satirlar) -> str:
-    """Başlık satırı + ayraç + satırlar; kod bloğu içinde."""
-    sutun = [max(len(str(x)) for x in col) for col in zip(basliklar, *satirlar)]
-    def satir(r):
-        return "  ".join(str(x).ljust(w) for x, w in zip(r, sutun)).rstrip()
-    ayrac = "  ".join("-" * w for w in sutun)
-    return kod("\n".join([satir(basliklar), ayrac] + [satir(r) for r in satirlar]))
+def oku(ad: str):
+    with dataiku.Folder(FOLDER).get_download_stream(ad) as s:
+        return json.loads(s.read().decode("utf-8"))
 
 
-def hata(mesaj: str, kullanim: str = None) -> str:
-    out = f"Hata: {mesaj}"
-    if kullanim:
-        out += f"\nKullanım: `{kullanim}`"
-    return out
 
 
-def bolum(*parcalar) -> str:
-    """Boş olmayan parçaları boş satırla birleştirir."""
-    return "\n\n".join(p for p in parcalar if p)
+
+
+
+
+
+
+
+
+
+
+"""Aşama 1 — Kurulum: veri seti ve sözlüğün tanımlanması ve doğrulanması."""
+import datetime
+import dataiku
+import pandas as pd
+
+from . import asamalar, hafiza, metin
+
+
+def _sema(dataset: str):
+    """(kolon_listesi, tip_sozlugu) veya dataset yoksa None."""
+    try:
+        sema = dataiku.Dataset(dataset).read_schema()
+        return [c["name"] for c in sema], {c["name"]: c["type"] for c in sema}
+    except Exception:
+        return None
+
+
+def _satir_sayisi(dataset: str) -> int:
+    return sum(len(p) for p in dataiku.Dataset(dataset).iter_dataframes(chunksize=50000))
+
+
+# ---- komutlar ----
+def veri(state, komut):
+    if len(komut.args) != 1:
+        return metin.hata("eksik argüman.", komut.kullanim)
+    ad = komut.args[0]
+    sema = _sema(ad)
+    if sema is None:
+        return metin.hata(f"'{ad}' dataset'i bu projede bulunamadı.", komut.kullanim)
+    state["veri_seti"] = ad
+    return f"Veri seti tanımlandı: `{ad}` ({metin.sayi(len(sema[0]))} kolon)."
+
+
+def sozluk(state, komut):
+    if len(komut.args) != 3:
+        return metin.hata("üç argüman gerekli.", komut.kullanim)
+    ad, kol_ad, kol_acik = komut.args
+    sema = _sema(ad)
+    if sema is None:
+        return metin.hata(f"'{ad}' dataset'i bu projede bulunamadı.", komut.kullanim)
+    eksik = [k for k in (kol_ad, kol_acik) if k not in sema[0]]
+    if eksik:
+        return metin.bolum(
+            metin.hata(f"'{ad}' içinde bulunmayan kolon: {', '.join(eksik)}.", komut.kullanim),
+            "Mevcut kolonlar:", metin.kod("\n".join(sema[0])))
+    state["sozluk"], state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"] = ad, kol_ad, kol_acik
+    return f"Sözlük tanımlandı: `{ad}` ({kol_ad} → {kol_acik})."
+
+
+def cikar(state, komut):
+    if not komut.args:
+        return metin.hata("en az bir kolon adı gerekli.", komut.kullanim)
+    for k in komut.args:
+        if k not in state["haric_kolonlar"]:
+            state["haric_kolonlar"].append(k)
+    return "Kapsam dışı: " + ", ".join(state["haric_kolonlar"])
+
+
+def dahil(state, komut):
+    if not komut.args:
+        return metin.hata("en az bir kolon adı gerekli.", komut.kullanim)
+    state["haric_kolonlar"] = [k for k in state["haric_kolonlar"] if k not in komut.args]
+    return "Kapsam dışı: " + (", ".join(state["haric_kolonlar"]) or "yok")
+
+
+def onay(state, komut):
+    if not (state["veri_seti"] and state["sozluk"]):
+        return metin.hata("doğrulama için önce `veri` ve `sozluk` tanımlanmalı.")
+
+    veri_ad, sz_ad = state["veri_seti"], state["sozluk"]
+    kol_ad, kol_acik = state["sozluk_ad_kolonu"], state["sozluk_acik_kolonu"]
+
+    kolonlar, tipler = _sema(veri_ad)
+    n_satir = _satir_sayisi(veri_ad)
+    sz = dataiku.Dataset(sz_ad).get_dataframe(columns=[kol_ad, kol_acik])
+    sz[kol_ad] = sz[kol_ad].astype(str).str.strip()
+    bos = sz[kol_acik].isna() | (sz[kol_acik].astype(str).str.strip() == "")
+
+    kapsam = [k for k in kolonlar if k not in state["haric_kolonlar"]]
+    sozluk_adlari = set(sz[kol_ad])
+    eslesen = [k for k in kapsam if k in sozluk_adlari]
+    sozlukte_yok = [k for k in kapsam if k not in sozluk_adlari]
+    tabloda_yok = sorted(sozluk_adlari - set(kolonlar))
+    duplicate = int(sz[kol_ad].duplicated().sum())
+
+    aciklamalar = {
+        r[kol_ad]: (None if pd.isna(r[kol_acik]) else str(r[kol_acik]))
+        for _, r in sz.drop_duplicates(kol_ad).iterrows() if r[kol_ad] in kolonlar
+    }
+    yol = hafiza.yaz("sema.json", {
+        "veri_seti": veri_ad, "sozluk": sz_ad,
+        "sozluk_ad_kolonu": kol_ad, "sozluk_acik_kolonu": kol_acik,
+        "n_satir": int(n_satir), "n_kolon": len(kolonlar),
+        "kolonlar": kolonlar, "tipler": tipler,
+        "haric_kolonlar": list(state["haric_kolonlar"]),
+        "aciklamalar": aciklamalar,
+        "sozlukte_yok": sozlukte_yok, "tabloda_yok": tabloda_yok,
+        "guncelleme": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+
+    rapor = metin.anahtar_deger([
+        ("Veri seti",        f"{veri_ad}  ·  {metin.sayi(n_satir)} satır  ·  "
+                             f"{metin.sayi(len(kolonlar))} kolon  ·  {metin.sayi(len(kapsam))} kapsamda"),
+        ("Sözlük",           f"{sz_ad}  ·  {metin.sayi(len(sz))} kayıt"),
+        ("Eşleşen kolon",    f"{metin.sayi(len(eslesen))} / {metin.sayi(len(kapsam))}"),
+        ("Sözlükte olmayan", metin.sayi(len(sozlukte_yok))
+                             + (": " + ", ".join(sozlukte_yok[:10]) if sozlukte_yok else "")),
+        ("Tabloda olmayan",  metin.sayi(len(tabloda_yok))),
+        ("Duplicate kayıt",  metin.sayi(duplicate)),
+        ("Boş açıklama",     metin.sayi(int(bos.sum()))),
+    ])
+
+    state["asama"] = asamalar.sonraki(state["asama"])
+    return metin.bolum(
+        metin.baslik("Kurulum doğrulandı"), rapor, f"Kayıt: `{yol}`",
+        f"Sonraki aşama {asamalar.etiket(state['asama'])} — `onay` ile devam, `gec` ile atla.")
+
+
+ISLEYICILER = {"veri": veri, "sozluk": sozluk, "cikar": cikar, "dahil": dahil, "onay": onay}
+
+
+
+
+
+
+
+
+
+
+
+"""Komutu mevcut aşamanın işleyicisine yönlendirir; aşama geçişleri yalnızca burada olur."""
+from . import asamalar, durum, komut as komut_mod, kurulum, metin
+
+ASAMA_ISLEYICILERI = {"kurulum": kurulum.ISLEYICILER}
+
+KARSILAMA = metin.bolum(
+    metin.baslik("Feature Engineering Asistanı"),
+    "Bir veri seti ve kolon sözlüğünden başlayarak feature üretimi, kalite kontrolü ve "
+    "model karşılaştırmasını onaylı aşamalar halinde yönetir. Komut olmayan mesajlar "
+    "aşama bağlamında yanıtlanır; asistan tek başına hiçbir şeyi değiştirmez.",
+)
+
+
+def yardim() -> str:
+    satirlar = [(k, a) for k, a in komut_mod.KOMUTLAR.values()]
+    return metin.bolum(metin.baslik("Komutlar"), metin.tablo(("Komut", "Açıklama"), satirlar))
+
+
+def karsilama(state) -> str:
+    return metin.bolum(
+        KARSILAMA,
+        f"Aşama {state['asama_etiketi']}",
+        "Gerekli girdiler:",
+        metin.kod("veri    <DATASET>\nsozluk  <DATASET> <ad_kolonu> <aciklama_kolonu>"),
+        "Ardından `onay` ile doğrulama başlar. Tüm komutlar için `yardim`.",
+    )
+
+
+def calistir(state, komut) -> str:
+    asama = state["asama"]
+
+    if komut.ad == "yardim":
+        return yardim()
+    if komut.ad == "durum":
+        return state["durum_ozeti"]
+    if komut.ad == "geri":
+        o = asamalar.onceki(asama)
+        if o is None:
+            return "İlk aşamadasın; geri dönülecek aşama yok."
+        state["asama"] = o
+        return f"Aşama {asamalar.etiket(o)} — geri dönüldü."
+    if komut.ad == "gec":
+        if asama in asamalar.ATLANAMAZ:
+            return metin.hata(f"'{asamalar.ETIKETLER[asama]}' aşaması atlanamaz.")
+        s = asamalar.sonraki(asama)
+        state["asama"] = s
+        return f"Aşama {asamalar.etiket(s)} — önceki aşama atlandı."
+
+    isleyiciler = ASAMA_ISLEYICILERI.get(asama)
+    if isleyiciler is None:
+        return metin.hata(f"'{asamalar.ETIKETLER[asama]}' aşamasının işleyicisi henüz tanımlı değil. "
+                          "`geri` ile dönebilir, `gec` ile atlayabilirsin.")
+    islem = isleyiciler.get(komut.ad)
+    if islem is None:
+        return metin.hata(f"`{komut.ad}` bu aşamada geçerli değil.")
+    return islem(state, komut)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
