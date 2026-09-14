@@ -1,12 +1,236 @@
-def _sema(dataset: str):
-    """Dataset adını harf duyarsız çözer; (kolon_listesi, tip_sozlugu, gercek_ad) veya None."""
-    try:
-        proje = dataiku.api_client().get_default_project()
-        adlar = {d["name"].lower(): d["name"] for d in proje.list_datasets()}
-        gercek = adlar.get(dataset.lower())
-        if gercek is None:
-            return None
-        sema = dataiku.Dataset(gercek).read_schema()
-        return [c["name"] for c in sema], {c["name"]: c["type"] for c in sema}, gercek
-    except Exception:
-        return None
+# -*- coding: utf-8 -*-
+"""
+feature_registry.json + feature_rejects.json -> tek Excel
+
+- İki dosyadaki alanlar farklı olduğu için ortak bir sütun şeması kullanılır.
+- Karşılığı olmayan alanlar boş bırakılmaz, BOS_DOLGU ile doldurulur.
+- rejects kayıtlarında 'ad' alanı olmadığı için isim üretilir:
+  LLM_REJECT_001_<ad_soneki>
+"""
+
+import json
+from pathlib import Path
+
+import pandas as pd
+from openpyxl.utils import get_column_letter
+
+# ----------------------------- AYARLAR -----------------------------
+REGISTRY_PATH = "feature_registry.json"
+REJECTS_PATH = "feature_rejects.json"
+OUTPUT_PATH = "feature_birlesik.xlsx"
+
+BOS_DOLGU = "-"            # eksik/boş alanlara yazılacak değer
+BOOL_TURKCE = True         # True/False -> Evet/Hayır
+KAYNAK_SAYFALARI_EKLE = True  # ayrıca REGISTRY ve REJECTS sheet'lerini de yaz
+# -------------------------------------------------------------------
+
+
+# ----------------------- YARDIMCI FONKSİYONLAR ----------------------
+def json_oku(path: str) -> list:
+    """JSON dosyasını okur ve her zaman liste döndürür."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Dosya bulunamadi: {p.resolve()}")
+
+    # utf-8-sig: Windows'ta dosya başında BOM varsa da sorunsuz okur
+    with open(p, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError(f"{p.name} beklenen formatta degil (liste veya dict olmali).")
+    return data
+
+
+def temizle(deger):
+    """Tek bir değeri Excel'e yazılabilir, boş olmayan bir değere çevirir."""
+    if deger is None:
+        return BOS_DOLGU
+    if isinstance(deger, bool):
+        if BOOL_TURKCE:
+            return "Evet" if deger else "Hayir"
+        return deger
+    if isinstance(deger, (list, tuple)):
+        if len(deger) == 0:
+            return BOS_DOLGU
+        return ", ".join(str(x) for x in deger)
+    if isinstance(deger, dict):
+        if len(deger) == 0:
+            return BOS_DOLGU
+        return json.dumps(deger, ensure_ascii=False)
+    if isinstance(deger, (int, float)):
+        return deger  # sayısal kalsın ki Excel'de sıralanabilsin
+    s = str(deger).strip()
+    return s if s else BOS_DOLGU
+
+
+def ilk_dolu(kayit: dict, *anahtarlar):
+    """Verilen anahtarlardan ilk mevcut olanın değerini döndürür, yoksa None."""
+    for a in anahtarlar:
+        if a in kayit and kayit[a] not in (None, "", [], {}):
+            return kayit[a]
+    return None
+
+
+def decile_ozet(decile):
+    """decile_egrisi listesinden metin + adet + min + max üretir."""
+    if not isinstance(decile, (list, tuple)) or len(decile) == 0:
+        return BOS_DOLGU, BOS_DOLGU, BOS_DOLGU, BOS_DOLGU
+    sayisal = [x for x in decile if isinstance(x, (int, float))]
+    metin = ", ".join(str(x) for x in decile)
+    if not sayisal:
+        return metin, len(decile), BOS_DOLGU, BOS_DOLGU
+    return metin, len(decile), min(sayisal), max(sayisal)
+
+
+def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
+    """Bir JSON kaydını ortak sütun şemasına çevirir."""
+    ist = kayit.get("istatistikler") or {}
+    if not isinstance(ist, dict):
+        ist = {}
+
+    ad_soneki = kayit.get("ad_soneki")
+
+    # İsim: registry'de 'ad' var, rejects'te yok -> üretiyoruz
+    if kayit.get("ad"):
+        ad = kayit["ad"]
+    elif durum == "RED":
+        ad = f"LLM_REJECT_{sira:03d}"
+        if ad_soneki:
+            ad = f"{ad}_{ad_soneki}"
+    else:
+        ad = f"LLM_F{sira:03d}_ISIMSIZ"
+
+    kolonlar = ilk_dolu(kayit, "kaynak_kolonlar", "kolonlar") or []
+    kolon_sayisi = len(kolonlar) if isinstance(kolonlar, (list, tuple)) else BOS_DOLGU
+
+    d_metin, d_adet, d_min, d_max = decile_ozet(ist.get("decile_egrisi"))
+
+    satir = {
+        "sira": sira,
+        "durum": durum,                                   # KABUL / RED
+        "ad": temizle(ad),
+        "ad_soneki": temizle(ad_soneki),
+        "tema": temizle(kayit.get("tema")),
+        "tur_iterasyon": temizle(ilk_dolu(kayit, "iterasyon", "tur")),
+        "red_nedeni": temizle(kayit.get("neden")),
+        "formul": temizle(kayit.get("formul")),
+        "kolonlar": temizle(kolonlar),
+        "kolon_sayisi": kolon_sayisi,
+        "gerekce": temizle(kayit.get("gerekce")),
+        "mekanizma": temizle(kayit.get("mekanizma")),
+        "beklenen_yon": temizle(kayit.get("beklenen_yon")),
+        "gozlenen_yon": temizle(ist.get("gozlenen_yon")),
+        "yon_guvenilir": temizle(ist.get("yon_guvenilir")),
+        "yon_notu": temizle(kayit.get("yon_notu")),
+        "zayif_sinyal": temizle(kayit.get("zayif_sinyal")),
+        "base_rate": temizle(ist.get("base_rate")),
+        "en_riskli_dilim_rate": temizle(ist.get("en_riskli_dilim_rate")),
+        "pp_gap": temizle(ist.get("pp_gap")),
+        "lift": temizle(ist.get("lift")),
+        "egri_sekli": temizle(ist.get("egri_sekli")),
+        "sifir_orani": temizle(ist.get("sifir_orani")),
+        "mevcutlarla_max_korelasyon": temizle(ist.get("mevcutlarla_max_korelasyon")),
+        "decile_egrisi": d_metin,
+        "decile_adet": d_adet,
+        "decile_min": d_min,
+        "decile_max": d_max,
+        "tarih": temizle(kayit.get("tarih")),
+    }
+    return satir
+
+
+SUTUN_SIRASI = [
+    "sira", "durum", "ad", "ad_soneki", "tema", "tur_iterasyon", "red_nedeni",
+    "formul", "kolonlar", "kolon_sayisi",
+    "gerekce", "mekanizma",
+    "beklenen_yon", "gozlenen_yon", "yon_guvenilir", "yon_notu", "zayif_sinyal",
+    "base_rate", "en_riskli_dilim_rate", "pp_gap", "lift",
+    "egri_sekli", "sifir_orani", "mevcutlarla_max_korelasyon",
+    "decile_egrisi", "decile_adet", "decile_min", "decile_max",
+    "tarih",
+]
+
+
+def bilinmeyen_alanlari_bildir(kayitlar: list, dosya_adi: str):
+    """Şemada olmayan JSON alanı varsa uyarır (veri sessizce kaybolmasın)."""
+    bilinen = {
+        "ad", "ad_soneki", "tema", "iterasyon", "tur", "neden", "formul",
+        "kaynak_kolonlar", "kolonlar", "gerekce", "mekanizma", "beklenen_yon",
+        "yon_notu", "zayif_sinyal", "tarih", "istatistikler",
+    }
+    bilinen_ist = {
+        "base_rate", "en_riskli_dilim_rate", "pp_gap", "lift", "gozlenen_yon",
+        "egri_sekli", "yon_guvenilir", "sifir_orani", "decile_egrisi",
+        "mevcutlarla_max_korelasyon",
+    }
+    eksikler = set()
+    for k in kayitlar:
+        eksikler |= (set(k.keys()) - bilinen)
+        ist = k.get("istatistikler")
+        if isinstance(ist, dict):
+            eksikler |= {f"istatistikler.{x}" for x in (set(ist.keys()) - bilinen_ist)}
+    if eksikler:
+        print(f"[UYARI] {dosya_adi} icinde semada olmayan alanlar var, "
+              f"Excel'e yazilmadi: {sorted(eksikler)}")
+
+
+def sutun_genisliklerini_ayarla(writer, sheet_adi: str, df: pd.DataFrame):
+    """Sütun genişliklerini içeriğe göre ayarlar, üst satırı dondurur."""
+    ws = writer.sheets[sheet_adi]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i, sutun in enumerate(df.columns, start=1):
+        uzunluklar = [len(str(sutun))] + [len(str(v)) for v in df[sutun].head(200)]
+        genislik = min(max(uzunluklar) + 2, 60)  # 60 karakterde kes
+        ws.column_dimensions[get_column_letter(i)].width = genislik
+
+
+# ------------------------------- ANA AKIŞ ---------------------------
+def main():
+    registry = json_oku(REGISTRY_PATH)
+    rejects = json_oku(REJECTS_PATH)
+
+    bilinmeyen_alanlari_bildir(registry, Path(REGISTRY_PATH).name)
+    bilinmeyen_alanlari_bildir(rejects, Path(REJECTS_PATH).name)
+
+    satirlar = []
+    for i, kayit in enumerate(registry, start=1):
+        satirlar.append(satir_uret(kayit, "KABUL", i))
+    for i, kayit in enumerate(rejects, start=1):
+        satirlar.append(satir_uret(kayit, "RED", i))
+
+    df = pd.DataFrame(satirlar)
+    df = df.reindex(columns=SUTUN_SIRASI)      # sütun sırasını sabitle
+    df = df.fillna(BOS_DOLGU)                  # kalan boşluk varsa doldur
+
+    # global sıra numarası (KABUL 1..n, RED 1..m yerine tabloda 1..n+m)
+    df["sira"] = range(1, len(df) + 1)
+
+    # isim çakışması kontrolü
+    cakisan = df.loc[df["ad"].duplicated(keep=False), "ad"].unique().tolist()
+    if cakisan:
+        print(f"[UYARI] Ayni isimden birden fazla kayit var: {cakisan}")
+
+    with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="TUM_FEATURELAR", index=False)
+        sutun_genisliklerini_ayarla(writer, "TUM_FEATURELAR", df)
+
+        if KAYNAK_SAYFALARI_EKLE:
+            df_kabul = df[df["durum"] == "KABUL"]
+            df_red = df[df["durum"] == "RED"]
+            if not df_kabul.empty:
+                df_kabul.to_excel(writer, sheet_name="REGISTRY", index=False)
+                sutun_genisliklerini_ayarla(writer, "REGISTRY", df_kabul)
+            if not df_red.empty:
+                df_red.to_excel(writer, sheet_name="REJECTS", index=False)
+                sutun_genisliklerini_ayarla(writer, "REJECTS", df_red)
+
+    print(f"Tamam -> {Path(OUTPUT_PATH).resolve()}")
+    print(f"KABUL: {len(registry)} satir | RED: {len(rejects)} satir | "
+          f"Toplam: {len(df)} satir, {len(df.columns)} sutun")
+
+
+if __name__ == "__main__":
+    main()
