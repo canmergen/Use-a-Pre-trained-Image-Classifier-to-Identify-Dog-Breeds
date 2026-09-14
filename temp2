@@ -1,114 +1,179 @@
 # -*- coding: utf-8 -*-
-"""fe_agent/niyet_kural.py — kullanicinin cumlesini LLM'siz cozumler.
+"""fe_agent/llm.py — sistemin TEK LLM temas noktasi.
 
-Tek isi: bir metinden su ikisini cikarmak
-  aksiyon : onay / ret / adim_tekrar / alan_ver / belirsiz
-  alanlar : {"veri_seti": "HAVALE_EFT_NTT", "sozluk": "DEGISKENLER"}
+1) gelenekse_plan_oner : hangi kolona hangi klasik donusum uygulanmali
+2) kesif_oner          : her sey bitince yeni degisken fikirleri
+
+Ikisi de sadece ONERI doner. Uretim ve karar akis.py'de, Python'da.
+LLM kod yazmaz, kapali bir donusum sozlugunden secim yapar; kolon adlari
+sozlukle dogrulanir. Hallusinasyon uretime donusemez.
 """
 
+import json
 import re
 
-# Turkce karakterler 1'e 1 ASCII'ye cevriliyor; metin uzunlugu DEGISMIYOR.
-# Bu sayede normalize metinde bulunan konumu ORIJINAL metne uygulayip
-# dataset adini buyuk harfleri bozmadan kesebiliyoruz.
-_TR_MAP = str.maketrans("ıİşŞğĞüÜöÖçÇ", "iisSgGuUoOcC")
+import dataiku
+
+# LLM Connections ekranindaki kayitlar. Id formati:
+#   openai:<baglanti_adi>:<model_adi>
+# Model adinda nokta YOK (dropdown'da gorunen isimle ayni degil).
+LLAMA = "openai:dataiku-llama-31-70b-instruct-gptq-int4:meta-llama-31-70b-instruct-gptq-int4"
+QWEN  = "openai:dataiku-qwen3-30b-a3b-thinking-2507-fp8:qwen3-30b-a3b-thinking-2507-fp8"
+
+# Varsayilan: Llama. Instruct-tuned oldugu icin JSON formatina daha sadik.
+# Qwen "thinking" modeli; once uzun muhakeme uretiyor, JSON onun icinde geliyor.
+VARSAYILAN_MODEL = LLAMA
+
+# Thinking modellerinin muhakeme bloklarini temizleyen kaliplar.
+# Model muhakemeyi uretmeyi birakmaz; biz ciktidan siliyoruz.
+_THINK_KALIPLARI = [
+    re.compile(r"<think>.*?</think>", re.S | re.I),
+    re.compile(r"<thinking>.*?</thinking>", re.S | re.I),
+]
+
+IZINLI_DONUSUMLER = {"delta", "oran", "log", "rank", "winsor"}
 
 
-def normalize(metin):
+def _cagir(sistem, kullanici, model=None, sicaklik=0.2):
+    proje = dataiku.api_client().get_default_project()
+    comp = proje.get_llm(model or VARSAYILAN_MODEL).new_completion()
+    comp.with_message(sistem, role="system")
+    comp.with_message(kullanici, role="user")
+    comp.settings["temperature"] = sicaklik   # dusuk = daha kararli JSON
+    return comp.execute().text or ""
+
+
+def _think_temizle(metin):
+    """Muhakeme bloklarini siler. Kapanis etiketi hic gelmediyse
+    (cikti kesildiyse) son acilis etiketinden sonrasini da atar."""
     if not metin:
         return ""
-    return metin.translate(_TR_MAP).lower()
+    for kalip in _THINK_KALIPLARI:
+        metin = kalip.sub("", metin)
+    m = re.search(r"<think(?:ing)?>", metin, re.I)
+    if m:
+        metin = metin[:m.start()]
+    return metin.strip()
 
 
-# SIRA ONEMLI: ret once kontrol edilir.
-# "onaylamiyorum" icinde "onay" gecer; ters sirada olsa red onay sayilirdi.
-RET_KALIPLARI = [
-    r"\bonaylam\w*", r"\bkabul etmiyorum\b", r"\bhayir\b", r"\bolmaz\b",
-    r"\bred\b", r"\breddediyorum\b", r"\bvazgec\w*", r"\biptal\b",
-    r"\bistemiyorum\b",
-]
+def _json_ayristir(metin, varsayilan):
+    """LLM cikti gurultusune dayanikli JSON okuma.
+    Sirasiyla: muhakeme temizligi -> kod bloklari -> ilk gecerli JSON."""
+    metin = _think_temizle(metin)
+    if not metin:
+        return varsayilan
 
-ONAY_KALIPLARI = [
-    r"\bonay\w*", r"\btamamdir\b", r"\btamam\b", r"\bevet\b", r"\bolur\b",
-    r"\bdevam\b", r"\bkabul\b", r"\buygun\b", r"\bgecelim\b", r"\bbasla\w*",
-]
+    metin = re.sub(r"```(?:json)?", "", metin).strip()
 
-TEKRAR_KALIPLARI = [
-    r"\btekrar\w*", r"\byeniden\b", r"\bbastan\b", r"\bgeri don\w*",
-]
+    try:
+        return json.loads(metin)
+    except Exception:
+        pass
 
-# Cumleden dataset/sozluk adi cikaran kaliplar. Grup 1 = yakalanacak deger.
-ALAN_KALIPLARI = {
-    "veri_seti": [
-        r"veri\s*seti\s*[:=]?\s*([a-z0-9_]+)",
-        r"\bdataset\s*[:=]?\s*([a-z0-9_]+)",
-        r"\btablo\s*[:=]?\s*([a-z0-9_]+)",
-    ],
-    "sozluk": [
-        r"sozluk\s*[:=]?\s*([a-z0-9_]+)",
-        r"\bsozlugu\s*[:=]?\s*([a-z0-9_]+)",
-    ],
-}
-
-# "sozluk olarak DEGISKENLER" gibi cumlelerde regex "olarak"i yakalayabiliyor.
-DOLGU_KELIMELER = {
-    "ve", "ile", "olarak", "icin", "da", "de", "ki", "bir",
-    "adinda", "adli", "ismi", "su", "bu", "o", "var", "yok",
-    "kolonu", "kolon", "seti", "sozluk", "aciklama", "ad",
-}
+    for acan, kapanan in (("[", "]"), ("{", "}")):
+        bas = metin.find(acan)
+        son = metin.rfind(kapanan)
+        if bas != -1 and son > bas:
+            try:
+                return json.loads(metin[bas:son + 1])
+            except Exception:
+                continue
+    return varsayilan
 
 
-def _herhangi_esles(norm, kaliplar):
-    for k in kaliplar:
-        if re.search(k, norm):
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# LLM #1 — geleneksel donusum plani
+# ---------------------------------------------------------------------------
+SISTEM_PLAN = """Sen bir feature engineering danismanisin.
+Sana kolon adlari ve aciklamalari verilecek. Gorevin, hangi kolonlara hangi
+KLASIK donusumun uygulanmasi gerektigini sablon duzeyinde onermek.
+
+Izin verilen donusumler SADECE: delta, oran, log, rank, winsor
+
+CIKTI KURALI: Cevabin SADECE JSON dizisi olsun. Muhakeme, aciklama veya
+kod blogu YAZMA. Format:
+[{"ad":"...","donusum":"delta","kolonlar":["KOL_A","KOL_B"],"gerekce":"..."}]
+
+Kurallar:
+- delta ve oran icin kolonlar ayni ailenin ARDISIK pencereleri olmali.
+- Sadece sayisal kolonlar.
+- Kolon adlarini sana verilen listeden AYNEN kopyala, uydurma.
+- "gerekce" alanina hedef degiskenle iliskisini bir cumlede yaz.
+- En fazla 12 sablon oner."""
 
 
-def _alan_bul(orijinal, norm, kaliplar):
-    for k in kaliplar:
-        m = re.search(k, norm)
-        if not m:
+def gelenekse_plan_oner(sozluk_df, haric, meta, max_satir=400):
+    ad_kol, ack_kol = sozluk_df.columns[0], sozluk_df.columns[1]
+
+    kayitlar = []
+    for _, r in sozluk_df.head(max_satir).iterrows():
+        kolon = str(r[ad_kol])
+        if kolon in haric or kolon in (meta.get("target"), meta.get("id")):
             continue
-        bas, son = m.span(1)
-        deger = orijinal[bas:son].strip()      # ORIJINAL metinden kesiyoruz
-        if not deger or len(deger) < 2:
+        kayitlar.append("%s: %s" % (kolon, str(r[ack_kol])[:120]))
+
+    istek = ("Hedef degisken: %s\n\nKolonlar:\n%s"
+             % (meta.get("target", "?"), "\n".join(kayitlar)))
+
+    ham = _cagir(SISTEM_PLAN, istek, sicaklik=0.2)
+    plan = _json_ayristir(ham, [])
+
+    # --- LLM'e GUVENME: dogrula ve temizle -------------------------------
+    # Uydurma kolon adi, izinsiz donusum, eksik kolon -> hepsi eleniyor.
+    # Bu katman olmasa LLM hallusinasyonu dogrudan uretilen koda donusurdu.
+    gecerli = set(sozluk_df[ad_kol].astype(str))
+
+    temiz = []
+    for p in (plan if isinstance(plan, list) else []):
+        if not isinstance(p, dict) or p.get("donusum") not in IZINLI_DONUSUMLER:
             continue
-        if normalize(deger) in DOLGU_KELIMELER:
+        kolonlar = [k for k in (p.get("kolonlar") or [])
+                    if k in gecerli and k not in haric]
+        if not kolonlar:
             continue
-        return deger
-    return None
+        if p["donusum"] in ("delta", "oran") and len(kolonlar) < 2:
+            continue
+        temiz.append({"ad": p.get("ad") or p["donusum"],
+                      "donusum": p["donusum"],
+                      "kolonlar": kolonlar,
+                      "gerekce": p.get("gerekce", "")})
+    return temiz[:12]
 
 
-def alanlari_cikar(metin):
-    """Mesajdan veri_seti / sozluk adlarini cikarir."""
-    orijinal = metin or ""
-    norm = normalize(orijinal)
-    alanlar = {}
-    for alan_adi, kaliplar in ALAN_KALIPLARI.items():
-        deger = _alan_bul(orijinal, norm, kaliplar)
-        if deger:
-            alanlar[alan_adi] = deger
-    return alanlar
+# ---------------------------------------------------------------------------
+# LLM #2 — final fikirler
+# ---------------------------------------------------------------------------
+SISTEM_KESIF = """Sen bir feature engineering danismanisin.
+Mevcut uretilmis degiskenlerin listesi verilecek. Bunlardan FARKLI, yeni
+degisken fikirleri oner. Her fikir tek satir olsun: ad - kisa gerekce.
+
+CIKTI KURALI: Cevabin SADECE JSON string dizisi olsun. Muhakeme veya
+aciklama YAZMA. Format: ["fikir 1","fikir 2"]
+En fazla 10 fikir."""
 
 
-def coz(metin):
-    """Ana fonksiyon.
-    Doner: {"aksiyon": "...", "alanlar": {...}, "ham": "..."}"""
-    orijinal = metin or ""
-    norm = normalize(orijinal)
-    alanlar = alanlari_cikar(orijinal)
-    sonuc = {"alanlar": alanlar, "ham": orijinal}
+def kesif_oner(meta, uretilen, model_ozeti):
+    istek = ("Hedef: %s\nUretilmis degiskenler:\n%s\n\nModel notu: %s"
+             % (meta.get("target", "?"),
+                "\n".join(uretilen[:200]),
+                json.dumps(model_ozeti, ensure_ascii=False)))
 
-    if _herhangi_esles(norm, RET_KALIPLARI):
-        sonuc["aksiyon"] = "ret"
-    elif _herhangi_esles(norm, TEKRAR_KALIPLARI):
-        sonuc["aksiyon"] = "adim_tekrar"
-    elif _herhangi_esles(norm, ONAY_KALIPLARI):
-        sonuc["aksiyon"] = "onay"
-    elif alanlar:
-        sonuc["aksiyon"] = "alan_ver"
-    else:
-        sonuc["aksiyon"] = "belirsiz"
+    ham = _cagir(SISTEM_KESIF, istek, sicaklik=0.7)
+    fikirler = _json_ayristir(ham, [])
+    return [str(f) for f in fikirler if isinstance(f, (str, int, float))][:10]
 
-    return sonuc
+
+# ---------------------------------------------------------------------------
+# Test yardimcisi
+# ---------------------------------------------------------------------------
+def test(model=None):
+    """Notebook'ta calistir: model baglantisi ve JSON ayristirma calisiyor mu."""
+    ham = _cagir(
+        "Sadece JSON dondur, aciklama yazma.",
+        'Su formatta ornek dondur: [{"ad":"test","donusum":"delta"}]',
+        model=model,
+    )
+    print("--- HAM CIKTI ---")
+    print(repr(ham))
+    print("--- AYRISTIRILMIS ---")
+    print(_json_ayristir(ham, "AYRISTIRILAMADI"))
