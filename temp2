@@ -1,647 +1,243 @@
-# -*- coding: utf-8 -*-
-"""fe_agent/akis.py — deterministik adim makinesi.
-
-Icinde LLM cagrisi YOK. LLM gereken iki adim fe_agent.llm'e delege edilir.
-
-Her adimin 3 parcasi var:
-  girdi()  -> kullanicidan bilgi ister (her adimda yok)
-  plan()   -> "sunu yapacagim" der, HICBIR SEY DEGISTIRMEZ
-  uygula() -> kullanici "onay" deyince gercek isi yapar
-"""
-
-import json
-import re
-import datetime
+import os
+import unicodedata
+import traceback
 
 import dataiku
-import numpy as np
-import pandas as pd
+from flask import request, jsonify, Response
 
-from fe_agent import niyet_kural
-from fe_agent import llm as llm_mod
+from fe_agent import akis
 
-HAFIZA_FOLDER = "PROJE_HAFIZASI"
-MODEL_SENARYO = "MODEL_COMPARISON"      # projendeki gercek senaryo adiyla degistir
-OKUMA_LIMITI = 10000
+GORSEL_FOLDER = "LLM_WEBAPP_GORSEL"
 
-ADIM_SIRASI = [
-    "kurulum", "sozluk", "meta", "gelenekse",
-    "uretim", "kalite", "model", "kesif",
-]
-
-GERI_KALIP = re.compile(r"\b(geri|onceki adim|bir onceki|geri don\w*)\b")
-
-KARSILAMA = """Değişken Keşif Asistanı
-
-Modelleme veri setinizden yeni ve anlamlı değişkenler keşfetmek için veri \
-yapısını, değişken sözlüğünü ve hedef değişkeni birlikte analiz ederim.
-
-Süreç boyunca geleneksel dönüşüm fırsatlarını belirler, yeni değişken \
-hipotezleri oluşturur, üretimi çalıştırır, kalite kontrollerini uygular ve \
-oluşan değişken setinin model performansına katkısını ölçerim.
-
-Başlamak için veri seti ve değişken sözlüğünü seçin."""
-
-
-# ===========================================================================
-# DURUM — folder'da JSON. Backend restart olunca sohbet kaybolmasin diye.
-# ===========================================================================
-def _folder():
-    return dataiku.Folder(HAFIZA_FOLDER)
-
-
-def _yol(oturum_id):
-    return "/oturum_%s.json" % re.sub(r"[^A-Za-z0-9_-]", "", str(oturum_id))
-
-
-def yeni_durum():
-    return {
-        "i": 0,                  # ADIM_SIRASI icindeki konum
-        "bekleyen": "girdi",     # "girdi" | "onay"
-        "veri_seti": None,
-        "sozluk": None,
-        "haric_kolonlar": [],
-        "meta": {},
-        "profil": {},            # ust seritteki kartlarin kaynagi
-        "plan": [],
-        "uretilen": [],
-        "kalite": {},
-        "model": {},
-    }
-
-
-def durum_yukle(oturum_id):
-    try:
-        with _folder().get_download_stream(_yol(oturum_id)) as s:
-            return json.loads(s.read().decode("utf-8"))
-    except Exception:
-        return yeni_durum()
-
-
-def durum_kaydet(oturum_id, durum):
-    veri = json.dumps(durum, ensure_ascii=False, indent=2).encode("utf-8")
-    _folder().upload_stream(_yol(oturum_id), veri)
-
-
-# ===========================================================================
-# YARDIMCILAR
-# ===========================================================================
-def _df_oku(dataset_adi, limit=OKUMA_LIMITI):
-    return dataiku.Dataset(dataset_adi).get_dataframe(limit=limit)
-
-
-def _dataset_var_mi(ad):
-    try:
-        dataiku.Dataset(ad).get_config()
-        return True
-    except Exception:
-        return False
-
-
-def _sayi(n):
-    """1042 -> '1.042' (Turkce binlik ayraci)."""
-    try:
-        return "{:,}".format(int(n)).replace(",", ".")
-    except Exception:
-        return str(n)
-
-
-def _ondalik(x, basamak=1):
-    return ("%.*f" % (basamak, x)).replace(".", ",")
-
-
-def _liste(baslik, satirlar, en_fazla=20):
-    if not satirlar:
-        return baslik + "\n  (yok)"
-    govde = "\n".join("  • %s" % s for s in satirlar[:en_fazla])
-    if len(satirlar) > en_fazla:
-        govde += "\n  … (+%d tane daha)" % (len(satirlar) - en_fazla)
-    return baslik + "\n" + govde
-
-
-def ozet(durum):
-    """Ust seritteki 4 kart. Veri OKUMAZ — adimlar ilerledikce durum['profil']
-    icine yazilan degerleri okur; her mesajda 1042 kolonluk tablo acilmasin diye."""
-    m = durum.get("meta") or {}
-    p = durum.get("profil") or {}
-    k = durum.get("kalite") or {}
-    bos = "—"
-
-    # --- Veri seti ---
-    if p.get("kolon"):
-        satir = _sayi(p["satir"]) + ("+" if p.get("satir_ustsinir") else "")
-        veri_alt = "%s satır × %s kolon" % (satir, _sayi(p["kolon"]))
-    else:
-        veri_alt = "seçilmedi"
-
-    # --- Sozluk ---
-    if p.get("eslesen") is not None:
-        sozluk_alt = "%s / %s eşleşti · %%%s kapsam" % (
-            _sayi(p["eslesen"]), _sayi(p["kolon"]), _ondalik(p.get("kapsam", 0)))
-    elif p.get("sozluk_satir"):
-        sozluk_alt = "%s tanım" % _sayi(p["sozluk_satir"])
-    else:
-        sozluk_alt = "seçilmedi"
-
-    # --- Hedef ---
-    hedef_alt = p.get("hedef_ozet") or ("tanımlanmadı" if not m.get("target") else "")
-
-    # --- Degisken seti ---
-    uretilen = len(durum.get("uretilen") or [])
-    if uretilen and p.get("kolon"):
-        deger = "%s → %s" % (_sayi(p["kolon"]), _sayi(p["kolon"] + uretilen))
-        alt = "+%s yeni" % _sayi(uretilen)
-        if k:
-            elenen = uretilen - len(k.get("gecti") or [])
-            alt += " · %s elendi" % _sayi(elenen)
-    elif durum.get("plan"):
-        deger = bos
-        alt = "%s dönüşüm planlandı" % _sayi(len(durum["plan"]))
-    else:
-        deger = bos
-        alt = "henüz üretilmedi"
-
-    return {"kartlar": [
-        {"etiket": "Veri seti",     "deger": durum.get("veri_seti") or bos, "alt": veri_alt},
-        {"etiket": "Sözlük",        "deger": durum.get("sozluk") or bos,    "alt": sozluk_alt},
-        {"etiket": "Hedef",         "deger": m.get("target") or bos,        "alt": hedef_alt},
-        {"etiket": "Değişken seti", "deger": deger,                          "alt": alt},
-    ]}
-
-
-# ===========================================================================
-# ADIM 0: CALISMA KURULUMU
-# ===========================================================================
-def kurulum_girdi(durum, mesaj):
-    """Doner: (tamam_mi, sorulacak_soru)"""
-    alanlar = niyet_kural.alanlari_cikar(mesaj)
-    veri = alanlar.get("veri_seti") or durum.get("veri_seti")
-    sozluk = alanlar.get("sozluk") or durum.get("sozluk")
-
-    eksik = []
-    if not veri:
-        eksik.append("veri setinin adı")
-    if not sozluk:
-        eksik.append("sözlüğün adı")
-    if eksik:
-        return False, ("Devam edebilmem için %s gerekiyor.\n\n"
-                       "Yukarıdaki listeden seçebilir ya da şöyle yazabilirsiniz:\n"
-                       "    veri seti HAVALE_EFT_NTT ve sözlük DEGISKENLER"
-                       % " ve ".join(eksik))
-
-    for ad in (veri, sozluk):
-        if not _dataset_var_mi(ad):
-            return False, ("Projede '%s' adında bir veri seti bulamadım. "
-                           "Adını kontrol eder misiniz?" % ad)
-
-    durum["veri_seti"] = veri
-    durum["sozluk"] = sozluk
-    return True, None
-
-
-def kurulum_plan(durum):
-    df = _df_oku(durum["veri_seti"])
-    sz = _df_oku(durum["sozluk"])
-
-    # Profil bir kez burada hesaplanip durum'a yaziliyor; ozet() bunu okuyor.
-    p = durum.get("profil") or {}
-    p["satir"] = int(df.shape[0])
-    p["satir_ustsinir"] = bool(df.shape[0] >= OKUMA_LIMITI)   # limite dayandiysa "10.000+"
-    p["kolon"] = int(df.shape[1])
-    p["sozluk_satir"] = int(sz.shape[0])
-
-    sayisal = int(df.select_dtypes(include=[np.number]).shape[1])
-    p["sayisal"] = sayisal
-    durum["profil"] = p
-
-    return ("İkisini de buldum:\n\n"
-            "  Veri seti : %s\n"
-            "              %s satır × %s kolon  (%s sayısal, %s kategorik)\n"
-            "  Sözlük    : %s  —  %s tanım\n\n"
-            "Bunlarla devam edelim mi?"
-            % (durum["veri_seti"],
-               _sayi(p["satir"]) + ("+" if p["satir_ustsinir"] else ""),
-               _sayi(p["kolon"]), _sayi(sayisal), _sayi(p["kolon"] - sayisal),
-               durum["sozluk"], _sayi(p["sozluk_satir"])))
-
-
-def kurulum_uygula(durum):
-    return "Kurulum tamam. Bu ikisiyle çalışıyoruz."
-
-
-# ===========================================================================
-# ADIM 1: SOZLUK KONTROLU
-# ===========================================================================
-def sozluk_plan(durum):
-    df = _df_oku(durum["veri_seti"], limit=1000)
-    sz = _df_oku(durum["sozluk"])
-    ad_kol, ack_kol = sz.columns[0], sz.columns[1]
-    sozluk_map = dict(zip(sz[ad_kol].astype(str), sz[ack_kol].astype(str)))
-
-    aciklamasiz = [c for c in df.columns if c not in sozluk_map]
-    bos_ack = [k for k, v in sozluk_map.items()
-               if not v or str(v).strip().lower() in ("nan", "none", "")]
-
-    durum["_sozluk_eksik"] = aciklamasiz
-
-    toplam = int(df.shape[1])
-    eslesen = toplam - len(aciklamasiz)
-    p = durum.get("profil") or {}
-    p["eslesen"] = eslesen
-    p["kapsam"] = round(100.0 * eslesen / max(toplam, 1), 1)
-    durum["profil"] = p
-
-    return ("Tabloda %s kolon var; %s tanesinin sözlükte açıklaması mevcut "
-            "(%%%s kapsam).\n\n%s\n\n%s\n\n"
-            "Açıklaması olmayan kolonları süreç dışı bırakmayı öneriyorum — "
-            "ne işe yaradığını bilmediğim kolondan sağlıklı değişken çıkmaz. "
-            "Uygun mu?"
-            % (_sayi(toplam), _sayi(eslesen), _ondalik(p["kapsam"]),
-               _liste("Sözlükte karşılığı olmayanlar:", aciklamasiz),
-               _liste("Açıklaması boş bırakılmış olanlar:", bos_ack)))
-
-
-def sozluk_uygula(durum):
-    durum["haric_kolonlar"] = durum.get("_sozluk_eksik", [])
-    return "%s kolonu süreç dışı bıraktım." % _sayi(len(durum["haric_kolonlar"]))
-
-
-# ===========================================================================
-# ADIM 2: META TANIMI
-# ===========================================================================
-META_KALIP = {
-    "target": r"target\s*[:=]?\s*([a-z0-9_]+)",
-    "id": r"\bid\s*[:=]?\s*([a-z0-9_]+)",
-    "donem": r"donem\s*[:=]?\s*([a-z0-9_]+)",
+# Mantiksal ad -> folder'daki gercek dosya adi.
+# Gorsel degistirmek istersen SADECE burayi duzenle, JS'e dokunma.
+GORSELLER = {
+    "banner": "akbank_robot_llm_ust.png",
+    "bot":    "akbank_robot_llm_chat.png",
+    "user":   "akbank_robot_llm_person.png",
 }
 
+_MIME = {".png": "image/png", ".jpg": "image/jpeg",
+         ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
-def meta_girdi(durum, mesaj):
-    norm = niyet_kural.normalize(mesaj)
-    meta = dict(durum.get("meta") or {})
-    for anahtar, kalip in META_KALIP.items():
-        m = re.search(kalip, norm)
-        if m:
-            # normalize uzunlugu bozmuyor -> konumu ORIJINAL metne uyguluyoruz
-            meta[anahtar] = mesaj[m.start(1):m.end(1)]
-
-    # Verilen kolonlar tabloda gercekten var mi? Yoksa hata 5. adima kadar
-    # sessiz kalir, orada df[target] KeyError verir.
-    if durum.get("veri_seti") and meta:
-        try:
-            kolonlar = set(_df_oku(durum["veri_seti"], limit=5).columns)
-            hatali = [(k, v) for k, v in meta.items() if v not in kolonlar]
-            if hatali:
-                for k, _ in hatali:
-                    meta.pop(k, None)
-                durum["meta"] = meta
-                return False, ("Şu kolonları tabloda bulamadım: %s\n\n"
-                               "Adlarını kontrol eder misiniz?"
-                               % ", ".join("%s → %s" % (k, v) for k, v in hatali))
-        except Exception:
-            pass   # kolon listesi okunamadiysa dogrulamayi atliyoruz
-
-    durum["meta"] = meta
-
-    eksik = [k for k in ("target", "id") if k not in meta]
-    if eksik:
-        etiket = {"target": "hedef değişken", "id": "kimlik kolonu"}
-        return False, ("Şunlara ihtiyacım var: %s\n\n"
-                       "Örnek:\n"
-                       "    target TGT_CS_ALL_TKP_ST_5M90 id SM_ID donem PERIOD"
-                       % ", ".join(etiket[k] for k in eksik))
-    return True, None
+_dosya_haritasi = None
 
 
-def meta_plan(durum):
-    m = durum["meta"]
-    return ("Şöyle anladım:\n\n"
-            "  Hedef değişken : %s\n"
-            "  Kimlik kolonu  : %s\n"
-            "  Dönem kolonu   : %s\n\n"
-            "Bu üçü hem üretimde hem kalite kontrolünde referans alınacak. "
-            "Doğru mu?"
-            % (m.get("target"), m.get("id"), m.get("donem", "belirtilmedi")))
+def _sadelestir(ad):
+    """Unicode normalizasyon farkini (NFC/NFD) ve buyuk-kucuk harfi eler."""
+    return unicodedata.normalize("NFC", (ad or "")).casefold()
 
 
-def meta_uygula(durum):
-    """Onay geldiginde hedefin dagilimini da cikariyoruz; ust seritte
-    'Binary · %0,42 pozitif' gibi gorunecek."""
-    hedef = (durum.get("meta") or {}).get("target")
-    p = durum.get("profil") or {}
+def _haritayi_kur(zorla=False):
+    global _dosya_haritasi
+    if _dosya_haritasi is not None and not zorla:
+        return _dosya_haritasi
+    harita = {}
     try:
-        s = pd.to_numeric(_df_oku(durum["veri_seti"])[hedef], errors="coerce")
-        tekil = int(s.nunique(dropna=True))
-        if tekil <= 2:
-            p["hedef_ozet"] = "Binary · %%%s pozitif" % _ondalik(100.0 * float((s > 0).mean()), 2)
-        else:
-            p["hedef_ozet"] = "Sürekli · %s farklı değer" % _sayi(tekil)
+        for yol in dataiku.Folder(GORSEL_FOLDER).list_paths_in_partition():
+            harita[_sadelestir(os.path.basename(yol))] = yol
     except Exception:
-        p["hedef_ozet"] = "dağılım okunamadı"
-    durum["profil"] = p
-    return "Meta bilgilerini kaydettim."
+        harita = {}
+    _dosya_haritasi = harita
+    return harita
 
 
-# ===========================================================================
-# ADIM 3: GELENEKSEL PLAN   <-- LLM #1 BURADA
-# ===========================================================================
-def gelenekse_plan(durum):
-    sz = _df_oku(durum["sozluk"])
-    plan = llm_mod.gelenekse_plan_oner(
-        sozluk_df=sz,
-        haric=durum.get("haric_kolonlar", []),
-        meta=durum.get("meta", {}),
-    )
-    durum["plan"] = plan
-
-    if not plan:
-        return ("Sözlüğü inceledim ama kullanılabilir bir plan çıkaramadım — "
-                "model ya bozuk bir yanıt döndü ya da tanımadığı kolon adları "
-                "önerdi.\n\n"
-                "\"geri\" deyip sözlük adımına dönebilir, ya da \"onay\" deyip "
-                "bu adımı boş geçebiliriz.")
-
-    # Donusum turune gore kirilim — "32 firsat: 8 oran, 6 delta..." gorunumu
-    kirilim = {}
-    for p in plan:
-        kirilim[p["donusum"]] = kirilim.get(p["donusum"], 0) + 1
-    ozet_satir = " · ".join("%s %s" % (v, k) for k, v in sorted(kirilim.items()))
-
-    satirlar = []
-    for p in plan:
-        satirlar.append("  %-26s → %-7s (%s kolon)"
-                        % (p["ad"][:26], p["donusum"], _sayi(len(p["kolonlar"]))))
-        if p.get("gerekce"):
-            satirlar.append("      %s" % p["gerekce"][:90])
-
-    toplam = sum(len(p["kolonlar"]) for p in plan)
-    return ("Sözlüğü inceledim. %s dönüşüm fırsatı belirledim (%s):\n\n%s\n\n"
-            "Bunlar yaklaşık %s yeni kolon üretir. Başlayalım mı?"
-            % (_sayi(len(plan)), ozet_satir, "\n".join(satirlar), _sayi(toplam)))
+def _dosya_bul(ad):
+    anahtar = _sadelestir(os.path.basename(ad))
+    harita = _haritayi_kur()
+    if anahtar in harita:
+        return harita[anahtar]
+    return _haritayi_kur(zorla=True).get(anahtar)
 
 
-def gelenekse_uygula(durum):
-    return "Planı not aldım."
+@app.route("/gorsel/<anahtar>")
+def gorsel(anahtar):
+    dosya_adi = GORSELLER.get(anahtar)
+    if not dosya_adi:
+        return Response("tanimsiz gorsel", status=404)
+    uzanti = os.path.splitext(dosya_adi)[1].lower()
+    if uzanti not in _MIME:
+        return Response("gecersiz uzanti", status=404)
+    yol = _dosya_bul(dosya_adi)
+    if not yol:
+        return Response("folder'da bulunamadi: %s" % dosya_adi, status=404)
+    try:
+        with dataiku.Folder(GORSEL_FOLDER).get_download_stream(yol) as s:
+            veri = s.read()
+    except Exception as e:
+        return Response("okuma hatasi: %s" % e, status=500)
+    return Response(veri, mimetype=_MIME[uzanti],
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
-# ===========================================================================
-# ADIM 4: URETIM  (tamamen deterministik, LLM yok)
-# ===========================================================================
-def _tekli_donustur(df, kolonlar, donusum):
-    yeni = {}
-    for kol in kolonlar:
-        if kol not in df.columns:
-            continue
-        s = pd.to_numeric(df[kol], errors="coerce")
-        if donusum == "log":
-            yeni["%s__LOG" % kol] = np.log1p(s.clip(lower=0))
-        elif donusum == "rank":
-            yeni["%s__RANK" % kol] = s.rank(pct=True)
-        elif donusum == "winsor":
-            yeni["%s__WNS" % kol] = s.clip(s.quantile(0.01), s.quantile(0.99))
-    return yeni
-
-
-def _ikili_donustur(df, kolonlar, donusum):
-    """delta / oran: ayni aileden ardisik iki kolon gerektirir."""
-    yeni = {}
-    for i in range(len(kolonlar) - 1):
-        a, b = kolonlar[i], kolonlar[i + 1]
-        if a not in df.columns or b not in df.columns:
-            continue
-        sa = pd.to_numeric(df[a], errors="coerce")
-        sb = pd.to_numeric(df[b], errors="coerce")
-        if donusum == "delta":
-            yeni["%s__MINUS__%s" % (a, b)] = sa - sb
-        elif donusum == "oran":
-            yeni["%s__DIV__%s" % (a, b)] = sa / sb.replace(0, np.nan)
-    return yeni
-
-
-def uretim_plan(durum):
-    return ("Planı çalıştırıp yeni kolonları üreteceğim. Üretimi Python yapıyor; "
-            "yapay zekâ yalnızca hangi dönüşümün uygulanacağını önerdi.\n\n"
-            "Sonuç %s_ENRICHED veri setine yazılacak, kaynak tablonuza "
-            "dokunulmayacak. Başlayayım mı?" % durum["veri_seti"])
-
-
-def uretim_uygula(durum):
-    df = _df_oku(durum["veri_seti"])
-    uretilen = {}
-    for p in durum.get("plan", []):
-        d = p["donusum"]
-        if d in ("delta", "oran"):
-            uretilen.update(_ikili_donustur(df, p["kolonlar"], d))
-        else:
-            uretilen.update(_tekli_donustur(df, p["kolonlar"], d))
-
-    for ad, seri in uretilen.items():
-        df[ad] = seri
-
-    hedef = "%s_ENRICHED" % durum["veri_seti"]
-    dataiku.Dataset(hedef).write_with_schema(df)
-    durum["uretilen"] = list(uretilen.keys())
-    return ("%s yeni kolon ürettim ve %s veri setine yazdım."
-            % (_sayi(len(uretilen)), hedef))
-
-
-# ===========================================================================
-# ADIM 5: VERI KALITESI
-# ===========================================================================
-def kalite_plan(durum):
-    return ("Ürettiğim %s kolonu elemeden geçirmek istiyorum:\n\n"
-            "  • yarıdan fazlası boş olanlar\n"
-            "  • tek değer taşıyanlar (bilgi yok)\n"
-            "  • hedefle korelasyonu 0,95 üstü olanlar (sızıntı şüphesi)\n\n"
-            "Kontrolleri çalıştırayım mı?" % _sayi(len(durum.get("uretilen", []))))
-
-
-def kalite_uygula(durum):
-    df = _df_oku("%s_ENRICHED" % durum["veri_seti"])
-    target = durum["meta"]["target"]
-    yeni = [c for c in durum.get("uretilen", []) if c in df.columns]
-    y = pd.to_numeric(df[target], errors="coerce")
-
-    eksik, sabit, sizinti = [], [], []
-    for c in yeni:
-        s = pd.to_numeric(df[c], errors="coerce")
-        if s.isna().mean() > 0.5:
-            eksik.append(c)
-            continue
-        if s.nunique(dropna=True) <= 1:
-            sabit.append(c)
-            continue
-        kor = s.corr(y)
-        if kor is not None and not pd.isna(kor) and abs(kor) > 0.95:
-            sizinti.append(c)
-
-    elendi = set(eksik) | set(sabit) | set(sizinti)
-    durum["kalite"] = {"eksik": eksik, "sabit": sabit, "sizinti": sizinti,
-                       "gecti": [c for c in yeni if c not in elendi]}
-
-    return (_liste("Çok fazla boş değer:", eksik) + "\n\n" +
-            _liste("Tek değer taşıyor:", sabit) + "\n\n" +
-            _liste("Sızıntı şüpheli:", sizinti) +
-            "\n\n%s kolon elemeden geçti, %s kolon elendi."
-            % (_sayi(len(durum["kalite"]["gecti"])), _sayi(len(elendi))))
-
-
-# ===========================================================================
-# ADIM 6: MODEL DEGERLENDIRMESI
-# ===========================================================================
-def model_plan(durum):
-    return ("Sıra karşılaştırmada: aynı bölme, aynı algoritma, tek fark yeni "
-            "kolonların eklenmiş olması. Böylece katkının gerçekten "
-            "değişkenlerden geldiğini ölçebiliriz.\n\n"
-            "Uzun sürdüğü için '%s' senaryosunu tetikleyeceğim. "
-            "Senaryo hazır değilse \"red\" deyip bu adımı geçebiliriz."
-            % MODEL_SENARYO)
-
-
-def model_uygula(durum):
-    # UZUN ISLEM: Flask endpoint icinde model egitilmez, senaryo tetiklenir.
+@app.route("/datasetler")
+def datasetler():
+    """Projedeki tum dataset adlari — kullanici elle yazmak zorunda kalmasin."""
     try:
         proje = dataiku.api_client().get_default_project()
-        proje.get_scenario(MODEL_SENARYO).run_and_wait()
+        adlar = sorted(d["name"] for d in proje.list_datasets())
+        return jsonify({"datasetler": adlar})
     except Exception as e:
-        return ("Senaryoyu çalıştıramadım: %s\n"
-                "Bu adımı şimdilik atlıyorum." % e)
-    durum["model"] = {"tetiklendi": True,
-                      "tarih": datetime.datetime.now().isoformat()}
-    return "Senaryo çalıştı. Sonuçları Flow üzerinden inceleyebilirsiniz."
+        return jsonify({"datasetler": [], "hata": str(e)})
 
 
-# ===========================================================================
-# ADIM 7: YENI FEATURE KESFI   <-- LLM #2 BURADA
-# ===========================================================================
-def kesif_plan(durum):
-    oneriler = llm_mod.kesif_oner(
-        meta=durum.get("meta", {}),
-        uretilen=durum.get("kalite", {}).get("gecti", []),
-        model_ozeti=durum.get("model", {}),
-    )
-    durum["kesif_onerileri"] = oneriler
-    if not oneriler:
-        return ("Bu turda ek bir fikir çıkaramadım. \"onay\" deyip süreci "
-                "kapatabiliriz.")
-    return ("Ürettiklerimizin dışında şunlar denenebilir:\n\n" +
-            "\n".join("  • %s" % o for o in oneriler[:10]) +
-            "\n\nBunlar henüz üretilmiyor, yalnızca hipotez. Kaydedeyim mi?")
+@app.route("/adimlar")
+def adimlar():
+    """Sol paneldeki stepper. Tek kaynak akis.py."""
+    return jsonify({
+        "adimlar": [{"anahtar": a,
+                     "baslik": akis.ADIMLAR[a]["baslik"],
+                     "aciklama": akis.ADIMLAR[a].get("aciklama", "")}
+                    for a in akis.ADIM_SIRASI]
+    })
 
 
-def kesif_uygula(durum):
-    icerik = json.dumps(durum.get("kesif_onerileri", []),
-                        ensure_ascii=False, indent=2)
-    _folder().upload_stream("/kesif_onerileri.json", icerik.encode("utf-8"))
-    return "Önerileri PROJE_HAFIZASI/kesif_onerileri.json dosyasına yazdım."
+@app.route("/karsilama")
+def karsilama():
+    durum = akis.yeni_durum()
+    return jsonify({"metin": akis.KARSILAMA, "ozet": akis.ozet(durum)})
 
 
-# ===========================================================================
-# ADIM KAYIT DEFTERI
-# ===========================================================================
-ADIMLAR = {
-    "kurulum": {
-        "baslik": "Çalışma Kurulumu",
-        "aciklama": "Analiz edilecek veri seti ve değişken sözlüğü seçilir; "
-                    "satır, kolon ve tip dağılımı çıkarılır.",
-        "girdi": kurulum_girdi, "plan": kurulum_plan, "uygula": kurulum_uygula},
-    "sozluk": {
-        "baslik": "Sözlük Analizi",
-        "aciklama": "Kolonlar sözlükle eşleştirilir, kapsam oranı hesaplanır. "
-                    "Açıklaması olmayan kolonlar kapsam dışına alınır — anlamı "
-                    "bilinmeyen kolondan sağlıklı değişken çıkmaz.",
-        "girdi": None, "plan": sozluk_plan, "uygula": sozluk_uygula},
-    "meta": {
-        "baslik": "Meta Tanımı",
-        "aciklama": "Hedef değişken, kimlik ve dönem kolonu belirlenir; hedefin "
-                    "dağılımı çıkarılır. Bu üçü üretim ve kalite kontrolünde "
-                    "referans alınır.",
-        "girdi": meta_girdi, "plan": meta_plan, "uygula": meta_uygula},
-    "gelenekse": {
-        "baslik": "Dönüşüm Planı",
-        "aciklama": "Kolon açıklamaları yapay zekâya okutulur; hangi kolon "
-                    "ailesine fark, oran, log, sıralama veya budama "
-                    "uygulanacağı önerilir. Öneri kod değil, plandır ve kolon "
-                    "adları sözlükle doğrulanır.",
-        "girdi": None, "plan": gelenekse_plan, "uygula": gelenekse_uygula},
-    "uretim": {
-        "baslik": "Değişken Üretimi",
-        "aciklama": "Onaylanan plan Python ile çalıştırılır. Yeni kolonlar ayrı "
-                    "bir veri setine yazılır, kaynak tabloya dokunulmaz.",
-        "girdi": None, "plan": uretim_plan, "uygula": uretim_uygula},
-    "kalite": {
-        "baslik": "Veri Kalitesi",
-        "aciklama": "Üretilen kolonlar boşluk oranı, sabitlik ve hedefle aşırı "
-                    "korelasyon açısından denetlenir; başarısız olanlar elenir.",
-        "girdi": None, "plan": kalite_plan, "uygula": kalite_uygula},
-    "model": {
-        "baslik": "Model Değerlendirmesi",
-        "aciklama": "Aynı bölme ve aynı algoritmayla iki model karşılaştırılır. "
-                    "Tek fark yeni kolonların eklenmiş olması; böylece katkı "
-                    "ölçülebilir hale gelir.",
-        "girdi": None, "plan": model_plan, "uygula": model_uygula},
-    "kesif": {
-        "baslik": "Yeni Değişken Keşfi",
-        "aciklama": "Elemeyi geçen değişkenler yapay zekâya özetlenir; kalıpların "
-                    "dışında, hedefi açıklayabilecek yeni değişken hipotezleri "
-                    "istenir.",
-        "girdi": None, "plan": kesif_plan, "uygula": kesif_uygula},
-}
+@app.route("/mesaj", methods=["POST"])
+def mesaj():
+    try:
+        govde = request.get_json(force=True) or {}
+        oturum_id = govde.get("oturum_id") or "varsayilan"
+
+        durum = akis.durum_yukle(oturum_id)
+        cevap = akis.mesaj_isle(durum, govde.get("mesaj", ""))
+        akis.durum_kaydet(oturum_id, durum)
+
+        return jsonify({
+            "cevap": cevap,
+            "adim": akis.ADIM_SIRASI[durum["i"]],
+            "adim_no": durum["i"],
+            "toplam": len(akis.ADIM_SIRASI),
+            "ozet": akis.ozet(durum),
+        })
+    except Exception as e:
+        # Hatayi sohbet balonunda gosteriyoruz; aksi halde JS'te sessiz kalir.
+        return jsonify({
+            "cevap": "HATA: %s\n\n%s" % (e, traceback.format_exc()[-1000:])
+        }), 200
 
 
-# ===========================================================================
-# ANA DONGU
-# ===========================================================================
-def _adima_gir(durum):
-    """Yeni adima girilirken: girdi gerekiyorsa sor, gerekmiyorsa plani goster."""
-    adim = ADIMLAR[ADIM_SIRASI[durum["i"]]]
-    if adim["girdi"] is not None:
-        durum["bekleyen"] = "girdi"
-        _, soru = adim["girdi"](durum, "")      # bos mesaj -> eksik listesi doner
-        return soru or "Devam etmek için bilgi vermeniz gerekiyor."
-    durum["bekleyen"] = "onay"
-    return adim["plan"](durum)
+@app.route("/sifirla", methods=["POST"])
+def sifirla():
+    govde = request.get_json(force=True) or {}
+    oturum_id = govde.get("oturum_id") or "varsayilan"
+    durum = akis.yeni_durum()
+    akis.durum_kaydet(oturum_id, durum)
+    return jsonify({"metin": akis.KARSILAMA, "ozet": akis.ozet(durum)})
 
 
-def mesaj_isle(durum, mesaj):
-    """Webapp'in cagirdigi TEK fonksiyon. Cevap metnini doner."""
-    mesaj = (mesaj or "").strip()
-    norm = niyet_kural.normalize(mesaj)
-    adim = ADIMLAR[ADIM_SIRASI[durum["i"]]]
 
-    # --- geri donus: her an gecerli ---
-    if GERI_KALIP.search(norm):
-        if durum["i"] == 0:
-            return "Zaten ilk adımdayız, daha geriye gidemiyorum."
-        durum["i"] -= 1
-        yeni_adim = ADIMLAR[ADIM_SIRASI[durum["i"]]]
-        return ("Tamam, \"%s\" adımına dönüyorum.\n\n" % yeni_adim["baslik"]
-                + _adima_gir(durum))
 
-    # --- girdi bekleniyor ---
-    if durum["bekleyen"] == "girdi":
-        tamam, uyari = adim["girdi"](durum, mesaj)
-        if not tamam:
-            return uyari
-        durum["bekleyen"] = "onay"
-        return adim["plan"](durum)
 
-    # --- onay bekleniyor ---
-    sonuc = niyet_kural.coz(mesaj)
 
-    if sonuc["aksiyon"] == "onay":
-        cikti = adim["uygula"](durum)
-        if durum["i"] >= len(ADIM_SIRASI) - 1:
-            return cikti + "\n\nSüreç tamamlandı. Yeni bir tur için üstteki " \
-                           "\"Yeni oturum\" düğmesini kullanabilirsiniz."
-        durum["i"] += 1
-        return cikti + "\n\n" + _adima_gir(durum)
 
-    if sonuc["aksiyon"] == "ret":
-        return ("Anladım, uygulamadım. Neyi değiştirmemi istersiniz? "
-                "İstediğinizi yazabilir ya da \"geri\" deyip önceki adıma "
-                "dönebilirsiniz.")
 
-    return ("Şu an \"%s\" adımındayım ve onayınızı bekliyorum. "
-            "\"onay\", \"red\" ya da \"geri\" diyebilirsiniz."
-            % adim["baslik"])
+
+
+
+
+
+
+
+
+
+
+
+<div id="kabuk">
+
+  <header id="ustbar">
+    <div id="ustbar-sol">
+      <img id="banner" alt="Akbank">
+      <div id="baslik-blok">
+        <div id="urun-adi">Değişken Keşif Asistanı</div>
+        <div id="urun-alt">Bireysel Krediler Analitik ve Tahsis Bİ</div>
+      </div>
+    </div>
+    <div id="ustbar-sag">
+      <span id="durum-rozet"><i class="nokta-yesil"></i> Oturum aktif</span>
+      <button id="sifirla-btn" type="button">Yeni oturum</button>
+    </div>
+  </header>
+
+  <div id="govde">
+
+    <aside id="panel">
+      <div class="panel-ust">
+        <span class="panel-baslik">İŞ AKIŞI</span>
+        <button id="bilgi-btn" type="button" title="Bu araç ne yapar?">?</button>
+      </div>
+
+      <div id="bilgi-kutu" class="gizli">
+        <p>
+          Ham tablolardaki yüzlerce kolon tek başına yeterli değil; modele asıl
+          katkı bunlardan türetilen oran, fark ve eğilim değişkenlerinden gelir.
+          Bu türetme bugün elle yapılıyor — yavaş ve tekrarlanamayan bir süreç.
+        </p>
+        <p>
+          Bu araç süreci standartlaştırır. Yapay zekâ <b>kolon açıklamalarını
+          yorumlar ve hangi dönüşümün anlamlı olduğunu önerir</b>; üretimi,
+          kalite kontrolünü ve ölçümü Python yapar. Model kod yazmaz, veriye
+          dokunmaz.
+        </p>
+      </div>
+
+      <ol id="adim-listesi"></ol>
+
+      <div class="panel-baslik komut-baslik">KOMUTLAR</div>
+      <div class="panel-not">
+        <b>onay</b><span>adımı uygula</span>
+        <b>red</b><span>uygulama, değiştir</span>
+        <b>geri</b><span>önceki adıma dön</span>
+      </div>
+    </aside>
+
+    <main id="sohbet-alani">
+
+      <div id="ozet-serit"></div>
+
+      <div id="sohbet">
+        <div id="secici-kart">
+          <div class="kart-baslik">Çalışma kurulumu</div>
+          <div class="kart-alt">
+            Analiz edilecek veri setini ve değişken sözlüğünü seçin. Listede
+            projedeki tüm veri setleri yer alır; adını yazarak da arayabilirsiniz.
+          </div>
+
+          <div class="kart-govde">
+            <div class="combo" data-alan="veri_seti">
+              <label>Veri seti</label>
+              <input class="combo-giris" placeholder="Ara veya yaz…" autocomplete="off">
+              <ul class="combo-liste"></ul>
+            </div>
+
+            <div class="combo" data-alan="sozluk">
+              <label>Değişken sözlüğü</label>
+              <input class="combo-giris" placeholder="Ara veya yaz…" autocomplete="off">
+              <ul class="combo-liste"></ul>
+            </div>
+
+            <button id="secici-btn" type="button" disabled>Analizi başlat</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="giris-bolge">
+        <div id="hizli-aksiyon">
+          <button class="chip" data-mesaj="onay">onay</button>
+          <button class="chip" data-mesaj="red">red</button>
+          <button class="chip" data-mesaj="geri">geri</button>
+        </div>
+        <div id="giris">
+          <textarea id="kutu" rows="1" placeholder="Mesajınızı yazın…"></textarea>
+          <button id="gonder" type="button">Gönder</button>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
