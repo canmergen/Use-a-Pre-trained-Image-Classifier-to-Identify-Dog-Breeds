@@ -1,280 +1,448 @@
-# -*- coding: utf-8 -*-
-"""
-FEATURE_STATE folder'indaki feature_registry.json + feature_rejects.json
--> tek Excel (COMPACT_JSON folder'ina yazilir)
-
-Calisma yeri: Dataiku notebook veya Python recipe.
-Recipe'de FEATURE_STATE input, COMPACT_JSON output olarak eklenmeli.
-"""
-
-import io
+import os
 import json
-import re
-import posixpath
+import unicodedata
+import traceback
 
 import dataiku
-import pandas as pd
-from openpyxl.utils import get_column_letter
+from flask import request, jsonify, Response
 
-# ----------------------------- AYARLAR -----------------------------
-KAYNAK_FOLDER = "FEATURE_STATE"      # JSON'larin bulundugu managed folder
-REGISTRY_YOL = "/feature_registry.json"
-REJECTS_YOL = "/feature_rejects.json"
+from fe_agent import akis
 
-HEDEF_FOLDER = "COMPACT_JSON"        # Excel buraya yazilacak
-CIKTI_YOL = "/feature_birlesik.xlsx"
+GORSEL_FOLDER = "LLM_WEBAPP_GORSEL"
 
-AD_PREFIX = "LLM_F"                  # reject isimleri bu prefix + numara ile uretilir
-BOS_DOLGU = "-"                      # eksik/bos alanlara yazilacak deger
-BOOL_TURKCE = True                   # True/False -> Evet/Hayir
-KAYNAK_SAYFALARI_EKLE = True         # ayrica REGISTRY ve REJECTS sheet'leri
-# -------------------------------------------------------------------
+# Mantiksal ad -> folder'daki gercek dosya adi.
+# Gorsel degistirmek istersen SADECE burayi duzenle, JS'e dokunma.
+GORSELLER = {
+    "banner": "akbank_robot_llm_ust.png",
+    "bot":    "akbank_robot_llm_chat.png",
+    "user":   "akbank_robot_llm_person.png",
+}
 
+_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+}
 
-# --------------------------- FOLDER I/O ----------------------------
-def folder_json_oku(folder, yol: str) -> list:
-    """Managed folder icindeki JSON dosyasini okur, her zaman liste dondurur."""
-    mevcut = folder.list_paths_in_partition()
-    if yol not in mevcut:
-        alternatif = "/" + yol.lstrip("/")
-        if alternatif in mevcut:
-            yol = alternatif
-        else:
-            raise FileNotFoundError(
-                f"'{yol}' folder'da bulunamadi. Folder icerigi: {mevcut}"
-            )
-
-    with folder.get_download_stream(yol) as stream:
-        ham = stream.read()
-
-    if isinstance(ham, bytes):
-        ham = ham.decode("utf-8-sig")   # dosya basinda BOM varsa da okur
-
-    data = json.loads(ham)
-    if isinstance(data, dict):
-        data = [data]
-    if not isinstance(data, list):
-        raise ValueError(f"{yol} beklenen formatta degil (liste veya dict olmali).")
-    return data
+# Folder listesi her istekte cekilmesin diye basit onbellek
+_dosya_haritasi = None
 
 
-def folder_excel_yaz(folder, yol: str, sheetler: dict):
-    """sheetler: {"SHEET_ADI": DataFrame, ...} — bellekte olusturulup yuklenir."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet_adi, df in sheetler.items():
-            if df is None or df.empty:
-                continue
-            df.to_excel(writer, sheet_name=sheet_adi, index=False)
-            sutun_genisliklerini_ayarla(writer, sheet_adi, df)
-
-    buffer.seek(0)
-    folder.upload_stream(yol, buffer.getvalue())
+def _sadelestir(ad):
+    """Unicode normalizasyon farkini (NFC/NFD) ve buyuk-kucuk harfi eler."""
+    return unicodedata.normalize("NFC", (ad or "")).casefold()
 
 
-def sutun_genisliklerini_ayarla(writer, sheet_adi: str, df: pd.DataFrame):
-    """Sutun genisliklerini icerige gore ayarlar, ust satiri dondurur."""
-    ws = writer.sheets[sheet_adi]
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for i, sutun in enumerate(df.columns, start=1):
-        uzunluklar = [len(str(sutun))] + [len(str(v)) for v in df[sutun].head(200)]
-        genislik = min(max(uzunluklar) + 2, 60)   # 60 karakterde kes
-        ws.column_dimensions[get_column_letter(i)].width = genislik
+def _haritayi_kur(zorla=False):
+    """Folder'daki tum dosyalari {sadelestirilmis_ad: gercek_yol} olarak tarar."""
+    global _dosya_haritasi
+    if _dosya_haritasi is not None and not zorla:
+        return _dosya_haritasi
+    harita = {}
+    try:
+        for yol in dataiku.Folder(GORSEL_FOLDER).list_paths_in_partition():
+            harita[_sadelestir(os.path.basename(yol))] = yol
+    except Exception:
+        harita = {}
+    _dosya_haritasi = harita
+    return harita
 
 
-# ----------------------- DONUSUM FONKSIYONLARI ----------------------
-def temizle(deger):
-    """Tek bir degeri Excel'e yazilabilir, bos olmayan bir degere cevirir."""
-    if deger is None:
-        return BOS_DOLGU
-    if isinstance(deger, bool):
-        return ("Evet" if deger else "Hayir") if BOOL_TURKCE else deger
-    if isinstance(deger, (list, tuple)):
-        if len(deger) == 0:
-            return BOS_DOLGU
-        return ", ".join(str(x) for x in deger)
-    if isinstance(deger, dict):
-        if len(deger) == 0:
-            return BOS_DOLGU
-        return json.dumps(deger, ensure_ascii=False)
-    if isinstance(deger, (int, float)):
-        return deger                      # sayisal kalsin ki Excel'de siralanabilsin
-    s = str(deger).strip()
-    return s if s else BOS_DOLGU
+def _dosya_bul(ad):
+    """Once onbellekten, bulunamazsa folder'i bir kez yenileyerek arar."""
+    anahtar = _sadelestir(os.path.basename(ad))
+    harita = _haritayi_kur()
+    if anahtar in harita:
+        return harita[anahtar]
+    harita = _haritayi_kur(zorla=True)
+    return harita.get(anahtar)
 
 
-def yuzdeye_cevir(deger, ondalik=2):
-    """Orani (0-1) yuzdeye cevirir. Sayisal degilse BOS_DOLGU dondurur."""
-    if isinstance(deger, bool) or deger is None:
-        return BOS_DOLGU
-    if isinstance(deger, (int, float)):
-        return round(deger * 100, ondalik)
-    return BOS_DOLGU
+@app.route("/gorsel/<anahtar>")
+def gorsel(anahtar):
+    dosya_adi = GORSELLER.get(anahtar)
+    if not dosya_adi:
+        return Response("tanimsiz gorsel", status=404)
+
+    uzanti = os.path.splitext(dosya_adi)[1].lower()
+    if uzanti not in _MIME:
+        return Response("gecersiz uzanti", status=404)
+
+    yol = _dosya_bul(dosya_adi)
+    if not yol:
+        return Response("dosya folder'da bulunamadi: %s" % dosya_adi, status=404)
+
+    try:
+        with dataiku.Folder(GORSEL_FOLDER).get_download_stream(yol) as s:
+            veri = s.read()
+    except Exception as e:
+        return Response("okuma hatasi: %s" % e, status=500)
+
+    return Response(veri, mimetype=_MIME[uzanti],
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
-def ilk_dolu(kayit: dict, *anahtarlar):
-    """Verilen anahtarlardan ilk mevcut olanin degerini dondurur, yoksa None."""
-    for a in anahtarlar:
-        if a in kayit and kayit[a] not in (None, "", [], {}):
-            return kayit[a]
-    return None
+@app.route("/karsilama")
+def karsilama():
+    return jsonify({"metin": akis.KARSILAMA})
 
 
-def decile_ozet(decile):
-    """decile_egrisi listesinden metin + adet + min + max uretir."""
-    if not isinstance(decile, (list, tuple)) or len(decile) == 0:
-        return BOS_DOLGU, BOS_DOLGU, BOS_DOLGU, BOS_DOLGU
-    sayisal = [x for x in decile if isinstance(x, (int, float))]
-    metin = ", ".join(str(x) for x in decile)
-    if not sayisal:
-        return metin, len(decile), BOS_DOLGU, BOS_DOLGU
-    return metin, len(decile), min(sayisal), max(sayisal)
+@app.route("/mesaj", methods=["POST"])
+def mesaj():
+    try:
+        govde = request.get_json(force=True) or {}
+        oturum_id = govde.get("oturum_id") or "varsayilan"
+        kullanici_mesaji = govde.get("mesaj", "")
+
+        durum = akis.durum_yukle(oturum_id)
+        cevap = akis.mesaj_isle(durum, kullanici_mesaji)
+        akis.durum_kaydet(oturum_id, durum)
+
+        return jsonify({
+            "cevap": cevap,
+            "adim": akis.ADIM_SIRASI[durum["i"]],
+            "adim_no": durum["i"],
+            "toplam": len(akis.ADIM_SIRASI),
+        })
+    except Exception as e:
+        return jsonify({"cevap": "HATA: %s\n\n%s" % (e, traceback.format_exc()[-800:])}), 200
 
 
-def registry_son_numara(registry: list) -> int:
-    """
-    Registry adlarindaki en buyuk LLM_F numarasini bulur (LLM_F013_... -> 13).
-    Reject numaralari buradan devam eder.
-    Hicbir ad parse edilemezse kayit sayisina duser.
-    """
-    bulunan = []
-    desen = re.compile(rf"{re.escape(AD_PREFIX)}(\d+)")
-    for kayit in registry:
-        ad = kayit.get("ad")
-        if not ad:
-            continue
-        bulunan.extend(int(x) for x in desen.findall(str(ad)))
-    return max(bulunan) if bulunan else len(registry)
+@app.route("/sifirla", methods=["POST"])
+def sifirla():
+    govde = request.get_json(force=True) or {}
+    oturum_id = govde.get("oturum_id") or "varsayilan"
+    akis.durum_kaydet(oturum_id, akis.yeni_durum())
+    return jsonify({"metin": akis.KARSILAMA})
 
 
-def satir_uret(kayit: dict, durum: str, sira: int, ad_no: int) -> dict:
-    """
-    Bir JSON kaydini ortak sutun semasina cevirir.
-    sira  : Excel'deki satir sirasi
-    ad_no : isim uretiminde kullanilacak feature numarasi
-    """
-    ist = kayit.get("istatistikler") or {}
-    if not isinstance(ist, dict):
-        ist = {}
 
-    # registry'de 'ad' hazir; rejects'te 'ad_soneki' asil isim, basina numara geliyor
-    if kayit.get("ad"):
-        ad = kayit["ad"]
-    else:
-        soneki = kayit.get("ad_soneki")
-        ad = f"{AD_PREFIX}{ad_no:03d}_{soneki}" if soneki else f"{AD_PREFIX}{ad_no:03d}"
 
-    kolonlar = ilk_dolu(kayit, "kaynak_kolonlar", "kolonlar") or []
-    d_metin, d_adet, d_min, d_max = decile_ozet(ist.get("decile_egrisi"))
 
-    return {
-        "sira": sira,
-        "durum": durum,                                   # KABUL / RED
-        "ad": temizle(ad),
-        "tema": temizle(kayit.get("tema")),
-        "red_nedeni": temizle(kayit.get("neden")),
-        "formul": temizle(kayit.get("formul")),
-        "kolonlar": temizle(kolonlar),
-        "gerekce": temizle(kayit.get("gerekce")),
-        "mekanizma": temizle(kayit.get("mekanizma")),
-        "beklenen_yon": temizle(kayit.get("beklenen_yon")),
-        "gozlenen_yon": temizle(ist.get("gozlenen_yon")),
-        "yon_guvenilir": temizle(ist.get("yon_guvenilir")),
-        "yon_notu": temizle(kayit.get("yon_notu")),
-        "zayif_sinyal": temizle(kayit.get("zayif_sinyal")),
-        "en_riskli_dilim_rate": temizle(ist.get("en_riskli_dilim_rate")),
-        "pp_gap": temizle(ist.get("pp_gap")),
-        "lift": temizle(ist.get("lift")),
-        "egri_sekli": temizle(ist.get("egri_sekli")),
-        "sifir_orani_yuzde": yuzdeye_cevir(ist.get("sifir_orani")),
-        "mevcutlarla_max_korelasyon": temizle(ist.get("mevcutlarla_max_korelasyon")),
-        "decile_egrisi": d_metin,
-        "decile_adet": d_adet,
-        "decile_min": d_min,
-        "decile_max": d_max,
+
+
+
+
+
+
+
+<div id="kabuk">
+
+  <header id="ustbar">
+    <img id="banner" alt="Akbank">
+    <div id="ustbar-sag">
+      <span id="adim-etiket">Adım 0 / 8</span>
+      <button id="sifirla-btn" type="button">Sıfırla</button>
+    </div>
+  </header>
+
+  <main id="sohbet"></main>
+
+  <footer id="giris">
+    <textarea id="kutu" rows="2"
+              placeholder="Mesajını yaz…  (onay / hayır / geri)"></textarea>
+    <button id="gonder" type="button">Gönder</button>
+  </footer>
+
+</div>
+
+
+
+
+
+
+
+
+
+
+
+const OTURUM_ID = "oturum_" + Math.random().toString(36).slice(2, 10);
+
+// Gorsel URL'leri: dosya adlari backend'de, JS sadece mantiksal ad biliyor.
+const GORSEL = {
+    banner: getWebAppBackendUrl("gorsel/banner"),
+    bot:    getWebAppBackendUrl("gorsel/bot"),
+    user:   getWebAppBackendUrl("gorsel/user"),
+};
+
+const sohbetEl = document.getElementById("sohbet");
+const kutuEl   = document.getElementById("kutu");
+const gonderEl = document.getElementById("gonder");
+const etiketEl = document.getElementById("adim-etiket");
+const bannerEl = document.getElementById("banner");
+
+bannerEl.src = GORSEL.banner;
+bannerEl.onerror = () => { bannerEl.style.display = "none"; };
+
+/** Sohbete bir satir ekler ve satir DOM elemanini doner. rol: "bot" | "kullanici" */
+function balonEkle(rol, metin) {
+    const satir = document.createElement("div");
+    satir.className = "satir " + rol;
+
+    const av = document.createElement("img");
+    av.className = "avatar";
+    av.src = (rol === "bot") ? GORSEL.bot : GORSEL.user;
+    av.alt = (rol === "bot") ? "Asistan" : "Sen";
+    av.onerror = () => { av.style.visibility = "hidden"; };
+    satir.appendChild(av);
+
+    const balon = document.createElement("div");
+    balon.className = "balon";
+    balon.textContent = metin;   // textContent: gelen metin HTML olarak yorumlanmaz
+    satir.appendChild(balon);
+
+    sohbetEl.appendChild(satir);
+    sohbetEl.scrollTop = sohbetEl.scrollHeight;
+    return satir;
+}
+
+/** Avatarli "yaziyor..." satiri; silmek icin satiri doner. */
+function yaziyorEkle() {
+    const satir = balonEkle("bot", "");
+    const balon = satir.querySelector(".balon");
+    balon.classList.add("yaziyor");
+    for (let i = 0; i < 3; i++) {
+        const n = document.createElement("span");
+        n.className = "nokta";
+        balon.appendChild(n);
     }
+    sohbetEl.scrollTop = sohbetEl.scrollHeight;
+    return satir;
+}
+
+function etiketGuncelle(d) {
+    if (d.adim_no === undefined) return;
+    etiketEl.textContent = "Adım " + d.adim_no + " / " + d.toplam + " · " + d.adim;
+}
+
+/* ---------- Karsilama: sayfa acilir acilmaz ---------- */
+fetch(getWebAppBackendUrl("karsilama"))
+    .then(r => r.json())
+    .then(d => balonEkle("bot", d.metin))
+    .catch(e => balonEkle("bot", "Bağlantı hatası: " + e));
+
+/* ---------- Mesaj gonderme ---------- */
+function gonder() {
+    const metin = kutuEl.value.trim();
+    if (!metin) return;
+
+    balonEkle("kullanici", metin);
+    kutuEl.value = "";
+    gonderEl.disabled = true;
+
+    const yaziyor = yaziyorEkle();
+
+    fetch(getWebAppBackendUrl("mesaj"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ oturum_id: OTURUM_ID, mesaj: metin })
+    })
+    .then(r => r.json())
+    .then(d => {
+        yaziyor.remove();
+        balonEkle("bot", d.cevap);
+        etiketGuncelle(d);
+    })
+    .catch(e => {
+        yaziyor.remove();
+        balonEkle("bot", "Bağlantı hatası: " + e);
+    })
+    .finally(() => {
+        gonderEl.disabled = false;
+        kutuEl.focus();
+    });
+}
+
+gonderEl.onclick = gonder;
+
+kutuEl.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); gonder(); }
+});
+
+document.getElementById("sifirla-btn").onclick = () => {
+    fetch(getWebAppBackendUrl("sifirla"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ oturum_id: OTURUM_ID })
+    })
+    .then(r => r.json())
+    .then(d => {
+        sohbetEl.innerHTML = "";
+        balonEkle("bot", d.metin || d.cevap);
+        etiketEl.textContent = "Adım 0 / 8";
+    });
+};
 
 
-SUTUN_SIRASI = [
-    "sira", "durum", "ad", "tema", "red_nedeni",
-    "formul", "kolonlar",
-    "gerekce", "mekanizma",
-    "beklenen_yon", "gozlenen_yon", "yon_guvenilir", "yon_notu", "zayif_sinyal",
-    "en_riskli_dilim_rate", "pp_gap", "lift",
-    "egri_sekli", "sifir_orani_yuzde", "mevcutlarla_max_korelasyon",
-    "decile_egrisi", "decile_adet", "decile_min", "decile_max",
-]
 
 
-def bilinmeyen_alanlari_bildir(kayitlar: list, dosya_adi: str):
-    """Semada olmayan JSON alani varsa uyarir (veri sessizce kaybolmasin)."""
-    bilinen = {
-        "ad", "ad_soneki", "tema", "iterasyon", "tur", "neden", "formul",
-        "kaynak_kolonlar", "kolonlar", "gerekce", "mekanizma", "beklenen_yon",
-        "yon_notu", "zayif_sinyal", "tarih", "istatistikler",
-    }
-    bilinen_ist = {
-        "base_rate", "en_riskli_dilim_rate", "pp_gap", "lift", "gozlenen_yon",
-        "egri_sekli", "yon_guvenilir", "sifir_orani", "decile_egrisi",
-        "mevcutlarla_max_korelasyon",
-    }
-    eksikler = set()
-    for k in kayitlar:
-        eksikler |= (set(k.keys()) - bilinen)
-        ist = k.get("istatistikler")
-        if isinstance(ist, dict):
-            eksikler |= {f"istatistikler.{x}" for x in (set(ist.keys()) - bilinen_ist)}
-    if eksikler:
-        print(f"[UYARI] {dosya_adi} icinde semada olmayan alanlar var, "
-              f"Excel'e yazilmadi: {sorted(eksikler)}")
 
 
-# ------------------------------- ANA AKIS ---------------------------
-def main():
-    kaynak = dataiku.Folder(KAYNAK_FOLDER)
-    hedef = kaynak if HEDEF_FOLDER == KAYNAK_FOLDER else dataiku.Folder(HEDEF_FOLDER)
-
-    print("Kaynak folder icerigi:", kaynak.list_paths_in_partition())
-
-    registry = folder_json_oku(kaynak, REGISTRY_YOL)
-    rejects = folder_json_oku(kaynak, REJECTS_YOL)
-
-    bilinmeyen_alanlari_bildir(registry, posixpath.basename(REGISTRY_YOL))
-    bilinmeyen_alanlari_bildir(rejects, posixpath.basename(REJECTS_YOL))
-
-    satirlar = []
-    for i, kayit in enumerate(registry, start=1):
-        satirlar.append(satir_uret(kayit, "KABUL", i, i))
-
-    # reject numaralari registry'nin bittigi yerden devam eder
-    baslangic = registry_son_numara(registry)
-    print(f"Registry'deki en yuksek {AD_PREFIX} numarasi: {baslangic} "
-          f"-> rejectler {baslangic + 1}'den basliyor")
-
-    for j, kayit in enumerate(rejects, start=1):
-        satirlar.append(satir_uret(kayit, "RED", len(registry) + j, baslangic + j))
-
-    df = pd.DataFrame(satirlar)
-    df = df.reindex(columns=SUTUN_SIRASI)     # sutun sirasini sabitle
-    df = df.fillna(BOS_DOLGU)                 # kalan bosluk varsa doldur
-    df["sira"] = range(1, len(df) + 1)        # global sira numarasi
-
-    cakisan = df.loc[df["ad"].duplicated(keep=False), "ad"].unique().tolist()
-    if cakisan:
-        print(f"[UYARI] Ayni isimden birden fazla kayit var: {cakisan}")
-
-    sheetler = {"TUM_FEATURELAR": df}
-    if KAYNAK_SAYFALARI_EKLE:
-        sheetler["REGISTRY"] = df[df["durum"] == "KABUL"]
-        sheetler["REJECTS"] = df[df["durum"] == "RED"]
-
-    folder_excel_yaz(hedef, CIKTI_YOL, sheetler)
-
-    print(f"Tamam -> {HEDEF_FOLDER}{CIKTI_YOL}")
-    print(f"KABUL: {len(registry)} | RED: {len(rejects)} | "
-          f"Toplam: {len(df)} satir, {len(df.columns)} sutun")
-    print(f"Yazilan sutunlar: {list(df.columns)}")
 
 
-main()
+
+
+
+
+
+
+:root {
+  --akbank-kirmizi: #E4002B;
+  --akbank-koyu:    #B00020;
+  --zemin:          #F4F5F7;
+  --kenar:          #E2E4E8;
+  --metin:          #1C1E21;
+  --gri-metin:      #6B7280;
+  --avatar-boyut:   42px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+
+#kabuk {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--metin);
+  background: var(--zemin);
+}
+
+/* ---------- ÜST BANNER ---------- */
+#ustbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 20px;
+  background: #fff;
+  border-bottom: 3px solid var(--akbank-kirmizi);
+  flex-shrink: 0;
+}
+
+#banner { height: 44px; width: auto; display: block; }
+
+#ustbar-sag { display: flex; align-items: center; gap: 12px; }
+
+#adim-etiket {
+  font-size: 12px;
+  color: var(--gri-metin);
+  background: var(--zemin);
+  border: 1px solid var(--kenar);
+  border-radius: 20px;
+  padding: 4px 12px;
+  white-space: nowrap;
+}
+
+#sifirla-btn {
+  font-size: 12px;
+  padding: 5px 14px;
+  border: 1px solid var(--kenar);
+  background: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--gri-metin);
+}
+#sifirla-btn:hover { border-color: var(--akbank-kirmizi); color: var(--akbank-kirmizi); }
+
+/* ---------- SOHBET ---------- */
+#sohbet { flex: 1; overflow-y: auto; padding: 24px 20px; }
+
+.satir {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 18px;
+  max-width: 880px;
+}
+
+.satir.kullanici { flex-direction: row-reverse; margin-left: auto; }
+
+.avatar {
+  width: var(--avatar-boyut);
+  height: var(--avatar-boyut);
+  min-width: var(--avatar-boyut);
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #fff;
+  object-fit: cover;
+  box-shadow: 0 1px 3px rgba(0,0,0,.12);
+}
+
+.balon {
+  padding: 12px 16px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 74%;
+}
+
+.satir.bot .balon {
+  background: #fff;
+  border: 1px solid var(--kenar);
+  border-top-left-radius: 3px;
+}
+
+.satir.kullanici .balon {
+  background: var(--akbank-kirmizi);
+  color: #fff;
+  border-top-right-radius: 3px;
+}
+
+/* ---------- YAZIYOR ---------- */
+.balon.yaziyor { padding: 14px 18px; }
+
+.nokta {
+  display: inline-block;
+  width: 7px; height: 7px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: var(--gri-metin);
+  animation: zipla 1.2s infinite;
+}
+.nokta:nth-child(2) { animation-delay: .2s; }
+.nokta:nth-child(3) { animation-delay: .4s; }
+
+@keyframes zipla {
+  0%, 60%, 100% { opacity: .25; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-4px); }
+}
+
+/* ---------- GİRİŞ ---------- */
+#giris {
+  display: flex;
+  gap: 10px;
+  padding: 14px 20px;
+  background: #fff;
+  border-top: 1px solid var(--kenar);
+  flex-shrink: 0;
+}
+
+#kutu {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid var(--kenar);
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 14px;
+  resize: none;
+  outline: none;
+}
+#kutu:focus { border-color: var(--akbank-kirmizi); }
+
+#gonder {
+  padding: 0 26px;
+  background: var(--akbank-kirmizi);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#gonder:hover:not(:disabled) { background: var(--akbank-koyu); }
+#gonder:disabled { opacity: .5; cursor: not-allowed; }
