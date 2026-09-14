@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 FEATURE_STATE folder'indaki feature_registry.json + feature_rejects.json
--> tek Excel (yine ayni folder'a yazilir)
+-> tek Excel (COMPACT_JSON folder'ina yazilir)
 
 Calisma yeri: Dataiku notebook veya Python recipe.
-Recipe'de kullaniyorsan FEATURE_STATE'i input, cikti folder'ini output olarak
-recipe'ye eklemeyi unutma (notebook'ta gerek yok).
+Recipe'de FEATURE_STATE input, COMPACT_JSON output olarak eklenmeli.
 """
 
 import io
 import json
+import re
 import posixpath
 
 import dataiku
@@ -21,10 +21,10 @@ KAYNAK_FOLDER = "FEATURE_STATE"      # JSON'larin bulundugu managed folder
 REGISTRY_YOL = "/feature_registry.json"
 REJECTS_YOL = "/feature_rejects.json"
 
-HEDEF_FOLDER = "FEATURE_STATE"       # Excel'in yazilacagi folder
-                                     # ("ALL_GENERATED_FEATURES" de yazabilirsin)
+HEDEF_FOLDER = "COMPACT_JSON"        # Excel buraya yazilacak
 CIKTI_YOL = "/feature_birlesik.xlsx"
 
+AD_PREFIX = "LLM_F"                  # reject isimleri bu prefix + numara ile uretilir
 BOS_DOLGU = "-"                      # eksik/bos alanlara yazilacak deger
 BOOL_TURKCE = True                   # True/False -> Evet/Hayir
 KAYNAK_SAYFALARI_EKLE = True         # ayrica REGISTRY ve REJECTS sheet'leri
@@ -36,7 +36,6 @@ def folder_json_oku(folder: "dataiku.Folder", yol: str) -> list:
     """Managed folder icindeki JSON dosyasini okur, her zaman liste dondurur."""
     mevcut = folder.list_paths_in_partition()
     if yol not in mevcut:
-        # Kullanici basta '/' koymayi unutmus olabilir, toleransli ara
         alternatif = "/" + yol.lstrip("/")
         if alternatif in mevcut:
             yol = alternatif
@@ -60,10 +59,7 @@ def folder_json_oku(folder: "dataiku.Folder", yol: str) -> list:
 
 
 def folder_excel_yaz(folder: "dataiku.Folder", yol: str, sheetler: dict):
-    """
-    sheetler: {"SHEET_ADI": DataFrame, ...}
-    Excel'i bellekte olusturup folder'a yukler (folder S3/HDFS olsa da calisir).
-    """
+    """sheetler: {"SHEET_ADI": DataFrame, ...} — bellekte olusturulup yuklenir."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for sheet_adi, df in sheetler.items():
@@ -108,6 +104,15 @@ def temizle(deger):
     return s if s else BOS_DOLGU
 
 
+def yuzdeye_cevir(deger, ondalik=2):
+    """Orani (0-1) yuzdeye cevirir. Sayisal degilse BOS_DOLGU dondurur."""
+    if isinstance(deger, bool) or deger is None:
+        return BOS_DOLGU
+    if isinstance(deger, (int, float)):
+        return round(deger * 100, ondalik)
+    return BOS_DOLGU
+
+
 def ilk_dolu(kayit: dict, *anahtarlar):
     """Verilen anahtarlardan ilk mevcut olanin degerini dondurur, yoksa None."""
     for a in anahtarlar:
@@ -127,40 +132,51 @@ def decile_ozet(decile):
     return metin, len(decile), min(sayisal), max(sayisal)
 
 
-def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
-    """Bir JSON kaydini ortak sutun semasina cevirir."""
+def registry_son_numara(registry: list) -> int:
+    """
+    Registry adlarindaki en buyuk LLM_F numarasini bulur (LLM_F013_... -> 13).
+    Reject numaralari buradan devam eder.
+    Hicbir ad parse edilemezse kayit sayisina duser.
+    """
+    bulunan = []
+    desen = re.compile(rf"{re.escape(AD_PREFIX)}(\d+)")
+    for kayit in registry:
+        ad = kayit.get("ad")
+        if not ad:
+            continue
+        eslesme = desen.findall(str(ad))
+        bulunan.extend(int(x) for x in eslesme)
+    return max(bulunan) if bulunan else len(registry)
+
+
+def satir_uret(kayit: dict, durum: str, sira: int, ad_no: int) -> dict:
+    """
+    Bir JSON kaydini ortak sutun semasina cevirir.
+    sira  : Excel'deki satir sirasi
+    ad_no : isim uretiminde kullanilacak feature numarasi
+    """
     ist = kayit.get("istatistikler") or {}
     if not isinstance(ist, dict):
         ist = {}
 
-    ad_soneki = kayit.get("ad_soneki")
-
-    # registry'de 'ad' var, rejects'te yok -> uretiyoruz
+    # registry'de 'ad' hazir; rejects'te 'ad_soneki' asil isim, basina numara geliyor
     if kayit.get("ad"):
         ad = kayit["ad"]
-    elif durum == "RED":
-        ad = f"LLM_REJECT_{sira:03d}"
-        if ad_soneki:
-            ad = f"{ad}_{ad_soneki}"
     else:
-        ad = f"LLM_F{sira:03d}_ISIMSIZ"
+        soneki = kayit.get("ad_soneki")
+        ad = f"{AD_PREFIX}{ad_no:03d}_{soneki}" if soneki else f"{AD_PREFIX}{ad_no:03d}"
 
     kolonlar = ilk_dolu(kayit, "kaynak_kolonlar", "kolonlar") or []
-    kolon_sayisi = len(kolonlar) if isinstance(kolonlar, (list, tuple)) else BOS_DOLGU
-
     d_metin, d_adet, d_min, d_max = decile_ozet(ist.get("decile_egrisi"))
 
     return {
         "sira": sira,
         "durum": durum,                                   # KABUL / RED
         "ad": temizle(ad),
-        "ad_soneki": temizle(ad_soneki),
         "tema": temizle(kayit.get("tema")),
-        "tur_iterasyon": temizle(ilk_dolu(kayit, "iterasyon", "tur")),
         "red_nedeni": temizle(kayit.get("neden")),
         "formul": temizle(kayit.get("formul")),
         "kolonlar": temizle(kolonlar),
-        "kolon_sayisi": kolon_sayisi,
         "gerekce": temizle(kayit.get("gerekce")),
         "mekanizma": temizle(kayit.get("mekanizma")),
         "beklenen_yon": temizle(kayit.get("beklenen_yon")),
@@ -168,30 +184,27 @@ def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
         "yon_guvenilir": temizle(ist.get("yon_guvenilir")),
         "yon_notu": temizle(kayit.get("yon_notu")),
         "zayif_sinyal": temizle(kayit.get("zayif_sinyal")),
-        "base_rate": temizle(ist.get("base_rate")),
         "en_riskli_dilim_rate": temizle(ist.get("en_riskli_dilim_rate")),
         "pp_gap": temizle(ist.get("pp_gap")),
         "lift": temizle(ist.get("lift")),
         "egri_sekli": temizle(ist.get("egri_sekli")),
-        "sifir_orani": temizle(ist.get("sifir_orani")),
+        "sifir_orani_yuzde": yuzdeye_cevir(ist.get("sifir_orani")),
         "mevcutlarla_max_korelasyon": temizle(ist.get("mevcutlarla_max_korelasyon")),
         "decile_egrisi": d_metin,
         "decile_adet": d_adet,
         "decile_min": d_min,
         "decile_max": d_max,
-        "tarih": temizle(kayit.get("tarih")),
     }
 
 
 SUTUN_SIRASI = [
-    "sira", "durum", "ad", "ad_soneki", "tema", "tur_iterasyon", "red_nedeni",
-    "formul", "kolonlar", "kolon_sayisi",
+    "sira", "durum", "ad", "tema", "red_nedeni",
+    "formul", "kolonlar",
     "gerekce", "mekanizma",
     "beklenen_yon", "gozlenen_yon", "yon_guvenilir", "yon_notu", "zayif_sinyal",
-    "base_rate", "en_riskli_dilim_rate", "pp_gap", "lift",
-    "egri_sekli", "sifir_orani", "mevcutlarla_max_korelasyon",
+    "en_riskli_dilim_rate", "pp_gap", "lift",
+    "egri_sekli", "sifir_orani_yuzde", "mevcutlarla_max_korelasyon",
     "decile_egrisi", "decile_adet", "decile_min", "decile_max",
-    "tarih",
 ]
 
 
@@ -223,7 +236,7 @@ def main():
     kaynak = dataiku.Folder(KAYNAK_FOLDER)
     hedef = kaynak if HEDEF_FOLDER == KAYNAK_FOLDER else dataiku.Folder(HEDEF_FOLDER)
 
-    print("Folder icerigi:", kaynak.list_paths_in_partition())
+    print("Kaynak folder icerigi:", kaynak.list_paths_in_partition())
 
     registry = folder_json_oku(kaynak, REGISTRY_YOL)
     rejects = folder_json_oku(kaynak, REJECTS_YOL)
@@ -233,9 +246,15 @@ def main():
 
     satirlar = []
     for i, kayit in enumerate(registry, start=1):
-        satirlar.append(satir_uret(kayit, "KABUL", i))
-    for i, kayit in enumerate(rejects, start=1):
-        satirlar.append(satir_uret(kayit, "RED", i))
+        satirlar.append(satir_uret(kayit, "KABUL", i, i))
+
+    # reject numaralari registry'nin bittigi yerden devam eder
+    baslangic = registry_son_numara(registry)
+    print(f"Registry'deki en yuksek {AD_PREFIX} numarasi: {baslangic} "
+          f"-> rejectler {baslangic + 1}'den basliyor")
+
+    for j, kayit in enumerate(rejects, start=1):
+        satirlar.append(satir_uret(kayit, "RED", len(registry) + j, baslangic + j))
 
     df = pd.DataFrame(satirlar)
     df = df.reindex(columns=SUTUN_SIRASI)     # sutun sirasini sabitle
@@ -258,4 +277,4 @@ def main():
           f"Toplam: {len(df)} satir, {len(df.columns)} sutun")
 
 
-main()   # notebook'ta dogrudan calissin diye if __name__ bloğu yok
+main()
