@@ -1,130 +1,175 @@
-import os
-import unicodedata
-import traceback
+# -*- coding: utf-8 -*-
+"""fe_agent/llm.py — sistemin TEK LLM temas noktasi.
+
+1) gelenekse_plan_oner : hangi kolona hangi klasik donusum uygulanmali
+2) kesif_oner          : her sey bitince yeni degisken fikirleri
+
+Ikisi de sadece ONERI doner. Uretim ve karar akis.py'de, Python'da.
+"""
+
+import json
+import re
 
 import dataiku
-from flask import request, jsonify, Response
 
-from fe_agent import akis
+# LLM Connections ekranindaki kayitlar. Id formati:
+#   openai:<baglanti_adi>:<model_adi>
+# Model adinda nokta YOK (dropdown'da gorunen isimle ayni degil).
+LLAMA = "openai:dataiku-llama-31-70b-instruct-gptq-int4:meta-llama-31-70b-instruct-gptq-int4"
+QWEN  = "openai:dataiku-qwen3-30b-a3b-thinking-2507-fp8:qwen3-30b-a3b-thinking-2507-fp8"
 
-GORSEL_FOLDER = "LLM_WEBAPP_GORSEL"
+# Varsayilan: Llama. Instruct-tuned oldugu icin JSON formatina daha sadik.
+# Qwen "thinking" modeli; once uzun muhakeme uretiyor, JSON onun icinde geliyor.
+VARSAYILAN_MODEL = LLAMA
 
-# Mantiksal ad -> folder'daki gercek dosya adi.
-# Gorsel degistirmek istersen SADECE burayi duzenle, JS'e dokunma.
-GORSELLER = {
-    "banner": "akbank_robot_llm_ust.png",
-    "bot":    "akbank_robot_llm_chat.png",
-    "user":   "akbank_robot_llm_person.png",
-}
-
-_MIME = {".png": "image/png", ".jpg": "image/jpeg",
-         ".jpeg": "image/jpeg", ".webp": "image/webp"}
-
-_dosya_haritasi = None
-
-
-def _sadelestir(ad):
-    """Unicode normalizasyon farkini (NFC/NFD) ve buyuk-kucuk harfi eler."""
-    return unicodedata.normalize("NFC", (ad or "")).casefold()
+# Thinking modellerinin muhakeme bloklarini temizleyen kaliplar.
+# Model muhakemeyi uretmeyi birakmaz; biz ciktidan siliyoruz.
+_THINK_KALIPLARI = [
+    re.compile(r"<think>.*?</think>", re.S | re.I),
+    re.compile(r"<thinking>.*?</thinking>", re.S | re.I),
+]
 
 
-def _haritayi_kur(zorla=False):
-    global _dosya_haritasi
-    if _dosya_haritasi is not None and not zorla:
-        return _dosya_haritasi
-    harita = {}
+def _cagir(sistem, kullanici, model=None, sicaklik=0.2):
+    proje = dataiku.api_client().get_default_project()
+    comp = proje.get_llm(model or VARSAYILAN_MODEL).new_completion()
+    comp.with_message(sistem, role="system")
+    comp.with_message(kullanici, role="user")
+    comp.settings["temperature"] = sicaklik   # dusuk = daha kararli JSON
+    return comp.execute().text or ""
+
+
+def _think_temizle(metin):
+    """Muhakeme bloklarini siler. Kapanis etiketi hic gelmediyse
+    (cikti kesildiyse) son acilis etiketinden sonrasini da atar."""
+    if not metin:
+        return ""
+    for kalip in _THINK_KALIPLARI:
+        metin = kalip.sub("", metin)
+    m = re.search(r"<think(?:ing)?>", metin, re.I)
+    if m:
+        metin = metin[:m.start()]
+    return metin.strip()
+
+
+def _json_ayristir(metin, varsayilan):
+    """LLM cikti gurultusune dayanikli JSON okuma.
+    Sirasiyla: muhakeme temizligi -> kod bloklari -> ilk gecerli JSON."""
+    metin = _think_temizle(metin)
+    if not metin:
+        return varsayilan
+
+    metin = re.sub(r"```(?:json)?", "", metin).strip()
+
     try:
-        for yol in dataiku.Folder(GORSEL_FOLDER).list_paths_in_partition():
-            harita[_sadelestir(os.path.basename(yol))] = yol
+        return json.loads(metin)
     except Exception:
-        harita = {}
-    _dosya_haritasi = harita
-    return harita
+        pass
+
+    for acan, kapanan in (("[", "]"), ("{", "}")):
+        bas = metin.find(acan)
+        son = metin.rfind(kapanan)
+        if bas != -1 and son > bas:
+            try:
+                return json.loads(metin[bas:son + 1])
+            except Exception:
+                continue
+    return varsayilan
 
 
-def _dosya_bul(ad):
-    anahtar = _sadelestir(os.path.basename(ad))
-    harita = _haritayi_kur()
-    if anahtar in harita:
-        return harita[anahtar]
-    return _haritayi_kur(zorla=True).get(anahtar)
+# ---------------------------------------------------------------------------
+# LLM #1 — geleneksel donusum plani
+# ---------------------------------------------------------------------------
+SISTEM_PLAN = """Sen bir feature engineering danismanisin.
+Sana kolon adlari ve aciklamalari verilecek. Gorevin, hangi kolonlara hangi
+KLASIK donusumun uygulanmasi gerektigini sablon duzeyinde onermek.
+
+Izin verilen donusumler SADECE: delta, oran, log, rank, winsor
+
+CIKTI KURALI: Cevabin SADECE JSON dizisi olsun. Muhakeme, aciklama veya
+kod blogu YAZMA. Format:
+[{"ad":"...","donusum":"delta","kolonlar":["KOL_A","KOL_B"],"gerekce":"..."}]
+
+Kurallar:
+- delta ve oran icin kolonlar ayni ailenin ARDISIK pencereleri olmali.
+- Sadece sayisal kolonlar.
+- Kolon adlarini sana verilen listeden AYNEN kopyala, uydurma.
+- En fazla 12 sablon oner."""
 
 
-@app.route("/gorsel/<anahtar>")
-def gorsel(anahtar):
-    dosya_adi = GORSELLER.get(anahtar)
-    if not dosya_adi:
-        return Response("tanimsiz gorsel", status=404)
-    uzanti = os.path.splitext(dosya_adi)[1].lower()
-    if uzanti not in _MIME:
-        return Response("gecersiz uzanti", status=404)
-    yol = _dosya_bul(dosya_adi)
-    if not yol:
-        return Response("folder'da bulunamadi: %s" % dosya_adi, status=404)
-    try:
-        with dataiku.Folder(GORSEL_FOLDER).get_download_stream(yol) as s:
-            veri = s.read()
-    except Exception as e:
-        return Response("okuma hatasi: %s" % e, status=500)
-    return Response(veri, mimetype=_MIME[uzanti],
-                    headers={"Cache-Control": "public, max-age=86400"})
+def gelenekse_plan_oner(sozluk_df, haric, meta, max_satir=400):
+    ad_kol, ack_kol = sozluk_df.columns[0], sozluk_df.columns[1]
+
+    kayitlar = []
+    for _, r in sozluk_df.head(max_satir).iterrows():
+        kolon = str(r[ad_kol])
+        if kolon in haric or kolon in (meta.get("target"), meta.get("id")):
+            continue
+        kayitlar.append("%s: %s" % (kolon, str(r[ack_kol])[:120]))
+
+    istek = ("Hedef degisken: %s\n\nKolonlar:\n%s"
+             % (meta.get("target", "?"), "\n".join(kayitlar)))
+
+    ham = _cagir(SISTEM_PLAN, istek, sicaklik=0.2)
+    plan = _json_ayristir(ham, [])
+
+    # --- LLM'e GUVENME: dogrula ve temizle -------------------------------
+    # Uydurma kolon adi, izinsiz donusum, eksik kolon -> hepsi eleniyor.
+    # Bu katman olmasa LLM hallusinasyonu dogrudan uretilen koda donusurdu.
+    izinli = {"delta", "oran", "log", "rank", "winsor"}
+    gecerli = set(sozluk_df[ad_kol].astype(str))
+
+    temiz = []
+    for p in (plan if isinstance(plan, list) else []):
+        if not isinstance(p, dict) or p.get("donusum") not in izinli:
+            continue
+        kolonlar = [k for k in (p.get("kolonlar") or [])
+                    if k in gecerli and k not in haric]
+        if not kolonlar:
+            continue
+        if p["donusum"] in ("delta", "oran") and len(kolonlar) < 2:
+            continue
+        temiz.append({"ad": p.get("ad") or p["donusum"],
+                      "donusum": p["donusum"],
+                      "kolonlar": kolonlar,
+                      "gerekce": p.get("gerekce", "")})
+    return temiz[:12]
 
 
-@app.route("/datasetler")
-def datasetler():
-    """Projedeki tum dataset adlari — kullanici elle yazmak zorunda kalmasin."""
-    try:
-        proje = dataiku.api_client().get_default_project()
-        adlar = sorted(d["name"] for d in proje.list_datasets())
-        return jsonify({"datasetler": adlar})
-    except Exception as e:
-        return jsonify({"datasetler": [], "hata": str(e)})
+# ---------------------------------------------------------------------------
+# LLM #2 — final fikirler
+# ---------------------------------------------------------------------------
+SISTEM_KESIF = """Sen bir feature engineering danismanisin.
+Mevcut uretilmis degiskenlerin listesi verilecek. Bunlardan FARKLI, yeni
+degisken fikirleri oner. Her fikir tek satir olsun: ad - kisa gerekce.
+
+CIKTI KURALI: Cevabin SADECE JSON string dizisi olsun. Muhakeme veya
+aciklama YAZMA. Format: ["fikir 1","fikir 2"]
+En fazla 10 fikir."""
 
 
-@app.route("/adimlar")
-def adimlar():
-    """Sol paneldeki is akisi. Tek kaynak akis.py."""
-    return jsonify({
-        "adimlar": [{"anahtar": a,
-                     "baslik": akis.ADIMLAR[a]["baslik"],
-                     "aciklama": akis.ADIMLAR[a].get("aciklama", "")}
-                    for a in akis.ADIM_SIRASI]
-    })
+def kesif_oner(meta, uretilen, model_ozeti):
+    istek = ("Hedef: %s\nUretilmis degiskenler:\n%s\n\nModel notu: %s"
+             % (meta.get("target", "?"),
+                "\n".join(uretilen[:200]),
+                json.dumps(model_ozeti, ensure_ascii=False)))
+
+    ham = _cagir(SISTEM_KESIF, istek, sicaklik=0.7)
+    fikirler = _json_ayristir(ham, [])
+    return [str(f) for f in fikirler if isinstance(f, (str, int, float))][:10]
 
 
-@app.route("/karsilama")
-def karsilama():
-    return jsonify({"metin": akis.KARSILAMA})
-
-
-@app.route("/mesaj", methods=["POST"])
-def mesaj():
-    try:
-        govde = request.get_json(force=True) or {}
-        oturum_id = govde.get("oturum_id") or "varsayilan"
-
-        durum = akis.durum_yukle(oturum_id)
-        cevap = akis.mesaj_isle(durum, govde.get("mesaj", ""))
-        akis.durum_kaydet(oturum_id, durum)
-
-        return jsonify({
-            "cevap": cevap,
-            "adim": akis.ADIM_SIRASI[durum["i"]],
-            "adim_no": durum["i"],
-            "toplam": len(akis.ADIM_SIRASI),
-            "ozet": akis.ozet(durum),
-        })
-    except Exception as e:
-        # Hatayi sohbet balonunda gosteriyoruz; aksi halde JS'te sessiz kalir.
-        return jsonify({
-            "cevap": "HATA: %s\n\n%s" % (e, traceback.format_exc()[-1000:])
-        }), 200
-
-
-@app.route("/sifirla", methods=["POST"])
-def sifirla():
-    govde = request.get_json(force=True) or {}
-    oturum_id = govde.get("oturum_id") or "varsayilan"
-    durum = akis.yeni_durum()
-    akis.durum_kaydet(oturum_id, durum)
-    return jsonify({"metin": akis.KARSILAMA, "ozet": akis.ozet(durum)})
+# ---------------------------------------------------------------------------
+# Test yardimcisi
+# ---------------------------------------------------------------------------
+def test(model=None):
+    """Notebook'ta calistir: model baglantisi ve JSON ayristirma calisiyor mu."""
+    ham = _cagir(
+        "Sadece JSON dondur, aciklama yazma.",
+        'Su formatta ornek dondur: [{"ad":"test","donusum":"delta"}]',
+        model=model,
+    )
+    print("--- HAM CIKTI ---")
+    print(repr(ham))
+    print("--- AYRISTIRILMIS ---")
+    print(_json_ayristir(ham, "AYRISTIRILAMADI"))
