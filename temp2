@@ -1,56 +1,99 @@
 # -*- coding: utf-8 -*-
 """
-feature_registry.json + feature_rejects.json -> tek Excel
+FEATURE_STATE folder'indaki feature_registry.json + feature_rejects.json
+-> tek Excel (yine ayni folder'a yazilir)
 
-- İki dosyadaki alanlar farklı olduğu için ortak bir sütun şeması kullanılır.
-- Karşılığı olmayan alanlar boş bırakılmaz, BOS_DOLGU ile doldurulur.
-- rejects kayıtlarında 'ad' alanı olmadığı için isim üretilir:
-  LLM_REJECT_001_<ad_soneki>
+Calisma yeri: Dataiku notebook veya Python recipe.
+Recipe'de kullaniyorsan FEATURE_STATE'i input, cikti folder'ini output olarak
+recipe'ye eklemeyi unutma (notebook'ta gerek yok).
 """
 
+import io
 import json
-from pathlib import Path
+import posixpath
 
+import dataiku
 import pandas as pd
 from openpyxl.utils import get_column_letter
 
 # ----------------------------- AYARLAR -----------------------------
-REGISTRY_PATH = "feature_registry.json"
-REJECTS_PATH = "feature_rejects.json"
-OUTPUT_PATH = "feature_birlesik.xlsx"
+KAYNAK_FOLDER = "FEATURE_STATE"      # JSON'larin bulundugu managed folder
+REGISTRY_YOL = "/feature_registry.json"
+REJECTS_YOL = "/feature_rejects.json"
 
-BOS_DOLGU = "-"            # eksik/boş alanlara yazılacak değer
-BOOL_TURKCE = True         # True/False -> Evet/Hayır
-KAYNAK_SAYFALARI_EKLE = True  # ayrıca REGISTRY ve REJECTS sheet'lerini de yaz
+HEDEF_FOLDER = "FEATURE_STATE"       # Excel'in yazilacagi folder
+                                     # ("ALL_GENERATED_FEATURES" de yazabilirsin)
+CIKTI_YOL = "/feature_birlesik.xlsx"
+
+BOS_DOLGU = "-"                      # eksik/bos alanlara yazilacak deger
+BOOL_TURKCE = True                   # True/False -> Evet/Hayir
+KAYNAK_SAYFALARI_EKLE = True         # ayrica REGISTRY ve REJECTS sheet'leri
 # -------------------------------------------------------------------
 
 
-# ----------------------- YARDIMCI FONKSİYONLAR ----------------------
-def json_oku(path: str) -> list:
-    """JSON dosyasını okur ve her zaman liste döndürür."""
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Dosya bulunamadi: {p.resolve()}")
+# --------------------------- FOLDER I/O ----------------------------
+def folder_json_oku(folder: "dataiku.Folder", yol: str) -> list:
+    """Managed folder icindeki JSON dosyasini okur, her zaman liste dondurur."""
+    mevcut = folder.list_paths_in_partition()
+    if yol not in mevcut:
+        # Kullanici basta '/' koymayi unutmus olabilir, toleransli ara
+        alternatif = "/" + yol.lstrip("/")
+        if alternatif in mevcut:
+            yol = alternatif
+        else:
+            raise FileNotFoundError(
+                f"'{yol}' folder'da bulunamadi. Folder icerigi: {mevcut}"
+            )
 
-    # utf-8-sig: Windows'ta dosya başında BOM varsa da sorunsuz okur
-    with open(p, "r", encoding="utf-8-sig") as f:
-        data = json.load(f)
+    with folder.get_download_stream(yol) as stream:
+        ham = stream.read()
 
+    if isinstance(ham, bytes):
+        ham = ham.decode("utf-8-sig")   # dosya basinda BOM varsa da okur
+
+    data = json.loads(ham)
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):
-        raise ValueError(f"{p.name} beklenen formatta degil (liste veya dict olmali).")
+        raise ValueError(f"{yol} beklenen formatta degil (liste veya dict olmali).")
     return data
 
 
+def folder_excel_yaz(folder: "dataiku.Folder", yol: str, sheetler: dict):
+    """
+    sheetler: {"SHEET_ADI": DataFrame, ...}
+    Excel'i bellekte olusturup folder'a yukler (folder S3/HDFS olsa da calisir).
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_adi, df in sheetler.items():
+            if df is None or df.empty:
+                continue
+            df.to_excel(writer, sheet_name=sheet_adi, index=False)
+            sutun_genisliklerini_ayarla(writer, sheet_adi, df)
+
+    buffer.seek(0)
+    folder.upload_stream(yol, buffer.getvalue())
+
+
+def sutun_genisliklerini_ayarla(writer, sheet_adi: str, df: pd.DataFrame):
+    """Sutun genisliklerini icerige gore ayarlar, ust satiri dondurur."""
+    ws = writer.sheets[sheet_adi]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i, sutun in enumerate(df.columns, start=1):
+        uzunluklar = [len(str(sutun))] + [len(str(v)) for v in df[sutun].head(200)]
+        genislik = min(max(uzunluklar) + 2, 60)   # 60 karakterde kes
+        ws.column_dimensions[get_column_letter(i)].width = genislik
+
+
+# ----------------------- DONUSUM FONKSIYONLARI ----------------------
 def temizle(deger):
-    """Tek bir değeri Excel'e yazılabilir, boş olmayan bir değere çevirir."""
+    """Tek bir degeri Excel'e yazilabilir, bos olmayan bir degere cevirir."""
     if deger is None:
         return BOS_DOLGU
     if isinstance(deger, bool):
-        if BOOL_TURKCE:
-            return "Evet" if deger else "Hayir"
-        return deger
+        return ("Evet" if deger else "Hayir") if BOOL_TURKCE else deger
     if isinstance(deger, (list, tuple)):
         if len(deger) == 0:
             return BOS_DOLGU
@@ -60,13 +103,13 @@ def temizle(deger):
             return BOS_DOLGU
         return json.dumps(deger, ensure_ascii=False)
     if isinstance(deger, (int, float)):
-        return deger  # sayısal kalsın ki Excel'de sıralanabilsin
+        return deger                      # sayisal kalsin ki Excel'de siralanabilsin
     s = str(deger).strip()
     return s if s else BOS_DOLGU
 
 
 def ilk_dolu(kayit: dict, *anahtarlar):
-    """Verilen anahtarlardan ilk mevcut olanın değerini döndürür, yoksa None."""
+    """Verilen anahtarlardan ilk mevcut olanin degerini dondurur, yoksa None."""
     for a in anahtarlar:
         if a in kayit and kayit[a] not in (None, "", [], {}):
             return kayit[a]
@@ -74,7 +117,7 @@ def ilk_dolu(kayit: dict, *anahtarlar):
 
 
 def decile_ozet(decile):
-    """decile_egrisi listesinden metin + adet + min + max üretir."""
+    """decile_egrisi listesinden metin + adet + min + max uretir."""
     if not isinstance(decile, (list, tuple)) or len(decile) == 0:
         return BOS_DOLGU, BOS_DOLGU, BOS_DOLGU, BOS_DOLGU
     sayisal = [x for x in decile if isinstance(x, (int, float))]
@@ -85,14 +128,14 @@ def decile_ozet(decile):
 
 
 def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
-    """Bir JSON kaydını ortak sütun şemasına çevirir."""
+    """Bir JSON kaydini ortak sutun semasina cevirir."""
     ist = kayit.get("istatistikler") or {}
     if not isinstance(ist, dict):
         ist = {}
 
     ad_soneki = kayit.get("ad_soneki")
 
-    # İsim: registry'de 'ad' var, rejects'te yok -> üretiyoruz
+    # registry'de 'ad' var, rejects'te yok -> uretiyoruz
     if kayit.get("ad"):
         ad = kayit["ad"]
     elif durum == "RED":
@@ -107,7 +150,7 @@ def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
 
     d_metin, d_adet, d_min, d_max = decile_ozet(ist.get("decile_egrisi"))
 
-    satir = {
+    return {
         "sira": sira,
         "durum": durum,                                   # KABUL / RED
         "ad": temizle(ad),
@@ -138,7 +181,6 @@ def satir_uret(kayit: dict, durum: str, sira: int) -> dict:
         "decile_max": d_max,
         "tarih": temizle(kayit.get("tarih")),
     }
-    return satir
 
 
 SUTUN_SIRASI = [
@@ -154,7 +196,7 @@ SUTUN_SIRASI = [
 
 
 def bilinmeyen_alanlari_bildir(kayitlar: list, dosya_adi: str):
-    """Şemada olmayan JSON alanı varsa uyarır (veri sessizce kaybolmasın)."""
+    """Semada olmayan JSON alani varsa uyarir (veri sessizce kaybolmasin)."""
     bilinen = {
         "ad", "ad_soneki", "tema", "iterasyon", "tur", "neden", "formul",
         "kaynak_kolonlar", "kolonlar", "gerekce", "mekanizma", "beklenen_yon",
@@ -176,24 +218,18 @@ def bilinmeyen_alanlari_bildir(kayitlar: list, dosya_adi: str):
               f"Excel'e yazilmadi: {sorted(eksikler)}")
 
 
-def sutun_genisliklerini_ayarla(writer, sheet_adi: str, df: pd.DataFrame):
-    """Sütun genişliklerini içeriğe göre ayarlar, üst satırı dondurur."""
-    ws = writer.sheets[sheet_adi]
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for i, sutun in enumerate(df.columns, start=1):
-        uzunluklar = [len(str(sutun))] + [len(str(v)) for v in df[sutun].head(200)]
-        genislik = min(max(uzunluklar) + 2, 60)  # 60 karakterde kes
-        ws.column_dimensions[get_column_letter(i)].width = genislik
-
-
-# ------------------------------- ANA AKIŞ ---------------------------
+# ------------------------------- ANA AKIS ---------------------------
 def main():
-    registry = json_oku(REGISTRY_PATH)
-    rejects = json_oku(REJECTS_PATH)
+    kaynak = dataiku.Folder(KAYNAK_FOLDER)
+    hedef = kaynak if HEDEF_FOLDER == KAYNAK_FOLDER else dataiku.Folder(HEDEF_FOLDER)
 
-    bilinmeyen_alanlari_bildir(registry, Path(REGISTRY_PATH).name)
-    bilinmeyen_alanlari_bildir(rejects, Path(REJECTS_PATH).name)
+    print("Folder icerigi:", kaynak.list_paths_in_partition())
+
+    registry = folder_json_oku(kaynak, REGISTRY_YOL)
+    rejects = folder_json_oku(kaynak, REJECTS_YOL)
+
+    bilinmeyen_alanlari_bildir(registry, posixpath.basename(REGISTRY_YOL))
+    bilinmeyen_alanlari_bildir(rejects, posixpath.basename(REJECTS_YOL))
 
     satirlar = []
     for i, kayit in enumerate(registry, start=1):
@@ -202,35 +238,24 @@ def main():
         satirlar.append(satir_uret(kayit, "RED", i))
 
     df = pd.DataFrame(satirlar)
-    df = df.reindex(columns=SUTUN_SIRASI)      # sütun sırasını sabitle
-    df = df.fillna(BOS_DOLGU)                  # kalan boşluk varsa doldur
+    df = df.reindex(columns=SUTUN_SIRASI)     # sutun sirasini sabitle
+    df = df.fillna(BOS_DOLGU)                 # kalan bosluk varsa doldur
+    df["sira"] = range(1, len(df) + 1)        # global sira numarasi
 
-    # global sıra numarası (KABUL 1..n, RED 1..m yerine tabloda 1..n+m)
-    df["sira"] = range(1, len(df) + 1)
-
-    # isim çakışması kontrolü
     cakisan = df.loc[df["ad"].duplicated(keep=False), "ad"].unique().tolist()
     if cakisan:
         print(f"[UYARI] Ayni isimden birden fazla kayit var: {cakisan}")
 
-    with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="TUM_FEATURELAR", index=False)
-        sutun_genisliklerini_ayarla(writer, "TUM_FEATURELAR", df)
+    sheetler = {"TUM_FEATURELAR": df}
+    if KAYNAK_SAYFALARI_EKLE:
+        sheetler["REGISTRY"] = df[df["durum"] == "KABUL"]
+        sheetler["REJECTS"] = df[df["durum"] == "RED"]
 
-        if KAYNAK_SAYFALARI_EKLE:
-            df_kabul = df[df["durum"] == "KABUL"]
-            df_red = df[df["durum"] == "RED"]
-            if not df_kabul.empty:
-                df_kabul.to_excel(writer, sheet_name="REGISTRY", index=False)
-                sutun_genisliklerini_ayarla(writer, "REGISTRY", df_kabul)
-            if not df_red.empty:
-                df_red.to_excel(writer, sheet_name="REJECTS", index=False)
-                sutun_genisliklerini_ayarla(writer, "REJECTS", df_red)
+    folder_excel_yaz(hedef, CIKTI_YOL, sheetler)
 
-    print(f"Tamam -> {Path(OUTPUT_PATH).resolve()}")
-    print(f"KABUL: {len(registry)} satir | RED: {len(rejects)} satir | "
+    print(f"Tamam -> {HEDEF_FOLDER}{CIKTI_YOL}")
+    print(f"KABUL: {len(registry)} | RED: {len(rejects)} | "
           f"Toplam: {len(df)} satir, {len(df.columns)} sutun")
 
 
-if __name__ == "__main__":
-    main()
+main()   # notebook'ta dogrudan calissin diye if __name__ bloğu yok
