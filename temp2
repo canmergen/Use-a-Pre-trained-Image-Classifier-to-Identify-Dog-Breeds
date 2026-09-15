@@ -1,580 +1,844 @@
 # -*- coding: utf-8 -*-
-"""fe_agent/ifade.py — kisitli ifade grameri.
+"""fe_agent/akis.py — deterministik adim makinesi (8 adim).
 
-LLM Python KODU YAZMAZ. Sadece su gramere uyan bir ifade yazar:
-    KOL_A / KOL_B
-    log1p(KOL_C) - KOL_D
-    clip(KOL_E / (KOL_F + 1), 0, 10)
-
-Ifade ast ile ayristirilip dugum dugum denetlenir. Gecerse:
-  - degerlendir() pandas Serisi uretir (eval YOK, kendi yurutucusu var)
-  - python_kodu() okunabilir, calistirilabilir Python satiri uretir
-
-Boylece LLM'in hallusinasyonu koda donusemez ama cikti yine de
-tekrar uretilebilir gercek Python olur.
+LLM cagrisi YOK; iki adim fe_agent.llm'e delege edilir.
+Her adimin 3 parcasi: girdi() / plan() / uygula()
+plan() hicbir sey degistirmez, uygula() onaydan sonra calisir.
 """
 
-import ast
+import json
+import re
+import datetime
 
+import dataiku
 import numpy as np
 import pandas as pd
 
-# Izinli fonksiyonlar ve argüman sayilari
-IZINLI_FONK = {
-    "log1p": (1, 1),
-    "abs":   (1, 1),
-    "sqrt":  (1, 1),
-    "rank":  (1, 1),
-    "clip":  (3, 3),
-    "fark":  (2, 2),
+from fe_agent import niyet_kural
+from fe_agent import llm as llm_mod
+from fe_agent import sfa as sfa_mod
+from fe_agent import ifade as ifade_mod
+
+HAFIZA_FOLDER = "PROJE_HAFIZASI"
+MODEL_SENARYO = "MODEL_COMPARISON"
+OKUMA_LIMITI = 10000
+
+ADIM_SIRASI = ["kurulum", "meta", "analiz", "baz",
+               "gelenekse", "kesif", "kalite", "model"]
+
+GERI_KALIP = re.compile(r"\b(geri|onceki adim|bir onceki|geri don\w*)\b")
+SECIM_KALIP = re.compile(r"\d+")
+
+KARSILAMA = """Değişken Keşif Asistanı
+
+Modelleme veri setinizden yeni ve anlamlı değişkenler keşfetmek için veri \
+yapısını, değişken sözlüğünü ve hedef değişkeni birlikte analiz ederim.
+
+Mevcut değişkenlerin tek başına ayırt etme gücünü ölçer (IV, C-value, PSI), \
+sorunlu kolonları raporlar, geleneksel dönüşümleri ve yeni değişken \
+hipotezlerini üretir, kalite kontrolünden geçirir ve model katkısını ölçerim.
+
+Ürettiğim her değişkenin Python kodunu da yazarım; dilediğiniz zaman \
+inceleyip kendiniz çalıştırabilirsiniz.
+
+Başlamak için veri seti ve değişken sözlüğünü seçin."""
+
+
+# ===========================================================================
+# DURUM
+# ===========================================================================
+def _folder():
+    return dataiku.Folder(HAFIZA_FOLDER)
+
+
+def _yol(oturum_id):
+    return "/oturum_%s.json" % re.sub(r"[^A-Za-z0-9_-]", "", str(oturum_id))
+
+
+def yeni_durum():
+    return {
+        "i": 0, "bekleyen": "girdi",
+        "veri_seti": None, "sozluk": None,
+        "meta": {}, "profil": {},
+        "haric_kolonlar": [],
+        "sfa": {},           # ozet + teshis (tablo ayri dataset'te)
+        "baz": {},           # baz dataset adi + doldurma karari
+        "plan": [],          # geleneksel donusum plani
+        "hipotez": [],       # serbest kesif ifadeleri
+        "uretilen": [],
+        "kod_bloklari": [],  # (baslik, [(ad, kod, gerekce)])
+        "kalite": {}, "model": {},
+    }
+
+
+def durum_yukle(oturum_id):
+    try:
+        with _folder().get_download_stream(_yol(oturum_id)) as s:
+            return json.loads(s.read().decode("utf-8"))
+    except Exception:
+        return yeni_durum()
+
+
+def durum_kaydet(oturum_id, durum):
+    veri = json.dumps(durum, ensure_ascii=False, indent=2).encode("utf-8")
+    _folder().upload_stream(_yol(oturum_id), veri)
+
+
+# ===========================================================================
+# YARDIMCILAR
+# ===========================================================================
+def _df_oku(ad, limit=OKUMA_LIMITI):
+    return dataiku.Dataset(ad).get_dataframe(limit=limit)
+
+
+def _dataset_var_mi(ad):
+    try:
+        dataiku.Dataset(ad).get_config()
+        return True
+    except Exception:
+        return False
+
+
+def _sayi(n):
+    try:
+        return "{:,}".format(int(n)).replace(",", ".")
+    except Exception:
+        return str(n)
+
+
+def _ond(x, b=1):
+    if x is None:
+        return "—"
+    return ("%.*f" % (b, x)).replace(".", ",")
+
+
+def _liste(baslik, satirlar, en_fazla=15):
+    if not satirlar:
+        return baslik + "\n  (yok)"
+    g = "\n".join("  • %s" % s for s in satirlar[:en_fazla])
+    if len(satirlar) > en_fazla:
+        g += "\n  … (+%d)" % (len(satirlar) - en_fazla)
+    return baslik + "\n" + g
+
+
+def _secim_ayikla(mesaj, adet):
+    """'1,3,5 onay' -> [0,2,4]. Numara yoksa None (= hepsi)."""
+    numaralar = [int(n) for n in SECIM_KALIP.findall(mesaj or "")]
+    gecerli = sorted({n - 1 for n in numaralar if 1 <= n <= adet})
+    return gecerli or None
+
+
+def ozet(durum):
+    m, p = durum.get("meta") or {}, durum.get("profil") or {}
+    s, k = durum.get("sfa") or {}, durum.get("kalite") or {}
+    bos = "—"
+
+    veri_alt = ("%s satır × %s kolon" % (
+        _sayi(p["satir"]) + ("+" if p.get("satir_ustsinir") else ""),
+        _sayi(p["kolon"]))) if p.get("kolon") else "seçilmedi"
+
+    if s.get("pass_adet") is not None:
+        sozluk_alt = "%s / %s değişken PASS" % (
+            _sayi(s["pass_adet"]), _sayi(s.get("analiz_edilen", 0)))
+    elif p.get("sozluk_satir"):
+        sozluk_alt = "%s tanım" % _sayi(p["sozluk_satir"])
+    else:
+        sozluk_alt = "seçilmedi"
+
+    uretilen = len(durum.get("uretilen") or [])
+    if uretilen and p.get("kolon"):
+        deger = "%s → %s" % (_sayi(p["kolon"]), _sayi(p["kolon"] + uretilen))
+        alt = "+%s yeni" % _sayi(uretilen)
+        if k:
+            alt += " · %s elendi" % _sayi(uretilen - len(k.get("gecti") or []))
+    else:
+        deger, alt = bos, "henüz üretilmedi"
+
+    return {"kartlar": [
+        {"etiket": "Veri seti", "deger": durum.get("veri_seti") or bos, "alt": veri_alt},
+        {"etiket": "Sözlük", "deger": durum.get("sozluk") or bos, "alt": sozluk_alt},
+        {"etiket": "Hedef", "deger": m.get("target") or bos,
+         "alt": p.get("hedef_ozet") or "tanımlanmadı"},
+        {"etiket": "Değişken seti", "deger": deger, "alt": alt},
+    ]}
+
+
+# ===========================================================================
+# 01 — CALISMA KURULUMU
+# ===========================================================================
+def kurulum_girdi(durum, mesaj):
+    a = niyet_kural.alanlari_cikar(mesaj)
+    veri = a.get("veri_seti") or durum.get("veri_seti")
+    sozluk = a.get("sozluk") or durum.get("sozluk")
+
+    eksik = ([] if veri else ["veri setinin adı"]) + ([] if sozluk else ["sözlüğün adı"])
+    if eksik:
+        return False, ("Devam edebilmem için %s gerekiyor.\n\n"
+                       "Yukarıdaki listeden seçebilir ya da şöyle yazabilirsiniz:\n"
+                       "    veri seti HAVALE_EFT_NTT ve sözlük DEGISKENLER"
+                       % " ve ".join(eksik))
+    for ad in (veri, sozluk):
+        if not _dataset_var_mi(ad):
+            return False, "Projede '%s' adında bir veri seti bulamadım." % ad
+
+    durum["veri_seti"], durum["sozluk"] = veri, sozluk
+    return True, None
+
+
+def kurulum_plan(durum):
+    df = _df_oku(durum["veri_seti"])
+    sz = _df_oku(durum["sozluk"])
+    ad_kol = sz.columns[0]
+    sozluk_ad = set(sz[ad_kol].astype(str))
+
+    aciklamasiz = [c for c in df.columns if c not in sozluk_ad]
+    eslesen = df.shape[1] - len(aciklamasiz)
+
+    p = durum.get("profil") or {}
+    p.update({
+        "satir": int(df.shape[0]),
+        "satir_ustsinir": bool(df.shape[0] >= OKUMA_LIMITI),
+        "kolon": int(df.shape[1]),
+        "sayisal": int(df.select_dtypes(include=[np.number]).shape[1]),
+        "sozluk_satir": int(sz.shape[0]),
+        "eslesen": eslesen,
+        "kapsam": round(100.0 * eslesen / max(df.shape[1], 1), 1),
+    })
+    durum["profil"] = p
+    durum["_aciklamasiz"] = aciklamasiz
+
+    return ("Veri seti : %s\n"
+            "            %s satır × %s kolon  (%s sayısal, %s kategorik)\n"
+            "Sözlük    : %s  —  %s tanım\n\n"
+            "Kolonların %s tanesinin sözlükte açıklaması var (%%%s kapsam).\n\n%s\n\n"
+            "Açıklaması olmayan kolonları kapsam dışında tutacağım — anlamı "
+            "bilinmeyen kolondan sağlıklı değişken çıkmaz.\n\nDevam edelim mi?"
+            % (durum["veri_seti"],
+               _sayi(p["satir"]) + ("+" if p["satir_ustsinir"] else ""),
+               _sayi(p["kolon"]), _sayi(p["sayisal"]), _sayi(p["kolon"] - p["sayisal"]),
+               durum["sozluk"], _sayi(p["sozluk_satir"]),
+               _sayi(eslesen), _ond(p["kapsam"]),
+               _liste("Sözlükte karşılığı olmayanlar:", aciklamasiz)))
+
+
+def kurulum_uygula(durum):
+    durum["haric_kolonlar"] = sorted(set(durum.get("_aciklamasiz") or []))
+    return "Kurulum tamam. %s kolon kapsam dışı." % _sayi(len(durum["haric_kolonlar"]))
+
+
+# ===========================================================================
+# 02 — META TANIMI
+# ===========================================================================
+META_KALIP = {
+    "target": r"target\s*[:=]?\s*([a-z0-9_]+)",
+    "id": r"\bid\s*[:=]?\s*([a-z0-9_]+)",
+    "donem": r"donem\s*[:=]?\s*([a-z0-9_]+)",
 }
 
-IZINLI_IKILI = (ast.Add, ast.Sub, ast.Mult, ast.Div)
-IZINLI_TEKLI = (ast.UAdd, ast.USub)
 
-MAX_UZUNLUK = 160
-MAX_DUGUM = 40
-
-
-class IfadeHatasi(Exception):
-    pass
-
-
-# ===========================================================================
-# DOGRULAMA
-# ===========================================================================
-def _denetle(dugum, kolonlar, kullanilan, sayac):
-    sayac[0] += 1
-    if sayac[0] > MAX_DUGUM:
-        raise IfadeHatasi("ifade fazla karmasik")
-
-    if isinstance(dugum, ast.BinOp):
-        if not isinstance(dugum.op, IZINLI_IKILI):
-            raise IfadeHatasi("izinsiz operator")
-        _denetle(dugum.left, kolonlar, kullanilan, sayac)
-        _denetle(dugum.right, kolonlar, kullanilan, sayac)
-        return
-
-    if isinstance(dugum, ast.UnaryOp):
-        if not isinstance(dugum.op, IZINLI_TEKLI):
-            raise IfadeHatasi("izinsiz tekli operator")
-        _denetle(dugum.operand, kolonlar, kullanilan, sayac)
-        return
-
-    if isinstance(dugum, ast.Call):
-        if not isinstance(dugum.func, ast.Name):
-            raise IfadeHatasi("izinsiz cagri")
-        ad = dugum.func.id
-        if ad not in IZINLI_FONK:
-            raise IfadeHatasi("bilinmeyen fonksiyon: %s" % ad)
-        if dugum.keywords:
-            raise IfadeHatasi("anahtar argüman kullanilamaz")
-        alt, ust = IZINLI_FONK[ad]
-        if not (alt <= len(dugum.args) <= ust):
-            raise IfadeHatasi("%s icin argüman sayisi hatali" % ad)
-        for a in dugum.args:
-            _denetle(a, kolonlar, kullanilan, sayac)
-        return
-
-    if isinstance(dugum, ast.Name):
-        if dugum.id not in kolonlar:
-            raise IfadeHatasi("tabloda olmayan kolon: %s" % dugum.id)
-        kullanilan.add(dugum.id)
-        return
-
-    if isinstance(dugum, ast.Constant):
-        if not isinstance(dugum.value, (int, float)) or isinstance(dugum.value, bool):
-            raise IfadeHatasi("sadece sayisal sabit kullanilabilir")
-        return
-
-    raise IfadeHatasi("izinsiz ifade ogesi: %s" % type(dugum).__name__)
-
-
-def dogrula(ifade, kolonlar):
-    """Doner: (gecerli_mi, hata_metni, kullanilan_kolon_listesi)"""
-    if not ifade or not isinstance(ifade, str):
-        return False, "bos ifade", []
-    ifade = ifade.strip()
-    if len(ifade) > MAX_UZUNLUK:
-        return False, "ifade cok uzun", []
-    try:
-        agac = ast.parse(ifade, mode="eval")
-    except SyntaxError as e:
-        return False, "sozdizimi hatasi: %s" % e.msg, []
-
-    kullanilan = set()
-    try:
-        _denetle(agac.body, set(kolonlar), kullanilan, [0])
-    except IfadeHatasi as e:
-        return False, str(e), []
-
-    if not kullanilan:
-        return False, "hicbir kolon kullanilmamis", []
-    return True, None, sorted(kullanilan)
-
-
-# ===========================================================================
-# YURUTME  (eval YOK — agac elle gezilir)
-# ===========================================================================
-def _seri(df, kol):
-    return pd.to_numeric(df[kol], errors="coerce")
-
-
-def _bol(a, b):
-    """Sifira bolmeyi NaN yapar; pandas sonsuz uretmesin diye."""
-    if isinstance(b, pd.Series):
-        b = b.replace(0, np.nan)
-    elif b == 0:
-        return np.nan
-    return a / b
-
-
-def _yurut(dugum, df):
-    if isinstance(dugum, ast.BinOp):
-        sol = _yurut(dugum.left, df)
-        sag = _yurut(dugum.right, df)
-        if isinstance(dugum.op, ast.Add):  return sol + sag
-        if isinstance(dugum.op, ast.Sub):  return sol - sag
-        if isinstance(dugum.op, ast.Mult): return sol * sag
-        if isinstance(dugum.op, ast.Div):  return _bol(sol, sag)
-
-    if isinstance(dugum, ast.UnaryOp):
-        d = _yurut(dugum.operand, df)
-        return -d if isinstance(dugum.op, ast.USub) else d
-
-    if isinstance(dugum, ast.Call):
-        ad = dugum.func.id
-        a = [_yurut(x, df) for x in dugum.args]
-        if ad == "log1p": return np.log1p(a[0].clip(lower=0))
-        if ad == "abs":   return a[0].abs()
-        if ad == "sqrt":  return np.sqrt(a[0].clip(lower=0))
-        if ad == "rank":  return a[0].rank(pct=True)
-        if ad == "clip":  return a[0].clip(a[1], a[2])
-        if ad == "fark":  return a[0] - a[1]
-
-    if isinstance(dugum, ast.Name):
-        return _seri(df, dugum.id)
-
-    if isinstance(dugum, ast.Constant):
-        return dugum.value
-
-    raise IfadeHatasi("yurutulemeyen oge")
-
-
-def degerlendir(df, ifade):
-    """Dogrulanmis bir ifadeyi df uzerinde hesaplar."""
-    agac = ast.parse(ifade.strip(), mode="eval")
-    return _yurut(agac.body, df)
-
-
-# ===========================================================================
-# KOD URETIMI  (kullanicinin okuyup calistirabilecegi Python)
-# ===========================================================================
-def _kod(dugum):
-    if isinstance(dugum, ast.BinOp):
-        sol, sag = _kod(dugum.left), _kod(dugum.right)
-        if isinstance(dugum.op, ast.Div):
-            return "_bol(%s, %s)" % (sol, sag)
-        op = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*"}[type(dugum.op)]
-        return "(%s %s %s)" % (sol, op, sag)
-
-    if isinstance(dugum, ast.UnaryOp):
-        return ("-" if isinstance(dugum.op, ast.USub) else "") + _kod(dugum.operand)
-
-    if isinstance(dugum, ast.Call):
-        ad = dugum.func.id
-        a = [_kod(x) for x in dugum.args]
-        if ad == "log1p": return "np.log1p(%s.clip(lower=0))" % a[0]
-        if ad == "abs":   return "%s.abs()" % a[0]
-        if ad == "sqrt":  return "np.sqrt(%s.clip(lower=0))" % a[0]
-        if ad == "rank":  return "%s.rank(pct=True)" % a[0]
-        if ad == "clip":  return "%s.clip(%s, %s)" % (a[0], a[1], a[2])
-        if ad == "fark":  return "(%s - %s)" % (a[0], a[1])
-
-    if isinstance(dugum, ast.Name):
-        return '_s(df, "%s")' % dugum.id
-
-    if isinstance(dugum, ast.Constant):
-        return repr(dugum.value)
-
-    raise IfadeHatasi("koda cevrilemeyen oge")
-
-
-def python_kodu(ad, ifade):
-    """Tek satirlik, calistirilabilir pandas atamasi uretir."""
-    agac = ast.parse(ifade.strip(), mode="eval")
-    return 'df["%s"] = %s' % (ad, _kod(agac.body))
-
-
-BASLIK = '''# -*- coding: utf-8 -*-
-"""Degisken Kesif Asistani tarafindan uretilen kod.
-Bu dosya elle calistirilabilir; asistanin urettigi kolonlarin aynisini uretir."""
-
-import numpy as np
-import pandas as pd
-import dataiku
-
-
-def _s(df, kol):
-    """Kolonu sayisala cevirir."""
-    return pd.to_numeric(df[kol], errors="coerce")
-
-
-def _bol(a, b):
-    """Sifira bolmeyi NaN yapar."""
-    if isinstance(b, pd.Series):
-        b = b.replace(0, np.nan)
-    elif b == 0:
-        return np.nan
-    return a / b
-'''
-
-
-def script_olustur(kaynak_dataset, hedef_dataset, doldurma, bloklar):
-    """bloklar: [(baslik, [(ad, kod_satiri, gerekce), ...]), ...]"""
-    p = [BASLIK, "",
-         'df = dataiku.Dataset("%s").get_dataframe()' % kaynak_dataset, ""]
-
-    if doldurma == "medyan":
-        p += ["# --- Eksik deger doldurma (baz veri setinde uygulandi) ---",
-              "for _k in df.select_dtypes(include=[np.number]).columns:",
-              "    df[_k] = df[_k].fillna(df[_k].median())", ""]
-
-    for baslik, satirlar in bloklar:
-        if not satirlar:
-            continue
-        p += ["# " + "=" * 68, "# %s" % baslik, "# " + "=" * 68]
-        for i, (ad, kod, gerekce) in enumerate(satirlar, 1):
-            if gerekce:
-                p.append("# %02d. %s" % (i, gerekce))
-            p.append(kod)
-        p.append("")
-
-    p += ['dataiku.Dataset("%s").write_with_schema(df)' % hedef_dataset,
-          'print("Tamamlandi: %d kolon")'
-          % sum(len(s) for _, s in bloklar), ""]
-    return "\n".join(p)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# -*- coding: utf-8 -*-
-"""fe_agent/sfa.py — Single Factor Analysis.
-
-Her degisken icin tek basina hedefle iliskisini olcer:
-    TYPE, NULL_COUNT, NULL_RATIO, IMPUTATION_METHOD, IMPUTATION_VALUE,
-    ENCODING, IV, C_VALUE, PSI, SFA_RESULT
-
-SFA bir ELEME kurali DEGILDIR: FAIL alan bir degisken multivariate modelde
-(SHAP vb.) anlamli olabilir. Burada sadece tek degiskenli gucu ve
-aciklanabilirligi raporlanir. Gercek eleme yalnizca teknik kusurlar icin
-yapilir (asiri null, sabit, kimlik benzeri, sizinti).
-"""
-
-import numpy as np
-import pandas as pd
-
-IV_ESIK = 0.05
-C_ESIK = 0.55
-PSI_ESIK = 0.10
-
-BIN_SAYISI = 10
-KATEGORIK_MAX = 50        # bundan cok tekil degeri olan kategorik atlanir
-MIN_SATIR = 100
-
-
-# ===========================================================================
-# TEMEL METRIKLER
-# ===========================================================================
-def _c_value(s, y):
-    """Tek degisken AUC. Mann-Whitney rank formu — dongusuz.
-    Yon onemli degil: 0.5 altinda kalirsa 1'e tamamlaniyor."""
-    m = s.notna() & y.notna()
-    if int(m.sum()) < MIN_SATIR:
-        return None
-    x, t = s[m], y[m]
-    n1 = float((t > 0).sum())
-    n0 = float((t <= 0).sum())
-    if n1 == 0 or n0 == 0:
-        return None
-    r = x.rank()
-    auc = (float(r[t > 0].sum()) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
-    return max(auc, 1.0 - auc)
-
-
-def _iv_gruplu(gruplar, y):
-    """gruplar: her satira karsilik gelen bin/kategori etiketi (Series)."""
-    df = pd.DataFrame({"g": gruplar, "y": y}).dropna()
-    if len(df) < MIN_SATIR:
-        return None
-    toplam_kotu = float((df["y"] > 0).sum())
-    toplam_iyi = float((df["y"] <= 0).sum())
-    if toplam_kotu == 0 or toplam_iyi == 0:
-        return None
-
-    iv = 0.0
-    for _, alt in df.groupby("g", observed=False):
-        kotu = float((alt["y"] > 0).sum())
-        iyi = float((alt["y"] <= 0).sum())
-        # Sifir bolme icin duzeltme (Laplace benzeri)
-        p_kotu = (kotu if kotu else 0.5) / toplam_kotu
-        p_iyi = (iyi if iyi else 0.5) / toplam_iyi
-        iv += (p_kotu - p_iyi) * np.log(p_kotu / p_iyi)
-    return float(iv)
-
-
-def _binle(s, bin_sayisi=BIN_SAYISI):
-    """Sayisal kolonu quantile bin'lere ayirir; tekrarli sinirlari toplar."""
-    try:
-        return pd.qcut(s, bin_sayisi, duplicates="drop", labels=False)
-    except Exception:
-        return None
-
-
-def _psi(dev, oot, kategorik=False):
-    """Population Stability Index. dev = gelistirme, oot = out-of-time."""
-    if dev is None or oot is None or len(dev) < MIN_SATIR or len(oot) < MIN_SATIR:
-        return None
-
-    if kategorik:
-        d = dev.astype(str).value_counts(normalize=True)
-        o = oot.astype(str).value_counts(normalize=True)
-        etiketler = set(d.index) | set(o.index)
-        beklenen = {k: float(d.get(k, 0.0)) for k in etiketler}
-        gerceklesen = {k: float(o.get(k, 0.0)) for k in etiketler}
-    else:
+def meta_girdi(durum, mesaj):
+    norm = niyet_kural.normalize(mesaj)
+    meta = dict(durum.get("meta") or {})
+    for anahtar, kalip in META_KALIP.items():
+        m = re.search(kalip, norm)
+        if m:
+            meta[anahtar] = mesaj[m.start(1):m.end(1)]
+
+    if durum.get("veri_seti") and meta:
         try:
-            sinirlar = np.unique(np.nanpercentile(
-                dev.dropna(), np.linspace(0, 100, BIN_SAYISI + 1)))
+            kolonlar = set(_df_oku(durum["veri_seti"], limit=5).columns)
+            hatali = [(k, v) for k, v in meta.items() if v not in kolonlar]
+            if hatali:
+                for k, _ in hatali:
+                    meta.pop(k, None)
+                durum["meta"] = meta
+                return False, ("Şu kolonları tabloda bulamadım: %s"
+                               % ", ".join("%s → %s" % x for x in hatali))
         except Exception:
-            return None
-        if len(sinirlar) < 3:
-            return None
-        sinirlar[0], sinirlar[-1] = -np.inf, np.inf
-        d = pd.cut(dev, sinirlar).value_counts(normalize=True, sort=False)
-        o = pd.cut(oot, sinirlar).value_counts(normalize=True, sort=False)
-        etiketler = d.index
-        beklenen = {k: float(d.get(k, 0.0)) for k in etiketler}
-        gerceklesen = {k: float(o.get(k, 0.0)) for k in etiketler}
+            pass
 
-    psi = 0.0
-    for k in etiketler:
-        e = max(beklenen[k], 0.0001)
-        g = max(gerceklesen[k], 0.0001)
-        psi += (g - e) * np.log(g / e)
-    return float(psi)
+    durum["meta"] = meta
+    eksik = [k for k in ("target", "id") if k not in meta]
+    if eksik:
+        etiket = {"target": "hedef değişken", "id": "kimlik kolonu"}
+        return False, ("Şunlara ihtiyacım var: %s\n\nÖrnek:\n"
+                       "    target TGT_CS_ALL_TKP_ST_5M90 id SM_ID donem PERIOD\n\n"
+                       "Dönem kolonu zorunlu değil ama verirseniz PSI "
+                       "(zaman içinde kayma) hesaplayabilirim."
+                       % ", ".join(etiket[k] for k in eksik))
+    return True, None
 
 
-# ===========================================================================
-# ANA FONKSIYON
-# ===========================================================================
-def calistir(df, target, haric=(), oot_maske=None, null_esik=0.50,
-             sizinti_esik=0.95):
-    """Doner: (sfa_dataframe, teshis_sozlugu)
+def meta_plan(durum):
+    m = durum["meta"]
+    df = _df_oku(durum["veri_seti"])
+    p = durum.get("profil") or {}
 
-    oot_maske: PSI icin out-of-time satirlarini isaretleyen boolean Series.
-               None ise PSI hesaplanmaz.
-    """
-    y = pd.to_numeric(df[target], errors="coerce")
-    haric = set(haric) | {target}
-    satir = float(len(df))
+    # Hedef tipi
+    y = pd.to_numeric(df[m["target"]], errors="coerce")
+    tekil = int(y.nunique(dropna=True))
+    if tekil <= 2:
+        p["hedef_tip"] = "binary"
+        p["hedef_ozet"] = "Binary · %%%s pozitif" % _ond(100.0 * float((y > 0).mean()), 2)
+    else:
+        p["hedef_tip"] = "surekli"
+        p["hedef_ozet"] = "Sürekli · %s farklı değer" % _sayi(tekil)
 
-    dev_maske = None if oot_maske is None else ~oot_maske
-
-    kayitlar = []
-    cok_bos, sabit, kimlik_gibi, sizinti = [], [], [], []
-
-    for kol in df.columns:
-        if kol in haric:
-            continue
-        s = df[kol]
-        null_adet = int(s.isna().sum())
-        null_oran = null_adet / max(satir, 1.0)
-
-        # --- teknik kusur kontrolleri (bunlar GERCEK eleme sebebi) ---
-        if null_oran > null_esik:
-            cok_bos.append(kol)
-            continue
-        tekil = int(s.nunique(dropna=True))
-        if tekil <= 1:
-            sabit.append(kol)
-            continue
-        if tekil > 0.95 * satir and tekil > MIN_SATIR:
-            kimlik_gibi.append(kol)
-            continue
-
-        sayisal = pd.api.types.is_numeric_dtype(s)
-
-        if sayisal:
-            sn = pd.to_numeric(s, errors="coerce")
-            med = sn.median()
-            imp_yontem = "medyan" if null_adet else "-"
-            imp_deger = None if pd.isna(med) else round(float(med), 4)
-            dolu = sn.fillna(med) if null_adet else sn
-
-            gruplar = _binle(dolu)
-            iv = _iv_gruplu(gruplar, y) if gruplar is not None else None
-            c = _c_value(dolu, y)
-            psi = (None if dev_maske is None
-                   else _psi(dolu[dev_maske], dolu[oot_maske]))
-            tip, enc = "numeric", "binning (%d)" % BIN_SAYISI
+    # PSI bolmesi: donem kolonunun en son degeri OOT
+    donem = m.get("donem")
+    psi_satir = "  PSI            : hesaplanmayacak (dönem kolonu verilmedi)"
+    durum["_oot_deger"] = None
+    if donem and donem in df.columns:
+        donemler = sorted(pd.Series(df[donem].dropna().unique()).astype(str))
+        if len(donemler) < 2:
+            psi_satir = ("  PSI            : hesaplanmayacak — %s tek değer "
+                         "taşıyor (%s)" % (donem, donemler[0] if donemler else "?"))
         else:
-            if tekil > KATEGORIK_MAX:
-                kimlik_gibi.append(kol)
-                continue
-            sk = s.astype(str).where(s.notna(), "MISSING")
-            imp_yontem = "MISSING kategorisi" if null_adet else "-"
-            imp_deger = "MISSING" if null_adet else None
+            oot = donemler[-1]
+            durum["_oot_deger"] = oot
+            psi_satir = ("  PSI bölmesi    : %s = %s → OOT, kalan %s dönem → dev"
+                         % (donem, oot, _sayi(len(donemler) - 1)))
+    durum["profil"] = p
 
-            iv = _iv_gruplu(sk, y)
-            # Kategorik icin C-value: kategori bazli kotu oranini skor kabul et
-            oran = sk.map(pd.DataFrame({"k": sk, "y": y})
-                          .groupby("k")["y"].mean())
-            c = _c_value(pd.to_numeric(oran, errors="coerce"), y)
-            psi = (None if dev_maske is None
-                   else _psi(sk[dev_maske], sk[oot_maske], kategorik=True))
-            tip, enc = "categorical", "WoE / hedef oranı"
+    return ("Şöyle anladım:\n\n"
+            "  Hedef değişken : %s  (%s)\n"
+            "  Kimlik kolonu  : %s\n"
+            "  Dönem kolonu   : %s\n"
+            "%s\n\n"
+            "Başka bir dönemi OOT yapmak isterseniz \"red\" deyip "
+            "belirtebilirsiniz. Doğru mu?"
+            % (m["target"], p["hedef_ozet"], m["id"],
+               donem or "belirtilmedi", psi_satir))
 
-        if c is not None and c > sizinti_esik:
-            sizinti.append(kol)
 
-        gecti = (iv is not None and iv > IV_ESIK and
-                 c is not None and c > C_ESIK and
-                 (psi is None or psi < PSI_ESIK))
+def meta_uygula(durum):
+    return "Meta bilgilerini kaydettim."
 
-        kayitlar.append({
-            "FEATURE": kol,
-            "TYPE": tip,
-            "NULL_COUNT": null_adet,
-            "NULL_RATIO": round(null_oran, 4),
-            "IMPUTATION_METHOD": imp_yontem,
-            "IMPUTATION_VALUE": imp_deger,
-            "ENCODING": enc,
-            "IV": None if iv is None else round(iv, 4),
-            "C_VALUE": None if c is None else round(c, 4),
-            "PSI": None if psi is None else round(psi, 4),
-            "SFA_RESULT": "PASS" if gecti else "FAIL",
-        })
 
-    tablo = pd.DataFrame(kayitlar)
-    if len(tablo):
-        tablo = tablo.sort_values("IV", ascending=False, na_position="last")
-        tablo = tablo.reset_index(drop=True)
+# ===========================================================================
+# 03 — VERI VE SOZLUK ANALIZI (SFA)
+# ===========================================================================
+def analiz_plan(durum):
+    p = durum.get("profil") or {}
+    psi_not = ("PSI hesaplanacak (OOT: %s)" % durum.get("_oot_deger")
+               if durum.get("_oot_deger") else "PSI atlanacak")
+    return ("Her değişkeni tek tek inceleyeceğim:\n\n"
+            "  • null sayısı ve oranı, imputation kararı\n"
+            "  • numeric / categorical ayrımı, encoding\n"
+            "  • IV   — bilgi değeri        (eşik > %s)\n"
+            "  • C-value — tek değişken AUC (eşik > %s)\n"
+            "  • PSI  — zaman içinde kayma  (eşik < %s)  →  %s\n\n"
+            "Sonuç tek bir tabloya yazılacak. SFA bir ELEME kuralı değil: "
+            "FAIL alan bir değişken çok değişkenli modelde anlamlı olabilir, "
+            "bu yüzden otomatik atılmayacak. Gerçek eleme yalnızca teknik "
+            "kusurlar için yapılacak.\n\n"
+            "%s kolon taranacak, birkaç dakika sürebilir. Başlayayım mı?"
+            % (_ond(sfa_mod.IV_ESIK, 2), _ond(sfa_mod.C_ESIK, 2),
+               _ond(sfa_mod.PSI_ESIK, 2), psi_not, _sayi(p.get("kolon", 0))))
 
-    teshis = {
-        "cok_bos": cok_bos, "sabit": sabit,
-        "kimlik_gibi": kimlik_gibi, "sizinti": sizinti,
-        "psi_var": oot_maske is not None,
+
+def analiz_uygula(durum):
+    df = _df_oku(durum["veri_seti"])
+    m = durum["meta"]
+
+    oot_maske = None
+    oot = durum.get("_oot_deger")
+    if oot and m.get("donem") in df.columns:
+        oot_maske = df[m["donem"]].astype(str) == str(oot)
+
+    haric = set(durum.get("haric_kolonlar") or []) | {m.get("id"), m.get("donem")}
+    tablo, teshis = sfa_mod.calistir(df, m["target"],
+                                     haric={h for h in haric if h},
+                                     oot_maske=oot_maske)
+
+    hedef_ds = "%s_SFA" % durum["veri_seti"]
+    try:
+        dataiku.Dataset(hedef_ds).write_with_schema(tablo)
+        yazildi = hedef_ds
+    except Exception as e:
+        yazildi = None
+        _folder().upload_stream("/sfa_tablosu.csv",
+                                tablo.to_csv(index=False).encode("utf-8"))
+
+    gecen = tablo[tablo["SFA_RESULT"] == "PASS"] if len(tablo) else tablo
+    en_iyi = [(r["FEATURE"], r["IV"]) for _, r in tablo.head(15).iterrows()] \
+        if len(tablo) else []
+
+    durum["sfa"] = {
+        "analiz_edilen": int(len(tablo)),
+        "pass_adet": int(len(gecen)),
+        "en_iyi": en_iyi,
+        "teshis": teshis,
+        "tablo_dataset": yazildi,
     }
-    return tablo, teshis
+
+    satirlar = []
+    for _, r in tablo.head(12).iterrows():
+        satirlar.append("  %-30s %-12s IV %-7s C %-7s PSI %-7s %s"
+                        % (str(r["FEATURE"])[:30], r["TYPE"],
+                           _ond(r["IV"], 3), _ond(r["C_VALUE"], 3),
+                           _ond(r["PSI"], 3), r["SFA_RESULT"]))
+
+    nerede = ("%s veri setine yazıldı" % yazildi if yazildi
+              else "PROJE_HAFIZASI/sfa_tablosu.csv dosyasına yazıldı")
+
+    return ("SFA tamamlandı. %s değişken analiz edildi, %s tanesi PASS.\n\n"
+            "IV'YE GÖRE İLK 12\n%s\n\n"
+            "TEKNİK KUSURLAR (elenecek)\n%s\n%s\n%s\n%s\n\n"
+            "Tam tablo %s."
+            % (_sayi(len(tablo)), _sayi(len(gecen)),
+               "\n".join(satirlar) or "  (tablo boş)",
+               _liste("  Aşırı null:", teshis["cok_bos"], 8),
+               _liste("  Sabit:", teshis["sabit"], 8),
+               _liste("  Kimlik benzeri:", teshis["kimlik_gibi"], 8),
+               _liste("  Sızıntı şüpheli:", teshis["sizinti"], 8),
+               nerede))
 
 
+# ===========================================================================
+# 04 — BAZ VERI SETI
+# ===========================================================================
+def baz_plan(durum):
+    t = (durum.get("sfa") or {}).get("teshis") or {}
+    dusur = sorted(set(t.get("cok_bos", []) + t.get("sabit", []) +
+                       t.get("kimlik_gibi", []) + t.get("sizinti", [])))
+    durum["_dusurulecek"] = dusur
+    return ("Baz veri setini oluşturacağım — bundan sonraki tüm üretim bu "
+            "donmuş set üzerinde yapılacak.\n\n"
+            "  DÜŞÜR (%s kolon)\n"
+            "    aşırı null %s · sabit %s · kimlik benzeri %s · sızıntı %s\n\n"
+            "  DOLDUR\n"
+            "    kalan sayısal kolonlardaki boşluklar medyan ile\n"
+            "    (medyan, ortalamanın aksine uç değerlerden etkilenmez)\n\n"
+            "  YAZ\n"
+            "    %s_BAZ\n\n"
+            "SFA'da FAIL alan ama teknik kusuru olmayan değişkenler "
+            "kalıyor — bunlar kombinasyon içinde işe yarayabilir.\n\n"
+            "Oluşturayım mı?"
+            % (_sayi(len(dusur)), _sayi(len(t.get("cok_bos", []))),
+               _sayi(len(t.get("sabit", []))), _sayi(len(t.get("kimlik_gibi", []))),
+               _sayi(len(t.get("sizinti", []))), durum["veri_seti"]))
 
 
+def baz_uygula(durum):
+    df = _df_oku(durum["veri_seti"])
+    dusur = [c for c in (durum.get("_dusurulecek") or []) if c in df.columns]
+    df = df.drop(columns=dusur)
+
+    for k in df.select_dtypes(include=[np.number]).columns:
+        med = df[k].median()
+        if not pd.isna(med):
+            df[k] = df[k].fillna(med)
+
+    baz_ds = "%s_BAZ" % durum["veri_seti"]
+    dataiku.Dataset(baz_ds).write_with_schema(df)
+
+    haric = set(durum.get("haric_kolonlar") or []) | set(dusur)
+    durum["haric_kolonlar"] = sorted(haric)
+    durum["baz"] = {"dataset": baz_ds, "doldurma": "medyan",
+                    "kolon": int(df.shape[1])}
+
+    return ("Baz veri seti hazır: %s — %s kolon.\n"
+            "%s kolon düşürüldü, kalan sayısal kolonlar medyan ile dolduruldu."
+            % (baz_ds, _sayi(df.shape[1]), _sayi(len(dusur))))
 
 
+# ===========================================================================
+# 05 — GELENEKSEL URETIM   <-- LLM #1
+# ===========================================================================
+def gelenekse_plan(durum):
+    sz = _df_oku(durum["sozluk"])
+    plan = llm_mod.gelenekse_plan_oner(
+        sozluk_df=sz, haric=durum.get("haric_kolonlar", []),
+        meta=durum.get("meta", {}))
+    durum["plan"] = plan
+
+    if not plan:
+        return ("Kullanılabilir bir plan çıkaramadım. \"onay\" deyip bu adımı "
+                "geçebilir ya da \"geri\" deyip baz sete dönebiliriz.")
+
+    kirilim = {}
+    for p in plan:
+        kirilim[p["donusum"]] = kirilim.get(p["donusum"], 0) + 1
+
+    satirlar = []
+    for i, p in enumerate(plan, 1):
+        satirlar.append("  %2d. %-24s → %-7s (%s kolon)"
+                        % (i, p["ad"][:24], p["donusum"], _sayi(len(p["kolonlar"]))))
+        if p.get("gerekce"):
+            satirlar.append("      %s" % p["gerekce"][:88])
+
+    toplam = sum(len(p["kolonlar"]) for p in plan)
+    return ("Sözlüğü inceledim. %s dönüşüm fırsatı belirledim (%s):\n\n%s\n\n"
+            "Yaklaşık %s yeni kolon üretir.\n\n"
+            "Hepsi için \"onay\", seçmek için numara yazın: örn. \"1,3,5 onay\""
+            % (_sayi(len(plan)),
+               " · ".join("%s %s" % (v, k) for k, v in sorted(kirilim.items())),
+               "\n".join(satirlar), _sayi(toplam)))
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# LLM #2 — SERBEST KESIF (kisitli gramer)
-# ---------------------------------------------------------------------------
-SISTEM_IFADE = """Sen bir feature engineering danismanisin.
-Sana kolon adlari, aciklamalari ve tek degiskenli analiz sonuclari verilecek.
-Gorevin, hedefi daha iyi aciklayabilecek YENI degisken hipotezleri uretmek.
-
-Python KODU YAZMA. Sadece asagidaki gramere uyan bir ifade yaz:
-  operatorler : + - * /
-  fonksiyonlar: log1p(x), abs(x), sqrt(x), rank(x), clip(x, alt, ust), fark(a, b)
-  sayisal sabitler kullanilabilir
-  degisken adlari SANA VERILEN listeden AYNEN kopyalanmali
-
-CIKTI KURALI: Cevabin SADECE JSON dizisi olsun. Aciklama, muhakeme, kod
-blogu YAZMA. Format:
-[{"ad":"gelir_borc_orani","ifade":"KOL_A / KOL_B","gerekce":"..."}]
-
-Kurallar:
-- "ad" kucuk harf, Turkce karakter yok, bosluk yerine alt cizgi.
-- Onerilerin geleneksel donusumlerden (tek kolonun logu, ardisik iki
-  kolonun farki) FARKLI olsun; kolonlari birlestir, oranla, etkilesim kur.
-- Payda sifir olabiliyorsa +1 ekle: KOL_A / (KOL_B + 1)
-- En fazla 12 oneri."""
-
-
-def kesif_ifade_oner(sozluk_df, kolonlar, meta, sfa_ozet=None, max_satir=250):
-    """Serbest degisken hipotezleri. Doner: [{"ad","ifade","gerekce"}]
-    Ifadeler burada DOGRULANMAZ; dogrulamayi fe_agent.ifade yapar."""
-    ad_kol, ack_kol = sozluk_df.columns[0], sozluk_df.columns[1]
-    gecerli = set(kolonlar)
-
-    kayitlar = []
-    for _, r in sozluk_df.head(max_satir).iterrows():
-        k = str(r[ad_kol])
-        if k in gecerli:
-            kayitlar.append("%s: %s" % (k, str(r[ack_kol])[:100]))
-
-    istek = "Hedef degisken: %s\n\n" % meta.get("target", "?")
-    if sfa_ozet:
-        istek += ("Tek degiskenli analizde en guclu kolonlar:\n%s\n\n"
-                  % "\n".join("  %s (IV=%s)" % (c, v) for c, v in sfa_ozet[:15]))
-    istek += "Kullanilabilir kolonlar:\n%s" % "\n".join(kayitlar)
-
-    ham = _cagir(SISTEM_IFADE, istek, sicaklik=0.6)
-    oneriler = _json_ayristir(ham, [])
-
-    temiz = []
-    for o in (oneriler if isinstance(oneriler, list) else []):
-        if not isinstance(o, dict):
+def _tekli(df, kolonlar, d):
+    y = {}
+    for k in kolonlar:
+        if k not in df.columns:
             continue
-        ad = str(o.get("ad") or "").strip()
-        ifd = str(o.get("ifade") or "").strip()
-        if not ad or not ifd:
+        s = pd.to_numeric(df[k], errors="coerce")
+        if d == "log":    y["%s__LOG" % k] = np.log1p(s.clip(lower=0))
+        elif d == "rank": y["%s__RANK" % k] = s.rank(pct=True)
+        elif d == "winsor": y["%s__WNS" % k] = s.clip(s.quantile(.01), s.quantile(.99))
+    return y
+
+
+def _ikili(df, kolonlar, d):
+    y = {}
+    for i in range(len(kolonlar) - 1):
+        a, b = kolonlar[i], kolonlar[i + 1]
+        if a not in df.columns or b not in df.columns:
             continue
-        ad = re.sub(r"[^A-Za-z0-9_]", "_", ad).strip("_").lower()[:48]
-        if not ad:
-            continue
-        temiz.append({"ad": ad, "ifade": ifd, "gerekce": str(o.get("gerekce", ""))[:120]})
-    return temiz[:12]
+        sa = pd.to_numeric(df[a], errors="coerce")
+        sb = pd.to_numeric(df[b], errors="coerce")
+        if d == "delta":  y["%s__MINUS__%s" % (a, b)] = sa - sb
+        elif d == "oran": y["%s__DIV__%s" % (a, b)] = sa / sb.replace(0, np.nan)
+    return y
 
 
+# Her donusumun esdegeri ifade grameri — kod uretimi icin
+_IFADE_SABLON = {
+    "log":    ("%s__LOG",          "log1p({0})"),
+    "rank":   ("%s__RANK",         "rank({0})"),
+    "winsor": ("%s__WNS",          "clip({0}, 0, 0)"),   # sinirlar kodda ayri
+    "delta":  ("%s__MINUS__%s",    "fark({0}, {1})"),
+    "oran":   ("%s__DIV__%s",      "{0} / {1}"),
+}
 
 
+def gelenekse_uygula(durum, secim=None):
+    plan = durum.get("plan") or []
+    if secim is not None:
+        plan = [p for i, p in enumerate(plan) if i in set(secim)]
+    if not plan:
+        return "Bu adımda üretim yapılmadı."
+
+    baz = (durum.get("baz") or {}).get("dataset") or durum["veri_seti"]
+    df = _df_oku(baz)
+
+    uretilen, kod_satirlari = {}, []
+    for p in plan:
+        d, kolonlar = p["donusum"], p["kolonlar"]
+        if d in ("delta", "oran"):
+            yeni = _ikili(df, kolonlar, d)
+            for i in range(len(kolonlar) - 1):
+                a, b = kolonlar[i], kolonlar[i + 1]
+                ad = ("%s__MINUS__%s" if d == "delta" else "%s__DIV__%s") % (a, b)
+                if ad in yeni:
+                    ifd = ("fark(%s, %s)" if d == "delta" else "%s / %s") % (a, b)
+                    kod_satirlari.append((ad, ifade_mod.python_kodu(ad, ifd),
+                                          "%s — %s" % (p["ad"], p.get("gerekce", ""))))
+        else:
+            yeni = _tekli(df, kolonlar, d)
+            for k in kolonlar:
+                for sonek, ifd in (("__LOG", "log1p(%s)" % k),
+                                   ("__RANK", "rank(%s)" % k)):
+                    ad = k + sonek
+                    if ad in yeni:
+                        kod_satirlari.append((ad, ifade_mod.python_kodu(ad, ifd),
+                                              "%s — %s" % (p["ad"], p.get("gerekce", ""))))
+                ad = k + "__WNS"
+                if ad in yeni:
+                    kod_satirlari.append((
+                        ad,
+                        'df["%s"] = _s(df, "%s").clip(_s(df, "%s").quantile(0.01), '
+                        '_s(df, "%s").quantile(0.99))' % (ad, k, k, k),
+                        "%s — %s" % (p["ad"], p.get("gerekce", ""))))
+        uretilen.update(yeni)
+
+    for ad, seri in uretilen.items():
+        df[ad] = seri
+
+    hedef = "%s_ENRICHED" % durum["veri_seti"]
+    dataiku.Dataset(hedef).write_with_schema(df)
+
+    durum["uretilen"] = sorted(set(durum.get("uretilen") or []) | set(uretilen))
+    bloklar = durum.get("kod_bloklari") or []
+    bloklar.append(["Geleneksel dönüşümler", kod_satirlari])
+    durum["kod_bloklari"] = bloklar
+
+    return ("%s dönüşümden %s yeni kolon ürettim, %s veri setine yazdım."
+            % (_sayi(len(plan)), _sayi(len(uretilen)), hedef))
 
 
+# ===========================================================================
+# 06 — SERBEST KESIF   <-- LLM #2 (kisitli gramer)
+# ===========================================================================
+def kesif_plan(durum):
+    baz = (durum.get("baz") or {}).get("dataset") or durum["veri_seti"]
+    df = _df_oku(baz, limit=100)
+    kolonlar = list(df.columns)
+    sz = _df_oku(durum["sozluk"])
+
+    ham = llm_mod.kesif_ifade_oner(
+        sozluk_df=sz, kolonlar=kolonlar, meta=durum.get("meta", {}),
+        sfa_ozet=(durum.get("sfa") or {}).get("en_iyi"))
+
+    gecerli, reddedilen = [], []
+    for o in ham:
+        ok, hata, kullanilan = ifade_mod.dogrula(o["ifade"], kolonlar)
+        if ok:
+            o["kolonlar"] = kullanilan
+            o["kod"] = ifade_mod.python_kodu(o["ad"], o["ifade"])
+            gecerli.append(o)
+        else:
+            reddedilen.append((o.get("ad", "?"), hata))
+
+    durum["hipotez"] = gecerli
+    if not gecerli:
+        return ("Model bu turda geçerli bir hipotez üretemedi.\n%s\n\n"
+                "\"onay\" deyip bu adımı geçebiliriz."
+                % _liste("Reddedilenler:", ["%s — %s" % r for r in reddedilen], 6))
+
+    satirlar = []
+    for i, o in enumerate(gecerli, 1):
+        satirlar.append("  %2d. %s" % (i, o["ad"]))
+        satirlar.append("      %s" % o["ifade"])
+        if o.get("gerekce"):
+            satirlar.append("      %s" % o["gerekce"][:88])
+
+    red_not = ("\n\n%s" % _liste("Grameri geçemeyen öneriler (atıldı):",
+                                 ["%s — %s" % r for r in reddedilen], 5)
+               ) if reddedilen else ""
+
+    return ("Serbest keşif: model %s hipotez üretti. Her ifade denetimden "
+            "geçti — kullanılan tüm kolonlar tabloda mevcut, yalnızca izinli "
+            "operatörler var.\n\n%s%s\n\n"
+            "Üretirken her birinin Python kodunu da yazacağım.\n\n"
+            "Hepsi için \"onay\", seçmek için numara yazın: örn. \"2,4 onay\""
+            % (_sayi(len(gecerli)), "\n".join(satirlar), red_not))
 
 
+def kesif_uygula(durum, secim=None):
+    hipotez = durum.get("hipotez") or []
+    if secim is not None:
+        hipotez = [h for i, h in enumerate(hipotez) if i in set(secim)]
+    if not hipotez:
+        return "Bu adımda üretim yapılmadı."
+
+    hedef = "%s_ENRICHED" % durum["veri_seti"]
+    kaynak = hedef if _dataset_var_mi(hedef) else \
+        ((durum.get("baz") or {}).get("dataset") or durum["veri_seti"])
+    df = _df_oku(kaynak)
+
+    uretilen, kod_satirlari, hatali = [], [], []
+    for h in hipotez:
+        try:
+            df[h["ad"]] = ifade_mod.degerlendir(df, h["ifade"])
+            uretilen.append(h["ad"])
+            kod_satirlari.append((h["ad"], h["kod"],
+                                  "%s  |  %s" % (h["ifade"], h.get("gerekce", ""))))
+        except Exception as e:
+            hatali.append((h["ad"], str(e)[:60]))
+
+    dataiku.Dataset(hedef).write_with_schema(df)
+    durum["uretilen"] = sorted(set(durum.get("uretilen") or []) | set(uretilen))
+
+    bloklar = durum.get("kod_bloklari") or []
+    bloklar.append(["Serbest keşif (yapay zekâ hipotezleri)", kod_satirlari])
+    durum["kod_bloklari"] = bloklar
+
+    # Tum uretimin Python scripti
+    script = ifade_mod.script_olustur(
+        kaynak_dataset=(durum.get("baz") or {}).get("dataset") or durum["veri_seti"],
+        hedef_dataset=hedef,
+        doldurma=(durum.get("baz") or {}).get("doldurma"),
+        bloklar=[(b[0], b[1]) for b in bloklar])
+    _folder().upload_stream("/uretim_kodu.py", script.encode("utf-8"))
+
+    hata_not = ("\n%s" % _liste("Hesaplanamayanlar:",
+                                ["%s — %s" % h for h in hatali], 5)) if hatali else ""
+
+    return ("%s hipotez üretildi ve %s veri setine yazıldı.%s\n\n"
+            "Tüm üretimin Python kodu PROJE_HAFIZASI/uretim_kodu.py dosyasına "
+            "yazıldı — indirip notebook'ta olduğu gibi çalıştırabilirsiniz."
+            % (_sayi(len(uretilen)), hedef, hata_not))
 
 
+# ===========================================================================
+# 07 — KALITE KONTROLU
+# ===========================================================================
+def kalite_plan(durum):
+    return ("İki adımda ürettiğim toplam %s kolonu birlikte elemeden "
+            "geçireceğim:\n\n"
+            "  • yarıdan fazlası boş olanlar\n"
+            "  • tek değer taşıyanlar\n"
+            "  • hedefle korelasyonu 0,95 üstü olanlar (sızıntı şüphesi)\n\n"
+            "Çalıştırayım mı?" % _sayi(len(durum.get("uretilen", []))))
 
 
+def kalite_uygula(durum):
+    df = _df_oku("%s_ENRICHED" % durum["veri_seti"])
+    y = pd.to_numeric(df[durum["meta"]["target"]], errors="coerce")
+    yeni = [c for c in durum.get("uretilen", []) if c in df.columns]
+
+    eksik, sabit, sizinti = [], [], []
+    for c in yeni:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.isna().mean() > 0.5:
+            eksik.append(c); continue
+        if s.nunique(dropna=True) <= 1:
+            sabit.append(c); continue
+        kor = s.corr(y)
+        if kor is not None and not pd.isna(kor) and abs(kor) > 0.95:
+            sizinti.append(c)
+
+    elendi = set(eksik) | set(sabit) | set(sizinti)
+    durum["kalite"] = {"eksik": eksik, "sabit": sabit, "sizinti": sizinti,
+                       "gecti": [c for c in yeni if c not in elendi]}
+
+    return (_liste("Çok fazla boş:", eksik) + "\n\n" +
+            _liste("Tek değerli:", sabit) + "\n\n" +
+            _liste("Sızıntı şüpheli:", sizinti) +
+            "\n\n%s kolon geçti, %s kolon elendi."
+            % (_sayi(len(yeni) - len(elendi)), _sayi(len(elendi))))
 
 
+# ===========================================================================
+# 08 — MODEL DEGERLENDIRMESI
+# ===========================================================================
+def model_plan(durum):
+    k = durum.get("kalite") or {}
+    p = durum.get("profil") or {}
+    return ("Son adım: baz set ile zenginleştirilmiş seti aynı bölme ve aynı "
+            "algoritmayla karşılaştıracağım.\n\n"
+            "  Baseline : %s kolon\n"
+            "  Enhanced : %s kolon  (+%s yeni)\n\n"
+            "Uzun sürdüğü için '%s' senaryosu tetiklenecek. Senaryo hazır "
+            "değilse \"red\" deyip geçebiliriz."
+            % (_sayi((durum.get("baz") or {}).get("kolon", p.get("kolon", 0))),
+               _sayi((durum.get("baz") or {}).get("kolon", 0) + len(k.get("gecti") or [])),
+               _sayi(len(k.get("gecti") or [])), MODEL_SENARYO))
 
 
+def model_uygula(durum):
+    try:
+        proje = dataiku.api_client().get_default_project()
+        proje.get_scenario(MODEL_SENARYO).run_and_wait()
+    except Exception as e:
+        return "Senaryoyu çalıştıramadım: %s\nBu adımı atlıyorum." % e
+    durum["model"] = {"tetiklendi": True,
+                      "tarih": datetime.datetime.now().isoformat()}
+    return "Senaryo çalıştı. Sonuçları Flow üzerinden inceleyebilirsiniz."
 
 
+# ===========================================================================
+# ADIM KAYIT DEFTERI
+# ===========================================================================
+ADIMLAR = {
+    "kurulum": {
+        "baslik": "Çalışma Kurulumu",
+        "aciklama": "Veri seti ve değişken sözlüğü seçilir; boyut ve tip "
+                    "dağılımı çıkarılır, sözlük kapsamı ölçülür. Açıklaması "
+                    "olmayan kolonlar kapsam dışına alınır.",
+        "girdi": kurulum_girdi, "plan": kurulum_plan, "uygula": kurulum_uygula},
+    "meta": {
+        "baslik": "Meta Tanımı",
+        "aciklama": "Hedef değişken, kimlik ve dönem kolonu belirlenir. Dönem "
+                    "kolonu PSI için gelişim/OOT bölmesini tanımlar.",
+        "girdi": meta_girdi, "plan": meta_plan, "uygula": meta_uygula},
+    "analiz": {
+        "baslik": "Veri Analizi (SFA)",
+        "aciklama": "Her değişken tek başına incelenir: null oranı, imputation "
+                    "kararı, encoding, IV, C-value ve PSI. Sonuç tek bir "
+                    "tabloya yazılır. SFA eleme kuralı değildir — raporlar.",
+        "girdi": None, "plan": analiz_plan, "uygula": analiz_uygula},
+    "baz": {
+        "baslik": "Baz Veri Seti",
+        "aciklama": "Teknik kusurlu kolonlar düşürülür, boşluklar doldurulur "
+                    "ve çalışma seti dondurulur. Sonraki tüm üretim bu set "
+                    "üzerinde yapılır; kaynak tablo değişmez.",
+        "girdi": None, "plan": baz_plan, "uygula": baz_uygula},
+    "gelenekse": {
+        "baslik": "Geleneksel Üretim",
+        "aciklama": "Yapay zekâ kolon açıklamalarını okuyup hangi aileye fark, "
+                    "oran, log, sıralama veya budama uygulanacağını önerir. "
+                    "Seçtiklerinizi Python üretir ve kodunu yazar.",
+        "girdi": None, "plan": gelenekse_plan, "uygula": gelenekse_uygula},
+    "kesif": {
+        "baslik": "Serbest Keşif",
+        "aciklama": "Yapay zekâ kalıpların dışında değişken hipotezleri üretir. "
+                    "Kod yazmaz; kısıtlı bir ifade grameri kullanır ve her "
+                    "ifade denetimden geçirilir. Geçenler Python'a derlenip "
+                    "üretilir.",
+        "girdi": None, "plan": kesif_plan, "uygula": kesif_uygula},
+    "kalite": {
+        "baslik": "Kalite Kontrolü",
+        "aciklama": "İki üretim adımının çıktısı birlikte denetlenir: boşluk "
+                    "oranı, sabitlik ve hedefle aşırı korelasyon.",
+        "girdi": None, "plan": kalite_plan, "uygula": kalite_uygula},
+    "model": {
+        "baslik": "Model Değerlendirmesi",
+        "aciklama": "Baz set ile zenginleştirilmiş set aynı bölme ve aynı "
+                    "algoritmayla karşılaştırılır; yeni değişkenlerin katkısı "
+                    "ölçülür.",
+        "girdi": None, "plan": model_plan, "uygula": model_uygula},
+}
+
+# uygula() fonksiyonu secim parametresi alan adimlar
+SECIMLI = {"gelenekse", "kesif"}
 
 
+# ===========================================================================
+# ANA DONGU
+# ===========================================================================
+def _adima_gir(durum):
+    adim = ADIMLAR[ADIM_SIRASI[durum["i"]]]
+    if adim["girdi"] is not None:
+        durum["bekleyen"] = "girdi"
+        _, soru = adim["girdi"](durum, "")
+        return soru or "Devam etmek için bilgi vermeniz gerekiyor."
+    durum["bekleyen"] = "onay"
+    return adim["plan"](durum)
 
+
+def _adet(durum, anahtar):
+    return len(durum.get("plan" if anahtar == "gelenekse" else "hipotez") or [])
+
+
+def mesaj_isle(durum, mesaj):
+    mesaj = (mesaj or "").strip()
+    norm = niyet_kural.normalize(mesaj)
+    anahtar = ADIM_SIRASI[durum["i"]]
+    adim = ADIMLAR[anahtar]
+
+    if GERI_KALIP.search(norm):
+        if durum["i"] == 0:
+            return "Zaten ilk adımdayız."
+        durum["i"] -= 1
+        return ("Tamam, \"%s\" adımına dönüyorum.\n\n"
+                % ADIMLAR[ADIM_SIRASI[durum["i"]]]["baslik"]) + _adima_gir(durum)
+
+    if durum["bekleyen"] == "girdi":
+        tamam, uyari = adim["girdi"](durum, mesaj)
+        if not tamam:
+            return uyari
+        durum["bekleyen"] = "onay"
+        return adim["plan"](durum)
+
+    sonuc = niyet_kural.coz(mesaj)
+
+    if sonuc["aksiyon"] == "onay":
+        if anahtar in SECIMLI:
+            secim = _secim_ayikla(mesaj, _adet(durum, anahtar))
+            cikti = adim["uygula"](durum, secim)
+        else:
+            cikti = adim["uygula"](durum)
+        if durum["i"] >= len(ADIM_SIRASI) - 1:
+            return cikti + "\n\nSüreç tamamlandı. Üretim kodu " \
+                           "PROJE_HAFIZASI/uretim_kodu.py dosyasında."
+        durum["i"] += 1
+        return cikti + "\n\n" + _adima_gir(durum)
+
+    if sonuc["aksiyon"] == "ret":
+        return ("Anladım, uygulamadım. Neyi değiştirmemi istersiniz? "
+                "İstediğinizi yazabilir ya da \"geri\" diyebilirsiniz.")
+
+    return ("Şu an \"%s\" adımındayım. \"onay\", \"red\" ya da \"geri\" "
+            "diyebilirsiniz." % adim["baslik"])
