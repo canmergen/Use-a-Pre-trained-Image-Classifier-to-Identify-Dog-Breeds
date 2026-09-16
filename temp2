@@ -1,111 +1,180 @@
-# -*- coding: utf-8 -*-
-"""fe_agent/senaryo.py — webapp ile Dataiku senaryosu arasindaki el sikisma.
-
-Webapp uzun islemi kendi icinde calistiramaz (Flask timeout). Bunun yerine:
-  1) webapp  -> konfigurasyonu PROJE_HAFIZASI'na yazar
-  2) webapp  -> senaryoyu tetikler ve bitmesini bekler
-  3) senaryo -> ayni folder'dan konfigurasyonu okur, isi yapar
-  4) senaryo -> sonucu folder'a yazar
-  5) webapp  -> sonucu okur ve kullaniciya gosterir
-
-Iki taraf da bu modulu kullanir; dosya adlari tek yerde tanimli.
-"""
-
-import json
-import datetime
-
-import dataiku
-
-HAFIZA_FOLDER = "PROJE_HAFIZASI"
-
-# Senaryo adlari — Dataiku'da olusturdugun senaryolarla AYNI olmali
-SENARYO_ALGORITMA = "ALGORITMA_SECIMI"
-SENARYO_FINAL = "FINAL_MODEL"
-
-_KONFIG = "/senaryo_%s_konfig.json"
-_SONUC = "/senaryo_%s_sonuc.json"
+# ===========================================================================
+# ADIM 5.2: ALGORITMA SECIMI   (Dataiku senaryosunda calisir)
+# ===========================================================================
+ALGORITMALAR = ["Lojistik Regresyon", "Random Forest",
+                "Gradient Boosting", "XGBoost"]
 
 
-def _folder():
-    return dataiku.Folder(HAFIZA_FOLDER)
+def algoritma_plan(durum):
+    baz = len((durum.get("baz") or {}).get("kolonlar") or [])
+    yeni = len((durum.get("secim") or {}).get("secilen_liste") or [])
+    b = durum.get("bolme") or {}
+    bolme_ad = ("zamansal — test dönemi %s" % b.get("oot_deger")) \
+        if b.get("tur") == "zamansal" else "rastgele %%80 / %%20"
+
+    return ("Hangi algoritmanın bu veriye uyduğunu ölçeceğiz. Dört aday "
+            "aynı değişken seti, aynı bölme ve aynı seed ile eğitilecek; "
+            "tek fark algoritma olacak.\n\n"
+            "  Adaylar    : %s\n"
+            "  Değişken   : %s  (%s baz + %s yeni)\n"
+            "  Bölme      : %s\n"
+            "  Metrikler  : ROC-AUC, Gini, KS, eğitim süresi\n\n"
+            "Eğitim uzun sürdüğü için '%s' senaryosunu tetikleyeceğim; "
+            "webapp sonucu bekleyecek. Senaryo hazır değilse bu adımı "
+            "geçebiliriz.\n\n"
+            "Başlayalım mı?"
+            % (" · ".join(ALGORITMALAR), _sayi(baz + yeni), _sayi(baz),
+               _sayi(yeni), bolme_ad, senaryo_mod.SENARYO_ALGORITMA))
 
 
-def _oku(yol, varsayilan=None):
-    try:
-        with _folder().get_download_stream(yol) as s:
-            return json.loads(s.read().decode("utf-8"))
-    except Exception:
-        return varsayilan
+def algoritma_uygula(durum):
+    konfig = {
+        "veri_seti": "%s_ENRICHED" % durum["veri_seti"],
+        "target": durum["meta"]["target"],
+        "baz_kolonlar": (durum.get("baz") or {}).get("kolonlar") or [],
+        "yeni_kolonlar": (durum.get("secim") or {}).get("secilen_liste") or [],
+        "bolme": durum.get("bolme") or {},
+        "meta": durum.get("meta") or {},
+        "adaylar": ALGORITMALAR,
+    }
 
+    sonuc, hata = senaryo_mod.calistir(
+        senaryo_mod.SENARYO_ALGORITMA, "algoritma", konfig)
 
-def _yaz(yol, veri):
-    govde = json.dumps(veri, ensure_ascii=False, indent=2, default=str)
-    _folder().upload_stream(yol, govde.encode("utf-8"))
+    if hata:
+        durum["algoritma"] = {"hata": hata}
+        return "%s\n\nBu adımı şimdilik atlıyorum." % hata
+
+    durum["algoritma"] = sonuc
+
+    satirlar = []
+    for s in sonuc.get("siralama", []):
+        satirlar.append("  %-22s AUC %-8s Gini %-8s KS %-8s %ss"
+                        % (s["ad"][:22], _ond(s["auc"], 4), _ond(s["gini"], 4),
+                           _ond(s["ks"], 4), _ond(s.get("sure", 0), 1)))
+
+    kazanan = sonuc.get("kazanan") or {}
+    return ("Karşılaştırma tamamlandı. %s satırla eğitildi.\n\n"
+            "AYRIŞTIRMA GÜCÜNE GÖRE SIRALAMA\n%s\n\n"
+            "Önerim: %s — en yüksek ROC-AUC (%s) ve kabul edilebilir "
+            "eğitim süresi.\n\n"
+            "Final modelde bu algoritmayla devam edeceğim. Başka bir "
+            "algoritma tercih ederseniz adını yazabilirsiniz."
+            % (_sayi(sonuc.get("egitim_satir", 0)),
+               "\n".join(satirlar) or "  (sonuç boş)",
+               kazanan.get("ad", "—"), _ond(kazanan.get("auc"), 4)))
 
 
 # ===========================================================================
-# WEBAPP TARAFI
+# ADIM 5.3: FINAL MODEL   (Dataiku senaryosunda calisir)
 # ===========================================================================
-def konfig_yaz(is_adi, konfig):
-    """Senaryoyu tetiklemeden once cagrilir."""
-    konfig = dict(konfig or {})
-    konfig["_yazilma"] = datetime.datetime.now().isoformat()
-    _yaz(_KONFIG % is_adi, konfig)
+def final_plan(durum):
+    a = durum.get("algoritma") or {}
+    kazanan = (a.get("kazanan") or {}).get("ad")
+
+    if not kazanan:
+        return ("Algoritma karşılaştırması yapılmadığı için varsayılan "
+                "algoritmayla (Gradient Boosting) devam edeceğim.\n\n"
+                "Final modeli eğitip kaydedeyim mi?")
+
+    yeni = len((durum.get("secim") or {}).get("secilen_liste") or [])
+    baz = len((durum.get("baz") or {}).get("kolonlar") or [])
+
+    return ("Son adım: seçilen modeli tam veriyle eğitip kullanıma hazır "
+            "hale getireceğim.\n\n"
+            "  Algoritma    : %s\n"
+            "  Değişken     : %s\n"
+            "  Doğrulama    : test setinde ölçülecek\n"
+            "  Hiperparam.  : küçük bir ızgara üzerinde ayarlanacak\n\n"
+            "Kaydedilecekler:\n"
+            "  %s_FINAL_MODEL    — eğitilmiş model dosyası\n"
+            "  %s_FINAL_SKOR     — test seti tahminleri\n"
+            "  %s_FINAL_ONEM     — değişken önem sıralaması\n\n"
+            "'%s' senaryosu tetiklenecek. Başlayalım mı?"
+            % (kazanan, _sayi(baz + yeni),
+               durum["veri_seti"], durum["veri_seti"], durum["veri_seti"],
+               senaryo_mod.SENARYO_FINAL))
 
 
-def sonuc_temizle(is_adi):
-    """Eski sonucu gecersiz kilar; senaryo patlarsa bir onceki kosunun
-    sonucunu yeni sonuc sanmayalim."""
-    _yaz(_SONUC % is_adi, {"durum": "bekliyor",
-                           "_temizlenme": datetime.datetime.now().isoformat()})
+def final_uygula(durum):
+    a = durum.get("algoritma") or {}
+    konfig = {
+        "veri_seti": "%s_ENRICHED" % durum["veri_seti"],
+        "cikti_onek": durum["veri_seti"],
+        "target": durum["meta"]["target"],
+        "baz_kolonlar": (durum.get("baz") or {}).get("kolonlar") or [],
+        "yeni_kolonlar": (durum.get("secim") or {}).get("secilen_liste") or [],
+        "bolme": durum.get("bolme") or {},
+        "meta": durum.get("meta") or {},
+        "algoritma": (a.get("kazanan") or {}).get("ad") or "Gradient Boosting",
+    }
+
+    sonuc, hata = senaryo_mod.calistir(
+        senaryo_mod.SENARYO_FINAL, "final", konfig)
+
+    if hata:
+        durum["final"] = {"hata": hata}
+        return "%s\n\nBu adımı şimdilik atlıyorum." % hata
+
+    durum["final"] = sonuc
+
+    m = sonuc.get("metrikler") or {}
+    onem = ["  %-34s %s" % (c[:34], _ond(v, 4))
+            for c, v in (sonuc.get("en_onemli") or [])[:10]]
+
+    return ("Final model hazır.\n\n"
+            "  Algoritma      : %s\n"
+            "  Eğitim / test  : %s / %s satır\n"
+            "  Değişken       : %s\n\n"
+            "TEST SETİ PERFORMANSI\n"
+            "  ROC-AUC        : %s\n  Gini           : %s\n"
+            "  KS             : %s\n\n"
+            "EN ÖNEMLİ 10 DEĞİŞKEN\n%s\n\n"
+            "Model %s veri setine, tahminler %s veri setine yazıldı."
+            % (sonuc.get("algoritma"), _sayi(sonuc.get("egitim_satir", 0)),
+               _sayi(sonuc.get("test_satir", 0)),
+               _sayi(sonuc.get("kolon_sayisi", 0)),
+               _ond(m.get("auc"), 4), _ond(m.get("gini"), 4), _ond(m.get("ks"), 4),
+               "\n".join(onem) or "  (önem bilgisi yok)",
+               sonuc.get("model_dataset", "—"), sonuc.get("skor_dataset", "—")))
 
 
-def calistir(senaryo_adi, is_adi, konfig):
-    """Konfigurasyonu yazar, senaryoyu tetikler, biter bitmez sonucu okur.
-
-    Doner: (sonuc_sozlugu, hata_metni)
-    """
-    konfig_yaz(is_adi, konfig)
-    sonuc_temizle(is_adi)
-
-    try:
-        proje = dataiku.api_client().get_default_project()
-        kosu = proje.get_scenario(senaryo_adi).run_and_wait()
-    except Exception as e:
-        return None, ("'%s' senaryosu çalıştırılamadı: %s" % (senaryo_adi, e))
-
-    sonuc = _oku(_SONUC % is_adi, {})
-    durum = (sonuc or {}).get("durum")
-
-    if durum == "tamam":
-        return sonuc, None
-    if durum == "hata":
-        return None, ("Senaryo bir hatayla durdu: %s"
-                      % sonuc.get("mesaj", "ayrıntı yok"))
-    return None, ("Senaryo çalıştı ama sonuç dosyası yazılmamış. "
-                  "Senaryo adımının kodunu kontrol eder misiniz?")
 
 
-# ===========================================================================
-# SENARYO TARAFI
-# ===========================================================================
-def konfig_al(is_adi):
-    """Senaryo icinde cagrilir; webapp'in biraktigi konfigurasyonu okur."""
-    k = _oku(_KONFIG % is_adi)
-    if not k:
-        raise RuntimeError(
-            "Konfigürasyon bulunamadı: PROJE_HAFIZASI%s. "
-            "Senaryo webapp'ten tetiklenmemiş olabilir." % (_KONFIG % is_adi))
-    return k
 
 
-def sonuc_yaz(is_adi, sonuc):
-    sonuc = dict(sonuc or {})
-    sonuc["durum"] = "tamam"
-    sonuc["_bitis"] = datetime.datetime.now().isoformat()
-    _yaz(_SONUC % is_adi, sonuc)
 
 
-def hata_yaz(is_adi, mesaj):
-    _yaz(_SONUC % is_adi, {"durum": "hata", "mesaj": str(mesaj)[:2000],
-                           "_bitis": datetime.datetime.now().isoformat()})
+
+
+
+    "algoritma": {
+        "baslik": "Algoritma Seçimi",
+        "aciklama": "Dört algoritma aynı değişken seti, aynı bölme ve aynı "
+                    "seed ile eğitilir; ayrıştırma gücü ve eğitim süresi "
+                    "karşılaştırılır. Uzun sürdüğü için Dataiku senaryosunda "
+                    "çalışır.",
+        "girdi": None, "plan": algoritma_plan, "uygula": algoritma_uygula},
+    "final": {
+        "baslik": "Final Model",
+        "aciklama": "Seçilen algoritma tam veriyle eğitilir, hiperparametreleri "
+                    "ayarlanır, test setinde doğrulanır ve kullanıma hazır "
+                    "biçimde kaydedilir.",
+        "girdi": None, "plan": final_plan, "uygula": final_uygula},
+
+
+
+
+
+
+
+    {"no": "05", "baslik": "Modelleme ve Final",
+     "ozet": "Katkı ölçümü, algoritma seçimi ve final model",
+     "adimlar": ["model", "algoritma", "final", "katalog"]},
+
+
+
+
+
+
+
