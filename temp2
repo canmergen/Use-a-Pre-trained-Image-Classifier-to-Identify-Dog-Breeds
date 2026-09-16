@@ -1,26 +1,92 @@
-  /* Kullanici balonu */
-  --user-zemin:  #FFFFFF;
-  --user-metin:  #000000;
-  --user-kenar:  #D8DCE3;
+import time
+import dataiku
+import psutil
+import pyarrow.fs as pafs
+import pyarrow.dataset as pads
 
+t0 = time.time()                                   # yükleme süresini ölçmek için başlangıç zamanı
 
+DATASET_NAME = "BKATBALTERNATIFVERISKORKARTIPROJECT.FPD_CS_GIDEN_EFT"
+S3_ENDPOINT  = "loscdlhp.aknet.akb:9000"           # kurum içi S3 (MinIO benzeri)
 
+# --- 1) Dataset'in S3'teki yerini ve erişim bilgilerini Dataiku'dan al ---
+d    = dataiku.Dataset(DATASET_NAME)
+loc  = d.get_location_info(sensitive_info=True)
+info = loc.get("info", {})
+print("Location info anahtarları:", list(info.keys()))
+print("Kaynak:", info.get("path"))
 
+root = info["path"].replace("s3://", "")           # pyarrow "s3://" öneki istemez
 
-  --user-zemin:  #000000;
-  --user-metin:  #FFFFFF;
-  --user-kenar:  #3A3A3A;
+def get_s3_credentials():
+    """Önce location info'dan, olmazsa connection API'sinden key'leri almaya çalışır."""
+    # a) location info içinde geldiyse
+    cp = info.get("connectionParams")
+    if cp and cp.get("accessKey"):
+        return {"access_key": cp["accessKey"],
+                "secret_key": cp["secretKey"],
+                "session_token": cp.get("sessionToken")}
 
+    # b) connection API'si üzerinden (yine "Details readable by" yetkisi gerekir)
+    try:
+        conn_name = d.get_config()["params"]["connection"]
+        print("Connection:", conn_name)
+        ci   = dataiku.api_client().get_connection(conn_name).get_info()
+        cred = ci.get_aws_credential()
+        return {"access_key": cred.get("accessKey"),
+                "secret_key": cred.get("secretKey"),
+                "session_token": cred.get("sessionToken")}
+    except Exception as e:
+        print("Connection bilgisi alınamadı:", repr(e))
+        return None
 
+creds = get_s3_credentials()
 
+# --- 2-5) Okuma ---
+vm0 = psutil.virtual_memory().used                 # RAM ölçümü için okuma öncesi seviye
 
+if creds and creds["access_key"]:
+    print("Yöntem: pyarrow (S3'ten doğrudan)")
+    s3 = pafs.S3FileSystem(
+        access_key              = creds["access_key"],
+        secret_key              = creds["secret_key"],
+        session_token           = creds["session_token"],
+        endpoint_override       = S3_ENDPOINT,
+        scheme                  = "https",
+        force_virtual_addressing= False,           # kurum içi S3'ler path-style kullanır
+    )
 
+    dset = pads.dataset(root, filesystem=s3, format="parquet")
+    print(f"Dataset Boyutu: {dset.count_rows():,} satır x {len(dset.schema)} sütun")
 
+    # Kolon tiplerini Dataiku şemasından al
+    sch = d.read_schema()
+    names, dtypes, date_idx = d.get_dataframe_schema_st(sch, int_as_float=True)
+    date_cols = {names[i] for i in date_idx} if date_idx else set()
 
-/* Kullanici: acik temada beyaz zemin/siyah yazi, koyu temada tersi */
-.satir.kullanici .balon {
-  background: var(--user-zemin); color: var(--user-metin);
-  border: 1px solid var(--user-kenar);
-  border-top-right-radius: 4px; font-size: 1em;
-  box-shadow: 0 3px 12px rgba(0,0,0,.3);
-}
+    tbl = dset.to_table(use_threads=True)          # tüm parquet parçalarını paralel indir
+    df  = tbl.to_pandas(self_destruct=True, split_blocks=True)
+    del tbl                                        # self_destruct'ın işe yaraması için referansı bırak
+
+    cast = {c: t for c, t in dtypes.items() if c in df.columns and c not in date_cols}
+    df   = df.astype(cast)[names]                  # Dataiku tiplerine çevir + şema sırasına diz
+else:
+    print("Yöntem: Dataiku native (key alınamadı, daha yavaş)")
+    df = d.get_dataframe(infer_with_pandas=False)
+
+# --- 6) Özet: süre, RAM, boyut ---
+_elapsed = time.time() - t0
+_vm      = psutil.virtual_memory()
+_ram_add = (_vm.used - vm0) / 1e9                  # sadece bu okuma adımının RAM maliyeti
+
+print(f"Yükleme süresi : {int(_elapsed//60)}dk {int(_elapsed%60)}sn")
+print(f"Bu adım RAM    : +{_ram_add:.1f} GB")
+print(f"Sunucu RAM     : {_vm.used/1e9:.0f} / {_vm.total/1e9:.0f} GB  (%{_vm.percent:.0f} dolu)")
+print(f"Kalan RAM      : {_vm.available/1e9:.0f} GB")
+print(f"\nDataFrame: {df.shape[0]:,} satır x {df.shape[1]:,} sütun")
+print(f"Dönemler : {sorted(df['DONEM'].dropna().astype(int).unique().tolist())}")
+print(f"Bellek   : {df.memory_usage(deep=True).sum() / 1e9:.1f} GB")
+
+df_raw = df.copy()                                 # HAM KOPYA (RAM'i iki katına çıkarır, aşağıdaki nota bak)
+
+display(df.head())
