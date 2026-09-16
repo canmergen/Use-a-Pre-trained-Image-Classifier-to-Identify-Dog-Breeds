@@ -1,629 +1,560 @@
-:root {
-  /* Akbank kirmizisi — logo yazisindan alindi */
-  --kirmizi:      #D51115;
-  --kirmizi-koyu: #A00D10;
-  --kirmizi-canli:#F51513;
-  --kirmizi-acik: #FDF2F2;
-
-  --zemin:        #F4F5F7;
-  --yuzey:        #FFFFFF;
-  --yuzey-alt:    #FAFAFB;
-  --sohbet-zemin: #6B0A0D;
-  --kenar:        #C9CED6;
-  --kenar-acik:   #EAEDF1;
-
-  /* Metin: tek ton — siyah */
-  --metin:        #000000;
-  --gri:          #000000;
-  --gri-acik:     #000000;
-
-  /* Bot balonu ve calisma karti — koyu marka tonu */
-  --bot-zemin:    #9E1418;
-
-  /* Kullanici balonu */
-  --user-zemin:   #FFFFFF;
-  --user-metin:   #000000;
-  --user-kenar:   #D8DCE3;
-
-  /* Sohbet icindeki acilir listeler */
-  --balon-zemin:  #FFFFFF;
-  --balon-metin:  #000000;
-  --balon-kenar:  #D8DCE3;
-
-  /* Giris kapsulu ve aksiyon butonlari */
-  --giris-zemin:  #FFFFFF;
-  --giris-metin:  #000000;
-  --gonder-zemin: #000000;
-  --gonder-metin: #FFFFFF;
-  --aksiyon-cerceve: #000000;
-
-  /* Sohbet arka plan gorseli — JS dolduruyor */
-  --sohbet-gorsel: none;
-  --sohbet-perde:  rgba(255,255,255,.72);
-
-  --yesil:        #0E9F5C;
-  --sari:         #EAB308;
-  --sari-koyu:    #000000;
-  --sari-acik:    #FDF6D3;
-  --golge:        rgba(0,0,0,.10);
-
-  --panel-en:   clamp(340px, 27vw, 480px);
-  --analiz-en:  clamp(320px, 24vw, 420px);
-  --yazi:       11.4px;
-  --avatar:     30px;
-  --girinti:    40px;
-  --ustbar-h:   108px;
-}
+# -*- coding: utf-8 -*-
+"""fe_agent/birlestirme.py — ham tablolari denetlenebilir bicimde birlestirir.
+
+LLM kod yazmaz; kisitli bir BIRLESTIRME PLANI uretir. Bu modul plani
+dogrular, Python ile yurutur ve her uretilen kolon icin soy kutugu
+(lineage) tutar: hangi tablodan, hangi anahtarla, hangi pencereyle,
+hangi fonksiyonla uretildi.
+
+TABLO TURLERI
+  ana    : bir satir = bir gozlem (anahtar + donem). Iskeletin kendisi.
+  boyut  : anahtar basina TEK satir. Dogrudan join edilir.
+  islem  : anahtar basina COK satir. Once toplanir, sonra join edilir.
+
+POINT-IN-TIME KURALI
+  Islem tablolarindan toplama yapilirken yalnizca gozlem doneminden
+  ONCEKI islemler kullanilir. Pencere [donem - N ay, donem) araligidir;
+  donem ayinin kendisi dahil DEGILDIR. Bu kural sizinti onlemenin
+  temelidir ve ihlal edilemez.
+"""
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# IZINLI GRAMER
+# ---------------------------------------------------------------------------
+FONKSIYONLAR = {
+    "sum":     ("toplam",              lambda s: s.sum()),
+    "mean":    ("ortalama",            lambda s: s.mean()),
+    "max":     ("maksimum",            lambda s: s.max()),
+    "min":     ("minimum",             lambda s: s.min()),
+    "std":     ("standart sapma",      lambda s: s.std()),
+    "count":   ("kayıt sayısı",        lambda s: s.count()),
+    "nunique": ("farklı değer sayısı", lambda s: s.nunique()),
+    "last":    ("son değer",           lambda s: s.iloc[-1] if len(s) else np.nan),
+}
+
+# Pencere -> kac ay geriye bakilacak. None = tum gecmis.
+PENCERELER = {
+    "son_1a":  1,
+    "son_3a":  3,
+    "son_6a":  6,
+    "son_12a": 12,
+    "tum":     None,
+}
+
+PENCERE_ADI = {
+    "son_1a": "son 1 ay", "son_3a": "son 3 ay", "son_6a": "son 6 ay",
+    "son_12a": "son 12 ay", "tum": "tüm geçmiş",
+}
+
+TURLER = ("ana", "boyut", "islem")
+MAX_KOLON = 4000          # uretilecek toplam kolon tavani
+
+
+# ---------------------------------------------------------------------------
+# DOGRULAMA
+# ---------------------------------------------------------------------------
+def _kolonlar(df):
+    return set(df.columns)
+
+
+def dogrula(plan, semalar):
+    """Plani semalara karsi dogrular.
+
+    semalar: {tablo_adi: [kolon listesi]}
+    Doner: (gecerli_plan, hatalar)  — hatali kaynaklar ayiklanir.
+    """
+    hatalar = []
+
+    ana = plan.get("ana_tablo") or {}
+    ana_ad = ana.get("ad")
+    if not ana_ad or ana_ad not in semalar:
+        return None, ["Ana tablo bulunamadı: %s" % ana_ad]
+
+    ana_kol = set(semalar[ana_ad])
+    anahtar = [k for k in (ana.get("anahtar") or []) if k]
+    if not anahtar:
+        return None, ["Ana tabloda anahtar tanımlanmadı."]
+    eksik = [k for k in anahtar if k not in ana_kol]
+    if eksik:
+        return None, ["Ana tabloda bulunmayan anahtar: %s" % ", ".join(eksik)]
+
+    donem = ana.get("donem_kolon")
+    if donem and donem not in ana_kol:
+        hatalar.append("Ana tabloda dönem kolonu yok: %s — pencereli toplama kapalı" % donem)
+        donem = None
+        ana["donem_kolon"] = None
+
+    gecerli_kaynaklar = []
+    uretilecek = 0
+
+    for k in (plan.get("kaynaklar") or []):
+        ad = k.get("ad")
+        if ad not in semalar:
+            hatalar.append("%s — tablo projede yok" % ad)
+            continue
+
+        tur = k.get("tur")
+        if tur not in TURLER:
+            hatalar.append("%s — geçersiz tablo türü: %s" % (ad, tur))
+            continue
+
+        kol = set(semalar[ad])
+        k_anahtar = [a for a in (k.get("anahtar") or []) if a]
+        if not k_anahtar:
+            hatalar.append("%s — anahtar tanımlanmadı" % ad)
+            continue
+        eksik = [a for a in k_anahtar if a not in kol]
+        if eksik:
+            hatalar.append("%s — tabloda bulunmayan anahtar: %s" % (ad, ", ".join(eksik)))
+            continue
+        # Anahtar ana tabloda da olmali
+        eksik = [a for a in k_anahtar if a not in ana_kol]
+        if eksik:
+            hatalar.append("%s — ana tabloda bulunmayan anahtar: %s" % (ad, ", ".join(eksik)))
+            continue
+
+        if tur == "boyut":
+            secilen = [c for c in (k.get("kolonlar") or []) if c in kol and c not in k_anahtar]
+            if not secilen:
+                hatalar.append("%s — alınacak geçerli kolon yok" % ad)
+                continue
+            k["kolonlar"] = secilen
+            uretilecek += len(secilen)
+            gecerli_kaynaklar.append(k)
+            continue
+
+        # tur == "islem"
+        t_donem = k.get("donem_kolon")
+        if t_donem and t_donem not in kol:
+            hatalar.append("%s — dönem kolonu tabloda yok: %s" % (ad, t_donem))
+            t_donem = None
+            k["donem_kolon"] = None
+
+        gecerli_top = []
+        for t in (k.get("toplamalar") or []):
+            kaynak_kol = t.get("kolon")
+            fn = t.get("fonksiyon")
+            pen = t.get("pencere") or "tum"
+
+            if fn not in FONKSIYONLAR:
+                hatalar.append("%s — izinsiz fonksiyon: %s" % (ad, fn)); continue
+            if pen not in PENCERELER:
+                hatalar.append("%s — geçersiz pencere: %s" % (ad, pen)); continue
+            # count disinda kolon zorunlu
+            if fn != "count" and kaynak_kol not in kol:
+                hatalar.append("%s — kolon tabloda yok: %s" % (ad, kaynak_kol)); continue
+            # Pencereli toplama icin iki tarafta da donem lazim
+            if PENCERELER[pen] is not None and not (t_donem and donem):
+                hatalar.append("%s.%s — dönem kolonu olmadan '%s' penceresi uygulanamaz, "
+                               "tüm geçmişe çevrildi" % (ad, kaynak_kol, pen))
+                pen = "tum"
+                t["pencere"] = "tum"
+
+            t["yeni_ad"] = t.get("yeni_ad") or _ad_uret(ad, kaynak_kol, fn, pen)
+            gecerli_top.append(t)
+
+        if not gecerli_top:
+            hatalar.append("%s — geçerli toplama kalmadı" % ad)
+            continue
+
+        k["toplamalar"] = gecerli_top
+        uretilecek += len(gecerli_top)
+        gecerli_kaynaklar.append(k)
+
+    if uretilecek > MAX_KOLON:
+        hatalar.append("Plan %s kolon üretiyor; tavan %s. Fazlası kırpıldı."
+                       % (uretilecek, MAX_KOLON))
+
+    plan["kaynaklar"] = gecerli_kaynaklar
+    return plan, hatalar
+
+
+def _ad_uret(tablo, kolon, fn, pencere):
+    """HAVALE_ISLEM + TUTAR + sum + son_3a -> HAVALE_TUTAR_SUM_3A"""
+    t = tablo.replace("_ISLEM", "").replace("_TRX", "")[:14]
+    k = (kolon or "KAYIT")[:16]
+    p = {"son_1a": "1A", "son_3a": "3A", "son_6a": "6A",
+         "son_12a": "12A", "tum": "TUM"}[pencere]
+    return ("%s__%s_%s_%s" % (t, k, fn.upper(), p))[:120]
+
+
+# ---------------------------------------------------------------------------
+# YURUTME
+# ---------------------------------------------------------------------------
+def _donem_sayisal(s):
+    """Donem kolonunu karsilastirilabilir aylik sayiya cevirir.
+    202401 -> 24289 gibi. Tarih ya da YYYYMM tamsayi kabul eder."""
+    if pd.api.types.is_numeric_dtype(s):
+        v = pd.to_numeric(s, errors="coerce")
+        # YYYYMM bicimi
+        if v.dropna().between(190001, 299912).all():
+            yil = (v // 100).astype("float")
+            ay = (v % 100).astype("float")
+            return yil * 12 + ay
+    d = pd.to_datetime(s, errors="coerce")
+    return d.dt.year * 12 + d.dt.month
+
+
+def _boyut_birlestir(ana, df, kaynak, kutuk):
+    anahtar = kaynak["anahtar"]
+    kolonlar = kaynak["kolonlar"]
+
+    alt = df[anahtar + kolonlar].copy()
+    tekrar = int(alt.duplicated(subset=anahtar).sum())
+    if tekrar:
+        # Boyut tablosunda tekrar varsa ilk kaydi alip uyari birakiyoruz
+        alt = alt.drop_duplicates(subset=anahtar, keep="first")
+
+    ana = ana.merge(alt, on=anahtar, how="left")
+
+    for c in kolonlar:
+        kutuk.append({
+            "KOLON": c,
+            "KAYNAK_TABLO": kaynak["ad"],
+            "KAYNAK_KOLON": c,
+            "TUR": "boyut",
+            "ANAHTAR": " + ".join(anahtar),
+            "FONKSIYON": "-",
+            "PENCERE": "-",
+            "POINT_IN_TIME": "hayır",
+            "GEREKCE": kaynak.get("gerekce", ""),
+            "NOT": ("kaynakta %s tekrar eden anahtar vardı, ilk kayıt alındı" % tekrar)
+                   if tekrar else "",
+        })
+    return ana
+
+
+def _islem_birlestir(ana, df, kaynak, ana_donem, kutuk):
+    """Point-in-time toplama.
+
+    Her gozlem donemi icin islem tablosu [donem-N, donem) araliginda
+    filtrelenir, anahtara gore toplanir ve o doneme baglanir.
+    """
+    anahtar = kaynak["anahtar"]
+    t_donem = kaynak.get("donem_kolon")
+    toplamalar = kaynak["toplamalar"]
+
+    # Pencereli toplamalar donem gerektirir
+    pencereliler = [t for t in toplamalar if PENCERELER[t["pencere"]] is not None]
+    tumcukler = [t for t in toplamalar if PENCERELER[t["pencere"]] is None]
+
+    # ---- Tum gecmis: tek gecis, donem bagimsiz ----
+    if tumcukler:
+        grup = df.groupby(anahtar, observed=False)
+        parcalar = {}
+        for t in tumcukler:
+            fn = t["fonksiyon"]
+            if fn == "count":
+                parcalar[t["yeni_ad"]] = grup.size()
+            else:
+                seri = pd.to_numeric(df[t["kolon"]], errors="coerce") \
+                    if fn not in ("nunique", "last") else df[t["kolon"]]
+                parcalar[t["yeni_ad"]] = seri.groupby(
+                    [df[a] for a in anahtar], observed=False).agg(
+                    FONKSIYONLAR[fn][1])
+        ozet = pd.DataFrame(parcalar).reset_index()
+        ozet.columns = anahtar + [c for c in ozet.columns if c not in anahtar]
+        ana = ana.merge(ozet, on=anahtar, how="left")
+
+    # ---- Pencereli: donem donem ----
+    if pencereliler and t_donem and ana_donem:
+        ana_ay = _donem_sayisal(ana[ana_donem])
+        isl_ay = _donem_sayisal(df[t_donem])
+        df = df.assign(_AY=isl_ay)
+
+        toplu = []
+        for ay in sorted(ana_ay.dropna().unique()):
+            satir_parcalari = {}
+            for t in pencereliler:
+                n = PENCERELER[t["pencere"]]
+                # [ay - n, ay) — gozlem ayinin KENDISI dahil degil
+                maske = (df["_AY"] >= ay - n) & (df["_AY"] < ay)
+                alt = df[maske]
+                if not len(alt):
+                    continue
+                fn = t["fonksiyon"]
+                if fn == "count":
+                    seri = alt.groupby(anahtar, observed=False).size()
+                else:
+                    kol = pd.to_numeric(alt[t["kolon"]], errors="coerce") \
+                        if fn not in ("nunique", "last") else alt[t["kolon"]]
+                    seri = kol.groupby([alt[a] for a in anahtar],
+                                       observed=False).agg(FONKSIYONLAR[fn][1])
+                satir_parcalari[t["yeni_ad"]] = seri
+
+            if not satir_parcalari:
+                continue
+            blok = pd.DataFrame(satir_parcalari).reset_index()
+            blok.columns = anahtar + [c for c in blok.columns if c not in anahtar]
+            blok["_AY"] = ay
+            toplu.append(blok)
+
+        if toplu:
+            hepsi = pd.concat(toplu, ignore_index=True)
+            ana = ana.assign(_AY=ana_ay).merge(
+                hepsi, on=anahtar + ["_AY"], how="left").drop(columns=["_AY"])
+
+    # ---- Kutuk ----
+    for t in toplamalar:
+        pit = PENCERELER[t["pencere"]] is not None
+        kutuk.append({
+            "KOLON": t["yeni_ad"],
+            "KAYNAK_TABLO": kaynak["ad"],
+            "KAYNAK_KOLON": t.get("kolon") or "(satır sayısı)",
+            "TUR": "işlem toplama",
+            "ANAHTAR": " + ".join(anahtar),
+            "FONKSIYON": "%s (%s)" % (t["fonksiyon"], FONKSIYONLAR[t["fonksiyon"]][0]),
+            "PENCERE": PENCERE_ADI[t["pencere"]],
+            "POINT_IN_TIME": "evet" if pit else "hayır",
+            "GEREKCE": t.get("gerekce") or kaynak.get("gerekce", ""),
+            "NOT": "gözlem dönemi hariç, yalnızca geçmiş kullanıldı" if pit
+                   else "tüm geçmiş kullanıldı — dönem sınırı yok",
+        })
+
+    return ana
+
+
+def calistir(plan, tablo_okuyucu):
+    """Plani yurutur.
+
+    tablo_okuyucu: ad -> DataFrame donduren fonksiyon
+    Doner: (baz_df, kutuk_df, ozet)
+    """
+    ana_spec = plan["ana_tablo"]
+    ana = tablo_okuyucu(ana_spec["ad"]).copy()
+    ana_donem = ana_spec.get("donem_kolon")
+    baslangic_kolon = int(ana.shape[1])
+
+    kutuk = []
+    # Ana tablonun kendi kolonlari da kutuge girsin
+    for c in ana.columns:
+        kutuk.append({
+            "KOLON": c, "KAYNAK_TABLO": ana_spec["ad"], "KAYNAK_KOLON": c,
+            "TUR": "ana tablo", "ANAHTAR": " + ".join(ana_spec["anahtar"]),
+            "FONKSIYON": "-", "PENCERE": "-", "POINT_IN_TIME": "-",
+            "GEREKCE": ana_spec.get("gerekce", "iskelet tablo"), "NOT": "",
+        })
+
+    hatalar = []
+    for kaynak in plan.get("kaynaklar", []):
+        try:
+            df = tablo_okuyucu(kaynak["ad"])
+            if kaynak["tur"] == "boyut":
+                ana = _boyut_birlestir(ana, df, kaynak, kutuk)
+            else:
+                ana = _islem_birlestir(ana, df, kaynak, ana_donem, kutuk)
+        except Exception as e:
+            hatalar.append("%s — %s" % (kaynak["ad"], str(e)[:90]))
+
+    kutuk_df = pd.DataFrame(kutuk)
+    ozet = {
+        "ana_tablo": ana_spec["ad"],
+        "anahtar": ana_spec["anahtar"],
+        "donem_kolon": ana_donem,
+        "satir": int(ana.shape[0]),
+        "kolon": int(ana.shape[1]),
+        "baslangic_kolon": baslangic_kolon,
+        "eklenen_kolon": int(ana.shape[1]) - baslangic_kolon,
+        "kaynak_sayisi": len(plan.get("kaynaklar", [])),
+        "pit_kolon": int((kutuk_df["POINT_IN_TIME"] == "evet").sum()) if len(kutuk_df) else 0,
+        "hatalar": hatalar,
+    }
+    return ana, kutuk_df, ozet
+
+
+def plan_metni(plan):
+    """Plani kullaniciya gosterilecek okunakli metne cevirir."""
+    a = plan["ana_tablo"]
+    satirlar = ["İSKELET",
+                "  %s   —  anahtar: %s" % (a["ad"], " + ".join(a["anahtar"]))]
+    if a.get("donem_kolon"):
+        satirlar.append("  dönem kolonu: %s" % a["donem_kolon"])
+    if a.get("gerekce"):
+        satirlar.append("  %s" % a["gerekce"][:100])
+
+    for i, k in enumerate(plan.get("kaynaklar", []), 1):
+        satirlar.append("")
+        if k["tur"] == "boyut":
+            satirlar.append("%2d. %s   —  birebir eşleşme (%s kolon)"
+                            % (i, k["ad"], len(k["kolonlar"])))
+            satirlar.append("    anahtar : %s" % " + ".join(k["anahtar"]))
+            satirlar.append("    kolonlar: %s" % ", ".join(k["kolonlar"][:8])
+                            + (" …" if len(k["kolonlar"]) > 8 else ""))
+        else:
+            satirlar.append("%2d. %s   —  işlem toplama (%s değişken)"
+                            % (i, k["ad"], len(k["toplamalar"])))
+            satirlar.append("    anahtar : %s" % " + ".join(k["anahtar"]))
+            satirlar.append("    dönem   : %s" % (k.get("donem_kolon") or "yok"))
+            for t in k["toplamalar"][:6]:
+                satirlar.append("      %-34s %s · %s"
+                                % (t["yeni_ad"][:34],
+                                   FONKSIYONLAR[t["fonksiyon"]][0],
+                                   PENCERE_ADI[t["pencere"]]))
+            if len(k["toplamalar"]) > 6:
+                satirlar.append("      … ve %d değişken daha" % (len(k["toplamalar"]) - 6))
+        if k.get("gerekce"):
+            satirlar.append("    %s" % k["gerekce"][:100])
+
+    return "\n".join(satirlar)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""fe_agent/sozluk.py — veri setinden degisken sozlugu uretir.
+
+Her kolon icin istatistiksel profil cikarilir (tip, null orani, tekil
+sayisi, ornek degerler, dagilim). Bu profil LLM'e verilir, LLM kolonun
+ne anlama geldigini yazar. Ciktı sabit adli bir dataset olarak kaydedilir.
+
+GIZLILIK NOTU
+  Ornek degerler LLM'e gonderilir. Kimlik benzeri kolonlar (tekil oran
+  cok yuksek) ve serbest metin kolonlari ornek gondermeden, yalnizca
+  kolon adiyla islenir.
+"""
+
+import numpy as np
+import pandas as pd
+
+ORNEK_ADET = 8
+KIMLIK_ESIK = 0.85        # tekil oran bunun ustundeyse ornek gonderilmez
+UZUN_METIN = 60           # ortalama karakter bunun ustundeyse ornek gonderilmez
+
+
+def _ornek_guvenli_mi(s, satir):
+    tekil = int(s.nunique(dropna=True))
+    if satir and tekil / max(satir, 1) > KIMLIK_ESIK and tekil > 100:
+        return False, "kimlik benzeri"
+    if not pd.api.types.is_numeric_dtype(s):
+        try:
+            ort = s.dropna().astype(str).str.len().mean()
+            if ort and ort > UZUN_METIN:
+                return False, "uzun metin"
+        except Exception:
+            pass
+    return True, ""
+
+
+def profil_cikar(df, haric=()):
+    """Her kolon icin LLM'e gidecek profili hazirlar.
+    Doner: [{ad, tip, null_oran, tekil, ornekler, dagilim, not}]"""
+    haric = set(h for h in haric if h)
+    satir = int(len(df))
+    kayitlar = []
+
+    for kol in df.columns:
+        if kol in haric:
+            continue
+        s = df[kol]
+        sayisal = pd.api.types.is_numeric_dtype(s)
+        null_oran = float(s.isna().mean())
+        tekil = int(s.nunique(dropna=True))
+
+        guvenli, neden = _ornek_guvenli_mi(s, satir)
+        ornekler, dagilim = [], ""
+
+        if guvenli:
+            if sayisal:
+                sn = pd.to_numeric(s, errors="coerce").dropna()
+                if len(sn):
+                    q = sn.quantile([0, .25, .5, .75, 1]).round(3).tolist()
+                    dagilim = ("min %s · p25 %s · medyan %s · p75 %s · maks %s"
+                               % tuple(q))
+                    ornekler = [round(float(x), 3) for x in sn.head(ORNEK_ADET)]
+            else:
+                sayim = s.astype(str).value_counts().head(ORNEK_ADET)
+                ornekler = [str(i) for i in sayim.index]
+                dagilim = " · ".join("%s (%s)" % (k, v) for k, v in
+                                     list(sayim.items())[:5])
+
+        kayitlar.append({
+            "ad": kol,
+            "tip": "sayısal" if sayisal else "kategorik",
+            "null_oran": round(null_oran, 4),
+            "tekil": tekil,
+            "ornekler": ornekler,
+            "dagilim": dagilim,
+            "not": neden,
+        })
+    return kayitlar
+
+
+def tablo_olustur(profiller, aciklamalar):
+    """Profil + LLM aciklamasini tek tabloda birlestirir.
+
+    aciklamalar: {kolon_adi: {"aciklama": ..., "kategori": ...}}
+    Sozluk tablosunun ILK kolonu degisken adi olmali — akis.py bu
+    varsayimla sozluk kapsamini hesapliyor.
+    """
+    satirlar = []
+    for p in profiller:
+        a = aciklamalar.get(p["ad"]) or {}
+        satirlar.append({
+            "DEGISKEN": p["ad"],
+            "ACIKLAMA": (a.get("aciklama") or "").strip() or "(açıklama üretilemedi)",
+            "KATEGORI": (a.get("kategori") or "").strip() or "tanımsız",
+            "TIP": p["tip"],
+            "NULL_ORANI": p["null_oran"],
+            "TEKIL_DEGER": p["tekil"],
+            "DAGILIM": p["dagilim"],
+            "URETIM": "yapay zekâ" if a.get("aciklama") else "üretilemedi",
+            "NOT": p["not"],
+        })
+    return pd.DataFrame(satirlar)
+
+
+def ozet(tablo):
+    if not len(tablo):
+        return {"toplam": 0, "aciklamali": 0, "kapsam": 0.0, "kategoriler": {}}
+    aciklamali = int((tablo["URETIM"] == "yapay zekâ").sum())
+    kirilim = tablo["KATEGORI"].value_counts().to_dict()
+    return {
+        "toplam": int(len(tablo)),
+        "aciklamali": aciklamali,
+        "kapsam": round(100.0 * aciklamali / len(tablo), 1),
+        "kategoriler": {str(k): int(v) for k, v in list(kirilim.items())[:12]},
+    }
 
-/* -------- KOYU TEMA: siyah taban, beyaz metin -------- */
-#kabuk.koyu {
-  --kirmizi:      #FF4D4F;
-  --kirmizi-koyu: #C21B1E;
-  --kirmizi-canli:#FF6B5B;
-  --kirmizi-acik: #2A1418;
-
-  --zemin:        #000000;
-  --yuzey:        #161616;
-  --yuzey-alt:    #0B0B0B;
-  --sohbet-zemin: #3D0508;
-  --kenar:        #3A3A3A;
-  --kenar-acik:   #242424;
-
-  --metin:        #FFFFFF;
-  --gri:          #FFFFFF;
-  --gri-acik:     #FFFFFF;
-
-  --bot-zemin:    #5A1114;
-
-  --user-zemin:   #000000;
-  --user-metin:   #FFFFFF;
-  --user-kenar:   #3A3A3A;
-
-  --balon-zemin:  #161616;
-  --balon-metin:  #FFFFFF;
-  --balon-kenar:  #3A3A3A;
-
-  --giris-zemin:  #000000;
-  --giris-metin:  #FFFFFF;
-  --gonder-zemin: #FFFFFF;
-  --gonder-metin: #000000;
-  --aksiyon-cerceve: #FFFFFF;
-
-  --sohbet-perde: rgba(0,0,0,.78);
-
-  --yesil:        #3DDC8A;
-  --sari:         #FACC15;
-  --sari-koyu:    #FFFFFF;
-  --sari-acik:    #2A2410;
-  --golge:        rgba(0,0,0,.6);
-}
 
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
-
-#kabuk {
-  display: flex; flex-direction: column; height: 100vh;
-  background: var(--zemin); color: var(--metin);
-  font-family: Calibri, "Segoe UI", system-ui, -apple-system, sans-serif;
-  font-size: var(--yazi);
-  transition: background .2s, color .2s;
-}
 
-/* ==================== ÜST BAR ==================== */
-#ustbar {
-  display: flex; align-items: stretch;
-  padding: 0 clamp(14px, 1.6vw, 26px);
-  height: var(--ustbar-h);
-  background: var(--yuzey); border-bottom: 1px solid var(--kenar); flex-shrink: 0;
-  gap: clamp(14px, 1.6vw, 28px);
-}
-#ustbar-sol { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
-#banner { height: 84px; width: auto; display: block; }
-
-#baslik-blok { border-left: 1px solid var(--kenar); padding-left: 16px; line-height: 1.35; }
-#urun-adi {
-  font-weight: 700; font-size: 1.8em; letter-spacing: -.01em;
-  white-space: nowrap; color: var(--kirmizi);
-}
-#urun-alt {
-  font-size: 1.08em; font-weight: 700; color: var(--metin);
-  margin-top: 4px; white-space: nowrap;
-}
 
-/* -------- Özet şerit -------- */
-/* text-transform YOK — Turkce I/İ sorunu icin metinler Python'da buyuk yazılı */
-#ozet-serit {
-  flex: 1; min-width: 0; display: flex; align-items: center;
-  border-left: 1px solid var(--kenar-acik); border-right: 1px solid var(--kenar-acik);
-}
-.ozet-kart {
-  flex: 1; min-width: 0; padding: 0 clamp(10px, 1.2vw, 20px);
-  border-right: 1px solid var(--kenar-acik);
-}
-.ozet-kart:last-child { border-right: none; }
-.ozet-etiket {
-  display: block; font-size: .95em; font-weight: 700; letter-spacing: .07em;
-  color: var(--kirmizi); margin-bottom: 5px;
-}
-.ozet-deger {
-  display: block; font-family: ui-monospace, Consolas, monospace;
-  font-size: 1.3em; font-weight: 600; color: var(--metin);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.ozet-ust, .ozet-alt {
-  display: block; font-size: 1em; color: var(--metin); margin-top: 4px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
 
-/* -------- Sağ blok -------- */
-#ustbar-sag {
-  display: flex; flex-direction: column;
-  align-items: stretch; justify-content: center; gap: 9px; flex-shrink: 0;
-}
-.ustbar-sag-satir { display: flex; align-items: center; justify-content: center; gap: 9px; }
-
-#tema-btn, #sifirla-btn {
-  display: flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; padding: 0;
-  border: 1px solid var(--kenar); background: var(--yuzey);
-  border-radius: 7px; cursor: pointer; color: var(--metin); flex-shrink: 0;
-}
-#tema-btn:hover, #sifirla-btn:hover {
-  border-color: var(--kirmizi); color: var(--kirmizi); background: var(--kirmizi-acik);
-}
 
-#durum-rozet {
-  display: inline-flex; align-items: center; gap: 7px;
-  font-size: 1em; color: var(--metin); white-space: nowrap;
-}
-.nokta-yesil {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--yesil); display: inline-block;
-}
 
-#sekmeler {
-  display: flex; gap: 3px; padding: 3px;
-  background: var(--zemin); border: 1px solid var(--kenar); border-radius: 9px;
-}
-.sekme {
-  flex: 1; font-size: 1em; font-weight: 600; padding: 8px 22px;
-  border: none; background: none; border-radius: 7px;
-  cursor: pointer; color: var(--metin); white-space: nowrap;
-  transition: background .15s, color .15s;
-}
-.sekme:hover:not(.aktif) { background: var(--yuzey); }
-.sekme.aktif {
-  background: var(--kirmizi); color: #fff;
-  box-shadow: 0 1px 3px rgba(213,17,21,.28);
-}
 
-/* ==================== SAYFA KABI ==================== */
-.sayfa { flex: 1; min-height: 0; width: 100%; }
-.sayfa.gizli { display: none; }
-#sayfa-calisma { display: flex; background: var(--yuzey); }
-
-/* ==================== SOL PANEL ==================== */
-#panel {
-  width: var(--panel-en); flex-shrink: 0;
-  background: var(--yuzey-alt); border-right: 1px solid var(--kenar);
-  padding: 22px 20px 32px; overflow-y: auto;
-}
 
-.panel-blok { margin-bottom: 26px; }
-.panel-blok:last-child { margin-bottom: 0; }
-.panel-baslik {
-  font-size: 1.02em; font-weight: 800; letter-spacing: .09em;
-  color: var(--kirmizi); margin-bottom: 12px;
-}
-.panel-metin { margin: 0 0 12px; font-size: 1.02em; line-height: 1.75; color: var(--metin); }
-.panel-metin:last-child { margin-bottom: 0; }
-
-/* -------- Faz ağacı: yeşil tamam · sarı devam · nötr bekliyor -------- */
-.faz { margin-bottom: 3px; }
-.faz-bas {
-  display: flex; align-items: flex-start; gap: 8px;
-  padding: 10px 9px; border-radius: 7px; cursor: pointer;
-  color: var(--metin);
-}
-.faz-bas:hover { background: var(--kenar-acik); }
-.faz.aktif > .faz-bas { background: var(--sari-acik); color: var(--sari-koyu); }
-.faz.tamam > .faz-bas { color: var(--yesil); }
-
-.faz-ok {
-  flex-shrink: 0; width: 10px; margin-top: 2px;
-  font-size: 1em; transition: transform .15s;
-}
-.faz.acik .faz-ok { transform: rotate(90deg); }
-
-.faz-no {
-  flex-shrink: 0; font-family: ui-monospace, Consolas, monospace;
-  font-size: .88em; font-weight: 700; margin-top: 3px;
-}
-.faz-govde { min-width: 0; flex: 1; }
-.faz-ad { font-size: 1.1em; font-weight: 700; line-height: 1.35; color: inherit; }
-.faz-ozet {
-  font-size: .95em; color: inherit;
-  margin-top: 3px; line-height: 1.45; font-weight: 400;
-}
-.faz-durum {
-  flex-shrink: 0; font-size: .9em; font-family: ui-monospace, Consolas, monospace;
-  font-weight: 700; margin-top: 4px; cursor: help;
-}
 
-.faz-adimlar {
-  list-style: none; margin: 2px 0 8px 14px; padding: 0 0 0 26px; display: none;
-  border-left: 1px solid var(--kenar);
-}
-.faz.acik .faz-adimlar { display: block; }
-
-.faz-adimlar li {
-  display: flex; align-items: center; gap: 9px;
-  padding: 6px 8px; border-radius: 6px;
-  font-size: 1em; color: var(--metin); cursor: default;
-}
-.adim-isaret {
-  flex-shrink: 0; width: 14px; height: 14px;
-  border: 1.5px solid currentColor; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: .6em; font-weight: 700;
-}
-.faz-adimlar li.tamam { color: var(--yesil); }
-.faz-adimlar li.tamam .adim-isaret {
-  background: var(--yesil); border-color: var(--yesil); color: #fff;
-}
-.faz-adimlar li.aktif { color: var(--sari-koyu); font-weight: 700; }
-.faz-adimlar li.aktif .adim-isaret {
-  background: var(--sari); border-color: var(--sari); color: #000;
-  box-shadow: 0 0 0 3px var(--sari-acik);
-}
 
-/* ==================== ORTA: SOHBET ==================== */
-/* Arka plan gorseli tema ile degisir. Perde + bulaniklik ile dokunun
-   marka hissi korunur ama icerigin onune gecmez. */
-#sohbet-alani {
-  position: relative;
-  flex: 1; display: flex; flex-direction: column; min-width: 0;
-  background-color: var(--sohbet-zemin);
-  background-image: var(--sohbet-gorsel);
-  background-size: cover;
-  background-position: center;
-  background-repeat: no-repeat;
-}
-#sohbet-alani::before {
-  content: ""; position: absolute; inset: 0;
-  background: var(--sohbet-perde);
-  backdrop-filter: blur(3px);
-  pointer-events: none;
-}
-/* Icerik perdenin ustunde kalsin */
-#sohbet, #giris-bolge { position: relative; z-index: 1; }
-
-#sohbet {
-  flex: 1; overflow-y: auto;
-  padding: 22px 24px 16px;
-  background: transparent;
-}
 
-.satir {
-  display: flex; align-items: flex-start; gap: 10px;
-  margin: 0 0 18px; max-width: 100%;
-}
-.satir.kullanici { flex-direction: row-reverse; }
-
-.avatar {
-  width: var(--avatar); height: var(--avatar); min-width: var(--avatar);
-  border-radius: 50%; background: var(--yuzey); object-fit: cover;
-  border: 1px solid var(--kenar);
-  box-shadow: 0 2px 6px rgba(0,0,0,.15);
-}
 
-.balon {
-  padding: 15px 18px; border-radius: 14px;
-  white-space: pre-wrap; word-break: break-word;
-  max-width: 88%; max-height: 400px; overflow-y: auto;
-}
-/* Bot: koyu marka tonu, sol kenarda kirmizi serit */
-.satir.bot .balon {
-  background: var(--bot-zemin); color: #fff;
-  border: none;
-  border-left: 4px solid var(--kirmizi);
-  border-top-left-radius: 4px;
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
-  font-size: .95em; line-height: 1.7;
-  box-shadow: 0 4px 16px rgba(0,0,0,.22);
-}
 
-/* Kullanici: acik temada beyaz zemin/siyah yazi, koyu temada tersi */
-.satir.kullanici .balon {
-  background: var(--user-zemin); color: var(--user-metin);
-  border: 1px solid var(--user-kenar);
-  border-top-right-radius: 4px;
-  font-size: 1em; line-height: 1.65;
-  box-shadow: 0 3px 12px rgba(0,0,0,.18);
-}
 
-/* Hata: koyu marka tonundan ayrissin */
-.satir.bot .balon.hata {
-  background: #FFF4F4; color: #A00D10;
-  border-left-color: #F51513;
-}
 
-/* -------- Veri seçim kartı: bot balonuyla aynı dilde -------- */
-#secici-kart {
-  max-width: 88%; margin: 0 0 18px var(--girinti);
-  background: var(--bot-zemin); border: none;
-  border-left: 4px solid var(--kirmizi);
-  border-radius: 14px; border-top-left-radius: 4px;
-  padding: 20px 22px 22px; box-shadow: 0 4px 16px rgba(0,0,0,.22);
-  color: #fff;
-}
-#secici-kart.gizli { display: none; }
-.kart-baslik { font-weight: 700; font-size: 1.15em; margin-bottom: 6px; color: #fff; }
-.kart-alt { font-size: 1em; color: #fff; line-height: 1.65; margin-bottom: 16px; opacity: .9; }
-.kart-govde { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
-
-.combo { position: relative; flex: 1; min-width: 170px; }
-.combo label {
-  display: block; font-size: .95em; color: #fff;
-  margin-bottom: 6px; font-weight: 600;
-}
-.combo-giris {
-  width: 100%; padding: 10px 15px; border: 1px solid rgba(255,255,255,.35);
-  border-radius: 999px;
-  font-family: ui-monospace, Consolas, monospace; font-size: 1em;
-  outline: none; background: #fff; color: #000;
-}
-.combo-giris::placeholder { color: #000; opacity: .45; }
-.combo-giris:focus { border-color: #fff; box-shadow: 0 0 0 3px rgba(255,255,255,.3); }
-.combo-giris.secili { border-color: var(--yesil); border-width: 2px; }
-
-.combo-liste {
-  position: absolute; z-index: 20; top: 100%; left: 0; right: 0;
-  margin: 5px 0 0; padding: 5px; list-style: none;
-  background: var(--balon-zemin); border: 1px solid var(--balon-kenar);
-  border-radius: 12px; box-shadow: 0 8px 22px rgba(0,0,0,.28);
-  max-height: 240px; overflow-y: auto; display: none;
-}
-.combo-liste.acik { display: block; }
-.combo-liste li {
-  padding: 8px 13px; border-radius: 999px; cursor: pointer;
-  font-family: ui-monospace, Consolas, monospace; font-size: .98em;
-  color: var(--balon-metin);
-}
-.combo-liste li:hover { background: var(--kirmizi-acik); color: var(--kirmizi); }
-.combo-liste li.bos { cursor: default; font-family: inherit; opacity: .7; }
-.combo-liste li.bos:hover { background: none; color: var(--balon-metin); }
-
-#secici-btn {
-  padding: 10px 26px; background: #fff; color: var(--bot-zemin);
-  border: none; border-radius: 999px; font-size: 1.02em; font-weight: 700;
-  cursor: pointer; white-space: nowrap;
-}
-#secici-btn:hover:not(:disabled) { background: #FFE8E9; }
-#secici-btn:disabled { background: rgba(255,255,255,.3); color: rgba(255,255,255,.65); cursor: not-allowed; }
-
-/* -------- Yazıyor -------- */
-.nokta {
-  display: inline-block; width: 6px; height: 6px; margin-right: 4px;
-  border-radius: 50%; background: #fff; animation: zipla 1.2s infinite;
-}
-.nokta:nth-child(2) { animation-delay: .2s; }
-.nokta:nth-child(3) { animation-delay: .4s; }
-@keyframes zipla {
-  0%, 60%, 100% { opacity: .3; transform: translateY(0); }
-  30%           { opacity: 1;  transform: translateY(-3px); }
-}
 
-/* -------- Aksiyon butonları -------- */
-/* Tek renk vurgusu: birincil marka kirmizisi, digerleri notr.
-   Ucu de esit genislikte, balon hizasinda baslar ve biter. */
-#giris-bolge {
-  border-top: none;
-  background: transparent;
-  padding: 12px 24px 22px; flex-shrink: 0;
-}
-#aksiyonlar {
-  max-width: 88%; margin: 0 0 12px var(--girinti);
-  display: flex; gap: 10px;
-}
 
-.aksiyon {
-  flex: 1;
-  font-size: 1.02em; font-weight: 600; padding: 11px 18px;
-  border-radius: 999px; cursor: pointer; white-space: nowrap;
-  text-align: center;
-  transition: background .15s, border-color .15s, color .15s, opacity .15s;
-}
-.aksiyon:disabled { opacity: .4; cursor: not-allowed; }
-
-/* Birincil — tek renkli oge */
-.aksiyon.onayla {
-  background: var(--kirmizi); color: #fff;
-  border: 2px solid var(--aksiyon-cerceve);
-  box-shadow: 0 2px 10px rgba(213,17,21,.28);
-}
-.aksiyon.onayla:hover:not(:disabled) { background: var(--kirmizi-koyu); }
-
-/* Ikincil — notr yuzey */
-.aksiyon.degistir {
-  background: var(--yuzey); color: var(--metin);
-  border: 2px solid var(--aksiyon-cerceve);
-}
-.aksiyon.degistir:hover:not(:disabled) { background: var(--kenar-acik); }
-
-/* Ucuncul — ayni yuzey, daha soluk */
-.aksiyon.geri {
-  background: var(--yuzey); color: var(--metin);
-  border: 2px solid var(--aksiyon-cerceve);
-  opacity: .72; font-weight: 500;
-}
-.aksiyon.geri:hover:not(:disabled) { background: var(--kenar-acik); opacity: 1; }
-
-/* Yazı bloğu: butonlarla ayni hizada ve genislikte */
-#giris {
-  max-width: 88%; margin: 0 0 0 var(--girinti);
-  display: flex; gap: 8px; align-items: center;
-  background: var(--giris-zemin);
-  border: 2px solid var(--aksiyon-cerceve);
-  border-radius: 999px;
-  padding: 8px 8px 8px 20px;
-  box-shadow: 0 3px 12px rgba(0,0,0,.15);
-}
-#kutu {
-  flex: 1; padding: 6px 0; border: none;
-  background: transparent; color: var(--giris-metin);
-  font-family: inherit; font-size: 1.02em; line-height: 1.55;
-  resize: none; outline: none; max-height: 96px; overflow-y: auto;
-}
-#kutu::placeholder { color: var(--giris-metin); opacity: .5; }
-
-#gonder {
-  padding: 10px 26px; background: var(--gonder-zemin); color: var(--gonder-metin);
-  border: none; border-radius: 999px;
-  font-size: 1.02em; font-weight: 600; cursor: pointer; white-space: nowrap;
-}
-#gonder:hover:not(:disabled) { filter: brightness(1.25); }
-#gonder:disabled { opacity: .4; cursor: not-allowed; }
-
-/* ==================== SAĞ: ANALİZ PANELİ ==================== */
-#analiz-panel {
-  width: var(--analiz-en); flex-shrink: 0;
-  background: var(--yuzey-alt); border-left: 1px solid var(--kenar);
-  display: flex; flex-direction: column; overflow: hidden;
-}
 
-#analiz-ust {
-  padding: 17px 19px 15px; border-bottom: 1px solid var(--kenar);
-  background: var(--yuzey); flex-shrink: 0;
-}
-#analiz-baslik { font-weight: 800; font-size: 1.18em; color: var(--kirmizi); }
-
-#analiz-sekmeler {
-  display: flex; gap: 3px; padding: 10px 12px;
-  border-bottom: 1px solid var(--kenar); background: var(--yuzey);
-  overflow-x: auto; flex-shrink: 0;
-}
-#analiz-sekmeler::-webkit-scrollbar { height: 0; }
-.analiz-sekme {
-  font-size: .98em; font-weight: 600; padding: 7px 14px;
-  border: none; background: none; border-radius: 999px;
-  cursor: pointer; color: var(--metin); white-space: nowrap;
-}
-.analiz-sekme:hover { background: var(--kenar-acik); }
-.analiz-sekme.aktif { background: var(--kirmizi); color: #fff; font-weight: 700; }
 
-#analiz-govde { flex: 1; overflow-y: auto; padding: 16px 19px 26px; }
 
-.iskele-kart {
-  background: var(--yuzey); border: 1px solid var(--kenar); border-radius: 12px;
-  padding: 15px 17px; margin-bottom: 12px;
-}
-.iskele-baslik { font-size: 1.05em; font-weight: 700; margin-bottom: 11px; color: var(--metin); }
-.iskele-satir {
-  display: flex; justify-content: space-between; gap: 12px;
-  font-size: 1em; padding: 7px 0; color: var(--metin);
-}
-.iskele-deger {
-  font-family: ui-monospace, Consolas, monospace;
-  color: var(--metin); background: var(--kenar-acik);
-  padding: 1px 10px; border-radius: 999px;
-}
-.iskele-grafik {
-  height: 86px; border-radius: 10px; margin-top: 4px;
-  background: repeating-linear-gradient(
-    -45deg, var(--kenar-acik), var(--kenar-acik) 6px,
-    var(--yuzey) 6px, var(--yuzey) 12px);
-  display: flex; align-items: center; justify-content: center;
-  color: var(--metin); font-size: .95em;
-}
 
-/* ==================== SAYFA 2: ÖZET ==================== */
-#sayfa-ozet { overflow-y: auto; background: var(--zemin); }
-#ozet-govde { max-width: 1280px; margin: 0 auto; padding: 28px clamp(18px, 2.4vw, 44px) 56px; }
-#ozet-baslik-blok { margin-bottom: 22px; }
-#ozet-h1 { margin: 0; font-size: 1.9em; font-weight: 800; letter-spacing: -.01em; color: var(--kirmizi); }
-#ozet-adim { font-size: 1.05em; color: var(--metin); margin-top: 7px; }
-
-#ozet-kartlar {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  gap: 15px; align-items: start;
-}
-.ozet-blok {
-  background: var(--yuzey); border: 1px solid var(--kenar); border-radius: 12px;
-  padding: 17px 19px 15px; box-shadow: 0 1px 2px var(--golge);
-}
-.ozet-blok-baslik {
-  font-size: .95em; font-weight: 800; letter-spacing: .08em;
-  color: var(--kirmizi); margin-bottom: 12px;
-  padding-bottom: 10px; border-bottom: 1px solid var(--kenar-acik);
-}
-.ozet-satir {
-  display: flex; justify-content: space-between; gap: 14px;
-  padding: 7px 0; font-size: 1.02em; align-items: baseline;
-  border-bottom: 1px solid var(--kenar-acik);
-}
-.ozet-satir:last-child { border-bottom: none; }
-.ozet-satir-etiket { color: var(--metin); flex-shrink: 0; }
-.ozet-satir-deger {
-  font-family: ui-monospace, Consolas, monospace; color: var(--metin);
-  text-align: right; font-weight: 600; word-break: break-word; min-width: 0;
-}
-#ozet-bos {
-  background: var(--yuzey); border: 1px dashed var(--kenar); border-radius: 12px;
-  padding: 44px; text-align: center; color: var(--metin);
-  font-size: 1.08em; grid-column: 1 / -1;
-}
 
-/* ==================== KAYDIRMA ÇUBUKLARI ==================== */
-/* Tum kaydirilabilir alanlarda Akbank kirmizisi; koyu temada
-   --kirmizi otomatik acilir tona doner. */
-#panel::-webkit-scrollbar,
-#sohbet::-webkit-scrollbar,
-#analiz-govde::-webkit-scrollbar,
-#sayfa-ozet::-webkit-scrollbar,
-#kutu::-webkit-scrollbar,
-.combo-liste::-webkit-scrollbar {
-  width: 7px;
-}
-#panel::-webkit-scrollbar-thumb,
-#sohbet::-webkit-scrollbar-thumb,
-#analiz-govde::-webkit-scrollbar-thumb,
-#sayfa-ozet::-webkit-scrollbar-thumb,
-#kutu::-webkit-scrollbar-thumb,
-.combo-liste::-webkit-scrollbar-thumb {
-  background: var(--kirmizi); border-radius: 4px;
-}
-#panel::-webkit-scrollbar-thumb:hover,
-#sohbet::-webkit-scrollbar-thumb:hover,
-#analiz-govde::-webkit-scrollbar-thumb:hover,
-#sayfa-ozet::-webkit-scrollbar-thumb:hover,
-#kutu::-webkit-scrollbar-thumb:hover,
-.combo-liste::-webkit-scrollbar-thumb:hover {
-  background: var(--kirmizi-koyu);
-}
-#panel::-webkit-scrollbar-track,
-#sohbet::-webkit-scrollbar-track,
-#analiz-govde::-webkit-scrollbar-track,
-#sayfa-ozet::-webkit-scrollbar-track,
-#kutu::-webkit-scrollbar-track,
-.combo-liste::-webkit-scrollbar-track {
-  background: transparent;
-}
 
-/* Bot balonu ici — kirmizi zemin uzerinde beyaz kalsin */
-.satir.bot .balon::-webkit-scrollbar { width: 6px; }
-.satir.bot .balon::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,.45); border-radius: 3px;
-}
-.satir.bot .balon::-webkit-scrollbar-track { background: transparent; }
-
-/* Firefox */
-#panel, #sohbet, #analiz-govde, #sayfa-ozet, #kutu, .combo-liste {
-  scrollbar-width: thin;
-  scrollbar-color: var(--kirmizi) transparent;
-}
+
 
-/* -------- Dar ekran -------- */
-@media (max-width: 1180px) { #analiz-panel { display: none; } }
-@media (max-width: 1280px) { #baslik-blok { display: none; } }
-@media (max-width: 1080px) { #panel { display: none; } #ozet-serit { display: none; } }
