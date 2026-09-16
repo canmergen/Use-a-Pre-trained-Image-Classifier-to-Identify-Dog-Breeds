@@ -1,166 +1,149 @@
-# ===========================================================================
-# ADIM 5.2: ALGORITMA SECIMI   (Dataiku senaryosunda calisir)
-# ===========================================================================
-ALGORITMALAR = ["Lojistik Regresyon", "Random Forest",
-                "Gradient Boosting", "XGBoost"]
+# -*- coding: utf-8 -*-
+"""Senaryo adimi: ALGORITMA_SECIMI
+
+Webapp'in PROJE_HAFIZASI'na biraktigi konfigurasyonu okur, dort algoritmayi
+ayni kosullarda egitir, sonucu yine folder'a yazar.
+"""
+
+import time
+
+import numpy as np
+import pandas as pd
+import dataiku
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+
+from fe_agent import senaryo as senaryo_mod
+
+IS_ADI = "algoritma"
+SEED = 42
 
 
-def algoritma_plan(durum):
-    baz = len((durum.get("baz") or {}).get("kolonlar") or [])
-    yeni = len((durum.get("secim") or {}).get("secilen_liste") or [])
-    b = durum.get("bolme") or {}
-    bolme_ad = ("zamansal — test dönemi %s" % b.get("oot_deger")) \
-        if b.get("tur") == "zamansal" else "rastgele %%80 / %%20"
+def _maskeler(df, bolme, meta):
+    """Webapp'teki bolme mantiginin AYNISI — ayni satirlar teste dusmeli."""
+    if bolme.get("tur") == "zamansal" and bolme.get("oot_deger") \
+            and meta.get("donem") in df.columns:
+        test = df[meta["donem"]].astype(str) == str(bolme["oot_deger"])
+        return ~test, test
 
-    return ("Hangi algoritmanın bu veriye uyduğunu ölçeceğiz. Dört aday "
-            "aynı değişken seti, aynı bölme ve aynı seed ile eğitilecek; "
-            "tek fark algoritma olacak.\n\n"
-            "  Adaylar    : %s\n"
-            "  Değişken   : %s  (%s baz + %s yeni)\n"
-            "  Bölme      : %s\n"
-            "  Metrikler  : ROC-AUC, Gini, KS, eğitim süresi\n\n"
-            "Eğitim uzun sürdüğü için '%s' senaryosunu tetikleyeceğim; "
-            "webapp sonucu bekleyecek. Senaryo hazır değilse bu adımı "
-            "geçebiliriz.\n\n"
-            "Başlayalım mı?"
-            % (" · ".join(ALGORITMALAR), _sayi(baz + yeni), _sayi(baz),
-               _sayi(yeni), bolme_ad, senaryo_mod.SENARYO_ALGORITMA))
+    oran = float(bolme.get("test_oran") or 0.20)
+    rng = np.random.RandomState(int(bolme.get("seed") or SEED))
+    sira = np.arange(len(df))
+    rng.shuffle(sira)
+    n_test = int(len(df) * oran)
+    test_konum = set(sira[:n_test].tolist())
+    test = pd.Series([k in test_konum for k in range(len(df))], index=df.index)
+    return ~test, test
 
 
-def algoritma_uygula(durum):
-    konfig = {
-        "veri_seti": "%s_ENRICHED" % durum["veri_seti"],
-        "target": durum["meta"]["target"],
-        "baz_kolonlar": (durum.get("baz") or {}).get("kolonlar") or [],
-        "yeni_kolonlar": (durum.get("secim") or {}).get("secilen_liste") or [],
-        "bolme": durum.get("bolme") or {},
-        "meta": durum.get("meta") or {},
-        "adaylar": ALGORITMALAR,
-    }
-
-    sonuc, hata = senaryo_mod.calistir(
-        senaryo_mod.SENARYO_ALGORITMA, "algoritma", konfig)
-
-    if hata:
-        durum["algoritma"] = {"hata": hata}
-        return "%s\n\nBu adımı şimdilik atlıyorum." % hata
-
-    durum["algoritma"] = sonuc
-
-    satirlar = []
-    for s in sonuc.get("siralama", []):
-        satirlar.append("  %-22s AUC %-8s Gini %-8s KS %-8s %ss"
-                        % (s["ad"][:22], _ond(s["auc"], 4), _ond(s["gini"], 4),
-                           _ond(s["ks"], 4), _ond(s.get("sure", 0), 1)))
-
-    kazanan = sonuc.get("kazanan") or {}
-    return ("Karşılaştırma tamamlandı. %s satırla eğitildi.\n\n"
-            "AYRIŞTIRMA GÜCÜNE GÖRE SIRALAMA\n%s\n\n"
-            "Önerim: %s — en yüksek ROC-AUC (%s) ve kabul edilebilir "
-            "eğitim süresi.\n\n"
-            "Final modelde bu algoritmayla devam edeceğim. Başka bir "
-            "algoritma tercih ederseniz adını yazabilirsiniz."
-            % (_sayi(sonuc.get("egitim_satir", 0)),
-               "\n".join(satirlar) or "  (sonuç boş)",
-               kazanan.get("ad", "—"), _ond(kazanan.get("auc"), 4)))
+def _ks(y, p):
+    df = pd.DataFrame({"y": y, "p": p}).dropna().sort_values("p")
+    poz = (df["y"] > 0).cumsum() / max((df["y"] > 0).sum(), 1)
+    neg = (df["y"] <= 0).cumsum() / max((df["y"] <= 0).sum(), 1)
+    return float((neg - poz).abs().max())
 
 
-# ===========================================================================
-# ADIM 5.3: FINAL MODEL   (Dataiku senaryosunda calisir)
-# ===========================================================================
-def final_plan(durum):
-    a = durum.get("algoritma") or {}
-    kazanan = (a.get("kazanan") or {}).get("ad")
-
-    if not kazanan:
-        return ("Algoritma karşılaştırması yapılmadığı için varsayılan "
-                "algoritmayla (Gradient Boosting) devam edeceğim.\n\n"
-                "Final modeli eğitip kaydedeyim mi?")
-
-    yeni = len((durum.get("secim") or {}).get("secilen_liste") or [])
-    baz = len((durum.get("baz") or {}).get("kolonlar") or [])
-
-    return ("Son adım: seçilen modeli tam veriyle eğitip kullanıma hazır "
-            "hale getireceğim.\n\n"
-            "  Algoritma    : %s\n"
-            "  Değişken     : %s\n"
-            "  Doğrulama    : test setinde ölçülecek\n"
-            "  Hiperparam.  : küçük bir ızgara üzerinde ayarlanacak\n\n"
-            "Kaydedilecekler:\n"
-            "  %s_FINAL_MODEL    — eğitilmiş model dosyası\n"
-            "  %s_FINAL_SKOR     — test seti tahminleri\n"
-            "  %s_FINAL_ONEM     — değişken önem sıralaması\n\n"
-            "'%s' senaryosu tetiklenecek. Başlayalım mı?"
-            % (kazanan, _sayi(baz + yeni),
-               durum["veri_seti"], durum["veri_seti"], durum["veri_seti"],
-               senaryo_mod.SENARYO_FINAL))
+def _modeller():
+    """Ad -> pipeline. Agac modellerinde olceklendirme gereksiz;
+    lojistik regresyonda sart."""
+    return [
+        ("Lojistik Regresyon", Pipeline([
+            ("doldur", SimpleImputer(strategy="median")),
+            ("olcek", StandardScaler()),
+            ("model", LogisticRegression(max_iter=2000, random_state=SEED)),
+        ])),
+        ("Random Forest", Pipeline([
+            ("doldur", SimpleImputer(strategy="median")),
+            ("model", RandomForestClassifier(
+                n_estimators=300, min_samples_leaf=20,
+                n_jobs=-1, random_state=SEED)),
+        ])),
+        ("Gradient Boosting", Pipeline([
+            ("model", HistGradientBoostingClassifier(
+                max_iter=300, learning_rate=0.08, random_state=SEED)),
+        ])),
+        ("XGBoost", _xgboost()),
+    ]
 
 
-def final_uygula(durum):
-    a = durum.get("algoritma") or {}
-    konfig = {
-        "veri_seti": "%s_ENRICHED" % durum["veri_seti"],
-        "cikti_onek": durum["veri_seti"],
-        "target": durum["meta"]["target"],
-        "baz_kolonlar": (durum.get("baz") or {}).get("kolonlar") or [],
-        "yeni_kolonlar": (durum.get("secim") or {}).get("secilen_liste") or [],
-        "bolme": durum.get("bolme") or {},
-        "meta": durum.get("meta") or {},
-        "algoritma": (a.get("kazanan") or {}).get("ad") or "Gradient Boosting",
-    }
-
-    sonuc, hata = senaryo_mod.calistir(
-        senaryo_mod.SENARYO_FINAL, "final", konfig)
-
-    if hata:
-        durum["final"] = {"hata": hata}
-        return "%s\n\nBu adımı şimdilik atlıyorum." % hata
-
-    durum["final"] = sonuc
-
-    m = sonuc.get("metrikler") or {}
-    onem = ["  %-34s %s" % (c[:34], _ond(v, 4))
-            for c, v in (sonuc.get("en_onemli") or [])[:10]]
-
-    return ("Final model hazır.\n\n"
-            "  Algoritma      : %s\n"
-            "  Eğitim / test  : %s / %s satır\n"
-            "  Değişken       : %s\n\n"
-            "TEST SETİ PERFORMANSI\n"
-            "  ROC-AUC        : %s\n  Gini           : %s\n"
-            "  KS             : %s\n\n"
-            "EN ÖNEMLİ 10 DEĞİŞKEN\n%s\n\n"
-            "Model %s veri setine, tahminler %s veri setine yazıldı."
-            % (sonuc.get("algoritma"), _sayi(sonuc.get("egitim_satir", 0)),
-               _sayi(sonuc.get("test_satir", 0)),
-               _sayi(sonuc.get("kolon_sayisi", 0)),
-               _ond(m.get("auc"), 4), _ond(m.get("gini"), 4), _ond(m.get("ks"), 4),
-               "\n".join(onem) or "  (önem bilgisi yok)",
-               sonuc.get("model_dataset", "—"), sonuc.get("skor_dataset", "—")))
+def _xgboost():
+    """XGBoost kurulu degilse None doner; karsilastirmadan sessizce duser."""
+    try:
+        from xgboost import XGBClassifier
+        return Pipeline([
+            ("model", XGBClassifier(
+                n_estimators=400, learning_rate=0.08, max_depth=5,
+                subsample=0.9, colsample_bytree=0.9,
+                eval_metric="auc", n_jobs=-1, random_state=SEED)),
+        ])
+    except Exception:
+        return None
 
 
+try:
+    konfig = senaryo_mod.konfig_al(IS_ADI)
 
+    df = dataiku.Dataset(konfig["veri_seti"]).get_dataframe()
+    target = konfig["target"]
 
+    kolonlar = [c for c in (konfig["baz_kolonlar"] + konfig["yeni_kolonlar"])
+                if c in df.columns]
+    # Sayisal olmayan kolonlar bu asamada disarida; encoding baz sette yapildi
+    kolonlar = [c for c in kolonlar
+                if pd.api.types.is_numeric_dtype(df[c])]
 
+    y = pd.to_numeric(df[target], errors="coerce")
+    gecerli = y.notna()
+    df, y = df[gecerli], y[gecerli]
 
+    tr, te = _maskeler(df, konfig.get("bolme") or {}, konfig.get("meta") or {})
 
+    X_tr = df.loc[tr, kolonlar].replace([np.inf, -np.inf], np.nan)
+    X_te = df.loc[te, kolonlar].replace([np.inf, -np.inf], np.nan)
+    y_tr, y_te = (y[tr] > 0).astype(int), (y[te] > 0).astype(int)
 
+    siralama = []
+    for ad, boru in _modeller():
+        if boru is None:
+            continue
+        t0 = time.time()
+        try:
+            boru.fit(X_tr, y_tr)
+            p = boru.predict_proba(X_te)[:, 1]
+            auc = float(roc_auc_score(y_te, p))
+            siralama.append({
+                "ad": ad,
+                "auc": auc,
+                "gini": 2 * auc - 1,
+                "ks": _ks(y_te.values, p),
+                "sure": round(time.time() - t0, 1),
+            })
+        except Exception as e:
+            siralama.append({"ad": ad, "auc": None, "gini": None,
+                             "ks": None, "sure": round(time.time() - t0, 1),
+                             "hata": str(e)[:200]})
 
+    basarili = [s for s in siralama if s.get("auc") is not None]
+    basarili.sort(key=lambda s: -s["auc"])
+    hatalilar = [s for s in siralama if s.get("auc") is None]
 
+    senaryo_mod.sonuc_yaz(IS_ADI, {
+        "siralama": basarili + hatalilar,
+        "kazanan": basarili[0] if basarili else {},
+        "egitim_satir": int(tr.sum()),
+        "test_satir": int(te.sum()),
+        "kolon_sayisi": len(kolonlar),
+    })
 
-    "algoritma": {
-        "baslik": "Algoritma Seçimi",
-        "aciklama": "Dört algoritma aynı değişken seti, aynı bölme ve aynı "
-                    "seed ile eğitilir; ayrıştırma gücü ve eğitim süresi "
-                    "karşılaştırılır. Uzun sürdüğü için Dataiku senaryosunda "
-                    "çalışır.",
-        "girdi": None, "plan": algoritma_plan, "uygula": algoritma_uygula},
-    "final": {
-        "baslik": "Final Model",
-        "aciklama": "Seçilen algoritma tam veriyle eğitilir, hiperparametreleri "
-                    "ayarlanır, test setinde doğrulanır ve kullanıma hazır "
-                    "biçimde kaydedilir.",
-        "girdi": None, "plan": final_plan, "uygula": final_uygula},
+except Exception as e:
+    import traceback
+    senaryo_mod.hata_yaz(IS_ADI, "%s\n%s" % (e, traceback.format_exc()[-1500:]))
+    raise
 
 
 
@@ -168,9 +151,6 @@ def final_uygula(durum):
 
 
 
-    {"no": "05", "baslik": "Modelleme ve Final",
-     "ozet": "Katkı ölçümü, algoritma seçimi ve final model",
-     "adimlar": ["model", "algoritma", "final", "katalog"]},
 
 
 
@@ -178,3 +158,175 @@ def final_uygula(durum):
 
 
 
+# -*- coding: utf-8 -*-
+"""Senaryo adimi: FINAL_MODEL
+
+Secilen algoritmayi kucuk bir izgara uzerinde ayarlar, tam veriyle egitir,
+test setinde dogrular ve ciktilari kaydeder.
+"""
+
+import io
+import pickle
+
+import numpy as np
+import pandas as pd
+import dataiku
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import roc_auc_score
+from sklearn.inspection import permutation_importance
+
+from fe_agent import senaryo as senaryo_mod
+
+IS_ADI = "final"
+SEED = 42
+MODEL_FOLDER = "PROJE_HAFIZASI"
+
+
+def _maskeler(df, bolme, meta):
+    if bolme.get("tur") == "zamansal" and bolme.get("oot_deger") \
+            and meta.get("donem") in df.columns:
+        test = df[meta["donem"]].astype(str) == str(bolme["oot_deger"])
+        return ~test, test
+
+    oran = float(bolme.get("test_oran") or 0.20)
+    rng = np.random.RandomState(int(bolme.get("seed") or SEED))
+    sira = np.arange(len(df))
+    rng.shuffle(sira)
+    n_test = int(len(df) * oran)
+    test_konum = set(sira[:n_test].tolist())
+    test = pd.Series([k in test_konum for k in range(len(df))], index=df.index)
+    return ~test, test
+
+
+def _ks(y, p):
+    d = pd.DataFrame({"y": y, "p": p}).dropna().sort_values("p")
+    poz = (d["y"] > 0).cumsum() / max((d["y"] > 0).sum(), 1)
+    neg = (d["y"] <= 0).cumsum() / max((d["y"] <= 0).sum(), 1)
+    return float((neg - poz).abs().max())
+
+
+def _boru_ve_izgara(ad):
+    """Ad -> (pipeline, hiperparametre izgarasi).
+    Izgara kucuk tutuldu; her ek kombinasyon suryi katliyor."""
+    if ad == "Lojistik Regresyon":
+        return Pipeline([
+            ("doldur", SimpleImputer(strategy="median")),
+            ("olcek", StandardScaler()),
+            ("model", LogisticRegression(max_iter=3000, random_state=SEED)),
+        ]), {"model__C": [0.05, 0.2, 1.0]}
+
+    if ad == "Random Forest":
+        return Pipeline([
+            ("doldur", SimpleImputer(strategy="median")),
+            ("model", RandomForestClassifier(n_jobs=-1, random_state=SEED)),
+        ]), {"model__n_estimators": [300, 600],
+             "model__min_samples_leaf": [10, 30]}
+
+    if ad == "XGBoost":
+        from xgboost import XGBClassifier
+        return Pipeline([
+            ("model", XGBClassifier(eval_metric="auc", n_jobs=-1,
+                                    random_state=SEED)),
+        ]), {"model__n_estimators": [400, 800],
+             "model__max_depth": [4, 6],
+             "model__learning_rate": [0.05, 0.1]}
+
+    # Varsayilan: Gradient Boosting
+    return Pipeline([
+        ("model", HistGradientBoostingClassifier(random_state=SEED)),
+    ]), {"model__max_iter": [300, 600],
+         "model__learning_rate": [0.05, 0.1],
+         "model__max_leaf_nodes": [31, 63]}
+
+
+try:
+    konfig = senaryo_mod.konfig_al(IS_ADI)
+
+    df = dataiku.Dataset(konfig["veri_seti"]).get_dataframe()
+    target = konfig["target"]
+    onek = konfig["cikti_onek"]
+    meta = konfig.get("meta") or {}
+
+    kolonlar = [c for c in (konfig["baz_kolonlar"] + konfig["yeni_kolonlar"])
+                if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+
+    y = pd.to_numeric(df[target], errors="coerce")
+    gecerli = y.notna()
+    df, y = df[gecerli], y[gecerli]
+
+    tr, te = _maskeler(df, konfig.get("bolme") or {}, meta)
+
+    X_tr = df.loc[tr, kolonlar].replace([np.inf, -np.inf], np.nan)
+    X_te = df.loc[te, kolonlar].replace([np.inf, -np.inf], np.nan)
+    y_tr, y_te = (y[tr] > 0).astype(int), (y[te] > 0).astype(int)
+
+    # --- Hiperparametre ayari: yalnizca GELISTIRME seti uzerinde ---
+    boru, izgara = _boru_ve_izgara(konfig.get("algoritma"))
+    arama = GridSearchCV(boru, izgara, scoring="roc_auc", cv=3, n_jobs=-1)
+    arama.fit(X_tr, y_tr)
+    model = arama.best_estimator_
+
+    # --- Test setinde dogrulama ---
+    p_te = model.predict_proba(X_te)[:, 1]
+    auc = float(roc_auc_score(y_te, p_te))
+    metrikler = {"auc": auc, "gini": 2 * auc - 1, "ks": _ks(y_te.values, p_te)}
+
+    # --- Degisken onemi: permutation, tum modellerde calisir ---
+    # Hiz icin test setinin en fazla 20 bin satirinda olculuyor
+    n = min(len(X_te), 20000)
+    perm = permutation_importance(model, X_te.iloc[:n], y_te.iloc[:n],
+                                  n_repeats=3, random_state=SEED,
+                                  scoring="roc_auc", n_jobs=-1)
+    onem_df = pd.DataFrame({
+        "DEGISKEN": kolonlar,
+        "ONEM": perm.importances_mean,
+        "ONEM_STD": perm.importances_std,
+    }).sort_values("ONEM", ascending=False)
+
+    # --- Ciktilar ---
+    skor_df = pd.DataFrame({
+        "SKOR": p_te,
+        "GERCEK": y_te.values,
+    })
+    if meta.get("id") and meta["id"] in df.columns:
+        skor_df.insert(0, meta["id"], df.loc[te, meta["id"]].values)
+    if meta.get("donem") and meta["donem"] in df.columns:
+        skor_df.insert(1, meta["donem"], df.loc[te, meta["donem"]].values)
+
+    dataiku.Dataset("%s_FINAL_SKOR" % onek).write_with_schema(skor_df)
+    dataiku.Dataset("%s_FINAL_ONEM" % onek).write_with_schema(onem_df)
+
+    # Model dosyasi folder'a pickle olarak; dataset'e yazilamaz
+    tampon = io.BytesIO()
+    pickle.dump({"model": model, "kolonlar": kolonlar,
+                 "algoritma": konfig.get("algoritma"),
+                 "en_iyi_parametre": arama.best_params_},
+                tampon)
+    dataiku.Folder(MODEL_FOLDER).upload_stream(
+        "/final_model_%s.pkl" % onek, tampon.getvalue())
+
+    senaryo_mod.sonuc_yaz(IS_ADI, {
+        "algoritma": konfig.get("algoritma"),
+        "en_iyi_parametre": {k: str(v) for k, v in arama.best_params_.items()},
+        "cv_auc": float(arama.best_score_),
+        "metrikler": metrikler,
+        "egitim_satir": int(tr.sum()),
+        "test_satir": int(te.sum()),
+        "kolon_sayisi": len(kolonlar),
+        "en_onemli": [[r["DEGISKEN"], float(r["ONEM"])]
+                      for _, r in onem_df.head(20).iterrows()],
+        "model_dataset": "PROJE_HAFIZASI/final_model_%s.pkl" % onek,
+        "skor_dataset": "%s_FINAL_SKOR" % onek,
+        "onem_dataset": "%s_FINAL_ONEM" % onek,
+    })
+
+except Exception as e:
+    import traceback
+    senaryo_mod.hata_yaz(IS_ADI, "%s\n%s" % (e, traceback.format_exc()[-1500:]))
+    raise
