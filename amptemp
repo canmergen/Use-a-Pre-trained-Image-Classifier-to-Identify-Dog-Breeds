@@ -1,3 +1,1143 @@
+# -*- coding: utf-8 -*-
+"""fe_agent/akis_panel.py - Ust serit ozeti ve Ozet sayfasi govdesi.
+
+akis.py bolundu; bu dosya o bolumun aynisidir.
+"""
+
+from fe_agent import sfa as sfa_mod
+from fe_agent import sozluk_calisma
+from fe_agent.akis_metin import MOD_ADLARI
+from fe_agent.akis_durum import (
+    LINEAGE_ADI, SOZLUK_ADI, TRAIN_KULLANIMI_BASLIK, _ond, _sayi,
+    bolme_ayarlari, bolme_ozeti, bolme_uyarilari,
+)
+from fe_agent.akis_kayit import ADIMLAR, adim_sirasi, fazlar
+
+
+# Sozluk YALNIZCA Mod B ve C'de platform tarafindan uretilir; Mod A'da
+# kullanicinin hazir sozlugu secmesi beklenir.
+SOZLUK_URETEN_MODLAR = ("B", "C")
+
+
+def _baz_degisken_sayisi(bz, p):
+    """Model adimlarinin kullandigi degisken sayisi.
+
+    bz["kolon"] veri setinin kolon sayisidir (target/id/donem DAHIL);
+    bz["kolonlar"] ise modele giren degiskenlerdir (bu uclu HARIC).
+    Ust serit ile model ekrani ayni sayiyi gostermeli."""
+    kolonlar = bz.get("kolonlar")
+    if kolonlar is not None:
+        return len(kolonlar)
+    return bz.get("kolon") or p.get("kolon_baslangic", 0)
+
+
+# ===========================================================================
+# OZET VE DETAY
+# ===========================================================================
+# Degeri henuz uretilmemis alanin isareti. Arayuz bunu ∅ olarak cizer.
+# ∅ kasitlidir: "bu veri HENUZ GELMEDI" demek. Bos birakmak ya da
+# uydurma bir metin yazmak, gelmemis veriyle gelmis veriyi ayirt
+# edilemez hale getirirdi. Ne bekledigi aciklama satirlarinda yazar.
+BOS_DEGER = "—"
+
+
+def _liste_adet(x):
+    """Liste uzunlugu; liste degilse None. Eski oturumda bu alanlar
+    metin olarak gelebiliyor ve len('ABC') sessizce 3 doner."""
+    return len(x) if isinstance(x, (list, tuple, set)) else None
+
+
+def _serit_veri_sozluk_karti(durum):
+    """Uzerinde calisilan tablo VE sozlugu — TEK kart.
+
+    Ikisi ayri kart tutacak kadar bilgi tasimiyordu: veri seti adi +
+    boyutu, sozluk adi + kapsami. Birlesince kart sag paneldeki
+    "VERİ & SÖZLÜK" sekmesiyle ayni adi tasiyor ve tiklayinca oraya
+    gidiyor — tiklamanin nereye goturdugu etiketten anlasiliyor.
+
+    Tiklama veri seti BAGLANDIKTAN sonra acilir; sozluk henuz yoksa da
+    sekme veri tarafini gosterebiliyor. Sozluk Mod B/C'de LLM tarafindan
+    uretilir, o yuzden bos hali moda gore farkli konusur."""
+    p = durum.get("profil") or {}
+    kolon = _tam(p.get("kolon_baslangic") or p.get("kolon"))
+    satir = _tam(p.get("satir"))
+    veri_ad = durum.get("veri_seti")
+    sozluk_ad = durum.get("sozluk") or durum.get("sozluk_yedek")
+    tanim = _tam(p.get("sozluk_satir"))
+    kapsam = p.get("kapsam")
+
+    # --- alt satir: sozlugun durumu --------------------------------------
+    if sozluk_ad:
+        kaynak = sozluk_calisma.kaynak_etiketi(durum) or sozluk_ad
+        alt = ("%s · %s tanım · %%%s kapsam"
+               % (kaynak, _sayi(tanim), _ond(kapsam, 1))
+               if tanim and kapsam is not None
+               else ("%s · %s tanım" % (kaynak, _sayi(tanim)) if tanim
+                     else str(kaynak)))
+    elif durum.get("mod") in SOZLUK_URETEN_MODLAR:
+        alt = "sözlük LLM tarafından üretilecek"
+    else:
+        alt = "sözlük seçilmedi"
+
+    if not (veri_ad and kolon):
+        return {"deger": BOS_DEGER, "bos": True,
+                "ust": ("kaynak tablolardan oluşturulacak"
+                        if durum.get("mod") == "C" else "veri seti seçilmedi"),
+                "alt": alt}
+
+    return {"deger": "%s × %s" % (_sayi(satir or 0), _sayi(kolon)),
+            "ust": veri_ad,
+            "alt": alt,
+            "hedef": "ozet",
+            "ipucu": ("Veri setinin ve sözlüğün son hâlini görmek, "
+                      "kategorileri düzenlemek için tıklayın.")}
+
+
+def _uretim_kumeleri(durum):
+    """kaynak -> uretilen adlar kumesi. Kaynak bilgisi yoksa bos."""
+    harita = durum.get("uretilen_kaynak")
+    if not isinstance(harita, dict):
+        return {}
+    kumeler = {}
+    for anahtar in ("kural", "kesif"):
+        adlar = harita.get(anahtar)
+        if isinstance(adlar, (list, tuple, set)) and adlar:
+            kumeler[anahtar] = set(adlar)
+    return kumeler
+
+
+def _eleme_noktalari(durum):
+    """Elemenin iki noktasi, SIRASIYLA: [(ad, hayatta kalanlar kumesi)].
+
+    Once kalite kontrolu, sonra aday set secimi. Hangi degiskenin
+    NEREDE elendigini soyleyebilmek icin ikisi ayri ayri gerekiyor;
+    tek bir "final" kumesi "nerede gitti" sorusunu cevaplamiyor."""
+    noktalar = []
+    gecti = (durum.get("kalite") or {}).get("gecti")
+    if isinstance(gecti, (list, tuple, set)):
+        noktalar.append(("kalite", set(gecti)))
+    secilen = (durum.get("secim") or {}).get("secilen_liste")
+    if isinstance(secilen, (list, tuple, set)):
+        noktalar.append(("seçim", set(secilen)))
+    return noktalar
+
+
+# Gosterim sirasi ALFABETIK DEGIL, akisin sirasi: once kural tabanli
+# uretim calisir, sonra AI kesfi. sorted() "kesif"i one aliyordu.
+KAYNAK_SIRASI = ("kural", "kesif")
+KAYNAK_ADI = {"kural": "kural", "kesif": "AI"}
+
+
+def _kaynak_sirali(kumeler):
+    return [(k, kumeler[k]) for k in KAYNAK_SIRASI if k in kumeler]
+
+
+def _uretim_karti(durum):
+    """YALNIZCA uretim: kural tabanli ve AI kac degisken uretti.
+
+    Eleme bu kartta YOK. Akisin gercek sirasi once uretim, sonra eleme;
+    ikisini tek kartta toplamak iki farkli adimi tek cumleye
+    sikistiriyordu."""
+    kumeler = _uretim_kumeleri(durum)
+    uretilen = _liste_adet(durum.get("uretilen"))
+
+    if not uretilen:
+        return {"deger": BOS_DEGER, "bos": True,
+                "ust": "kural tabanlı üretim + AI keşfi",
+                "alt": "henüz değişken üretilmedi"}
+
+    parcalar = ["%s %s" % (KAYNAK_ADI[k], _sayi(len(v)))
+                for k, v in _kaynak_sirali(kumeler)]
+    baz = _liste_adet((durum.get("baz") or {}).get("kolonlar"))
+    return {
+        "deger": _sayi(uretilen),
+        "ust": " · ".join(parcalar) if parcalar else "kaynak kırılımı yok",
+        "alt": ("baz setteki %s değişken üzerine üretildi" % _sayi(baz)
+                if baz else "baz set üzerine üretildi"),
+        "ipucu": ("Kural tabanlı üretim ve AI keşfi adımlarında toplam %s "
+                  "yeni değişken üretildi. Eleme bu kartta değil, ELEME "
+                  "kartında." % _sayi(uretilen)),
+    }
+
+
+def _kaynak_eleme_metni(kumeler, noktalar):
+    """'kural 180→38 · AI 132→16' — kaynak basina uretilen ve KALAN."""
+    if not kumeler or not noktalar:
+        return None
+    son_kume = noktalar[-1][1]
+    return " · ".join(
+        "%s %s→%s" % (KAYNAK_ADI[k], _sayi(len(v)), _sayi(len(v & son_kume)))
+        for k, v in _kaynak_sirali(kumeler))
+
+
+def _nerede_elendi(kumeler, noktalar):
+    """'kalitede −122 · seçimde −112' — hangi adimda kac aday dustu."""
+    if not noktalar:
+        return None
+    onceki = set().union(*kumeler.values()) if kumeler else None
+    parcalar = []
+    for ad, kalan in noktalar:
+        if onceki is None:
+            break
+        dusen = len(onceki - kalan)
+        parcalar.append("%sde −%s" % (ad, _sayi(dusen))
+                        if ad == "kalite" else "%sde −%s" % (ad, _sayi(dusen)))
+        onceki = onceki & kalan
+    return " · ".join(parcalar) if parcalar else None
+
+
+def _eleme_ipucu(kumeler, noktalar):
+    """Uzerine gelince gorunen TAM dokum: kaynak x eleme noktasi."""
+    if not kumeler or not noktalar:
+        return None
+    satirlar = []
+    for k, v in _kaynak_sirali(kumeler):
+        onceki, adimlar = set(v), []
+        for ad, kalan in noktalar:
+            dusen = len(onceki - kalan)
+            onceki = onceki & kalan
+            adimlar.append("%sde %s elendi" % (ad, _sayi(dusen)))
+        satirlar.append("%s: %s üretildi, %s — geriye %s kaldı"
+                        % (KAYNAK_ADI[k], _sayi(len(v)), ", ".join(adimlar),
+                           _sayi(len(onceki))))
+    return "  |  ".join(satirlar)
+
+
+def _eleme_karti(durum):
+    """BUTUN eleme hikayesi: featurelar nereden nereye geldi, NEREDE elendi.
+
+    Iki koldan gelir ve tek hunide birlesir:
+      ham kolonlar        -> profil -> SFA
+      uretilen degiskenler -> kalite -> aday set secimi
+    """
+    p = durum.get("profil") or {}
+    t = p.get("profil_teshis") or {}
+    sfa = durum.get("sfa") or {}
+
+    ham = _tam(p.get("kolon_baslangic") or p.get("kolon"))
+    temiz = _liste_adet(t.get("temiz")) if t else None
+    sfa_gecen = _tam(sfa.get("pass_adet"))
+    uretilen = _liste_adet(durum.get("uretilen"))
+
+    basamaklar = []
+    if temiz is not None:
+        basamaklar.append(("profil", temiz))
+    if sfa_gecen is not None:
+        basamaklar.append(("SFA", sfa_gecen))
+
+    kumeler = _uretim_kumeleri(durum)
+    noktalar = _eleme_noktalari(durum)
+    kalite_gecen = _liste_adet((durum.get("kalite") or {}).get("gecti"))
+    if kalite_gecen is not None:
+        basamaklar.append(("kalite", kalite_gecen))
+    secilen = (durum.get("secim") or {}).get("secilen")
+    if secilen is not None:
+        basamaklar.append(("final", _tam(secilen, 0)))
+
+    if not basamaklar:
+        return {"deger": BOS_DEGER, "bos": True,
+                "ust": "profil · SFA · kalite · seçim",
+                "alt": "üretim bittikten sonra eleme adımları başlar"}
+
+    # Uretilenler ANCAK bir elemeye girdikten sonra huni girisine sayilir;
+    # aksi halde hic elenmemisken "1.354 → 61" yazip 312 uretilmis
+    # degiskenin elendigi izlenimi veriyordu.
+    giris = (ham or 0) + ((uretilen or 0) if noktalar else 0)
+    cikis = basamaklar[-1][1]
+
+    kaynak_metni = _kaynak_eleme_metni(kumeler, noktalar)
+    nerede = _nerede_elendi(kumeler, noktalar)
+
+    return {
+        "deger": "%s → %s" % (_sayi(giris), _sayi(cikis)),
+        # Ust satir: kaynak basina uretilen -> kalan. Kaynak bilgisi
+        # yoksa (eski oturum) ham kolon basamaklari yazilir.
+        "ust": kaynak_metni or " · ".join(
+            "%s %s" % (ad, _sayi(n)) for ad, n in basamaklar),
+        # Alt satir: eleme NEREDE oldu.
+        "alt": nerede or ("%s aday elendi" % _sayi(max(giris - cikis, 0))),
+        "ipucu": _eleme_ipucu(kumeler, noktalar) or (
+            "Basamaklar: " + " · ".join("%s %s" % (ad, _sayi(n))
+                                        for ad, n in basamaklar)),
+    }
+
+
+# Ust seritte gosterilecek model metrikleri: (durum anahtari, etiket, basamak)
+MODEL_METRIKLERI = (("gini_test", "Gini test", 3),
+                    ("gini_oot", "Gini OOT", 3),
+                    ("ks_test", "KS", 3),
+                    ("gini_egitim", "Gini eğitim", 3))
+
+
+def _model_karti(durum):
+    """Modelin SONUCU: aday set buyuklugu ve olculen basari."""
+    sc = durum.get("secim") or {}
+    md = durum.get("model") or {}
+    metrik = md.get("metrikler") or {}
+    val = (durum.get("validasyon") or {}).get("metrikler") or {}
+    metrik = {**metrik, **val}
+
+    secilen = sc.get("secilen")
+    if secilen is None:
+        secilen = _liste_adet((durum.get("baz") or {}).get("kolonlar"))
+
+    bulunan = [(etiket, _ond(metrik[a], b))
+               for a, etiket, b in MODEL_METRIKLERI if metrik.get(a) is not None]
+
+    if secilen is None and not bulunan:
+        return {"deger": BOS_DEGER, "bos": True,
+                "ust": "eğitim + validasyon",
+                "alt": "Gini, KS ve OOT sonuçları burada görünür"}
+
+    if bulunan:
+        return {"deger": "%s %s" % (bulunan[0][0], bulunan[0][1]),
+                "ust": (" · ".join("%s %s" % x for x in bulunan[1:3])
+                        or "%s değişkenli model" % _sayi(_tam(secilen, 0))),
+                "alt": ("%s aday değişken" % _sayi(_tam(secilen, 0))
+                        if secilen is not None else "")}
+
+    delta = (md.get("delta") or {}).get("auc")
+    return {"deger": "%s değişken" % _sayi(_tam(secilen, 0)),
+            "ust": "aday değişken seti",
+            "alt": ("Δ AUC %s" % _ond(delta, 4)) if delta is not None
+                   else "model henüz eğitilmedi"}
+
+
+def ozet(durum):
+    """Ust serit: ÜRETİM · ELEME · MODEL.
+
+    BICIM eskisiyle ayni: kirmizi etiket, koyu deger, iki gri alt satir.
+
+    VERİ & SÖZLÜK KARTI KALDIRILDI. Serit, dar bir kutuda uc satira
+    sigdirilmis ozet demek; veri seti adi, boyut, sozluk adi, tanim
+    sayisi ve kapsam yuzdesi o kutuya sigmiyordu ve kirpilip
+    okunamaz hale geliyordu. Ayni bilgi sag paneldeki VERİ & SÖZLÜK
+    sekmesinde TAM ve detayli duruyor; serit artik yalnizca oradan
+    okunamayan seyi, yani akisin ILERLEYISINI gosteriyor.
+    `_serit_veri_sozluk_karti` SILINMEDI: sekmeye tiklanabilir kart
+    dondurmek gerekirse yeri hazir.
+
+    BOS HAL: deger ∅ ("bu veri henüz gelmedi"), aciklama satirlari o
+    adimda ne yapilacagini yazar. Boylece ∅ tek basina bir bosluk degil,
+    bekleyen bir adim anlatiyor."""
+    return {
+        # Secilmediyse cip cizilmez; None'i uc katmani bekliyor.
+        "veri_seti_cip": durum.get("veri_seti") or None,
+        "sozluk_cip": (durum.get("sozluk") or durum.get("sozluk_yedek")
+                       or None),
+        # SIRA AKISIN GERCEK SIRASI: degisken URETILIR, sonra ELENIR,
+        # sonunda MODEL kurulur.
+        "kartlar": [
+            {"etiket": "ÜRETİM", **_uretim_karti(durum)},
+            {"etiket": "ELEME", **_eleme_karti(durum)},
+            {"etiket": "MODEL", **_model_karti(durum)},
+        ],
+    }
+
+
+def _bolum(baslik, satirlar):
+    return {"baslik": baslik, "satirlar": [s for s in satirlar if s]}
+
+def detay(durum):
+    m, p = durum.get("meta") or {}, durum.get("profil") or {}
+    s, st = durum.get("sfa") or {}, durum.get("stabilite") or {}
+    k, sc = durum.get("kalite") or {}, durum.get("secim") or {}
+    md, bz = durum.get("model") or {}, durum.get("baz") or {}
+    kt, b = durum.get("katalog") or {}, durum.get("bolme") or {}
+    bl = durum.get("birlestirme") or {}
+    t = p.get("profil_teshis") or {}
+
+    bolumler = []
+
+    if durum.get("mod"):
+        # Etiketler TEK kaynaktan (MOD_SECENEKLERI -> MOD_ADLARI) turetilir.
+        # Burada ikinci bir sozluk tutulunca A ile C ters eslesmisti.
+        ad = MOD_ADLARI.get(durum["mod"], durum["mod"])
+        bolumler.append(_bolum("ÇALIŞMA BAŞLANGICI",
+                               [("Başlangıç", "%s — %s" % (durum["mod"], ad))]))
+
+    if bl.get("ozet"):
+        o = bl["ozet"]
+        bolumler.append(_bolum("BİRLEŞTİRME", [
+            ("İskelet tablo", o.get("ana_tablo")),
+            ("Anahtar", " + ".join(o.get("anahtar") or [])),
+            ("Dönem kolonu", o.get("donem_kolon") or "—"),
+            ("Kaynak tablo", _sayi(o.get("kaynak_sayisi", 0))),
+            ("Eklenen kolon", _sayi(o.get("eklenen_kolon", 0))),
+            ("Point-in-time", _sayi(o.get("pit_kolon", 0))),
+            ("Soy kütüğü", bl.get("lineage") or LINEAGE_ADI),
+        ]))
+
+    if durum.get("sozluk_uretim"):
+        o = durum["sozluk_uretim"]
+        bolumler.append(_bolum("SÖZLÜK ÜRETİMİ", [
+            ("Toplam kolon", _sayi(o.get("toplam", 0))),
+            ("Açıklanan", "%s  (%%%s)" % (_sayi(o.get("aciklamali", 0)),
+                                          _ond(o.get("kapsam", 0)))),
+            ("Dataset", SOZLUK_ADI),
+        ]))
+
+    if p.get("kolon"):
+        bolumler.append(_bolum("KAYNAK VERİ", [
+            ("Veri seti", durum.get("veri_seti")),
+            ("Satır", _sayi(p["satir"])),
+            ("Kolon", _sayi(p["kolon_baslangic"])),
+            ("Sayısal / kategorik", "%s / %s" % (
+                _sayi(p.get("sayisal", 0)),
+                _sayi(p["kolon_baslangic"] - p.get("sayisal", 0)))),
+            ("Sözlük", durum.get("sozluk") or durum.get("sozluk_yedek")),
+        ]))
+
+    if m.get("target"):
+        bolumler.append(_bolum("MODELLEME TANIMLARI", [
+            ("Hedef", m.get("target")),
+            ("Hedef tipi", p.get("hedef_ozet")),
+            ("Kimlik kolonu", m.get("id")),
+            ("Dönem kolonu", m.get("donem") or "belirtilmedi"),
+        ]))
+
+    if b.get("tur"):
+        bolumler.append(_bolum("BÖLME STRATEJİSİ", [
+            ("Tür", "zamansal (OOT)" if b["tur"] == "zamansal" else "rastgele"),
+            ("Test dönemi", b.get("oot_deger") or "—"),
+            ("Geliştirme satır", _sayi(b.get("train_satir", 0))),
+            ("Test satır", _sayi(b.get("test_satir", 0))),
+            ("Seed", b.get("seed", "—")),
+        ]))
+
+    if t:
+        bolumler.append(_bolum("VERİ PROFİLİ", [
+            ("Sorunsuz kolon", _sayi(len(t.get("temiz") or []))),
+            ("Eksik oranı yüksek", _sayi(len(t.get("cok_bos") or []))),
+            ("Sabit", _sayi(len(t.get("sabit") or []))),
+            ("Kimlik benzeri", _sayi(len(t.get("kimlik_gibi") or []))),
+            ("Kardinalite yüksek", _sayi(len(t.get("yuksek_kardinalite") or []))),
+        ]))
+
+    if s.get("analiz_edilen") is not None:
+        bolumler.append(_bolum("TEK DEĞİŞKEN ANALİZİ", [
+            ("Analiz edilen", _sayi(s["analiz_edilen"])),
+            ("PASS", _sayi(s.get("pass_adet", 0))),
+            ("Sızıntı şüpheli", _sayi(len(s.get("sizinti") or []))),
+        ]))
+
+    if st and not st.get("atlandi"):
+        bolumler.append(_bolum("STABİLİTE (PSI)", [
+            ("Ölçülen", _sayi(st.get("olculen", 0))),
+            ("Kararlı", _sayi(st.get("stabil", 0))),
+            ("Kayma gösteren", _sayi(len(st.get("kayan") or []))),
+        ]))
+
+    if bz.get("dataset"):
+        bolumler.append(_bolum("ANALİTİK BAZ SET", [
+            ("Dataset", bz["dataset"]),
+            ("Kolon", "%s  →  %s" % (_sayi(p.get("kolon_baslangic", 0)),
+                                     _sayi(bz["kolon"]))),
+            ("Doldurma", bz.get("doldurma")),
+        ]))
+
+    uretilen = len(durum.get("uretilen") or [])
+    if uretilen:
+        blok = {x[0]: len(x[1]) for x in (durum.get("kod_bloklari") or [])}
+        bolumler.append(_bolum("DEĞİŞKEN ÜRETİMİ", [
+            ("Toplam üretilen", _sayi(uretilen)),
+        ] + [(ad, _sayi(n)) for ad, n in blok.items()]))
+
+    if k:
+        bolumler.append(_bolum("KALİTE KONTROLÜ", [
+            ("Geçen", _sayi(len(k.get("gecti") or []))),
+            ("Elenen", _sayi(uretilen - len(k.get("gecti") or []))),
+        ]))
+
+    if sc.get("secilen") is not None:
+        bolumler.append(_bolum("ADAY DEĞİŞKEN SETİ", [
+            ("Aday", _sayi(sc.get("aday", 0))),
+            ("Seçilen", _sayi(sc["secilen"])),
+            ("Önem yöntemi", sc.get("onem_yontemi")),
+        ]))
+
+    if md and not md.get("hata"):
+        bb, e, d = md.get("baseline", {}), md.get("enhanced", {}), md.get("delta", {})
+        ds, ga = md.get("delta_std") or {}, md.get("delta_guven_araligi") or {}
+
+        satirlar, gurultulu = [], []
+        for etiket, anahtar in (("ROC-AUC", "auc"), ("Gini", "gini"), ("KS", "ks")):
+            if bb.get(anahtar) is None and e.get(anahtar) is None:
+                continue
+            satir = "%s → %s   Δ %s" % (_ond(bb.get(anahtar), 4),
+                                        _ond(e.get(anahtar), 4),
+                                        _ond(d.get(anahtar), 4))
+            if ds.get(anahtar) is not None:
+                satir += " ± %s (std)" % _ond(ds[anahtar], 4)
+            aralik = ga.get(anahtar)
+            if aralik and len(aralik) == 2 and None not in aralik:
+                satir += "   %%95 GA [%s ; %s]" % (_ond(aralik[0], 4),
+                                                   _ond(aralik[1], 4))
+                if float(aralik[0]) <= 0.0 <= float(aralik[1]):
+                    gurultulu.append(etiket)
+            satirlar.append((etiket, satir))
+
+        if md.get("tekrar"):
+            satirlar.append(("Tekrar", "%s farklı seed ile ölçüldü"
+                             % _sayi(md["tekrar"])))
+        if md.get("hedef_nan_dusen"):
+            satirlar.append(("Hedefi boş olan satır",
+                             "%s satır ölçüm dışı bırakıldı"
+                             % _sayi(md["hedef_nan_dusen"])))
+
+        # ONCE karsilastirma yapildi mi: yeni kolon yoksa iki model aynidir,
+        # delta mekanik olarak sifirdir ve guven araligi [0,0] cikar. Bunu
+        # gurultu yorumuna sokmak hic yapilmamis bir olcum hakkinda
+        # istatistiksel hukum kurmak olurdu.
+        if not md.get("karsilastirilabilir", True):
+            satirlar.append(("Yorum", md.get("karsilastirma_notu")
+                             or "Karşılaştırma yapılamadı."))
+        # Guven araligi sifiri iceriyorsa katki gurultuden ayirt EDILEMEZ;
+        # bunu ortu bas etmeden yaziyoruz.
+        elif gurultulu:
+            satirlar.append((
+                "Yorum",
+                "%s için %%95 güven aralığı sıfırı içeriyor: yeni "
+                "değişkenlerin katkısı gürültüden ayırt edilemiyor."
+                % " ve ".join(gurultulu)))
+        elif ga:
+            satirlar.append((
+                "Yorum",
+                "Güven aralıklarının hiçbiri sıfırı içermiyor: ölçülen "
+                "katkı seed değişiminden ayırt edilebiliyor."))
+
+        bolumler.append(_bolum("MODEL KARŞILAŞTIRMASI", satirlar))
+
+    if kt.get("satir"):
+        bolumler.append(_bolum("DEĞİŞKEN KATALOĞU", [
+            ("Kayıt", _sayi(kt["satir"])),
+            ("Seçili", _sayi(kt.get("secilen", 0))),
+        ]))
+
+    if not bolumler:
+        bolumler = [_bolum("DURUM", [("Bilgi", "Henüz bir adım tamamlanmadı.")])]
+
+    sira = adim_sirasi(durum.get("mod"))
+    return {"bolumler": bolumler,
+            "adim": ADIMLAR[sira[durum["i"]]]["baslik"],
+            "adim_no": durum["i"] + 1,
+            "toplam": len(sira)}
+
+
+# ===========================================================================
+# ANALIZ MERKEZI SEKMELERI
+# ---------------------------------------------------------------------------
+# validasyon.panel(durum) ile AYNI kalip: durumdan okur, ekranin cizecegi
+# JSON'u doner. Hicbiri veri OKUMAZ / HESAPLAMAZ; gosterilen her sayi ilgili
+# plan/uygula adiminda zaten hesaplanip durum'a yazilmistir.
+#
+# Ortak govde:
+#   {"durum": "hazir" | "bekliyor",
+#    "bekleme_notu": "...",            # yalnizca bekliyor
+#    "kartlar": [{"baslik", "not", "satirlar": [{"etiket", "deger"}]}],
+#    "tablo":   {"baslik", "kolonlar", "satirlar", "toplam", "gosterilen"}}
+#
+# Satir degeri None ise ekranda ∅ cikar; kartin "not" alani o satirin hangi
+# adimdan sonra dolacagini soyler.
+# ===========================================================================
+
+# Panelde gosterilen tablo satiri sayisi (durum'da saklanan ilk N ile ayni).
+PANEL_SATIR = 20
+
+
+def _yuzde(x, b=1):
+    """0.0473 -> '%4,7'. None -> None (ekranda ∅)."""
+    if x is None:
+        return None
+    try:
+        return "%" + _ond(100.0 * float(x), b)
+    except Exception:
+        return None
+
+
+def _yuzde_dogrudan(x, b=2):
+    """Zaten yuzde olarak saklanmis deger: 3.21 -> '%3,21'."""
+    if x is None:
+        return None
+    try:
+        return "%" + _ond(float(x), b)
+    except Exception:
+        return None
+
+
+def _kart(baslik, tanimlar):
+    """tanimlar: [(etiket, deger, "dolduran adim")]
+
+    Degeri olmayan satirlar ∅ kalir ve kart notu hangi adimdan sonra
+    dolacaklarini yazar. Adim adi None ise o satir icin not uretilmez."""
+    satirlar, bekleyen = [], []
+    for etiket, deger, adim in tanimlar:
+        satirlar.append({"etiket": etiket, "deger": deger})
+        if deger in (None, "") and adim and adim not in bekleyen:
+            bekleyen.append(adim)
+
+    kart = {"baslik": baslik, "satirlar": satirlar}
+    if bekleyen:
+        if len(bekleyen) == 1:
+            kart["not"] = "Boş satırlar «%s» adımından sonra dolar." % bekleyen[0]
+        else:
+            kart["not"] = ("Boş satırlar «%s» adımlarından sonra dolar."
+                           % "» ve «".join(bekleyen))
+    return kart
+
+
+def _bekleyen_panel(adim, kartlar=None):
+    veri = {"durum": "bekliyor",
+            "bekleme_notu": "Bu sekme «%s» adımından sonra dolar." % adim,
+            "kartlar": kartlar or []}
+    return veri
+
+
+# --------------------------------------------------------------------------
+# VERI sekmesi  (app.js'te data-tab="ozet")
+# --------------------------------------------------------------------------
+VERI_ADIMI = "Veri Seti"
+TANIM_ADIMI = "Modelleme Tanımları"
+PROFIL_ADIMI = "Veri Profili ve Kalite"
+SFA_ADIMI = "Tek Değişken Analizi (SFA)"
+
+
+def _tam(x, yedek=None):
+    """Sayiya cevrilemeyen degeri PATLAMADAN yedek'e dusurur.
+
+    durum JSON'dan okunur; eski bir oturum dosyasinda ya da elle
+    duzeltilmis bir kayitta sayisal alan metin gelebilir. Panelin
+    tamami .get() ile korunmusken burada ham int() kalmisti; tek bir
+    bozuk alan butun VERI sekmesini dusuruyordu."""
+    if x is None:
+        return yedek
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return yedek
+
+
+def _oran(pay, payda):
+    """pay/payda — payda 0, None ya da metin ise None."""
+    p, b = _tam(pay), _tam(payda)
+    if p is None or not b:
+        return None
+    return p / float(b)
+
+
+def _tip_dagilimi(p):
+    """'812 / 218 / 12' — sayisal / kategorik / tarih.
+
+    Tarih kolonlari eskiden kategorige sayiliyordu; kategorik artik
+    kolon - sayisal - tarih olarak hesaplanir."""
+    kolon = _tam(p.get("kolon_baslangic") or p.get("kolon"))
+    if not kolon:
+        return None
+    sayisal = _tam(p.get("sayisal"), 0)
+    tarih = _tam(p.get("tarih"), 0)
+    kategorik = max(kolon - sayisal - tarih, 0)
+    return "%s / %s / %s" % (_sayi(sayisal), _sayi(kategorik), _sayi(tarih))
+
+
+def _duplicate_metni(p):
+    adet = _tam(p.get("duplicate"))
+    if adet is None:
+        return None
+    oran = _oran(adet, p.get("satir"))
+    if oran is None:
+        return _sayi(adet)
+    return "%s  (%s)" % (_sayi(adet), _yuzde(oran, 2))
+
+
+def _donem_araligi(p):
+    if not p.get("donem_min"):
+        return None
+    if p.get("donem_min") == p.get("donem_maks"):
+        return "%s  (tek dönem)" % p["donem_min"]
+    return "%s – %s  (%s dönem)" % (p["donem_min"], p["donem_maks"],
+                                    _sayi(p.get("donem_adet") or 0))
+
+
+def veri_paneli(durum):
+    """VERI sekmesi. Tek seferde dolmaz: veri seti secilince boyutlar,
+    tanimlar girilince hedef satirlari, profil calisinca null orani dolar."""
+    p = durum.get("profil") or {}
+    kolon = _tam(p.get("kolon_baslangic") or p.get("kolon"))
+    satir = _tam(p.get("satir"))
+
+    boyut = ("%s × %s" % (_sayi(satir), _sayi(kolon))
+             if satir and kolon else None)
+
+    kimlik_dup = _tam(p.get("duplicate_kimlik"))
+    # HEDEF DEGISKEN AYRI KART DEGIL: hedef, veri setinin bir kolonu —
+    # ayri kart olunca "baska bir kaynak" gibi okunuyordu. Tek kartta,
+    # boyut/tip satirlarindan SONRA geliyor.
+    veri_kart = _kart("Veri seti", [
+        ("Veri seti", durum.get("veri_seti"), VERI_ADIMI),
+        ("Satır × kolon", boyut, VERI_ADIMI),
+        ("Sayısal / kategorik / tarih", _tip_dagilimi(p), VERI_ADIMI),
+        ("Duplicate satır", _duplicate_metni(p), VERI_ADIMI),
+        ("Kimlik bazlı tekrar",
+         None if kimlik_dup is None else _sayi(kimlik_dup), TANIM_ADIMI),
+        ("Toplam null oranı", _yuzde(p.get("null_oran"), 2), PROFIL_ADIMI),
+        ("Hedef değişken",
+         (durum.get("meta") or {}).get("target"), TANIM_ADIMI),
+        ("Hedef tipi ve dağılımı", p.get("hedef_ozet"), TANIM_ADIMI),
+        ("Event rate", _yuzde_dogrudan(p.get("event_rate")), TANIM_ADIMI),
+        ("Dönem aralığı", _donem_araligi(p), TANIM_ADIMI),
+    ])
+
+    kartlar = [veri_kart]
+    if not satir:
+        return _bekleyen_panel(VERI_ADIMI, kartlar)
+    return {"durum": "hazir", "kartlar": kartlar}
+
+
+# --------------------------------------------------------------------------
+# VERI & SOZLUK sekmesi  (app.js'te data-tab="ozet")
+# --------------------------------------------------------------------------
+# NEDEN AYRI BIR FONKSIYON
+#   veri_paneli hala duruyor ve KULLANILIYOR (hazirlik_paneli ile birlikte
+#   test edilebilir kucuk parca olarak). veri_sozluk_paneli onun ciktisini
+#   ALIR, uzerine sozluk kartini ve feature tablosunu ekler. Boylece iki
+#   sekme arasinda kart kopyalamak gerekmiyor.
+#
+# NEDEN TABLO BURADA URETILIYOR, VERI OKUNMUYOR
+#   feature_tablo veri setinin BUTUN kolonlarini listeler — 1.042 satir
+#   olabilir — ve her /analiz cagrisinda yeniden uretilir. Kaynagi
+#   durum["profil"]["kolon_ozet"] (profil adiminda bir kez cikarildi),
+#   sozluk calisma kopyasi (kucuk CSV, kisa omurlu onbellekli) ve
+#   durum["sfa"]["ilk20"]. Hicbir yerde veri seti okunmaz.
+# --------------------------------------------------------------------------
+SOZLUK_ADIMI = "Veri ve Sözlük"
+
+# IV / C degerleri durum'da yalnizca SFA'nin ilk N satiri icin duruyor
+# (tam tablo dataset'te). Tabloda gorunmeyen satirlarin iv/c alani
+# sozlesme geregi null kalir.
+FEATURE_KOLONLARI = ["FEATURE", "TİP", "SÖZLÜK TANIMI", "KATEGORİ",
+                     "NULL %", "TEKİL", "ÖRNEK", "DURUM"]
+
+DURUM_TANIMLI = "tanımlı"
+DURUM_YOK = "sözlükte yok"
+DURUM_HARIC = "süreç dışı"
+
+
+def _sozluk_kayitlari(durum):
+    """Sozlukten {degisken: (tanim, kategori)} haritasi + kaynak bilgisi.
+
+    Doner: (harita, kategoriler, tanim_sayisi, kopya_mi).
+    Ayni degisken sozlukte iki kez geciyorsa ILK satir kazanir; ikincisi
+    sessizce yutulmaz, kategori yazma tarafinda her iki satir da
+    guncelleniyor (bkz. sozluk_calisma._uygula)."""
+    tablo, kopya_mi = sozluk_calisma.sozluk_tablosu(durum)
+    if tablo is None or not len(tablo):
+        return {}, [], 0, kopya_mi
+
+    ad_kolon = sozluk_calisma.degisken_kolonu_bul(tablo)
+    tanim_kolon = sozluk_calisma.tanim_kolonu_bul(tablo)
+    kat_kolon = sozluk_calisma.kategori_kolonu_bul(tablo)
+    if ad_kolon is None:
+        return {}, [], int(len(tablo)), kopya_mi
+
+    harita, kategoriler = {}, []
+    for _, r in tablo.iterrows():
+        ad = str(r[ad_kolon]).strip()
+        if not ad or ad in harita:
+            continue
+        tanim = str(r[tanim_kolon]).strip() if tanim_kolon else ""
+        kategori = sozluk_calisma.kategori_sadelestir(
+            r[kat_kolon] if kat_kolon else None)
+        harita[ad] = (tanim or None, kategori)
+        if kategori not in kategoriler:
+            kategoriler.append(kategori)
+
+    kategoriler = sorted(k for k in kategoriler
+                         if k != sozluk_calisma.KATEGORISIZ)
+    kategoriler.append(sozluk_calisma.KATEGORISIZ)
+    return harita, kategoriler, int(len(tablo)), kopya_mi
+
+
+def _sfa_haritasi(durum):
+    """FEATURE -> (iv, c). Kaynak: durum["sfa"]["ilk20"]."""
+    harita = {}
+    for r in ((durum.get("sfa") or {}).get("ilk20") or []):
+        if isinstance(r, dict) and r.get("FEATURE"):
+            harita[str(r["FEATURE"])] = (r.get("IV"), r.get("C_VALUE"))
+    return harita
+
+
+def _kolon_listesi(durum, sozluk_harita):
+    """Tabloda satir acilacak kolonlar, veri setindeki SIRAYLA.
+
+    Once profil adiminin birakttigi kolon ozeti; o yoksa (veri seti henuz
+    okunmadi) sozlukteki degiskenler. Ikisi de yoksa tablo bos kalir."""
+    ozet = (durum.get("profil") or {}).get("kolon_ozet") or []
+    if ozet:
+        return [o for o in ozet if isinstance(o, dict) and o.get("ad")]
+    # Veri seti henuz profillenmedi: sozluk ne diyorsa onu goster.
+    return [{"ad": ad, "tip": None, "null_oran": None, "tekil": None,
+             "ornek": None} for ad in sozluk_harita]
+
+
+def feature_tablo(durum):
+    """VERI & SOZLUK sekmesindeki duzenlenebilir feature tablosu.
+
+    Bicimleme YAPILMAZ: null_oran ham oran (0–1), iv/c yoksa None.
+    Ekranin sanallastirdigi ham veridir."""
+    sozluk_harita, kategoriler, _, kopya_mi = _sozluk_kayitlari(durum)
+    sfa_harita = _sfa_haritasi(durum)
+    haric = set(durum.get("haric_kolonlar") or [])
+
+    satirlar = []
+    for o in _kolon_listesi(durum, sozluk_harita):
+        ad = str(o.get("ad"))
+        tanim, kategori = sozluk_harita.get(
+            ad, (None, sozluk_calisma.KATEGORISIZ))
+        if ad in haric:
+            satir_durum = DURUM_HARIC
+        elif ad in sozluk_harita:
+            satir_durum = DURUM_TANIMLI
+        else:
+            satir_durum = DURUM_YOK
+        iv, c = sfa_harita.get(ad, (None, None))
+        satirlar.append({
+            "feature": ad,
+            "tip": o.get("tip"),
+            "tanim": tanim,
+            "kategori": kategori,
+            "null_oran": o.get("null_oran"),
+            "tekil": o.get("tekil"),
+            "ornek": o.get("ornek"),
+            "durum": satir_durum,
+            "iv": iv,
+            "c": c,
+        })
+
+    # Tabloda gecen ama sozlukte hic kullanilmamis kategori olmaz; yine de
+    # liste tablodan turetilenle birlestiriliyor ki sozluk okunamadiginda
+    # bile filtre calissin.
+    for s in satirlar:
+        if s["kategori"] not in kategoriler:
+            kategoriler.insert(len(kategoriler) - 1, s["kategori"])
+
+    return {
+        "kolonlar": list(FEATURE_KOLONLARI),
+        "satirlar": satirlar,
+        "kategoriler": kategoriler or [sozluk_calisma.KATEGORISIZ],
+        "toplam": len(satirlar),
+        # Kategori YALNIZCA calisma kopyasina yazilabilir. Kopya yoksa
+        # hucre salt-okunur olmali; aksi halde kullanici yazdigini saniyor.
+        "duzenlenebilir": bool(kopya_mi),
+        "sozluk_kaynak": sozluk_calisma.kaynak_etiketi(durum),
+    }
+
+
+def _sozluk_karti(durum):
+    sozluk_harita, _, tanim_sayisi, kopya_mi = _sozluk_kayitlari(durum)
+    p = durum.get("profil") or {}
+    ozet = p.get("kolon_ozet")
+    kolonlar = [o.get("ad") for o in (ozet if isinstance(ozet, list) else [])
+                if isinstance(o, dict) and o.get("ad")]
+    # Kolon ozeti varsa gercek fark sayilir; yoksa kurulum adiminin
+    # surec disi biraktigi liste tek gostergedir.
+    tanimsiz = (len([k for k in kolonlar if k not in sozluk_harita])
+                if kolonlar else len(durum.get("haric_kolonlar") or []))
+
+    return _kart("Değişken sözlüğü", [
+        ("Sözlük", sozluk_calisma.kaynak_etiketi(durum), SOZLUK_ADIMI),
+        ("Tanım sayısı", _sayi(tanim_sayisi) if tanim_sayisi else None,
+         SOZLUK_ADIMI),
+        ("Kapsam", _yuzde_dogrudan(p.get("kapsam"), 1), SOZLUK_ADIMI),
+        ("Sözlükte olmayan kolon",
+         None if tanimsiz is None else _sayi(tanimsiz), SOZLUK_ADIMI),
+        ("Çalışma kopyası",
+         "var — düzenlemeler orijinal sözlüğe yazılmaz" if kopya_mi
+         else "yok — kategori düzenlemesi kapalı", SOZLUK_ADIMI),
+    ])
+
+
+def veri_sozluk_paneli(durum):
+    """VERI & SOZLUK sekmesi: veri_paneli kartlari + sozluk karti + tablo."""
+    temel = veri_paneli(durum)
+    veri = dict(temel)
+    veri["kartlar"] = list(temel.get("kartlar") or []) + [_sozluk_karti(durum)]
+    veri["feature_tablo"] = feature_tablo(durum)
+    return veri
+
+
+# --------------------------------------------------------------------------
+# EKSIK DEGER sekmesi
+# --------------------------------------------------------------------------
+def _en_yuksek_null(p, en_yuksek):
+    """En cok bos kolon. Hicbir kolonda null yoksa oran degil, bu gercek
+    yazilir — "%0,0 — —" satiri hatali hesap izlenimi veriyordu."""
+    if en_yuksek is None:
+        return None
+    if not en_yuksek or not p.get("null_maks_kolon"):
+        return "null içeren kolon yok"
+    return "%s  —  %s" % (_yuzde(en_yuksek, 1), p["null_maks_kolon"])
+
+
+def eksik_paneli(durum):
+    """EKSIK DEGER sekmesi. Kaynak: veri_profili_uygula'nin durum'a yazdigi
+    ilk 20 satir ve null dagilim ozeti; tam tablo dataset'te kalir."""
+    p = durum.get("profil") or {}
+    ilk20 = p.get("eksik_ilk20")
+    if not p.get("null_ozet") and not ilk20:
+        return _bekleyen_panel(PROFIL_ADIMI)
+
+    n = p.get("null_ozet") or {}
+    toplam_kolon = _tam(p.get("profil_kolon"), 0)
+    nullu_olan = _tam(p.get("null_kolon_adet"))
+    en_yuksek = p.get("null_maks")
+    nullu_oran = _oran(nullu_olan, toplam_kolon)
+
+    ozet_kart = _kart("Eksik değer özeti", [
+        ("İncelenen kolon", _sayi(toplam_kolon), PROFIL_ADIMI),
+        ("Null içeren kolon",
+         None if nullu_olan is None
+         else "%s  (%s)" % (_sayi(nullu_olan),
+                            _yuzde(nullu_oran, 1) if nullu_oran is not None
+                            else "—"), PROFIL_ADIMI),
+        ("Toplam null oranı", _yuzde(p.get("null_oran"), 2), PROFIL_ADIMI),
+        ("En yüksek null oranı", _en_yuksek_null(p, en_yuksek), PROFIL_ADIMI),
+        ("Aşırı null eşiğini aşan", _sayi(_tam(p.get("asiri_null_adet"), 0)),
+         PROFIL_ADIMI),
+    ])
+
+    dagilim_kart = _kart("Null oranı dağılımı", [
+        ("Hiç null yok", _sayi(_tam(n.get("hic_null_yok"), 0)), PROFIL_ADIMI),
+        ("Az  (≤ %5)", _sayi(_tam(n.get("az"), 0)), PROFIL_ADIMI),
+        ("Orta  (%5 – %50)", _sayi(_tam(n.get("orta"), 0)), PROFIL_ADIMI),
+        ("Aşırı  (> %50)", _sayi(_tam(n.get("asiri"), 0)), PROFIL_ADIMI),
+    ])
+
+    satirlar = [[r.get("FEATURE"), r.get("TYPE"),
+                 _sayi(_tam(r.get("NULL_COUNT"), 0)),
+                 _yuzde(r.get("NULL_RATIO"), 1) or "—",
+                 _sayi(_tam(r.get("UNIQUE"), 0)),
+                 r.get("DURUM") or ""]
+                for r in (ilk20 or [])]
+
+    return {
+        "durum": "hazir",
+        "kartlar": [ozet_kart, dagilim_kart],
+        "tablo": {
+            "baslik": "Null oranına göre ilk %d kolon" % len(satirlar),
+            "kolonlar": ["FEATURE", "TİP", "NULL", "NULL ORANI",
+                         "TEKİL", "DURUM"],
+            "satirlar": satirlar,
+            "toplam": toplam_kolon,
+            "gosterilen": len(satirlar),
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# HAZIRLIK sekmesi
+# --------------------------------------------------------------------------
+# EKSIK DEGER sekmesi kaldirildi; icerigi buraya tasindi. eksik_paneli
+# SILINMEDI: hem tek basina test ediliyor hem de bu sekme onu kaynak
+# olarak kullaniyor. Iki yerde ayni kart kodunu tutmak, birinin sessizce
+# eskimesi demekti.
+# --------------------------------------------------------------------------
+def _donusum_karti(durum):
+    """Planlanan donusumler.
+
+    Donusumun KENDISI bu turda yok; veri sozlesmesi ve bos liste hazir.
+    Kart bos gorunmesin diye listenin bos hali acikca yaziliyor —
+    "henüz tanımlanmadı" ile "hesaplanamadı" ayni sey degil."""
+    hz = durum.get("hazirlik")
+    adimlar = (hz or {}).get("adimlar") or []
+    if not adimlar:
+        return {"baslik": "Planlanan dönüşümler",
+                "not": "Dönüşüm tanımlandıkça bu kart dolar.",
+                "satirlar": [{"etiket": "Durum",
+                              "deger": "Henüz dönüşüm tanımlanmadı"}]}
+
+    satirlar = []
+    for sira, adim in enumerate(adimlar, 1):
+        if isinstance(adim, dict):
+            etiket = adim.get("ad") or adim.get("baslik") or "Adım %d" % sira
+            deger = adim.get("aciklama") or adim.get("ozet") or "—"
+        else:
+            etiket, deger = "Adım %d" % sira, str(adim)
+        satirlar.append({"etiket": etiket, "deger": deger})
+    return {"baslik": "Planlanan dönüşümler", "satirlar": satirlar}
+
+
+# Bolme degistirilince gecersiz kalan adimlarin durum anahtarlari.
+# Profil BURADA YOK: profil tum satirlarda olculuyor, bolmeden etkilenmiyor.
+BOLME_BAGIMLI = ("sfa", "stabilite", "baz", "kalite", "secim", "model",
+                 "final")
+
+
+def _bolme_kilidi(durum):
+    """(kilitli, neden). Bolme uygulanmis VE bolmeye bagli bir adim
+    calismissa form kilitlenir: degistirmek o analizleri gecersiz kilar."""
+    b = durum.get("bolme") or {}
+    if not b.get("kalici"):
+        return False, ""
+    calisan = [k for k in BOLME_BAGIMLI if durum.get(k)]
+    if not calisan:
+        return False, ""
+    return True, ("Bölme uygulandı ve sonraki adımlar bu bölme üzerinde "
+                  "çalıştı (%s). Bölmeyi değiştirmek bu analizleri geçersiz "
+                  "kılar; devam etmeden önce onayınızı isterim."
+                  % ", ".join(ADIMLAR.get(k, {}).get("baslik") or k
+                              for k in calisan))
+
+
+def bolme_formu(durum):
+    """HAZIRLIK sekmesindeki bolme formu.
+
+    Alanlarin degerleri bolme_ayarlari()'ndan geliyor; form ile fiilen
+    uygulanan bolme ayni kaynaktan okunmali, yoksa kullanici ekranda
+    baska, veride baska bir bolme gorur."""
+    a = bolme_ayarlari(durum)
+    m = durum.get("meta") or {}
+    kilitli, neden = _bolme_kilidi(durum)
+
+    birim = {"deger": a["birim"], "secenekler": ["satir", "kimlik"],
+             "kilitli": not bool(m.get("id"))}
+    if not m.get("id"):
+        birim["not"] = "kimlik kolonu tanımlı değil"
+
+    donemler = list(durum.get("_donemler") or [])
+    oot = {"deger": {"tur": a["oot_tanim"]["tur"],
+                     "deger": a["oot_tanim"]["deger"],
+                     "adet": a["oot_tanim"]["adet"]},
+           "donemler": donemler}
+    if not m.get("donem"):
+        oot["not"] = "dönem kolonu tanımlı değil"
+
+    # 1. ASAMA: test nasil ayrilir. Donem kolonu yoksa zamansal secenek
+    # kilitli gorunur — sebebini yazmadan pasif bir dugme birakmak
+    # kullaniciya "bozuk" hissi veriyor.
+    test_tanim = {"deger": a["test_tanim"],
+                  "secenekler": ["zamansal", "rastgele"],
+                  "kilitli_secenekler": [] if m.get("donem") else ["zamansal"]}
+    if not m.get("donem"):
+        test_tanim["not"] = ("Dönem kolonu tanımlı olmadığı için zamansal "
+                             "test kurulamıyor; test oranla ayrılır.")
+    else:
+        test_tanim["not"] = ("Zamansal testte son N dönem test olur; bu set "
+                             "aynı zamanda OOT'dur, ayrıca bir OOT seti "
+                             "açılmaz.")
+
+    # 2. ASAMA: kalan train nasil kullanilir. Dort secenek TEK alanda;
+    # val_var ve cv ince ayar olarak ayrica duruyor.
+    return {
+        "duzenlenebilir": not kilitli,
+        "alanlar": {
+            "test_tanim": test_tanim,
+            "oot_adet": {"deger": a["oot_adet"], "donemler": donemler,
+                         "kilitli": not bool(m.get("donem"))},
+            "test_oran": {"deger": a["test_oran"],
+                          "kilitli": a["test_tanim"] == "zamansal"},
+            "train_kullanimi": {
+                "deger": a["train_kullanimi"],
+                "secenekler": ["full", "val", "full_cv", "val_cv"],
+                "basliklar": TRAIN_KULLANIMI_BASLIK},
+            "birim": birim,
+            "val_var": {"deger": a["val_var"]},
+            "val_oran": {"deger": a["val_oran"],
+                         "kilitli": not a["val_var"]},
+            "cv": {"deger": a["cv"],
+                   "secenekler": ["yok", "kfold", "zaman"]},
+            "kat": {"deger": a["kat"], "kilitli": a["cv"] == "yok"},
+            "katmanla": {"deger": a["katmanla"]},
+            "oot_tanim": oot,
+            "seed": {"deger": a["seed"]},
+        },
+        "ozet": bolme_ozeti(durum),
+        "uyarilar": bolme_uyarilari(durum),
+        "kilitli": kilitli,
+        "kilit_nedeni": neden,
+    }
+
+
+def hazirlik_paneli(durum):
+    """HAZIRLIK sekmesi: bolme formu + eksik deger ozeti + donusumler."""
+    temel = eksik_paneli(durum)
+    veri = dict(temel)
+    veri["kartlar"] = list(temel.get("kartlar") or []) + [_donusum_karti(durum)]
+    # Form profil beklemeden gorunur: bolme profilden ONCEKI adim, sekme
+    # "bekliyor" durumundayken de kullanici bolmesini duzenleyebilmeli.
+    veri["bolme_formu"] = bolme_formu(durum)
+    return veri
+
+
+# --------------------------------------------------------------------------
+# SFA sekmesi
+# --------------------------------------------------------------------------
+def sfa_paneli(durum):
+    """SFA sekmesi. Kaynak: durum["sfa"] ozeti + sfa_uygula'nin yazdigi
+    IV'ye gore ilk 20 satir; tam tablo dataset'te kalir."""
+    s = durum.get("sfa") or {}
+    if s.get("analiz_edilen") is None:
+        return _bekleyen_panel(SFA_ADIMI)
+
+    olculen = _tam(s.get("analiz_edilen"), 0)
+    gecen = _tam(s.get("pass_adet"), 0)
+    atlanan = len(s.get("atlanan") or [])
+    sizinti = len(s.get("sizinti") or [])
+    pass_oran = _oran(gecen, olculen)
+
+    ozet_kart = _kart("Tek değişken analizi", [
+        ("Ölçülen değişken", _sayi(olculen), SFA_ADIMI),
+        ("PASS", "%s  (%s)" % (_sayi(gecen),
+                               _yuzde(pass_oran, 1)
+                               if pass_oran is not None else "—"), SFA_ADIMI),
+        ("Atlanan (ölçülemedi)", _sayi(atlanan), SFA_ADIMI),
+        ("Sızıntı şüpheli", _sayi(sizinti), SFA_ADIMI),
+        ("Tam tablo", s.get("tablo_dataset") or "proje hafızası", None),
+    ])
+
+    esik_kart = _kart("Eşikler", [
+        ("IV", "> %s" % _ond(sfa_mod.IV_ESIK, 2), None),
+        ("C-value", "> %s" % _ond(sfa_mod.C_ESIK, 2), None),
+        ("Sızıntı şüphesi", "C-value > %s" % _ond(sfa_mod.SIZINTI_ESIK, 2), None),
+        ("Kategorik seviye sınırı", _sayi(sfa_mod.KATEGORIK_MAX), None),
+    ])
+
+    satirlar = [[r.get("FEATURE"),
+                 _ond(r.get("IV"), 3),
+                 _ond(r.get("C_VALUE"), 3),
+                 r.get("SFA_RESULT") or "",
+                 r.get("NOT") or ""]
+                for r in (s.get("ilk20") or [])]
+
+    veri = {"durum": "hazir", "kartlar": [ozet_kart, esik_kart]}
+    if satirlar:
+        veri["tablo"] = {
+            "baslik": "Bilgi değerine göre ilk %d değişken" % len(satirlar),
+            "kolonlar": ["FEATURE", "IV", "C-VALUE", "SONUÇ", "NOT"],
+            "satirlar": satirlar,
+            "toplam": olculen + atlanan,
+            "gosterilen": len(satirlar),
+        }
+    return veri
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 :root {
   /* ===== YAZI OLCEGI - tum arayuz yalnizca bu degerleri kullanir =====
      Tek font: Calibri (urun adindaki font).
@@ -301,8 +1441,15 @@ button.ozet-kart:focus-visible {
 /* Çekmece düğmeleri yalnızca panelin gizlendiği dar ekranlarda görünür */
 .cekmece-btn { display: none; }
 
+/* "Yeni Çalışma" düğmesiyle AYNI kutu: aynı yükseklik, kenar, yarıçap ve
+   zemin. Rozet çıplak metinken komşusunun yanında hizasız duruyordu ve
+   ikisi tek bir öbek gibi okunmuyordu. Tıklanabilir DEĞİL (düğme değil,
+   span) — imleç de değişmiyor, bu yüzden düğme sanılmıyor. */
 #durum-rozet {
   display: inline-flex; align-items: center; gap: 6px;
+  height: 22px; padding: 0 var(--b-2); flex-shrink: 0;
+  border: 1px solid var(--kenar); background: var(--yuzey);
+  border-radius: var(--r-kucuk);
   font-size: var(--fs-govde); font-weight: var(--fw-kalin); color: var(--metin); white-space: nowrap;
 }
 .nokta-yesil {
@@ -414,11 +1561,19 @@ button.ozet-kart:focus-visible {
   display: flex; align-items: center; justify-content: center;
   font-size: 8px; font-weight: var(--fw-kalin);
 }
-.faz-adimlar li.tamam { color: var(--yesil); }
+/* Tamamlanan adim: yesil isaret VE yesil kalin yazi. Yazi ince kalinca
+   isaretle ayni oge gibi okunmuyordu. */
+.faz-adimlar li.tamam { color: var(--yesil); font-weight: var(--fw-kalin); }
 .faz-adimlar li.tamam .adim-isaret {
   background: var(--yesil); border-color: var(--yesil); color: #fff;
 }
-.faz-adimlar li.aktif { color: var(--sari-koyu); font-weight: var(--fw-kalin); }
+/* Calisan adim: yazi da isaretle ayni aileden, kalin.
+   RENK NEDEN --sari DEGIL: isaretin dolgusu #EAB308 ve bu bir DOLGU
+   olarak iyi duruyor, ama ayni sari beyaz zeminde METIN olunca kontrast
+   ~1,9:1 — okunmuyor. --amber ayni sari/kehribar ailesinden ama
+   okunabilir, ve koyu temada zaten kendi karsiligina (#F5B042)
+   donusuyor. Isaret degismedi. */
+.faz-adimlar li.aktif { color: var(--amber); font-weight: var(--fw-kalin); }
 .faz-adimlar li.aktif .adim-isaret {
   background: var(--sari); border-color: var(--sari); color: #000;
   box-shadow: 0 0 0 var(--halka) var(--sari-acik);
