@@ -1,30 +1,90 @@
-if 'df' in globals():
-    def _dogal_siralama_anahtari(s):
-        return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
+def _bucket_tablosu(y, prob, index, etiket, kume_adi, n_bucket):
+    """Tek bir küme (TRAIN/VAL/OOT) için bucket tablosu üretir."""
+    y = np.asarray(y); prob = np.asarray(prob)
 
-    def _liste_metni(kolonlar):
-        if not kolonlar:
-            return "[]"
-        _sirali = sorted(kolonlar, key=_dogal_siralama_anahtari)
-        return "[" + ", ".join(_sirali) + "]"
+    _lim = df.loc[index, LIMIT_COL].to_numpy(dtype="float64") \
+        if LIMIT_COL in df.columns else np.full(len(index), np.nan)
+    _rsk = df.loc[index, RISK_COL].to_numpy(dtype="float64") \
+        if RISK_COL in df.columns else np.full(len(index), np.nan)
+    _tkp = df.loc[index, TAKIP_COL].to_numpy(dtype="float64") \
+        if TAKIP_COL in df.columns else np.full(len(index), np.nan)
 
-    _otomatik = {c for c in df.columns
-                 if any(d.match(c) for d in SIZINTI_DESENLERI)}
-    _once = set(LEAK_COLS)
-    _zaten_olan   = _otomatik & _once
-    _yeni_eklenen = _otomatik - _once
-    LEAK_COLS.update(_otomatik)
+    d = pd.DataFrame({'y': y, 'score': prob, 'limit': _lim, 'risk': _rsk, 'takip': _tkp})
+    n     = len(d)
+    n_bad = int(d['y'].sum())
+    _nb   = n_bucket
 
-    def _liste_yaz(baslik, kolonlar):
-        print(f"\n{baslik} ({len(kolonlar)}): {_liste_metni(kolonlar)}")
+    # Ranklar 1..n; bucket kenarları analitik. (1 = en riskli / en yüksek skor)
+    order = np.argsort(d['score'].to_numpy(), kind="stable")
+    r     = np.empty(n, dtype="float64")
+    r[order] = np.arange(1, n + 1, dtype="float64")
+    edges = 1.0 + np.arange(_nb + 1) * (n - 1) / _nb
+    d['bucket'] = _nb - np.searchsorted(edges[1:-1], r, side="left")
 
-    _liste_yaz("Otomatik bulunan sizinti kolonu", _otomatik)
-    _liste_yaz("Zaten LEAK_COLS icinde olan", _zaten_olan)
-    _liste_yaz("Yeni eklenen", _yeni_eklenen)
+    d['limit_bad'] = d['limit'] * d['y']
+    d['risk_bad']  = d['risk']  * d['y']
 
-    _df_de_olmayan = set(LEAK_COLS) - set(df.columns)
-    _liste_yaz("LEAK_COLS icinde olup df'te OLMAYAN", _df_de_olmayan)
-else:
-    print("⚠ df bellekte yok -> otomatik sizinti taramasi atlandi")
+    g = (d.groupby('bucket')
+           .agg(n=('y', 'size'), bad=('y', 'sum'),
+                min_score=('score', 'min'), avg_score=('score', 'mean'),
+                max_score=('score', 'max'),
+                limit_sum=('limit', 'sum'), risk_sum=('risk', 'sum'),
+                limit_sum_bad=('limit_bad', 'sum'), risk_sum_bad=('risk_bad', 'sum'),
+                takip_adet=('takip', 'sum'), takip_dolu=('takip', 'count'))
+           .reset_index().sort_values('bucket'))
 
-print(f"\nLEAK_COLS ({len(LEAK_COLS)}):", LEAK_COLS)
+    g['bad_rate'] = g['bad'] / g['n']
+    g['dr_risk']  = g['risk_sum_bad'] / g['risk_sum']
+
+    # lift tavanı = min(1/base_rate, _nb); tavan_pct = lift / tavan
+    _base = float(np.mean(y))
+    g['lift'] = g['bad_rate'] / _base if _base > 0 else np.nan
+    _tavan = min(1.0 / _base, _nb) if _base > 0 else np.nan
+    g['lift_tavan_pct'] = g['lift'] / _tavan if np.isfinite(_tavan) else np.nan
+
+    _tot_bad       = g['bad'].sum()
+    g['cum_bad']   = g['bad'].cumsum()
+    g['capture']   = g['cum_bad'] / _tot_bad if _tot_bad > 0 else np.nan
+    g['cum_n_pct'] = g['n'].cumsum() / n
+
+    for c in ['min_score', 'avg_score', 'max_score', 'bad_rate', 'dr_risk',
+              'lift', 'lift_tavan_pct', 'capture', 'cum_n_pct']:
+        g[c] = g[c].round(4)
+    for c in ['limit_sum', 'risk_sum', 'limit_sum_bad', 'risk_sum_bad']:
+        g[c] = g[c].round(0)
+
+    _cap_tavan = min(1.0, CAPTURE_PCT / _base) if _base > 0 else np.nan
+
+    g.insert(0, 'renk', etiket)
+    g.insert(1, 'kume', kume_adi)
+    g.insert(2, 'base_rate', round(_base, 4))
+    g.insert(3, 'lift_tavan', round(_tavan, 2) if np.isfinite(_tavan) else None)
+    g.insert(4, 'n_bucket', _nb)
+
+    # Takip bayrağı: bucket bazında adet ve oran -> tablonun EN SAĞINA
+    _takip_adet = g.pop('takip_adet')
+    _takip_dolu = g.pop('takip_dolu')
+    g[f'{TAKIP_COL}_ADET'] = _takip_adet.round(0).astype('int64')
+    g[f'{TAKIP_COL}_ORAN'] = (_takip_adet / _takip_dolu.replace(0, np.nan)).round(4)
+
+    # monotonluk: bad_rate'in düştüğü komşu çift oranı (1.00 ideal)
+    _mono = float((np.diff(g['bad_rate'].to_numpy()) < 0).mean()) if len(g) > 1 else np.nan
+
+    # capture@pct skordan hesaplanıyor -> bucket sayısından bağımsız
+    _k    = max(1, int(CAPTURE_PCT * n))
+    _top  = np.argpartition(-prob, min(_k, n - 1))[:_k] if n > 1 else np.array([0])
+    cap10 = float(y[_top].sum() / n_bad) if n_bad > 0 else np.nan
+    _capN = int(CAPTURE_PCT * 100)
+    ozet = {'renk': etiket, 'kume': kume_adi, 'n': n, 'bad': n_bad,
+            'base_rate': round(_base, 4),
+            'lift_tavan': round(_tavan, 2) if np.isfinite(_tavan) else None,
+            'lift1': g['lift'].iloc[0],
+            'lift1_tavan_pct': g['lift_tavan_pct'].iloc[0],
+            f'capture{_capN}': round(cap10, 4) if pd.notna(cap10) else None,
+            f'capture{_capN}_tavan': round(_cap_tavan, 4) if np.isfinite(_cap_tavan) else None,
+            f'capture{_capN}_tavan_pct': (round(cap10 / _cap_tavan, 4)
+                                          if pd.notna(cap10) and np.isfinite(_cap_tavan)
+                                          and _cap_tavan > 0 else None),
+            'monoton_pct': round(_mono, 4) if np.isfinite(_mono) else None,
+            'n_bucket': _nb}
+    return g, ozet
