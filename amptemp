@@ -3,8 +3,12 @@
 # FPD_TXN_FEATS_2025 + FPD_TXN_FEATS_2026 -> ORTAK kolonlar uzerinden alt alta birlestir
 # feature_birlesik.xlsx'teki formullerle yeni feature'lari uret
 # -> FPD_TXN_FEATS_ENH
+#
+# BELLEK DOSTU: veri parca parca (PARCA_SATIR) okunur, feature'lari hesaplanir,
+# ciktiya yazilir ve bellekten atilir. Tum veri hicbir zaman ayni anda bellekte durmaz.
 # Yil ayrimi mevcut PERIOD kolonu ile yapilir (ek kolon eklenmez).
 # =====================================================================
+import gc
 import io
 import re
 import time
@@ -23,99 +27,50 @@ FEATURE_DOSYA     = "feature_birlesik.xlsx"
 ALINACAK_DURUMLAR = {"KABUL"}            # RED'leri de uretmek istersen: {"KABUL", "RED"}
 S3_ENDPOINT       = "loscdlhp.aknet.akb:9000"   # notebook'undaki endpoint; yazimini kontrol et
 DONEM_KOL         = "PERIOD"
+PARCA_SATIR       = 100_000              # bellek yine yetmezse 50_000'e dusur
+LOG_HER_N_PARCA   = 10                   # her kac parcada bir ilerleme yazilsin
 BOS_DEGERLER      = {"", "-", "nan", "none", "null"}
 YASAK_KALIPLAR    = ["import", "__", "exec(", "eval(", "open(", "lambda"]
 
 
-# ------------------------- 1) OKUMA -------------------------
-def s3_ile_oku(ad):
-    """Dataset'in parquet dosyalarini S3'ten pyarrow ile paralel okur (get_dataframe'den cok hizli)."""
+# ------------------------- 1) SEMALAR (veri okunmadan) -------------------------
+def sema_bilgisi(ad):
+    """Dataset'in Dataiku semasindan kolon adlari, pandas tipleri ve tarih kolonlari."""
     d = dataiku.Dataset(ad)
-    info = d.get_location_info(sensitive_info=True)["info"]
-    cp = info["connectionParams"]
-    root = info["path"].replace("s3://", "")
-
-    s3 = pafs.S3FileSystem(
-        access_key=cp["accessKey"],
-        secret_key=cp["secretKey"],
-        endpoint_override=S3_ENDPOINT,
-        scheme="https",
-        force_virtual_addressing=False,
-    )
-    dset = pads.dataset(root, filesystem=s3, format="parquet")
-    df = dset.to_table(use_threads=True).to_pandas(self_destruct=True, split_blocks=True)
-
-    # Dataiku semasindaki tiplere cevir (int+null -> float vb.), kolon sirasini semaya gore diz
     names, dtypes, date_idx = d.get_dataframe_schema_st(d.read_schema(), int_as_float=True)
     date_cols = {names[i] for i in date_idx} if date_idx else set()
-    cast = {c: t for c, t in dtypes.items() if c in df.columns and c not in date_cols}
-    return df.astype(cast)[names]
+    return names, dtypes, date_cols
 
 
-def oku(ad):
-    t0 = time.time()
-    try:
-        df = s3_ile_oku(ad)
-        yol = "S3 (pyarrow)"
-    except Exception as e:
-        print(f"[{ad}] S3'ten dogrudan okunamadi ({type(e).__name__}: {e}) -> get_dataframe ile okunuyor")
-        df = dataiku.Dataset(ad).get_dataframe()
-        yol = "get_dataframe"
-    print(f"[{ad}] {df.shape[0]:,} satir x {df.shape[1]:,} kolon | {yol} | {time.time() - t0:.0f} sn")
-    return df
+sema = {ad: sema_bilgisi(ad) for ad in GIRDI_DATASETLER}
 
+ortak_set = set.intersection(*(set(s[0]) for s in sema.values()))
+ortak = [c for c in sema[GIRDI_DATASETLER[0]][0] if c in ortak_set]   # sira ilk dataset'ten
 
-parcalar = {ad: oku(ad) for ad in GIRDI_DATASETLER}
-
-
-# ------------------------- 2) ORTAK KOLONLAR -------------------------
-ilk = parcalar[GIRDI_DATASETLER[0]]
-ortak_set = set.intersection(*(set(x.columns) for x in parcalar.values()))
-ortak = [c for c in ilk.columns if c in ortak_set]      # sira ilk dataset'ten
-
-print(f"\nOrtak kolon sayisi: {len(ortak):,}")
-for ad, x in parcalar.items():
-    disarida = [c for c in x.columns if c not in ortak_set]
+print(f"Ortak kolon sayisi: {len(ortak):,}")
+for ad, (names, _, _) in sema.items():
+    disarida = [c for c in names if c not in ortak_set]
     if disarida:
         print(f"UYARI: {ad} icinde sadece kendisinde olan {len(disarida)} kolon DISARIDA birakildi: "
               f"{disarida[:30]}{' ...' if len(disarida) > 30 else ''}")
     else:
-        print(f"[{ad}] tum kolonlari ortak.")
+        print(f"[{ad}] tum kolonlari ortak ({len(names):,}).")
 
 if DONEM_KOL not in ortak_set:
     raise ValueError(f"{DONEM_KOL} kolonu iki dataset'te ortak degil; yil ayrimi yapilamaz.")
 
-# Ayni isimli ama farkli tipte gelen kolonlar (concat'te object'e donup bozulabilir)
 tip_farki = []
 for c in ortak:
-    tipler = {ad: str(x[c].dtype) for ad, x in parcalar.items()}
+    tipler = {ad: str(sema[ad][1].get(c, "tarih" if c in sema[ad][2] else "?")) for ad in GIRDI_DATASETLER}
     if len(set(tipler.values())) > 1:
         tip_farki.append((c, tipler))
 if tip_farki:
-    print(f"\nUYARI: {len(tip_farki)} ortak kolonun tipi dataset'ler arasinda farkli:")
+    print(f"UYARI: {len(tip_farki)} ortak kolonun tipi dataset'ler arasinda farkli:")
     for c, tipler in tip_farki[:30]:
         print(f"  - {c}: {tipler}")
 
-# Donem kontrolu
-donemler = {ad: set(x[DONEM_KOL].dropna().unique()) for ad, x in parcalar.items()}
-for ad, s in donemler.items():
-    print(f"[{ad}] {DONEM_KOL}: {sorted(s)}")
-cakisan = set.intersection(*donemler.values())
-if cakisan:
-    print(f"UYARI: iki dataset'te de bulunan {DONEM_KOL} degerleri: {sorted(cakisan)} "
-          f"(bu donemlerin satirlari iki kez gelebilir)")
 
-
-# ------------------------- 3) BIRLESTIRME (alt alta, ortak kolonlar) -------------------------
-df = pd.concat([x[ortak] for x in parcalar.values()], ignore_index=True)
-parcalar.clear()   # bellegi bosalt
-del ilk
-
-print(f"\nBirlesik df: {df.shape[0]:,} satir x {df.shape[1]:,} kolon")
-print(df[DONEM_KOL].value_counts().sort_index().to_string())
-
-
-# ------------------------- 4) FEATURE TANIMLARINI OKU -------------------------
+# ------------------------- 2) FEATURE TANIMLARI (bir kez okunur, bir kez kontrol edilir) -------------------------
 klasor = dataiku.Folder(FEATURE_KLASOR)
 with klasor.get_download_stream(FEATURE_DOSYA) as s:
     fx = pd.read_excel(io.BytesIO(s.read()), sheet_name=0)
@@ -132,70 +87,179 @@ def bos_mu(x):
 
 fx = fx[fx["durum"].astype(str).str.strip().str.upper().isin(ALINACAK_DURUMLAR)]
 fx = fx[~fx["formul"].apply(bos_mu) & ~fx["ad"].apply(bos_mu)].copy()
-print(f"\nUretilecek feature tanimi: {len(fx)} (durum: {sorted(ALINACAK_DURUMLAR)})")
+print(f"\nExcel'deki feature tanimi: {len(fx)} (durum: {sorted(ALINACAK_DURUMLAR)})")
 
-
-# ------------------------- 5) FEATURE URETIMI -------------------------
-yeni = {}
-hatalar = []
-ortam = {"df": df, "np": np, "pd": pd}
-
+tanimlar = []        # (ad, formul) -> her parcada calistirilacaklar
+on_hatalar = []      # daha veri okunmadan elenenler
 for _, r in fx.iterrows():
     ad = str(r["ad"]).strip()
     formul = str(r["formul"]).strip()
-
-    if ad in df.columns or ad in yeni:
-        hatalar.append((ad, "bu isimde kolon zaten var", formul))
+    if ad in ortak_set or ad in {t[0] for t in tanimlar}:
+        on_hatalar.append((ad, "bu isimde kolon zaten var", formul))
         continue
     if any(k in formul for k in YASAK_KALIPLAR):
-        hatalar.append((ad, "formulde yasak kalip var", formul))
+        on_hatalar.append((ad, "formulde yasak kalip var", formul))
         continue
-
     kullanilan = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", formul)
-    yok = [k for k in kullanilan if k not in df.columns]
+    yok = [k for k in kullanilan if k not in ortak_set]
     if yok:
-        hatalar.append((ad, f"df'te olmayan kolon: {yok}", formul))
+        on_hatalar.append((ad, f"veride olmayan kolon: {yok}", formul))
         continue
+    tanimlar.append((ad, formul))
 
+print(f"Hesaplanacak feature: {len(tanimlar)} | on kontrolde elenen: {len(on_hatalar)}")
+
+
+# ------------------------- 3) PARCALI OKUMA -------------------------
+def s3_parcalari(ad, kolonlar):
+    """Parquet dosyalarini S3'ten pyarrow ile PARCA PARCA okur; sadece istenen kolonlari ceker."""
+    d = dataiku.Dataset(ad)
+    info = d.get_location_info(sensitive_info=True)["info"]
+    cp = info["connectionParams"]
+    root = info["path"].replace("s3://", "")
+    s3 = pafs.S3FileSystem(
+        access_key=cp["accessKey"],
+        secret_key=cp["secretKey"],
+        endpoint_override=S3_ENDPOINT,
+        scheme="https",
+        force_virtual_addressing=False,
+    )
+    dset = pads.dataset(root, filesystem=s3, format="parquet")
+    for batch in dset.to_batches(columns=kolonlar, batch_size=PARCA_SATIR, use_threads=True):
+        if batch.num_rows:
+            yield batch.to_pandas()
+
+
+def parcalar(ad, kolonlar):
+    """Once S3'ten hizli yol; kurulamazsa Dataiku'nun kendi parcali okumasina duser."""
     try:
-        sonuc = eval(formul, {"__builtins__": {}}, ortam)
+        gen = s3_parcalari(ad, kolonlar)
+        ilk = next(gen, None)
+        yol = "S3 (pyarrow)"
     except Exception as e:
-        hatalar.append((ad, f"{type(e).__name__}: {e}", formul))
-        continue
+        print(f"[{ad}] S3'ten dogrudan okunamadi ({type(e).__name__}: {e}) -> iter_dataframes ile okunuyor")
+        gen = dataiku.Dataset(ad).iter_dataframes(chunksize=PARCA_SATIR, columns=kolonlar)
+        ilk = next(gen, None)
+        yol = "iter_dataframes"
+    print(f"[{ad}] okuma yolu: {yol}")
+    if ilk is None:
+        return
+    yield ilk
+    yield from gen
 
-    if np.isscalar(sonuc):
-        hatalar.append((ad, "formul tek bir sayi dondurdu (seri degil)", formul))
-        continue
 
-    seri = sonuc if isinstance(sonuc, pd.Series) else pd.Series(np.asarray(sonuc), index=df.index)
-    if len(seri) != len(df):
-        hatalar.append((ad, f"uzunluk uyusmuyor ({len(seri)} != {len(df)})", formul))
-        continue
+def tiplere_cevir(parca, ad):
+    """Parcayi o dataset'in Dataiku tiplerine cevirir ve ortak kolon sirasina dizer."""
+    _, dtypes, date_cols = sema[ad]
+    cast = {c: dtypes[c] for c in ortak if c in dtypes and c not in date_cols}
+    return parca.astype(cast)[ortak]
 
-    seri = pd.to_numeric(seri, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float64")
-    yeni[ad] = seri
 
-# Tek seferde ekle (kolon kolon eklemek 1000+ kolonlu df'i parcalar, yavaslatir)
-if yeni:
-    df = pd.concat([df, pd.DataFrame(yeni, index=df.index)], axis=1)
+# ------------------------- 4) FEATURE HESABI (parca bazinda) -------------------------
+parca_hata_sayisi = {}   # ad -> kac parcada hata verdi
+parca_ilk_hata = {}      # ad -> ilk hata mesaji
+feat_dolu = {ad: 0 for ad, _ in tanimlar}         # NaN olmayan deger sayisi
+feat_min = {ad: np.inf for ad, _ in tanimlar}
+feat_max = {ad: -np.inf for ad, _ in tanimlar}
+
+
+def feature_ekle(df):
+    ortam = {"df": df, "np": np, "pd": pd}
+    yeni = {}
+    for ad, formul in tanimlar:
+        try:
+            sonuc = eval(formul, {"__builtins__": {}}, ortam)
+            if np.isscalar(sonuc):
+                raise ValueError("formul tek bir sayi dondurdu (seri degil)")
+            seri = sonuc if isinstance(sonuc, pd.Series) else pd.Series(np.asarray(sonuc), index=df.index)
+            if len(seri) != len(df):
+                raise ValueError(f"uzunluk uyusmuyor ({len(seri)} != {len(df)})")
+            seri = pd.to_numeric(seri, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float64")
+        except Exception as e:
+            parca_hata_sayisi[ad] = parca_hata_sayisi.get(ad, 0) + 1
+            parca_ilk_hata.setdefault(ad, f"{type(e).__name__}: {e}")
+            seri = pd.Series(np.nan, index=df.index, dtype="float64")   # sema sabit kalsin diye NaN
+
+        dolu = int(seri.notna().sum())
+        if dolu:
+            feat_dolu[ad] += dolu
+            feat_min[ad] = min(feat_min[ad], float(seri.min()))
+            feat_max[ad] = max(feat_max[ad], float(seri.max()))
+        yeni[ad] = seri
+
+    if not yeni:
+        return df
+    return pd.concat([df, pd.DataFrame(yeni, index=df.index)], axis=1)
+
+
+# ------------------------- 5) OKU -> HESAPLA -> YAZ (parca parca) -------------------------
+cikti = dataiku.Dataset(CIKTI_DATASET)
+writer = None
+donem_sayim = {ad: {} for ad in GIRDI_DATASETLER}
+toplam_satir = 0
+
+try:
+    for ad in GIRDI_DATASETLER:
+        t0 = time.time()
+        satir = 0
+        for i, parca in enumerate(parcalar(ad, ortak), start=1):
+            parca = tiplere_cevir(parca, ad)
+
+            for donem, adet in parca[DONEM_KOL].value_counts(dropna=False).items():
+                donem_sayim[ad][donem] = donem_sayim[ad].get(donem, 0) + int(adet)
+
+            parca = feature_ekle(parca)
+
+            if writer is None:                       # sema ilk parcadan bir kez yazilir
+                cikti.write_schema_from_dataframe(parca)
+                writer = cikti.get_writer()
+            writer.write_dataframe(parca)
+
+            satir += len(parca)
+            del parca
+            gc.collect()
+
+            if i % LOG_HER_N_PARCA == 0:
+                print(f"[{ad}] {i} parca, {satir:,} satir yazildi ({time.time() - t0:.0f} sn)")
+
+        toplam_satir += satir
+        print(f"[{ad}] TAMAM: {satir:,} satir ({time.time() - t0:.0f} sn)")
+finally:
+    if writer is not None:
+        writer.close()
+
+if writer is None:
+    raise ValueError("Hic satir okunamadi; girdi dataset'leri bos olabilir.")
 
 
 # ------------------------- 6) RAPOR -------------------------
-print(f"\nUretilen feature: {len(yeni)} / {len(fx)}")
-tamamen_bos = [k for k, v in yeni.items() if v.isna().all()]
-sabit = [k for k, v in yeni.items() if not v.isna().all() and v.nunique(dropna=True) <= 1]
+print(f"\nToplam yazilan satir: {toplam_satir:,} | kolon: {len(ortak) + len(tanimlar):,} "
+      f"({len(ortak):,} ortak + {len(tanimlar)} yeni feature)")
+
+for ad in GIRDI_DATASETLER:
+    print(f"[{ad}] {DONEM_KOL} dagilimi:")
+    for donem in sorted(donem_sayim[ad], key=str):
+        print(f"    {donem}: {donem_sayim[ad][donem]:,}")
+cakisan = set.intersection(*(set(v) for v in donem_sayim.values()))
+if cakisan:
+    print(f"UYARI: iki dataset'te de bulunan {DONEM_KOL} degerleri: {sorted(cakisan, key=str)} "
+          f"(bu donemlerin satirlari ciktida iki kez olabilir)")
+
+tamamen_bos = [ad for ad, _ in tanimlar if feat_dolu[ad] == 0]
+sabit = [ad for ad, _ in tanimlar if feat_dolu[ad] > 0 and feat_min[ad] == feat_max[ad]]
 if tamamen_bos:
     print(f"UYARI: tamamen NaN olan feature'lar: {tamamen_bos}")
 if sabit:
     print(f"UYARI: tek degerli (sabit) feature'lar: {sabit}")
-if hatalar:
-    print(f"\nUretilemeyen {len(hatalar)} feature:")
-    for ad, neden, formul in hatalar:
+
+if parca_hata_sayisi:
+    print(f"\nHesaplama sirasinda hata veren {len(parca_hata_sayisi)} feature (hatali parcalarda NaN yazildi):")
+    for ad, n in parca_hata_sayisi.items():
+        print(f"  - {ad}: {n} parcada hata | ilk hata: {parca_ilk_hata[ad]}")
+
+if on_hatalar:
+    print(f"\nOn kontrolde elenen {len(on_hatalar)} feature (ciktida YOK):")
+    for ad, neden, formul in on_hatalar:
         print(f"  - {ad}: {neden}\n      formul: {formul[:200]}")
 
-print(f"\nCikti: {df.shape[0]:,} satir x {df.shape[1]:,} kolon")
-
-
-# ------------------------- 7) YAZMA -------------------------
-dataiku.Dataset(CIKTI_DATASET).write_with_schema(df)
-print(f"{CIKTI_DATASET} yazildi.")
+print(f"\n{CIKTI_DATASET} yazildi.")
