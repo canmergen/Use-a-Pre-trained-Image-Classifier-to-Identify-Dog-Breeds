@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-# FPD_TXN_FEATS_2025 + FPD_TXN_FEATS_2026 -> alt alta birlestir
+# FPD_TXN_FEATS_2025 + FPD_TXN_FEATS_2026 -> ORTAK kolonlar uzerinden alt alta birlestir
 # feature_birlesik.xlsx'teki formullerle yeni feature'lari uret
 # -> FPD_TXN_FEATS_ENH
+# Yil ayrimi mevcut PERIOD kolonu ile yapilir (ek kolon eklenmez).
 # =====================================================================
 import io
 import re
@@ -15,15 +16,13 @@ import pyarrow.fs as pafs
 import dataiku
 
 # ------------------------- AYARLAR -------------------------
-GIRDI_DATASETLER  = ["FPD_TXN_FEATS_2025", "FPD_TXN_FEATS_2026"]   # sira onemli: 2026 sonda
+GIRDI_DATASETLER  = ["FPD_TXN_FEATS_2025", "FPD_TXN_FEATS_2026"]   # kolon sirasi ilkinden alinir
 CIKTI_DATASET     = "FPD_TXN_FEATS_ENH"
 FEATURE_KLASOR    = "COMPLETE_JSON"
 FEATURE_DOSYA     = "feature_birlesik.xlsx"
 ALINACAK_DURUMLAR = {"KABUL"}            # RED'leri de uretmek istersen: {"KABUL", "RED"}
 S3_ENDPOINT       = "loscdlhp.aknet.akb:9000"   # notebook'undaki endpoint; yazimini kontrol et
-DONEM_ADAYLARI    = ["DONEM", "PERIOD"]  # donem kolonu hangisiyse otomatik bulunur
-ANAHTAR_ADAYLARI  = ["SM_ID"]            # musteri/basvuru anahtari
-TEKRARLARI_AT     = False                # True: ayni anahtar+donem iki kez varsa sonuncuyu (2026) tutar
+DONEM_KOL         = "PERIOD"
 BOS_DEGERLER      = {"", "-", "nan", "none", "null"}
 YASAK_KALIPLAR    = ["import", "__", "exec(", "eval(", "open(", "lambda"]
 
@@ -69,41 +68,51 @@ def oku(ad):
 parcalar = {ad: oku(ad) for ad in GIRDI_DATASETLER}
 
 
-# ------------------------- 2) SEMA + DONEM KONTROLU -------------------------
-kolon_setleri = {ad: set(x.columns) for ad, x in parcalar.items()}
-ortak = set.intersection(*kolon_setleri.values())
-for ad, s in kolon_setleri.items():
-    fark = s - ortak
-    if fark:
-        print(f"UYARI: {ad} icinde digerinde olmayan {len(fark)} kolon var "
-              f"(birlesimde diger tarafta NaN olacak): {sorted(fark)[:20]}")
+# ------------------------- 2) ORTAK KOLONLAR -------------------------
+ilk = parcalar[GIRDI_DATASETLER[0]]
+ortak_set = set.intersection(*(set(x.columns) for x in parcalar.values()))
+ortak = [c for c in ilk.columns if c in ortak_set]      # sira ilk dataset'ten
 
-donem_kol = next((c for c in DONEM_ADAYLARI if c in ortak), None)
-anahtar_kol = next((c for c in ANAHTAR_ADAYLARI if c in ortak), None)
+print(f"\nOrtak kolon sayisi: {len(ortak):,}")
+for ad, x in parcalar.items():
+    disarida = [c for c in x.columns if c not in ortak_set]
+    if disarida:
+        print(f"UYARI: {ad} icinde sadece kendisinde olan {len(disarida)} kolon DISARIDA birakildi: "
+              f"{disarida[:30]}{' ...' if len(disarida) > 30 else ''}")
+    else:
+        print(f"[{ad}] tum kolonlari ortak.")
 
-if donem_kol:
-    donemler = {ad: set(x[donem_kol].dropna().unique()) for ad, x in parcalar.items()}
-    for ad, s in donemler.items():
-        print(f"[{ad}] {donem_kol}: {sorted(s)}")
-    cakisan = set.intersection(*donemler.values())
-    if cakisan:
-        print(f"UYARI: iki dataset'te de bulunan donemler: {sorted(cakisan)}")
-else:
-    print("Bilgi: donem kolonu bulunamadi, donem cakisma kontrolu yapilmadi.")
+if DONEM_KOL not in ortak_set:
+    raise ValueError(f"{DONEM_KOL} kolonu iki dataset'te ortak degil; yil ayrimi yapilamaz.")
+
+# Ayni isimli ama farkli tipte gelen kolonlar (concat'te object'e donup bozulabilir)
+tip_farki = []
+for c in ortak:
+    tipler = {ad: str(x[c].dtype) for ad, x in parcalar.items()}
+    if len(set(tipler.values())) > 1:
+        tip_farki.append((c, tipler))
+if tip_farki:
+    print(f"\nUYARI: {len(tip_farki)} ortak kolonun tipi dataset'ler arasinda farkli:")
+    for c, tipler in tip_farki[:30]:
+        print(f"  - {c}: {tipler}")
+
+# Donem kontrolu
+donemler = {ad: set(x[DONEM_KOL].dropna().unique()) for ad, x in parcalar.items()}
+for ad, s in donemler.items():
+    print(f"[{ad}] {DONEM_KOL}: {sorted(s)}")
+cakisan = set.intersection(*donemler.values())
+if cakisan:
+    print(f"UYARI: iki dataset'te de bulunan {DONEM_KOL} degerleri: {sorted(cakisan)} "
+          f"(bu donemlerin satirlari iki kez gelebilir)")
 
 
-# ------------------------- 3) BIRLESTIRME (alt alta) -------------------------
-df = pd.concat(list(parcalar.values()), ignore_index=True, sort=False)
+# ------------------------- 3) BIRLESTIRME (alt alta, ortak kolonlar) -------------------------
+df = pd.concat([x[ortak] for x in parcalar.values()], ignore_index=True)
 parcalar.clear()   # bellegi bosalt
+del ilk
 
-if anahtar_kol and donem_kol:
-    tekrar = int(df.duplicated([anahtar_kol, donem_kol]).sum())
-    print(f"{anahtar_kol}+{donem_kol} bazinda tekrar eden satir: {tekrar:,}")
-    if tekrar and TEKRARLARI_AT:
-        df = df.drop_duplicates([anahtar_kol, donem_kol], keep="last").reset_index(drop=True)
-        print(f"Tekrarlar atildi (sonuncu tutuldu). Yeni satir sayisi: {len(df):,}")
-
-print(f"Birlesik df: {df.shape[0]:,} satir x {df.shape[1]:,} kolon")
+print(f"\nBirlesik df: {df.shape[0]:,} satir x {df.shape[1]:,} kolon")
+print(df[DONEM_KOL].value_counts().sort_index().to_string())
 
 
 # ------------------------- 4) FEATURE TANIMLARINI OKU -------------------------
@@ -123,7 +132,7 @@ def bos_mu(x):
 
 fx = fx[fx["durum"].astype(str).str.strip().str.upper().isin(ALINACAK_DURUMLAR)]
 fx = fx[~fx["formul"].apply(bos_mu) & ~fx["ad"].apply(bos_mu)].copy()
-print(f"Uretilecek feature tanimi: {len(fx)} (durum: {sorted(ALINACAK_DURUMLAR)})")
+print(f"\nUretilecek feature tanimi: {len(fx)} (durum: {sorted(ALINACAK_DURUMLAR)})")
 
 
 # ------------------------- 5) FEATURE URETIMI -------------------------
