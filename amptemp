@@ -1,90 +1,245 @@
-def _bucket_tablosu(y, prob, index, etiket, kume_adi, n_bucket):
-    """Tek bir küme (TRAIN/VAL/OOT) için bucket tablosu üretir."""
-    y = np.asarray(y); prob = np.asarray(prob)
+# =====================================================================
+# FPD_TXN_FEATS_2025 + FPD_TXN_FEATS_2026 -> ortak kolonlarla alt alta birlestir
+# + feature_birlesik.xlsx'teki formullerle yeni feature'lar -> FPD_TXN_FEATS_ENH
+# Parca parca calisir: bellekte ayni anda sadece PARCA_SATIR satir durur.
+# =====================================================================
+import io
+import re
+import time
+import warnings
 
-    _lim = df.loc[index, LIMIT_COL].to_numpy(dtype="float64") \
-        if LIMIT_COL in df.columns else np.full(len(index), np.nan)
-    _rsk = df.loc[index, RISK_COL].to_numpy(dtype="float64") \
-        if RISK_COL in df.columns else np.full(len(index), np.nan)
-    _tkp = df.loc[index, TAKIP_COL].to_numpy(dtype="float64") \
-        if TAKIP_COL in df.columns else np.full(len(index), np.nan)
+import numpy as np
+import pandas as pd
+import psutil
+import pyarrow as pa
+import pyarrow.dataset as pads
+import pyarrow.fs as pafs
+import pyarrow.parquet as pq
+import dataiku
 
-    d = pd.DataFrame({'y': y, 'score': prob, 'limit': _lim, 'risk': _rsk, 'takip': _tkp})
-    n     = len(d)
-    n_bad = int(d['y'].sum())
-    _nb   = n_bucket
+warnings.filterwarnings("ignore")
 
-    # Ranklar 1..n; bucket kenarları analitik. (1 = en riskli / en yüksek skor)
-    order = np.argsort(d['score'].to_numpy(), kind="stable")
-    r     = np.empty(n, dtype="float64")
-    r[order] = np.arange(1, n + 1, dtype="float64")
-    edges = 1.0 + np.arange(_nb + 1) * (n - 1) / _nb
-    d['bucket'] = _nb - np.searchsorted(edges[1:-1], r, side="left")
+# ------------------------- AYARLAR -------------------------
+GIRDI_DATASETLER  = ["FPD_TXN_FEATS_2025", "FPD_TXN_FEATS_2026"]   # kolon sirasi ilkinden
+CIKTI_DATASET     = "FPD_TXN_FEATS_ENH"
+FEATURE_KLASOR    = "COMPLETE_JSON"
+FEATURE_DOSYA     = "feature_birlesik.xlsx"
+ALINACAK_DURUMLAR = {"KABUL"}            # RED'ler de istenirse: {"KABUL", "RED"}
+S3_ENDPOINT       = "loscdlhp.aknet.akb:9000"   # RENK_GOC_MODEL notebook'undakiyle ayni olmali
+DONEM_KOL         = "PERIOD"
+PARCA_SATIR       = 200_000              # kernel yine zorlanirsa 100_000 yap
+BOS_DEGERLER      = {"", "-", "nan", "none", "null"}
+YASAK_KALIPLAR    = ["import", "__", "exec(", "eval(", "open(", "lambda"]
 
-    d['limit_bad'] = d['limit'] * d['y']
-    d['risk_bad']  = d['risk']  * d['y']
+t_bas = time.time()
 
-    g = (d.groupby('bucket')
-           .agg(n=('y', 'size'), bad=('y', 'sum'),
-                min_score=('score', 'min'), avg_score=('score', 'mean'),
-                max_score=('score', 'max'),
-                limit_sum=('limit', 'sum'), risk_sum=('risk', 'sum'),
-                limit_sum_bad=('limit_bad', 'sum'), risk_sum_bad=('risk_bad', 'sum'),
-                takip_adet=('takip', 'sum'), takip_dolu=('takip', 'count'))
-           .reset_index().sort_values('bucket'))
 
-    g['bad_rate'] = g['bad'] / g['n']
-    g['dr_risk']  = g['risk_sum_bad'] / g['risk_sum']
+def ram(etiket=""):
+    vm = psutil.virtual_memory()
+    print(f"RAM {etiket}: {vm.used/1e9:.0f}/{vm.total/1e9:.0f} GB (%{vm.percent:.0f}) | bos {vm.available/1e9:.0f} GB")
 
-    # lift tavanı = min(1/base_rate, _nb); tavan_pct = lift / tavan
-    _base = float(np.mean(y))
-    g['lift'] = g['bad_rate'] / _base if _base > 0 else np.nan
-    _tavan = min(1.0 / _base, _nb) if _base > 0 else np.nan
-    g['lift_tavan_pct'] = g['lift'] / _tavan if np.isfinite(_tavan) else np.nan
 
-    _tot_bad       = g['bad'].sum()
-    g['cum_bad']   = g['bad'].cumsum()
-    g['capture']   = g['cum_bad'] / _tot_bad if _tot_bad > 0 else np.nan
-    g['cum_n_pct'] = g['n'].cumsum() / n
+def s3_fs(cp):
+    return pafs.S3FileSystem(
+        access_key=cp["accessKey"], secret_key=cp["secretKey"],
+        endpoint_override=S3_ENDPOINT, scheme="https", force_virtual_addressing=False,
+    )
 
-    for c in ['min_score', 'avg_score', 'max_score', 'bad_rate', 'dr_risk',
-              'lift', 'lift_tavan_pct', 'capture', 'cum_n_pct']:
-        g[c] = g[c].round(4)
-    for c in ['limit_sum', 'risk_sum', 'limit_sum_bad', 'risk_sum_bad']:
-        g[c] = g[c].round(0)
 
-    _cap_tavan = min(1.0, CAPTURE_PCT / _base) if _base > 0 else np.nan
+ram("baslangic")
 
-    g.insert(0, 'renk', etiket)
-    g.insert(1, 'kume', kume_adi)
-    g.insert(2, 'base_rate', round(_base, 4))
-    g.insert(3, 'lift_tavan', round(_tavan, 2) if np.isfinite(_tavan) else None)
-    g.insert(4, 'n_bucket', _nb)
+# ------------------------- 1) KAYNAKLAR (veri okunmaz, sadece dosya listesi + sema) -------------------------
+kaynaklar = {}
+for ad in GIRDI_DATASETLER:
+    info = dataiku.Dataset(ad).get_location_info(sensitive_info=True)["info"]
+    kaynaklar[ad] = pads.dataset(info["path"].replace("s3://", ""),
+                                 filesystem=s3_fs(info["connectionParams"]), format="parquet")
+    print(f"[{ad}] {len(kaynaklar[ad].schema):,} kolon, {kaynaklar[ad].count_rows():,} satir")
 
-    # Takip bayrağı: bucket bazında adet ve oran -> tablonun EN SAĞINA
-    _takip_adet = g.pop('takip_adet')
-    _takip_dolu = g.pop('takip_dolu')
-    g[f'{TAKIP_COL}_ADET'] = _takip_adet.round(0).astype('int64')
-    g[f'{TAKIP_COL}_ORAN'] = (_takip_adet / _takip_dolu.replace(0, np.nan)).round(4)
+# ------------------------- 2) ORTAK KOLONLAR + ORTAK TIPLER -------------------------
+ortak_set = set.intersection(*(set(k.schema.names) for k in kaynaklar.values()))
+ortak = [c for c in kaynaklar[GIRDI_DATASETLER[0]].schema.names if c in ortak_set]
+for ad, k in kaynaklar.items():
+    disarida = [c for c in k.schema.names if c not in ortak_set]
+    if disarida:
+        print(f"UYARI: [{ad}] sadece kendisinde olan {len(disarida)} kolon disarida: {disarida[:20]}")
+print(f"Ortak kolon: {len(ortak):,}")
+if DONEM_KOL not in ortak_set:
+    raise ValueError(f"{DONEM_KOL} iki dataset'te ortak degil.")
 
-    # monotonluk: bad_rate'in düştüğü komşu çift oranı (1.00 ideal)
-    _mono = float((np.diff(g['bad_rate'].to_numpy()) < 0).mean()) if len(g) > 1 else np.nan
 
-    # capture@pct skordan hesaplanıyor -> bucket sayısından bağımsız
-    _k    = max(1, int(CAPTURE_PCT * n))
-    _top  = np.argpartition(-prob, min(_k, n - 1))[:_k] if n > 1 else np.array([0])
-    cap10 = float(y[_top].sum() / n_bad) if n_bad > 0 else np.nan
-    _capN = int(CAPTURE_PCT * 100)
-    ozet = {'renk': etiket, 'kume': kume_adi, 'n': n, 'bad': n_bad,
-            'base_rate': round(_base, 4),
-            'lift_tavan': round(_tavan, 2) if np.isfinite(_tavan) else None,
-            'lift1': g['lift'].iloc[0],
-            'lift1_tavan_pct': g['lift_tavan_pct'].iloc[0],
-            f'capture{_capN}': round(cap10, 4) if pd.notna(cap10) else None,
-            f'capture{_capN}_tavan': round(_cap_tavan, 4) if np.isfinite(_cap_tavan) else None,
-            f'capture{_capN}_tavan_pct': (round(cap10 / _cap_tavan, 4)
-                                          if pd.notna(cap10) and np.isfinite(_cap_tavan)
-                                          and _cap_tavan > 0 else None),
-            'monoton_pct': round(_mono, 4) if np.isfinite(_mono) else None,
-            'n_bucket': _nb}
-    return g, ozet
+def ortak_tip(tipler):
+    """Iki yilda ayni kolon farkli tipteyse ikisini de tasiyabilecek tipi secer."""
+    if all(pa.types.is_timestamp(t) for t in tipler):
+        return pa.timestamp("ms")
+    if all(t.equals(tipler[0]) for t in tipler):
+        return tipler[0]
+    if all(pa.types.is_integer(t) or pa.types.is_floating(t) for t in tipler):
+        return pa.float64()
+    return pa.string()
+
+
+hedef_alanlar, tip_farki = [], []
+for c in ortak:
+    tipler = [k.schema.field(c).type for k in kaynaklar.values()]
+    ht = ortak_tip(tipler)
+    if not all(t.equals(tipler[0]) for t in tipler):
+        tip_farki.append(f"{c}: {[str(t) for t in tipler]} -> {ht}")
+    hedef_alanlar.append(pa.field(c, ht))
+hedef_sema = pa.schema(hedef_alanlar)
+if tip_farki:
+    print(f"Bilgi: {len(tip_farki)} kolonun tipi yillar arasinda farkli, ortak tipe cevrilecek: {tip_farki[:10]}")
+
+# ------------------------- 3) FEATURE TANIMLARI -------------------------
+with dataiku.Folder(FEATURE_KLASOR).get_download_stream(FEATURE_DOSYA) as s:
+    fx = pd.read_excel(io.BytesIO(s.read()), sheet_name=0)
+fx.columns = [str(c).strip() for c in fx.columns]
+eksik = {"ad", "formul", "durum"} - set(fx.columns)
+if eksik:
+    raise ValueError(f"Excel'de beklenen kolon(lar) yok: {eksik}. Mevcut: {list(fx.columns)}")
+
+
+def bos_mu(x):
+    return pd.isna(x) or str(x).strip().lower() in BOS_DEGERLER
+
+
+fx = fx[fx["durum"].astype(str).str.strip().str.upper().isin(ALINACAK_DURUMLAR)]
+fx = fx[~fx["formul"].apply(bos_mu) & ~fx["ad"].apply(bos_mu)]
+
+tanimlar, elenen, gerekli = [], [], {DONEM_KOL}
+for ad, formul in zip(fx["ad"].astype(str).str.strip(), fx["formul"].astype(str).str.strip()):
+    kullanilan = re.findall(r"df\[\s*['\"]([^'\"]+)['\"]\s*\]", formul)
+    yok = [k for k in kullanilan if k not in ortak_set]
+    if ad in ortak_set or ad in {t[0] for t in tanimlar}:
+        elenen.append((ad, "bu isimde kolon zaten var"))
+    elif any(k in formul for k in YASAK_KALIPLAR):
+        elenen.append((ad, "formulde yasak kalip var"))
+    elif yok:
+        elenen.append((ad, f"veride olmayan kolon: {yok}"))
+    else:
+        tanimlar.append((ad, formul))
+        gerekli.update(kullanilan)
+gerekli_liste = [c for c in ortak if c in gerekli]
+print(f"Feature: {len(tanimlar)} hesaplanacak, {len(elenen)} elendi | pandas'a cevrilecek kolon: {len(gerekli_liste)}")
+
+# ------------------------- 4) CIKTI HAZIRLIGI -------------------------
+proje = dataiku.api_client().get_project(dataiku.default_project_key())
+raw = proje.get_dataset(CIKTI_DATASET).get_settings().get_raw()
+if raw.get("type") != "S3" or raw.get("formatType") != "parquet":
+    raise ValueError(f"{CIKTI_DATASET} MinIO-S3 + Parquet olmali. Su an: type={raw.get('type')}, "
+                     f"format={raw.get('formatType')}. Dataset Settings'ten degistirip tekrar calistir.")
+
+out_info = dataiku.Dataset(CIKTI_DATASET).get_location_info(sensitive_info=True)["info"]
+out_fs = s3_fs(out_info["connectionParams"])
+out_root = out_info["path"].replace("s3://", "").rstrip("/")
+try:
+    out_fs.delete_dir_contents(out_root)          # onceki yarim denemelerin dosyalari
+except Exception as e:
+    print(f"Bilgi: eski cikti temizlenemedi/yoktu ({type(e).__name__})")
+
+cikis_sema = pa.schema(list(hedef_sema) + [pa.field(a, pa.float64()) for a, _ in tanimlar])
+
+# ------------------------- 5) OKU -> FEATURE -> YAZ -------------------------
+hata_sayisi, ilk_hata = {}, {}
+dolu = {a: 0 for a, _ in tanimlar}
+mn = {a: np.inf for a, _ in tanimlar}
+mx = {a: -np.inf for a, _ in tanimlar}
+donem_sayim = {ad: {} for ad in GIRDI_DATASETLER}
+
+
+def hesapla(pdf, ad, formul):
+    n = len(pdf)
+    try:
+        sonuc = eval(formul, {"__builtins__": {}}, {"df": pdf, "np": np, "pd": pd})
+        if np.isscalar(sonuc):
+            raise ValueError("formul tek bir sayi dondurdu")
+        seri = sonuc if isinstance(sonuc, pd.Series) else pd.Series(np.asarray(sonuc))
+        if len(seri) != n:
+            raise ValueError(f"uzunluk uyusmuyor ({len(seri)} != {n})")
+        arr = pd.to_numeric(seri, errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+        arr[~np.isfinite(arr)] = np.nan
+    except Exception as e:
+        hata_sayisi[ad] = hata_sayisi.get(ad, 0) + 1
+        ilk_hata.setdefault(ad, f"{type(e).__name__}: {e}")
+        arr = np.full(n, np.nan)
+    d = int(np.isfinite(arr).sum())
+    if d:
+        dolu[ad] += d
+        mn[ad] = min(mn[ad], float(np.nanmin(arr)))
+        mx[ad] = max(mx[ad], float(np.nanmax(arr)))
+    return arr
+
+
+toplam = 0
+for i, ad in enumerate(GIRDI_DATASETLER):
+    t0 = time.time()
+    satir = 0
+    writer = pq.ParquetWriter(f"{out_root}/part-{i:05d}.snappy.parquet", cikis_sema,
+                              filesystem=out_fs, compression="snappy")
+    try:
+        for j, batch in enumerate(kaynaklar[ad].to_batches(columns=ortak, batch_size=PARCA_SATIR,
+                                                           use_threads=True), start=1):
+            if batch.num_rows == 0:
+                continue
+            tablo = pa.Table.from_batches([batch]).select(ortak).cast(hedef_sema, safe=False)
+            pdf = tablo.select(gerekli_liste).to_pandas()        # sadece formul kolonlari
+
+            for donem, adet in pdf[DONEM_KOL].value_counts(dropna=False).items():
+                donem_sayim[ad][donem] = donem_sayim[ad].get(donem, 0) + int(adet)
+
+            for f_ad, formul in tanimlar:
+                arr = hesapla(pdf, f_ad, formul)
+                tablo = tablo.append_column(pa.field(f_ad, pa.float64()),
+                                            pa.array(arr, type=pa.float64(), from_pandas=True))
+            writer.write_table(tablo)
+            satir += tablo.num_rows
+            del tablo, pdf, batch
+            if j % 10 == 0:
+                print(f"  [{ad}] {satir:,} satir ({time.time() - t0:.0f} sn)")
+                ram()
+    finally:
+        writer.close()
+    toplam += satir
+    print(f"[{ad}] TAMAM: {satir:,} satir | {time.time() - t0:.0f} sn")
+
+# ------------------------- 6) SEMAYI DATAIKU'YA BILDIR -------------------------
+def dss_tip(t):
+    if pa.types.is_boolean(t):
+        return "boolean"
+    if pa.types.is_int8(t):
+        return "tinyint"
+    if pa.types.is_int16(t):
+        return "smallint"
+    if pa.types.is_int32(t):
+        return "int"
+    if pa.types.is_integer(t):
+        return "bigint"
+    if pa.types.is_float16(t) or pa.types.is_float32(t):
+        return "float"
+    if pa.types.is_floating(t):
+        return "double"
+    if pa.types.is_timestamp(t) or pa.types.is_date(t):
+        return "date"
+    return "string"
+
+
+dataiku.Dataset(CIKTI_DATASET).write_schema([{"name": f.name, "type": dss_tip(f.type)} for f in cikis_sema])
+
+# ------------------------- 7) RAPOR -------------------------
+print(f"\n{CIKTI_DATASET}: {toplam:,} satir x {len(cikis_sema):,} kolon "
+      f"({len(ortak):,} ortak + {len(tanimlar)} yeni) | toplam {(time.time() - t_bas)/60:.1f} dk")
+for ad in GIRDI_DATASETLER:
+    print(f"[{ad}] {DONEM_KOL}: " + ", ".join(f"{k}:{v:,}" for k, v in sorted(donem_sayim[ad].items(), key=lambda x: str(x[0]))))
+cakisan = set.intersection(*(set(v) for v in donem_sayim.values()))
+if cakisan:
+    print(f"UYARI: iki yilda da bulunan donemler: {sorted(cakisan, key=str)}")
+bos = [a for a, _ in tanimlar if dolu[a] == 0]
+sabit = [a for a, _ in tanimlar if dolu[a] > 0 and mn[a] == mx[a]]
+if bos:
+    print(f"UYARI: tamamen NaN feature'lar: {bos}")
+if sabit:
+    print(f"UYARI: sabit degerli feature'lar: {sabit}")
+for a, n in hata_sayisi.items():
+    print(f"HATA: {a} -> {n} parcada hata (NaN yazildi) | {ilk_hata[a]}")
+for a, neden in elenen:
+    print(f"ELENDI: {a} -> {neden}")
