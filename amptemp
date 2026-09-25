@@ -1,289 +1,82 @@
-# -*- coding: utf-8 -*-
-# =====================================================================
-# SAF PySpark: FPD_TXN_FEATS_2025 + FPD_TXN_FEATS_2026 -> ortak kolonlarla alt alta birlestir
-# + feature_birlesik.xlsx'teki formulleri Spark ifadesine cevirip yeni feature'lar
-# Veri hicbir asamada pandas'a alinmaz.
-# =====================================================================
+import dataiku, zipfile, tempfile, shutil, os
 
-# ---- Uyari/log gurultusunu kapat (pyspark import'undan ONCE olmali) ----
-import warnings
-warnings.filterwarnings("ignore")
+# ---- Ayarlar ----
+FOLDER_NAME      = "GOC_MODEL_RESULTS"
+ZIP_NAME         = "CCY_RENK_SONUCLAR.zip"
+TARGET_PREFIX    = "/CCY_RENK_SONUCLAR"   # "" yaparsan folder köküne açar
+OVERWRITE        = False                  # True: aynı yoldaki dosyaların üzerine yazar
+DELETE_ZIP_AFTER = False                  # True: hatasız biterse zip'i siler
+CHUNK            = 16 * 1024 * 1024       # 16 MB'lık parçalarla indir
 
-import logging
-logging.getLogger("py4j").setLevel(logging.ERROR)
+f = dataiku.Folder(FOLDER_NAME)
+paths = f.list_paths_in_partition()
+existing = set(paths)
 
-import io
-import math
-import re
+# 1) Zip'i adıyla bul (ilk bulduğu zip'i değil)
+matches = [p for p in paths if p.lstrip("/").lower() == ZIP_NAME.lower()]
+if not matches:
+    raise Exception(f"{ZIP_NAME} bulunamadı. Klasördeki zip'ler: "
+                    + str([p for p in paths if p.lower().endswith('.zip')]))
+zip_path = matches[0]
+print("Seçilen zip:", zip_path)
 
-import pandas as pd                      # SADECE Excel'i okumak icin (driver'da, kucuk dosya)
-import dataiku
-from dataiku import spark as dkuspark
-from pyspark import SparkContext
-from pyspark.sql import SQLContext, Column
-from pyspark.sql import functions as F
+def fix_name(info):
+    """Windows'ta sıkıştırılmış zip'lerde Türkçe karakterli isimleri düzeltir."""
+    name = info.filename
+    if info.flag_bits & 0x800:          # isim zaten UTF-8 işaretli
+        return name
+    raw = name.encode("cp437")
+    for enc in ("utf-8", "cp857"):      # cp857 = Türkçe DOS kodlaması
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return name
 
-# ------------------------- AYARLAR -------------------------
-GIRDI_DATASETLER  = ["FPD_TXN_FEATS_2025", "FPD_TXN_FEATS_2026"]   # kolon sirasi ilkinden
-CIKTI_DATASET     = "FPD_TXN_FEATS_ENH"  # SADECE recipe disinda (duz notebook) kullanilir
-FEATURE_KLASOR    = "COMPLETE_JSON"
-FEATURE_DOSYA     = "feature_birlesik.xlsx"
-ALINACAK_DURUMLAR = {"KABUL"}            # RED'ler de istenirse: {"KABUL", "RED"}
-DONEM_KOL         = "PERIOD"
-ORNEK_SATIR       = 100_000              # feature kontrolu icin orneklem
-BOS_DEGERLER      = {"", "-", "nan", "none", "null"}
-YASAK_KALIPLAR    = ["import", "__", "exec(", "eval(", "open(", "lambda"]
+tmp_dir = tempfile.mkdtemp()
+local_zip = os.path.join(tmp_dir, "archive.zip")
+added, skipped, errors = [], [], []
 
-# Recipe icinde calisiyorsa ciktiyi recipe'nin kendi output'undan al
 try:
-    CIKTI_DATASET = dataiku.get_output_names_for_role("main_output")[0]
-except Exception:
-    pass
-print(f"Cikti dataset: {CIKTI_DATASET}")
+    # 2) Zip'i RAM yerine geçici diske parça parça indir
+    print("Boş disk (GB):", round(shutil.disk_usage(tmp_dir).free / 1024**3, 2))
+    with f.get_download_stream(zip_path) as s, open(local_zip, "wb") as out:
+        shutil.copyfileobj(s, out, length=CHUNK)
+    print("İndirildi (GB):", round(os.path.getsize(local_zip) / 1024**3, 2))
 
-sc = SparkContext.getOrCreate()
-sc.setLogLevel("ERROR")                  # Spark/Hadoop INFO-WARN loglarini sustur
-sqlContext = SQLContext(sc)
+    # 3) Her dosyayı tek tek folder'a yaz
+    with zipfile.ZipFile(local_zip) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            name = fix_name(info).replace("\\", "/").lstrip("/")
+            base = os.path.basename(name)
+            # Mac çöpleri ve güvensiz yolları atla
+            if name.startswith("__MACOSX/") or base.startswith("._") or ".." in name.split("/"):
+                skipped.append(name)
+                continue
 
+            target = TARGET_PREFIX.rstrip("/") + "/" + name
+            if target in existing and not OVERWRITE:
+                skipped.append(target)
+                continue
 
-# =====================================================================
-# PANDAS SOZDIZIMI -> SPARK CEVIRICI
-# Formuldeki df['X'] bir Spark kolonuna, np.xxx Spark fonksiyonlarina donusur.
-# =====================================================================
-BOS = F.lit(None).cast("double")
+            try:
+                with z.open(info) as src:
+                    f.upload_stream(target, src)
+                added.append(target)
+                print("eklendi:", target)
+            except Exception as e:
+                errors.append((target, str(e)))
+                print("HATA:", target, e)
+finally:
+    shutil.rmtree(tmp_dir, ignore_errors=True)   # geçici zip'i temizle
 
+print(f"\nEklenen: {len(added)} | Atlanan: {len(skipped)} | Hata: {len(errors)}")
+if skipped:
+    print("Atlananlar (ilk 20):", skipped[:20])
 
-def _c(x):
-    """Formuldeki her degeri Spark Column'a cevirir (NaN -> null)."""
-    if isinstance(x, K):
-        return x.c
-    if isinstance(x, Column):
-        return x
-    if isinstance(x, float) and math.isnan(x):
-        return BOS
-    return F.lit(x)
-
-
-def _nan_mi(v):
-    return isinstance(v, float) and math.isnan(v)
-
-
-class K:
-    """pandas Series gibi davranan Spark kolonu sarmalayicisi."""
-
-    def __init__(self, c):
-        self.c = c
-
-    # --- aritmetik ---
-    def __add__(self, o):      return K(self.c + _c(o))
-    def __radd__(self, o):     return K(_c(o) + self.c)
-    def __sub__(self, o):      return K(self.c - _c(o))
-    def __rsub__(self, o):     return K(_c(o) - self.c)
-    def __mul__(self, o):      return K(self.c * _c(o))
-    def __rmul__(self, o):     return K(_c(o) * self.c)
-    def __truediv__(self, o):  return K(self.c / _c(o))           # sifira bolme -> null
-    def __rtruediv__(self, o): return K(_c(o) / self.c)
-    def __floordiv__(self, o): return K(F.floor(self.c / _c(o)))
-    def __mod__(self, o):      return K(self.c % _c(o))
-    def __pow__(self, o):      return K(F.pow(self.c, _c(o)))
-    def __neg__(self):         return K(-self.c)
-
-    # --- karsilastirma ---
-    def __gt__(self, o): return K(self.c > _c(o))
-    def __ge__(self, o): return K(self.c >= _c(o))
-    def __lt__(self, o): return K(self.c < _c(o))
-    def __le__(self, o): return K(self.c <= _c(o))
-    def __eq__(self, o): return K(self.c == _c(o))
-    def __ne__(self, o): return K(self.c != _c(o))
-
-    # --- mantiksal ---
-    def __and__(self, o):  return K(self.c & _c(o))
-    def __rand__(self, o): return K(_c(o) & self.c)
-    def __or__(self, o):   return K(self.c | _c(o))
-    def __ror__(self, o):  return K(_c(o) | self.c)
-    def __invert__(self):  return K(~self.c)
-
-    def __bool__(self):
-        raise TypeError("formulde 'and/or/not' yerine '&', '|', '~' kullanilmali")
-
-    # --- pandas metotlari ---
-    def replace(self, to_replace, value=None):
-        eskiler = to_replace if isinstance(to_replace, (list, tuple)) else [to_replace]
-        kosul = None
-        for e in eskiler:
-            k = F.isnan(self.c) if _nan_mi(e) else (self.c == F.lit(e))
-            kosul = k if kosul is None else (kosul | k)
-        return K(F.when(kosul, _c(value)).otherwise(self.c))
-
-    def clip(self, lower=None, upper=None):
-        s = self.c
-        if lower is not None:
-            s = F.when(self.c.isNull(), BOS).otherwise(F.greatest(s, _c(lower)))
-        if upper is not None:
-            s = F.when(self.c.isNull(), BOS).otherwise(F.least(s, _c(upper)))
-        return K(s)
-
-    def abs(self):               return K(F.abs(self.c))
-    def fillna(self, value):     return K(F.coalesce(self.c, _c(value)))
-    def isna(self):              return K(self.c.isNull() | F.isnan(self.c))
-    def isnull(self):            return self.isna()
-    def notna(self):             return K(~(self.c.isNull() | F.isnan(self.c)))
-    def notnull(self):           return self.notna()
-    def round(self, n=0):        return K(F.round(self.c, n))
-
-    def astype(self, tip):
-        eslem = {int: "bigint", float: "double", bool: "boolean", str: "string",
-                 "int": "bigint", "int64": "bigint", "int32": "int",
-                 "float": "double", "float64": "double", "bool": "boolean", "str": "string"}
-        if tip not in eslem:
-            raise TypeError(f"astype({tip}) desteklenmiyor")
-        return K(self.c.cast(eslem[tip]))
-
-
-class NpSpark:
-    """Formullerdeki np.xxx cagrilarinin Spark karsiliklari."""
-    nan = float("nan")
-    inf = float("inf")
-
-    @staticmethod
-    def where(kosul, a, b):   return K(F.when(_c(kosul), _c(a)).otherwise(_c(b)))
-    @staticmethod
-    def log1p(x):             return K(F.log1p(_c(x)))
-    @staticmethod
-    def log(x):               return K(F.log(_c(x)))
-    @staticmethod
-    def sqrt(x):              return K(F.sqrt(_c(x)))
-    @staticmethod
-    def exp(x):               return K(F.exp(_c(x)))
-    @staticmethod
-    def abs(x):               return K(F.abs(_c(x)))
-    @staticmethod
-    def sign(x):              return K(F.signum(_c(x)))
-
-    @staticmethod
-    def maximum(a, b):        # pandas'taki gibi: taraflardan biri NaN ise sonuc NaN
-        ca, cb = _c(a), _c(b)
-        return K(F.when(ca.isNull() | cb.isNull(), BOS).otherwise(F.greatest(ca, cb)))
-
-    @staticmethod
-    def minimum(a, b):
-        ca, cb = _c(a), _c(b)
-        return K(F.when(ca.isNull() | cb.isNull(), BOS).otherwise(F.least(ca, cb)))
-
-
-class DfSpark:
-    """Formuldeki df['X'] -> Spark kolonu."""
-
-    def __init__(self, kolonlar):
-        self.kolonlar = set(kolonlar)
-
-    def __getitem__(self, ad):
-        if ad not in self.kolonlar:
-            raise KeyError(f"veride olmayan kolon: {ad}")
-        return K(F.col(ad))
-
-
-def formulu_cevir(formul, kolonlar):
-    """pandas formulunu Spark ifadesine cevirir; sonuc double, NaN/inf -> null."""
-    sonuc = eval(formul, {"__builtins__": {}}, {"df": DfSpark(kolonlar), "np": NpSpark, "pd": None})
-    if not isinstance(sonuc, K):
-        raise ValueError("formul bir kolon degil sabit deger uretti")
-    s = sonuc.c.cast("double")
-    return F.when(F.isnan(s) | (F.abs(s) == float("inf")), BOS).otherwise(s)
-
-
-# ------------------------- 1) OKU -------------------------
-girdiler = {ad: dkuspark.get_dataframe(sqlContext, dataiku.Dataset(ad)) for ad in GIRDI_DATASETLER}
-
-# ------------------------- 2) ORTAK KOLONLAR + ORTAK TIPLER -------------------------
-tipler = {ad: dict(sdf.dtypes) for ad, sdf in girdiler.items()}
-ortak_set = set.intersection(*(set(t) for t in tipler.values()))
-ortak = [c for c in girdiler[GIRDI_DATASETLER[0]].columns if c in ortak_set]
-
-for ad, sdf in girdiler.items():
-    disarida = [c for c in sdf.columns if c not in ortak_set]
-    if disarida:
-        print(f"UYARI: [{ad}] sadece kendisinde olan {len(disarida)} kolon disarida: {disarida[:20]}")
-print(f"Ortak kolon: {len(ortak):,}")
-if DONEM_KOL not in ortak_set:
-    raise ValueError(f"{DONEM_KOL} iki dataset'te ortak degil.")
-
-SAYISAL = {"tinyint", "smallint", "int", "bigint", "float", "double"}
-hedef_tip = {}
-for c in ortak:
-    t_list = [tipler[ad][c] for ad in GIRDI_DATASETLER]
-    if len(set(t_list)) > 1:
-        hedef = "double" if all(t in SAYISAL or t.startswith("decimal") for t in t_list) else "string"
-        hedef_tip[c] = hedef
-        print(f"Bilgi: {c} tipleri {t_list} -> {hedef}")
-
-
-def hizala(sdf):
-    return sdf.select([F.col(c).cast(hedef_tip[c]).alias(c) if c in hedef_tip else F.col(c) for c in ortak])
-
-
-donemler = {}
-for ad, sdf in girdiler.items():
-    sayim = {r[DONEM_KOL]: r["count"] for r in sdf.groupBy(DONEM_KOL).count().collect()}
-    donemler[ad] = set(sayim)
-    print(f"[{ad}] {DONEM_KOL}: " + ", ".join(f"{k}:{v:,}" for k, v in sorted(sayim.items(), key=lambda x: str(x[0]))))
-cakisan = set.intersection(*donemler.values())
-if cakisan:
-    print(f"UYARI: iki yilda da bulunan donemler: {sorted(cakisan, key=str)}")
-
-df = hizala(girdiler[GIRDI_DATASETLER[0]])
-for ad in GIRDI_DATASETLER[1:]:
-    df = df.unionByName(hizala(girdiler[ad]))
-
-# ------------------------- 3) FEATURE TANIMLARI -> SPARK IFADELERI -------------------------
-with dataiku.Folder(FEATURE_KLASOR).get_download_stream(FEATURE_DOSYA) as s:
-    fx = pd.read_excel(io.BytesIO(s.read()), sheet_name=0)
-fx.columns = [str(c).strip() for c in fx.columns]
-eksik = {"ad", "formul", "durum"} - set(fx.columns)
-if eksik:
-    raise ValueError(f"Excel'de beklenen kolon(lar) yok: {eksik}. Mevcut: {list(fx.columns)}")
-
-
-def bos_mu(x):
-    return pd.isna(x) or str(x).strip().lower() in BOS_DEGERLER
-
-
-fx = fx[fx["durum"].astype(str).str.strip().str.upper().isin(ALINACAK_DURUMLAR)]
-fx = fx[~fx["formul"].apply(bos_mu) & ~fx["ad"].apply(bos_mu)]
-
-ifadeler, elenen = [], []
-for ad, formul in zip(fx["ad"].astype(str).str.strip(), fx["formul"].astype(str).str.strip()):
-    if ad in ortak_set or ad in {a for a, _ in ifadeler}:
-        elenen.append((ad, "bu isimde kolon zaten var"))
-        continue
-    if any(k in formul for k in YASAK_KALIPLAR):
-        elenen.append((ad, "formulde yasak kalip var"))
-        continue
-    try:
-        ifade = formulu_cevir(formul, ortak_set)
-        df.select(ifade.alias(ad)).schema           # Spark ifadeyi analiz etsin (veri okumaz)
-        ifadeler.append((ad, ifade))
-    except Exception as e:
-        elenen.append((ad, f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"))
-
-print(f"\nFeature: {len(ifadeler)} uretilecek, {len(elenen)} elendi")
-for ad, neden in elenen:
-    print(f"ELENDI: {ad} -> {neden}")
-
-# ------------------------- 4) ORNEKLEMDE KONTROL (tek Spark job) -------------------------
-if ifadeler:
-    ornek = df.limit(ORNEK_SATIR).select([i.alias(a) for a, i in ifadeler])
-    aggs = []
-    for a, _ in ifadeler:
-        aggs += [F.count(F.col(a)).alias(f"{a}__dolu"), F.min(a).alias(f"{a}__min"), F.max(a).alias(f"{a}__max")]
-    istat = ornek.agg(F.count(F.lit(1)).alias("__n"), *aggs).collect()[0].asDict()
-    n = istat["__n"] or 1
-    for a, _ in ifadeler:
-        dolu, mn, mx = istat[f"{a}__dolu"], istat[f"{a}__min"], istat[f"{a}__max"]
-        not_ = " | UYARI: tamamen null" if dolu == 0 else (" | UYARI: sabit deger" if mn == mx else "")
-        print(f"OK: {a} | ornekte dolu %{dolu / n * 100:.1f} | min {mn} | max {mx}{not_}")
-
-# ------------------------- 5) YAZ -------------------------
-df_out = df.select("*", *[i.alias(a) for a, i in ifadeler])
-dkuspark.write_with_schema(dataiku.Dataset(CIKTI_DATASET), df_out)
-print(f"\n{CIKTI_DATASET} yazildi: {len(df_out.columns):,} kolon ({len(ortak):,} ortak + {len(ifadeler)} yeni)")
+# 4) Zip'i sadece istenirse ve hata yoksa sil
+if DELETE_ZIP_AFTER and not errors and added:
+    f.delete_path(zip_path)
+    print("zip silindi:", zip_path)
