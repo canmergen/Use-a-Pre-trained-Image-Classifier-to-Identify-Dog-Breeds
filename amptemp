@@ -1,39 +1,278 @@
-## 12. Bucket Raporlarına FPD Eşleşmesi (Tüm Klasörler)
+import re
+import numpy as np
+import pandas as pd
+import dataiku
+from io import BytesIO
 
-**Amaç:** `GOC_MODEL_RESULTS` altındaki tüm model klasörlerinde, renk bazlı bucket20 ve bucket100 raporlarına FPD bilgisini ekleyerek modelin riskli bucket'larının FPD ile ne kadar örtüştüğünü görmek.
+# =====================================================================
+# AYARLAR
+# =====================================================================
+MAIN_FOLDER      = "GOC_MODEL_RESULTS"
+CIKTI_DOSYA      = "/fpd_bucket_ozet.xlsx"      # kök dizine tek dosya
 
-**Kaynaklar:**
-- Model skorları: her klasördeki `renk_{kod}_{ad}_musteri_skorlari.csv`
-- Bucket raporları: her klasördeki `renk_{kod}_{ad}_bucket{20|100}_train_val_oot.xlsx`
-- FPD: `FPD_CS_MODEL_INPUTS_2025_2026` (`SM_ID`, `PERIOD`, `TGT_CS_ALL_TKP_5M90`, `TGT_CS_ALL_TKP_ST_5M90`)
-- Anahtar eşleme: SM_ID (başvuru bazlı) → MBB_NO
+# Başka projedeki dataset: "PROJE_KEY.DATASET_ADI"
+FPD_DATASET      = "BKATBALTERNATIFVERISKORKARTIPROJECT.FPD_CS_MODEL_INPUTS_2025_2026"
+FPD_KEY_COL      = "SM_ID"
+FPD_DONEM_COL    = "PERIOD"                     # YYYYMM
+FPD_HEDEFLER     = {                            # kısa ad -> kolon adı
+    "TKP_5M90":    "TGT_CS_ALL_TKP_5M90",
+    "TKP_ST_5M90": "TGT_CS_ALL_TKP_ST_5M90",
+}
 
-**Yöntem:**
-1. FPD tablosu SM_ID üzerinden MBB_NO'ya eşlenir. Başvuru dönemi FPD tablosundaki `PERIOD` kolonundan alınır. Aynı müşterinin aynı dönemde birden fazla başvurusu varsa, herhangi birinde 1 olması müşteriyi 1 yapar (MAX).
-2. Her renk için skor dosyasındaki müşteriler, bucket raporuyla aynı rank mantığıyla (küme içinde, 1 = en yüksek skor) yeniden bucket'lara atanır.
-3. FPD bilgisi müşteri ve dönem bazında (`mbb_no` + `donem` = `MBB_NO` + `PERIOD`) left join edilir ve bucket bazında özetlenir.
-4. Yeniden kurulan `n` ve `bad` değerleri mevcut rapordakilerle karşılaştırılır (QA).
+# ZORUNLU: SM_ID <-> MBB_NO eşleme tablosu (SM_ID başvuru bazlı, müşteri no değil)
+ESLESME_DATASET  = None                         # örn. "PROJE_KEY.BASVURU_MUSTERI_ESLEME"
+ESLESME_SMID_COL = "SM_ID"
+ESLESME_MBB_COL  = "MBB_NO"
 
-**Eklenen kolonlar (her FPD hedefi için):**
-| Kolon | Açıklama |
-|---|---|
-| `KLASOR` | Satırın geldiği model klasörü |
-| `FPD_ESLESEN_ADET_<hedef>` | Bucket'ta aynı dönemde FPD tablosuyla eşleşen müşteri sayısı |
-| `FPD_1_ADET_<hedef>` | Eşleşenler içinde FPD = 1 olan müşteri sayısı |
-| `FPD_1_ORAN_<hedef>` | `FPD_1_ADET / FPD_ESLESEN_ADET` |
+# Skor dosyasındaki kolon adları
+SKOR_SET_COL     = "set_adi"
+SKOR_KEY_COL     = "mbb_no"
+SKOR_DONEM_COL   = "donem"
+SKOR_Y_COL       = "target_actual"
+SKOR_SCORE_COL   = "target_score"
 
-Hedefler: `TKP_5M90` (`TGT_CS_ALL_TKP_5M90`), `TKP_ST_5M90` (`TGT_CS_ALL_TKP_ST_5M90`)
+CHUNK            = 2_000_000                    # 21M satırı parça parça okumak için
+BUCKET_DOSYA_RE  = re.compile(r"^(renk_\d+_.+?)_bucket(\d+)_train_val_oot\.xlsx$")
 
-**Çıktı:** `GOC_MODEL_RESULTS/fpd_bucket_ozet.xlsx`. Klasörlerdeki mevcut dosyalara yazılmaz.
+mf = dataiku.Folder(MAIN_FOLDER)
 
-| Sheet | İçerik |
-|---|---|
-| `BUCKET20` | Tüm klasör × renk × küme bucket20 satırları + FPD kolonları |
-| `BUCKET100` | Tüm klasör × renk × küme bucket100 satırları + FPD kolonları |
-| `QA` | Yeniden kurulan bucket'ların mevcut raporla tutarlılığı |
-| `ESLESME_DONEM` | Klasör × renk × küme × dönem bazında FPD eşleşme oranı |
 
-**Notlar:**
-- FPD eşleşmesi müşteri ve dönem bazında yapılır: her skor satırına yalnızca aynı dönemdeki (ör. 202504 skoruna sadece `PERIOD` = 202504) başvuruların FPD'si bağlanır.
-- QA sheet'inde `n_fark`, `bad_fark` ve `bulunamayan` kolonlarının 0 olması beklenir. Sıfırdan büyük bir `bad_fark`, bucket sınırındaki eşit skorlardan kaynaklanabilir.
-- Bir dönemde `ESLESME_DONEM` oranı 0 ise o dönem FPD tablosunda yoktur ve ilgili kümenin FPD kolonları boş kalır.
+def _yeni_kolonlar(ad):
+    return [f"FPD_ESLESEN_ADET_{ad}", f"FPD_1_ADET_{ad}", f"FPD_1_ORAN_{ad}"]
+
+TUM_YENI_KOLONLAR = [c for ad in FPD_HEDEFLER for c in _yeni_kolonlar(ad)]
+
+
+# =====================================================================
+# YARDIMCILAR
+# =====================================================================
+def _sayi(s):
+    """'182753.0' / 182753 / '182753' değerlerini aynı Int64 değere çevirir."""
+    return pd.to_numeric(s, errors="coerce").round().astype("Int64")
+
+
+def _sm(s):
+    """SM_ID string anahtar: boşluk temizle, büyük harf."""
+    s = s.astype("string").str.strip().str.upper()
+    return s.where(s != "")
+
+
+def _cocuklar(yol):
+    det = mf.get_path_details(yol) or {}
+    return det.get("children") or []
+
+
+def _alt_klasorler():
+    kl = sorted(c["name"] for c in _cocuklar("/") if c.get("directory"))
+    if not kl:
+        kl = sorted({p.strip("/").split("/")[0]
+                     for p in mf.list_paths_in_partition() if "/" in p.strip("/")})
+    return kl
+
+
+def _dosyalar(klasor):
+    ad = [c["name"] for c in _cocuklar("/" + klasor) if not c.get("directory")]
+    if not ad:
+        on = "/" + klasor + "/"
+        ad = [p[len(on):] for p in mf.list_paths_in_partition()
+              if p.startswith(on) and "/" not in p[len(on):]]
+    return sorted(ad)
+
+
+def _bucket_ata(score, nb):
+    """Bucket raporundaki mantığın aynısı: rank bazlı, 1 = en yüksek skor."""
+    score = np.asarray(score, dtype="float64")
+    n = len(score)
+    order = np.argsort(score, kind="stable")
+    r = np.empty(n, dtype="float64")
+    r[order] = np.arange(1, n + 1, dtype="float64")
+    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
+    return nb - np.searchsorted(edges[1:-1], r, side="left")
+
+
+def _fpd_yukle():
+    if not ESLESME_DATASET:
+        raise ValueError("SM_ID müşteri numarası değil; ESLESME_DATASET (SM_ID <-> MBB_NO) doldurulmalı.")
+
+    e = dataiku.Dataset(ESLESME_DATASET).get_dataframe(
+        columns=[ESLESME_SMID_COL, ESLESME_MBB_COL])
+    e = pd.DataFrame({"_sm":  _sm(e[ESLESME_SMID_COL]),
+                      "_key": _sayi(e[ESLESME_MBB_COL])}).dropna().drop_duplicates()
+    cok = int(e["_sm"].duplicated(keep=False).sum())
+    if cok:
+        print(f"⚠ Eşleme tablosunda birden fazla mbb_no'ya bağlanan {cok:,} SM_ID satırı var")
+
+    hedef_kol = list(FPD_HEDEFLER.values())
+    parcalar, n_ham, n_donemsiz = [], 0, 0
+    for ch in dataiku.Dataset(FPD_DATASET).iter_dataframes(
+            chunksize=CHUNK, columns=[FPD_KEY_COL, FPD_DONEM_COL] + hedef_kol):
+        n_ham += len(ch)
+        ch = ch.assign(_sm=_sm(ch[FPD_KEY_COL]), _donem=_sayi(ch[FPD_DONEM_COL])) \
+               .drop(columns=[FPD_KEY_COL, FPD_DONEM_COL])
+        n_donemsiz += int(ch["_donem"].isna().sum())
+        ch = ch.dropna(subset=["_donem"])
+        parcalar.append(ch.merge(e, on="_sm", how="inner").drop(columns="_sm"))
+    f = pd.concat(parcalar, ignore_index=True)
+    n_eslesen = len(f)
+
+    if n_donemsiz:
+        print(f"⚠ {FPD_DONEM_COL} boş olan {n_donemsiz:,} satır atıldı")
+
+    for ad, kol in FPD_HEDEFLER.items():
+        v = pd.to_numeric(f[kol], errors="coerce")
+        gecersiz = v.notna() & ~v.isin([0, 1])
+        if gecersiz.any():
+            print(f"⚠ {kol}: 0/1 dışı {int(gecersiz.sum()):,} değer boş sayıldı")
+        f[ad] = v.where(v.isin([0, 1]))
+
+    # Aynı müşterinin aynı dönemde birden çok başvurusu varsa: biri 1 ise 1
+    f = f.groupby(["_key", "_donem"], as_index=False)[list(FPD_HEDEFLER)].max()
+
+    print(f"FPD: {n_ham:,} ham satır | eşleme sonrası {n_eslesen:,} satır | "
+          f"{len(f):,} tekil (mbb_no, dönem)")
+    print("FPD dönem dağılımı (tekil müşteri):")
+    print(f.groupby("_donem").size().rename("adet").to_string())
+    return f
+
+
+def _sheet_zenginlestir(sh, skor, sheet_adi):
+    sh = sh.drop(columns=[c for c in TUM_YENI_KOLONLAR if c in sh.columns])
+    kol = {str(c).lower(): c for c in sh.columns}
+    if "bucket" not in kol:
+        return None, None
+
+    if "kume" in kol:
+        kume = sh[kol["kume"]].astype(str).str.strip().str.upper()
+    else:
+        m = re.search(r"TRAIN|VAL|OOT", str(sheet_adi).upper())
+        if not m:
+            return None, None
+        kume = pd.Series(m.group(0), index=sh.index)
+    bucket = pd.to_numeric(sh[kol["bucket"]], errors="coerce")
+
+    agg = {"_n": ("_y", "size"), "_bad": ("_y", "sum")}
+    for ad in FPD_HEDEFLER:
+        agg[f"FPD_ESLESEN_ADET_{ad}"] = (ad, "count")
+        agg[f"FPD_1_ADET_{ad}"]       = (ad, "sum")
+
+    parcalar = []
+    for k in kume.dropna().unique():
+        satir = kume == k
+        if "n_bucket" in kol:
+            nb = int(pd.to_numeric(sh.loc[satir, kol["n_bucket"]], errors="coerce").max())
+        else:
+            nb = int(bucket[satir].max())
+        d = skor[skor["_kume"] == k]
+        if d.empty:
+            continue
+        d = d.assign(bucket=_bucket_ata(d["_score"].to_numpy(), nb))
+        g = d.groupby("bucket").agg(**agg).reset_index()
+        g["_kume"] = k
+        parcalar.append(g)
+
+    if not parcalar:
+        return None, {"hata": f"skor dosyasında eşleşen küme yok: {sorted(kume.unique())}"}
+
+    oz = pd.concat(parcalar, ignore_index=True)
+    for ad in FPD_HEDEFLER:
+        oz[f"FPD_1_ADET_{ad}"] = oz[f"FPD_1_ADET_{ad}"].astype("int64")
+        oz[f"FPD_1_ORAN_{ad}"] = (oz[f"FPD_1_ADET_{ad}"]
+                                  / oz[f"FPD_ESLESEN_ADET_{ad}"].replace(0, np.nan)).round(4)
+
+    anahtar = pd.DataFrame({"_kume": kume.values, "bucket": bucket.values})
+    birles = anahtar.merge(oz, on=["_kume", "bucket"], how="left")
+    birles.index = sh.index
+
+    qa = {"satir": len(sh), "bulunamayan": int(birles["_n"].isna().sum())}
+    if "n" in kol:
+        qa["n_fark"] = int((birles["_n"] != pd.to_numeric(sh[kol["n"]], errors="coerce")).sum())
+    if "bad" in kol:
+        qa["bad_fark"] = int((birles["_bad"] != pd.to_numeric(sh[kol["bad"]], errors="coerce")).sum())
+
+    sh = sh.copy()
+    for c in TUM_YENI_KOLONLAR:
+        sh[c] = birles[c]
+    return sh, qa
+
+
+# =====================================================================
+# ANA DÖNGÜ (klasörlere yazmaz, sadece okur)
+# =====================================================================
+fpd = _fpd_yukle()
+skor_kolonlari = {SKOR_SET_COL, SKOR_KEY_COL, SKOR_DONEM_COL, SKOR_Y_COL, SKOR_SCORE_COL}
+toplanan = {}      # "BUCKET20" / "BUCKET100" -> [df, ...]
+qa_log, eslesme_log = [], []
+
+for klasor in _alt_klasorler():
+    dosyalar = _dosyalar(klasor)
+    gruplar = {}
+    for ad in dosyalar:
+        m = BUCKET_DOSYA_RE.match(ad)
+        if m:
+            gruplar.setdefault(m.group(1), []).append((ad, int(m.group(2))))
+    if not gruplar:
+        print(f"- {klasor}: bucket dosyası yok, atlandı")
+        continue
+
+    print(f"\n=== {klasor} ({len(gruplar)} renk) ===")
+    for onek, xlsx_listesi in sorted(gruplar.items()):
+        skor_ad = f"{onek}_musteri_skorlari.csv"
+        if skor_ad not in dosyalar:
+            print(f"  ⚠ {skor_ad} yok, {onek} atlandı")
+            continue
+
+        with mf.get_download_stream(f"/{klasor}/{skor_ad}") as s:
+            skor = pd.read_csv(s, usecols=lambda c: c in skor_kolonlari)
+        eksik = skor_kolonlari - set(skor.columns)
+        if eksik:
+            print(f"  ⚠ {skor_ad} içinde eksik kolon: {eksik}, atlandı")
+            continue
+
+        skor = pd.DataFrame({
+            "_kume":  skor[SKOR_SET_COL].astype(str).str.strip().str.upper(),
+            "_key":   _sayi(skor[SKOR_KEY_COL]),
+            "_donem": _sayi(skor[SKOR_DONEM_COL]),
+            "_y":     pd.to_numeric(skor[SKOR_Y_COL], errors="coerce"),
+            "_score": pd.to_numeric(skor[SKOR_SCORE_COL], errors="coerce"),
+        }).merge(fpd, on=["_key", "_donem"], how="left")   # müşteri + aynı dönem
+
+        for (kume_ad, donem), g in skor.groupby(["_kume", "_donem"]):
+            eslesme_log.append({"KLASOR": klasor, "renk": onek, "kume": kume_ad,
+                                "donem": donem, "musteri": len(g),
+                                **{f"eslesme_{ad}": round(g[ad].notna().mean(), 4)
+                                   for ad in FPD_HEDEFLER}})
+        es = " | ".join(f"{ad} %{skor[ad].notna().mean() * 100:.1f}" for ad in FPD_HEDEFLER)
+        print(f"  {onek}: dönemler {sorted(skor['_donem'].dropna().unique())} | eşleşme {es}")
+
+        for xlsx_ad, nb_dosya in sorted(xlsx_listesi):
+            with mf.get_download_stream(f"/{klasor}/{xlsx_ad}") as s:
+                sheets = pd.read_excel(BytesIO(s.read()), sheet_name=None)
+
+            for sh_ad, sh in sheets.items():
+                yeni, qa = _sheet_zenginlestir(sh, skor, sh_ad)
+                if qa is not None:
+                    qa_log.append({"KLASOR": klasor, "dosya": xlsx_ad, "sheet": sh_ad, **qa})
+                if yeni is not None:
+                    yeni.insert(0, "KLASOR", klasor)
+                    toplanan.setdefault(f"BUCKET{nb_dosya}", []).append(yeni)
+
+# --- Tek Excel: her bucket sayısı ayrı sheet + QA + eşleşme -----------
+buf = BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+    for sh_ad in sorted(toplanan, key=lambda x: int(x.replace("BUCKET", ""))):
+        tablo = pd.concat(toplanan[sh_ad], ignore_index=True)
+        n0 = len(tablo)
+        tablo = tablo.drop_duplicates()               # aynı satır iki sheet'te varsa tek kalsın
+        bas = [c for c in tablo.columns if c not in TUM_YENI_KOLONLAR]
+        tablo = tablo[bas + TUM_YENI_KOLONLAR]        # 6 FPD kolonu en sonda
+        tablo.to_excel(xl, sheet_name=sh_ad, index=False)
+        print(f"{sh_ad}: {len(tablo):,} satır (tekrar atılan: {n0 - len(tablo):,})")
+    pd.DataFrame(qa_log).to_excel(xl, sheet_name="QA", index=False)
+    pd.DataFrame(eslesme_log).to_excel(xl, sheet_name="ESLESME_DONEM", index=False)
+buf.seek(0)
+mf.upload_stream(CIKTI_DOSYA, buf)
+print(f"\n✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı; klasörlerdeki dosyalara dokunulmadı")
+
+qa_df = pd.DataFrame(qa_log)
+print("\n===== QA (n_fark / bad_fark / bulunamayan hepsi 0 olmalı) =====")
+print(qa_df.to_string(index=False) if not qa_df.empty else "Hiç bucket sheet'i işlenmedi")
