@@ -72,8 +72,9 @@ ANALIZ_AYAR = {
     # "En riskli dilim" tanımı: kitlenin en riskli %20'si.
     # Hem HÜKÜM'deki yakalama oranında hem KAÇAN DİLİM'de kullanılır.
     "RISKLI_DILIM_PCT": 0.20,
-    # KAÇAN DİLİM: net ek vaka, toplam vakanın bu payından küçükse BERABER.
-    "ESIK_BERABER_PAY": 0.02,
+    # KAÇAN DİLİM: "sadece model riskli" ile "sadece mevcut skor riskli"
+    # gruplarının hedef oranı farkı bu kadardan küçükse BERABER (0,01 = 1 puan).
+    "ESIK_BERABER_PUAN": 0.01,
 
     # Bir segmentte vaka ya da vaka olmayan müşteri sayısı bundan azsa
     # Gini güvenilmez; hüküm YETERSİZ VAKA yazılır.
@@ -138,7 +139,7 @@ if _analiz_hazir:
     # Ayarları kısa adlara aç
     ESIK_GINI_GEREKLI       = float(ANALIZ_AYAR["ESIK_GINI_GEREKLI"])
     RISKLI_DILIM_PCT        = float(ANALIZ_AYAR["RISKLI_DILIM_PCT"])
-    ESIK_BERABER_PAY        = float(ANALIZ_AYAR["ESIK_BERABER_PAY"])
+    ESIK_BERABER_PUAN       = float(ANALIZ_AYAR["ESIK_BERABER_PUAN"])
     ESIK_MIN_VAKA           = int(ANALIZ_AYAR["ESIK_MIN_VAKA"])
     ESIK_SKOR_ESLESME       = float(ANALIZ_AYAR["ESIK_SKOR_ESLESME"])
     ESIK_MUSTERI_FARK       = float(ANALIZ_AYAR["ESIK_MUSTERI_FARK"])
@@ -293,47 +294,17 @@ if _analiz_hazir:
     # ================================================================
     # C) MODEL KLASÖRÜNDEKİ 20'Lİ BUCKET TABLOLARI (Excel'den, aynen)
     # ----------------------------------------------------------------
-    # Klasördeki tüm .xlsx dosyalarının tüm sheet'leri taranır.
-    # Başlık satırında hem 'bucket' hem 'bad_rate' geçen yer bir tablodur;
-    # bir üst satırdaki ilk dolu hücre tablonun adıdır
-    # (ör. "3M_İçinde_Kirmizi - Train: 202504 OOT: 202506").
-    # Hiçbir değer yeniden hesaplanmaz. Alınan kolonlar:
+    # Her model klasöründe her renk için TEK dosya okunur:
+    #   /<klasör>/renk_{kod}_{ad}_bucket20_train_val_oot.xlsx
+    # (bucket100 dosyaları ve diğer xlsx'ler okunmaz.)
+    # Dosyadaki tablo TRAIN, VAL ve OOT satırlarını alt alta içerir;
+    # SADECE kume == 'OOT' olan 20 satır alınır. Hiçbir değer yeniden
+    # hesaplanmaz. Alınan kolonlar:
     #   n        → MODEL DİLİMİ MÜŞTERİ
     #   bad      → MODEL DİLİMİNDE GERÇEKLEŞEN (adet)
-    #   bad_rate → MODEL DİLİMİNDE GERÇEKLEŞEN (%)
-    # base_rate, lift ve capture bu üçünden türediği için alınmaz:
-    #   base_rate = TOPLAM satırındaki oran, lift = bucket oranı / base_rate,
-    #   capture = bucket 1'den o bucket'a kadar vaka / toplam vaka.
-    # Satır seçimi: 'renk' kolonu (yoksa sheet adı) → segment,
-    # 'kume' kolonu OOT ile başlayan satırlar → OOT dönemi.
-    # Aynı sheet'te birden fazla tablo varsa tablo adı model önekiyle
-    # eşleştirilir: "3M_İçinde_Kirmizi" ↔ 3M_ICINDE_KIRMIZI_RENGE_GOC,
-    # "3M_İçinde_Kirmizi_Takip" ↔ 3M_ICINDE_KIRMIZI_TAKIP.
+    #   bad_rate → MODEL DİLİMİNDE GERÇEKLEŞEN (%)  (dosyada yoksa bad / n)
+    # base_rate, lift ve capture bu üçünden türediği için alınmaz.
     # ================================================================
-    MODEL_BUCKET_KOLONLARI = ["n", "bad", "bad_rate"]
-
-    def _norm_ad(x):
-        """Karşılaştırma anahtarı: Türkçe karakter, ayraç ve RENGE_GOC eki atılır."""
-        _s = str(x).upper().translate(str.maketrans("İÇĞÖŞÜ", "ICGOSU"))
-        return re.sub(r"[^A-Z0-9]", "", _s).replace("RENGEGOC", "")
-
-    def _baslik_anahtar(baslik):
-        """'3M_İçinde_Kirmizi - Train: ...' → '3MICINDEKIRMIZI'"""
-        return _norm_ad(re.split(r"\s+-\s+", str(baslik))[0])
-
-    def _renk_kodu(x):
-        _m = re.match(r"\s*(\d+)", str(x))
-        return int(_m.group(1)) if _m else None
-
-    def _sayi_mi(x):
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return False
-        try:
-            float(str(x).strip().replace(",", "."))
-            return True
-        except ValueError:
-            return False
-
     def _sayiya(seri):
         """Excel hücresini sayıya çevirir; '98,24%' gibi metinleri de çözer."""
         if seri.dtype != object:
@@ -346,86 +317,32 @@ if _analiz_hazir:
         _v = pd.to_numeric(_s, errors="coerce")
         return _v.where(~_pct, _v / 100.0)
 
-    _klasor_blok_cache = {}
-    def _klasor_bloklari(ek):
-        """Klasördeki tüm bucket tablolarını okur: [{'baslik', 'veri'}, ...]"""
-        if ek in _klasor_blok_cache:
-            return _klasor_blok_cache[ek]
-        bloklar = []
-        try:
-            _yollar = [p for p in mf.list_paths_in_partition()
-                       if p.startswith(f"/{ek}/") and p.lower().endswith(".xlsx")
-                       and not p.rsplit("/", 1)[-1].startswith("~$")]
-        except Exception as e:
-            print(f"   ⚠ {ek}: klasör listelenemedi ({e})")
-            _yollar = []
-        # Klasörde hem bucket20 hem bucket100 dosyası olabilir; bucket20 varsa
-        # sadece onu oku (bucket100 tabloları 20'li raporla karıştırılmasın).
-        _yol20 = [p for p in _yollar if "bucket20" in p.lower()]
-        if _yol20:
-            _yollar = _yol20
-        for _yol in _yollar:
-            try:
-                with mf.get_download_stream(_yol) as _s:
-                    _sheets = pd.read_excel(BytesIO(_s.read()), sheet_name=None, header=None)
-            except Exception as e:
-                print(f"   ⚠ {_yol} okunamadı ({e})")
-                continue
-            for _sh, _raw in _sheets.items():
-                _v = _raw.to_numpy(dtype=object)
-                for _i in range(_v.shape[0]):
-                    _hdr = [str(x).strip().lower() if pd.notna(x) else "" for x in _v[_i]]
-                    if "bucket" not in _hdr or "bad_rate" not in _hdr:
-                        continue
-                    _bi = _hdr.index("bucket")
-                    _j = _i + 1
-                    while _j < _v.shape[0] and _sayi_mi(_v[_j][_bi]):
-                        _j += 1
-                    if _j == _i + 1:
-                        continue
-                    _baslik = ""
-                    if _i > 0:
-                        _baslik = next((str(x).strip() for x in _v[_i - 1]
-                                        if pd.notna(x) and str(x).strip()), "")
-                    _kol = {}
-                    for _k, _h in enumerate(_hdr):
-                        if _h and _h not in _kol:
-                            _kol[_h] = _k
-                    _d = pd.DataFrame({_h: _v[_i + 1:_j, _k] for _h, _k in _kol.items()})
-                    _d["bucket"] = _sayiya(_d["bucket"]).astype(int)
-                    for _src in MODEL_BUCKET_KOLONLARI:
-                        if _src in _d.columns:
-                            _x = _sayiya(_d[_src])
-                            if _src == "bad_rate" and _x.max(skipna=True) > 1.5:
-                                _x = _x / 100.0          # 98,24 yazılmışsa 0,9824'e çek
-                            _d[_src] = _x
-                    _d["_RK"] = _d["renk"].map(_renk_kodu) if "renk" in _d.columns else _renk_kodu(_sh)
-                    bloklar.append({"baslik": _baslik, "veri": _d})
-        _klasor_blok_cache[ek] = bloklar
-        print(f"   {ek}: {len(_yollar)} xlsx, {len(bloklar)} bucket tablosu "
-              f"| adlar: {sorted({b['baslik'] for b in bloklar})}")
-        return bloklar
-
     def _model_tablosu(ek, onek, rk):
-        """(model, renk) için OOT bucket tablosu, index = bucket.
-        İkinci değer: bulunamazsa nedeni (kontrol tablosu için)."""
-        _aday = []
-        for b in _klasor_bloklari(ek):
-            _d = b["veri"]
-            _m = _d["_RK"] == rk
-            if "kume" in _d.columns:
-                _m &= _d["kume"].astype(str).str.strip().str.upper().str.startswith("OOT")
-            # Sadece 20 bucket'lı tablolar (100'lük tablo yanlışlıkla seçilmesin)
-            if _m.any() and _d.loc[_m, "bucket"].nunique() == ANALIZ_N_BUCKET:
-                _aday.append((b["baslik"], _d.loc[_m]))
-        if not _aday:
-            return None, "Klasör Excel'inde bu segmentin 20 bucket'lı OOT tablosu yok"
-        if len({_baslik_anahtar(t) for t, _ in _aday}) > 1:
-            _aday = [x for x in _aday if _baslik_anahtar(x[0]) == _norm_ad(onek)]
-            if not _aday:
-                return None, f"Birden fazla tablo var, hiçbirinin adı '{onek}' ile eşleşmedi"
-        _not = "" if len(_aday) == 1 else f"{len(_aday)} eş tablo bulundu, ilki kullanıldı"
-        return _aday[0][1].drop_duplicates(subset="bucket", keep="first").set_index("bucket"), _not
+        """(model klasörü, renk) için OOT bucket tablosu, index = bucket.
+        Bulunamazsa (None, neden) döner; neden KONTROLLER'e yazılır."""
+        _dosya = f"renk_{rk}_{_renk_map.get(rk, rk)}_bucket20_train_val_oot.xlsx"
+        _yol = f"/{ek}/{_dosya}"
+        try:
+            with mf.get_download_stream(_yol) as _s:
+                _d = pd.read_excel(BytesIO(_s.read()), sheet_name=0)
+        except Exception as e:
+            return None, f"{_dosya} okunamadı ({type(e).__name__})"
+        _d.columns = [str(c).strip().lower() for c in _d.columns]
+        _eksik = [c for c in ("kume", "bucket", "n", "bad") if c not in _d.columns]
+        if _eksik:
+            return None, f"{_dosya}: kolon eksik {_eksik}"
+        _d = _d[_d["kume"].astype(str).str.strip().str.upper() == "OOT"].copy()
+        if _d.empty:
+            return None, f"{_dosya}: kume = OOT satırı yok"
+        for _c in ("bucket", "n", "bad", "bad_rate"):
+            if _c in _d.columns:
+                _d[_c] = _sayiya(_d[_c])
+        if "bad_rate" not in _d.columns:
+            _d["bad_rate"] = _d["bad"] / _d["n"]
+        elif _d["bad_rate"].max(skipna=True) > 1.5:
+            _d["bad_rate"] = _d["bad_rate"] / 100.0      # 98,24 yazılmışsa 0,9824'e çek
+        _d["bucket"] = _d["bucket"].astype(int)
+        return _d.drop_duplicates(subset="bucket", keep="first").set_index("bucket"), _dosya
 
     # ================================================================
     # D) METRİK FONKSİYONLARI
@@ -579,7 +496,7 @@ if _analiz_hazir:
     _G_IKISI_RISKLI  = "İKİSİ DE RİSKLİ DİYOR"
     _G_IKISI_TEMIZ   = "İKİSİ DE TEMİZ DİYOR"
     _C_NET           = "NET EK VAKA: MODEL LEHİNE (adet)"
-    _C_NET_PAY       = "NET EK VAKA / KİTLE VAKA (%)"
+    _C_ORAN_FARK     = "ORAN FARKI: MODEL GRUBU − MEVCUT GRUBU (%)"
     _C_KAZANAN       = "KAZANAN"
 
     def _segment_isle(dsub, etiket, skorm_map, kacan_l, hukum_l):
@@ -608,13 +525,19 @@ if _analiz_hazir:
                     _G_IKISI_TEMIZ:   ~_mev_r & ~_mod_r,
                 }
                 _net = int(_y[_gruplar[_G_SADECE_MODEL]].sum() - _y[_gruplar[_G_SADECE_MEVCUT]].sum())
-                _net_pay = _net / _v if _v else np.nan
+                # KAZANAN: iki "sadece" grubun hedef oranı farkı (puan). Gruplar eşit
+                # büyüklükte olduğu için oranı yüksek olan grup daha çok vaka taşır.
+                _o_mod = _y[_gruplar[_G_SADECE_MODEL]].mean() if _gruplar[_G_SADECE_MODEL].any() else np.nan
+                _o_mev = _y[_gruplar[_G_SADECE_MEVCUT]].mean() if _gruplar[_G_SADECE_MEVCUT].any() else np.nan
+                _ofark = _o_mod - _o_mev
                 if _v == 0:
                     _kazanan = "VAKA YOK"
-                elif abs(_net_pay) <= ESIK_BERABER_PAY:
+                elif not np.isfinite(_ofark):
+                    _kazanan = "BERABER"               # iki skor aynı listeyi vermiş
+                elif abs(_ofark) < ESIK_BERABER_PUAN:
                     _kazanan = "BERABER"
                 else:
-                    _kazanan = "MODEL" if _net > 0 else "MEVCUT SKOR"
+                    _kazanan = "MODEL" if _ofark > 0 else "MEVCUT SKOR"
 
                 _satir = {"SEGMENT": etiket, "HEDEF": _kisa_ad(_a), "MEVCUT SKOR": _ad_tr,
                           "KİTLE (adet)": _n, "KİTLE VAKA (adet)": _v,
@@ -628,8 +551,8 @@ if _analiz_hazir:
 
                 _grup_yaz(_G_SADECE_MODEL)
                 _grup_yaz(_G_SADECE_MEVCUT)
+                _satir[_C_ORAN_FARK] = _r4(_ofark)
                 _satir[_C_NET] = _net
-                _satir[_C_NET_PAY] = _r4(_net_pay)
                 _satir[_C_KAZANAN] = _kazanan
                 _grup_yaz(_G_IKISI_RISKLI)
                 _grup_yaz(_G_IKISI_TEMIZ)
@@ -740,33 +663,39 @@ if _analiz_hazir:
             ozet_satirlar.append(_r)
 
         # ---- Klasör tabloları + tablo kontrolleri ----
+        # Model kitlesi, rapordaki "model skoru olan TÜM KİTLE" ile karşılaştırılır
+        # (iki mevcut skor şartı yok; modelin kendi kitlesiyle aynı tanım).
         _renk_listeleri = {}
         for _rk in _SKOR_RENKLER:
-            _do = dfO[dfO["RENK_KOD"] == _rk]
+            _ta = dfA0[dfA0["RENK_KOD"] == _rk]
             _liste = []
             for _ek, _onek, _act in _kls:
-                _tablo, _not = _model_tablosu(_ek, _onek, _rk)
+                _tablo, _bilgi = _model_tablosu(_ek, _onek, _rk)
                 _liste.append((_onek, _act, _tablo))
+                _sc = f"SKOR_{_ek}"
+                _dm = _ta[_ta[_sc].notna()] if _sc in _ta.columns else _ta.iloc[0:0]
                 _ktrl = {"MODEL": _kisa_ad(_onek), "SEGMENT": _renk_etiket(_rk),
-                         "TABLO BULUNDU": "EVET" if _tablo is not None else "HAYIR",
+                         "OKUNAN DOSYA": _bilgi if _tablo is not None else None,
                          "BUCKET SAYISI": None, "BAD_RATE = BAD / N": None,
-                         "MODEL KİTLESİ (adet)": None, "ORTAK KİTLE (adet)": int(len(_do)),
+                         "MODEL KİTLESİ (adet)": None,
+                         "RAPORDA MODEL SKORU OLAN (adet)": int(len(_dm)),
                          "KİTLE FARKI (%)": None,
                          "MODEL KİTLESİ HEDEF ORANI (%)": None,
-                         "ORTAK KİTLE HEDEF ORANI (%)": _r4(_do[_act].mean()) if len(_do) else None,
-                         "HEDEF ORANI FARKI (%)": None, "_not": _not}
-                if _tablo is not None and {"n", "bad", "bad_rate"} <= set(_tablo.columns):
+                         "RAPORDA MODEL SKORU OLANLARIN HEDEF ORANI (%)": _r4(_dm[_act].mean()) if len(_dm) else None,
+                         "HEDEF ORANI FARKI (%)": None,
+                         "_not": None if _tablo is not None else _bilgi}
+                if _tablo is not None:
                     _tn, _tb = float(_tablo["n"].sum()), float(_tablo["bad"].sum())
                     _sapma = (_tablo["bad_rate"] - _tablo["bad"] / _tablo["n"]).abs().max()
                     _ktrl["BUCKET SAYISI"] = int(len(_tablo))
                     _ktrl["BAD_RATE = BAD / N"] = "EVET" if _sapma <= ESIK_BADRATE_TUTARLILIK else "HAYIR"
                     _ktrl["MODEL KİTLESİ (adet)"] = int(_tn)
                     _ktrl["MODEL KİTLESİ HEDEF ORANI (%)"] = _r4(_tb / _tn) if _tn else None
-                    if len(_do):
-                        _ktrl["KİTLE FARKI (%)"] = _r4((_tn - len(_do)) / len(_do))
-                    if None not in (_ktrl["MODEL KİTLESİ HEDEF ORANI (%)"], _ktrl["ORTAK KİTLE HEDEF ORANI (%)"]):
-                        _ktrl["HEDEF ORANI FARKI (%)"] = _r4(_ktrl["MODEL KİTLESİ HEDEF ORANI (%)"]
-                                                            - _ktrl["ORTAK KİTLE HEDEF ORANI (%)"])
+                    if len(_dm):
+                        _ktrl["KİTLE FARKI (%)"] = _r4((_tn - len(_dm)) / len(_dm))
+                    _a1, _a2 = _ktrl["MODEL KİTLESİ HEDEF ORANI (%)"], _ktrl["RAPORDA MODEL SKORU OLANLARIN HEDEF ORANI (%)"]
+                    if _a1 is not None and _a2 is not None:
+                        _ktrl["HEDEF ORANI FARKI (%)"] = _r4(_a1 - _a2)
                 _ktrl_model_tablo.append(_ktrl)
             _renk_listeleri[_rk] = _liste
 
@@ -832,7 +761,7 @@ if _analiz_hazir:
     for _r in _ktrl_model_tablo:
         _n = [_r.pop("_not")] if _r.get("_not") else []
         _r.pop("_not", None)
-        if _r["TABLO BULUNDU"] == "HAYIR":
+        if _r["OKUNAN DOSYA"] is None:
             _r["DURUM"] = "YOK"
         else:
             _uyari = []
@@ -841,7 +770,7 @@ if _analiz_hazir:
             if _r["BAD_RATE = BAD / N"] == "HAYIR":
                 _uyari.append("Tablodaki bad_rate, bad / n ile tutmuyor")
             if _r["KİTLE FARKI (%)"] is None or abs(_r["KİTLE FARKI (%)"]) > ESIK_MUSTERI_FARK:
-                _uyari.append("Model kitlesi ile ortak kitle farklı büyüklükte (filtre farkı)")
+                _uyari.append("Model kitlesi ile raporda model skoru olan kitle farklı büyüklükte")
             if _r["HEDEF ORANI FARKI (%)"] is None or abs(_r["HEDEF ORANI FARKI (%)"]) > ESIK_HEDEF_ORANI_FARK:
                 _uyari.append("Hedef oranları tutmuyor: rapordaki hedef tanımı modelinkiyle aynı olmayabilir")
             _r["DURUM"] = "UYARI" if _uyari else "OK"
@@ -998,9 +927,11 @@ if _analiz_hazir:
                                        "İki oran çok farklıysa ortak kitle seçici daralmış demektir."),
                 ("2) MODEL SKOR DOSYALARI", "Modelin renk dosyaları okundu mu (6/6), mükerrer satır var mı ve tüm kitlenin "
                                             f"ne kadarında skor var. {_yzd(ESIK_SKOR_ESLESME)} altı UYARI."),
-                ("3) BUCKET TABLOLARI", "BUCKET20'deki MODEL kolonlarının kaynağı. Tablo bulundu mu, 20 bucket mı, bad_rate = bad / n mi."),
-                ("   KİTLE FARKI (%)", f"(Model kitlesi − ortak kitle) / ortak kitle. {_yzd(ESIK_MUSTERI_FARK)} üstü UYARI."),
-                ("   HEDEF ORANI FARKI (%)", f"Model kitlesi hedef oranı − ortak kitle hedef oranı. {_yzd(ESIK_HEDEF_ORANI_FARK)} üstü UYARI. "
+                ("3) BUCKET TABLOLARI", "BUCKET20'deki MODEL kolonlarının kaynağı: her model klasöründen renk_<kod>_<ad>_bucket20_train_val_oot.xlsx, "
+                                        "sadece kume = OOT satırları. Dosya okundu mu, 20 bucket mı, bad_rate = bad / n mi."),
+                ("   KİTLE FARKI (%)", "(Model kitlesi − raporda model skoru olan müşteri) / raporda model skoru olan müşteri. "
+                                     f"İki taraf da aynı tanım (OOT, segment, model skoru dolu). {_yzd(ESIK_MUSTERI_FARK)} üstü UYARI."),
+                ("   HEDEF ORANI FARKI (%)", f"Model kitlesi hedef oranı − raporda model skoru olanların hedef oranı. {_yzd(ESIK_HEDEF_ORANI_FARK)} üstü UYARI. "
                                             "EN KRİTİK KONTROL: tutmuyorsa BUCKET20'de iki oran karşılaştırılamaz."),
                 ("4) MEVCUT SKOR KAPSAMASI", "Tüm kitlede. Model yerine sadece mevcut skor kullanılırsa skoru OLMAYAN "
                                              "kişilerdeki vakalar hiç görülmez; SKORSUZ KİŞİLERDEKİ VAKA PAYI bu kaybı gösterir."),
@@ -1020,7 +951,7 @@ if _analiz_hazir:
                 [
                     "Tablo iki taraftan oluşur ve iki tarafın KİTLESİ FARKLIDIR:",
                     f"SKOR tarafı: ORTAK KİTLE, {_KUCUK[_ad_tr]}na göre 20 eşit dilime bölündü ({_yon}). Bucket 1 = en riskli %5.",
-                    "MODEL tarafı: model klasöründeki OOT bucket tablosu, hesaplanmadan aynen alındı. Kitlesi MODEL KİTLESİ'dir (rapordan bağımsız). Bucket 1 = modelin en riskli %5'i.",
+                    "MODEL tarafı: model klasöründeki renk_<kod>_<ad>_bucket20_train_val_oot.xlsx dosyasının kume = OOT satırları, hesaplanmadan aynen alındı. Kitlesi MODEL KİTLESİ'dir (rapordan bağımsız). Bucket 1 = modelin en riskli %5'i.",
                     "Bu yüzden aynı satırdaki iki bucket'ta farklı müşteriler var; karşılaştırılan şey dilimlerin oranlarıdır.",
                     "Karşılaştırma ancak KONTROLLER 3. tablodaki HEDEF ORANI FARKI küçükse geçerlidir (aynı hedef, benzer kitle).",
                     "İyi bir skorda oran bucket 1'de en yüksektir ve aşağı indikçe düzenli düşer. MODEL oranı üstte daha yüksek, altta daha düşükse model daha iyi ayırıyor.",
@@ -1049,8 +980,8 @@ if _analiz_hazir:
                 [
                     "KİTLE: " + _KITLE_ORTAK + " DAVRANIŞ ve MÜŞTERİ satırlarının kitlesi aynıdır.",
                     f"İki skor da kitlenin en riskli %{_RISKLI_YZD}'sini 'riskli' sayar. Listeler aynı büyüklükte olduğundan farklı kalan kişiler iki eşit gruba ayrılır.",
-                    "Bu iki grubun HEDEF ORANI'nı karşılaştırın: oranı yüksek olan grup haklı skoru gösterir.",
-                    f"KAZANAN: NET EK VAKA / KİTLE VAKA mutlak değerce {_yzd(ESIK_BERABER_PAY)} veya altındaysa BERABER, değilse işarete göre MODEL / MEVCUT SKOR.",
+                    "Bu iki grubun HEDEF ORANI'nı karşılaştırın: oranı yüksek olan grup haklı skoru gösterir (ORAN FARKI kolonu).",
+                    f"KAZANAN: ORAN FARKI {_yzd(ESIK_BERABER_PUAN)} puandan küçükse BERABER; değilse pozitif → MODEL, negatif → MEVCUT SKOR. Kural segmentin hedef oranından bağımsızdır, Kırmızı gibi yüksek oranlı segmentlerde de çalışır.",
                     "Eşik yok: PRED (0/1) değil, model skorunun sıralaması kullanılır.",
                 ],
                 [
@@ -1062,7 +993,7 @@ if _analiz_hazir:
                     (f"{_G_SADECE_MEVCUT}", "Mevcut skor riskli, model temiz diyor: modelin kaçırdığı kişiler."),
                     ("... (adet) / VAKA (adet) / HEDEF ORANI (%)", "Gruptaki kişi sayısı, vaka sayısı ve vaka oranı."),
                     (_C_NET, "Sadece-model grubundaki vaka − sadece-mevcut grubundaki vaka. Pozitif = model fazladan vaka yakalıyor."),
-                    (_C_NET_PAY, "NET EK VAKA / KİTLE VAKA."),
+                    (_C_ORAN_FARK, "Sadece-model grubunun hedef oranı − sadece-mevcut grubunun hedef oranı (puan). KAZANAN bu kolondan verilir."),
                     ("KAZANAN", "MODEL / MEVCUT SKOR / BERABER."),
                     (f"{_G_IKISI_RISKLI} / {_G_IKISI_TEMIZ}", "İki skorun anlaştığı kişiler; bağlam içindir."),
                     ("RİSKLİ LİSTE ÖRTÜŞMESİ (%)", "İkisi de riskli / mevcut skorun riskli listesi. Yüksekse iki skor büyük ölçüde aynı kişileri gösteriyor."),
