@@ -19,9 +19,12 @@
 #   B) Tüm model klasörlerinden 6 rengin
 #      renk_{kod}_{ad}_musteri_skorlari.csv dosyaları okunur;
 #      SKOR_<klasör> ve PRED_<klasör> join edilir.
-#   C) İki kıyas skoru için 20'li bucket sheet'leri + HÜKÜM (Gini +
-#      capture kıyası) + KAÇAN DİLİM (2×2 tam kırılım) + HÜKÜM - HER OOT × HER
-#      DÖNEM için ayrı: TRAIN (202504) + OOT dönemi (202506).
+#   B-2) Model klasörlerindeki .xlsx bucket tabloları (renk × 20 bucket:
+#      n, bad, bad_rate) OLDUĞU GİBİ okunur.
+#   C) İki kıyas skoru için 20'li bucket sheet'leri (sol: kıyas skoru
+#      bucket'ları + ACT, sağ: modelin klasördeki kendi bucket tablosu)
+#      + HÜKÜM (Gini + capture kıyası) + KAÇAN DİLİM (2×2 tam kırılım) -
+#      HER OOT × HER DÖNEM için ayrı: TRAIN (202504) + OOT dönemi (202506).
 #   F) TREND: mevcut skorların GINI'si tüm dönemlerde - model/OOT'tan
 #      bağımsız olduğu için TEK sheet.
 #   ⚠ TRAIN sheet'leri modelin lehine taraflı; asıl karar OOT
@@ -32,6 +35,9 @@
 #   Sheet sırası: HUKUM_TRAIN_202504 / HUKUM_OOT_202506 → BUCKET20_<skor>_<tag>_<dönem>
 #     → KACAN_DILIM_<tag>_<dönem> → TREND  (capture/Gini kıyası HÜKÜM içinde)
 # ============================================================
+
+import re
+from io import BytesIO
 
 # --- 0) Config bayrağı (config hücresinde tanımlı; yoksa kapalı say) ---
 
@@ -272,6 +278,182 @@ if _analiz_hazir:
           f"{df_analiz.shape[1]} kolon")
 
     # ================================================================
+    # B-2) MODEL KLASÖRLERİNDEKİ 20'Lİ BUCKET TABLOLARI (Excel'den)
+    # ----------------------------------------------------------------
+    # Her model klasöründeki tüm .xlsx dosyaları ve tüm sheet'leri
+    # taranır. İçinde hem 'bucket' hem 'bad_rate' başlığı olan satır
+    # bir tablo başlığı sayılır; bir üst satırdaki ilk dolu hücre
+    # tablonun adıdır (ör. "3M_İçinde_Kirmizi - Train: 202504 OOT: 202506").
+    # Başlığın altındaki satırlar, bucket hücresi sayı olduğu sürece
+    # okunur. Değerler HESAPLANMAZ; Excel'deki haliyle alınır.
+    # Satır seçimi:
+    #   renk : 'renk' kolonundaki etiketin baştaki sayısı (1-KIRMIZI → 1);
+    #          kolon yoksa sheet adının baştaki sayısı (1-Kırmızı_UPDT → 1)
+    #   dönem: 'kume' kolonu TRAIN/OOT ile başlıyorsa ona göre; kolon
+    #          yoksa tablo yalnız OOT sheet'lerinde kullanılır.
+    #   model: bir klasörde aynı renk/dönem için birden fazla tablo varsa
+    #          tablo adı klasörün model önekiyle eşleştirilir
+    #          ("3M_İçinde_Kirmizi" ↔ 3M_ICINDE_KIRMIZI_RENGE_GOC,
+    #           "3M_İçinde_Kirmizi_Takip" ↔ 3M_ICINDE_KIRMIZI_TAKIP).
+    # ================================================================
+    # Klasör tablosundan yalnız bu 3 kolon alınır. base_rate, lift ve
+    # capture bu üçünden türediği için ayrıca taşınmaz (veri kaybı yok):
+    #   base_rate = TOPLAM satırındaki oran (toplam bad / toplam n)
+    #   lift      = bucket oranı / base_rate
+    #   capture   = bucket 1'den o bucket'a kadar bad toplamı / toplam bad
+    MODEL_BUCKET_KOLONLARI = ["n", "bad", "bad_rate"]
+    _YUZDE_KAYNAK = {"bad_rate"}
+
+    # Rapor başlıklarında kullanılan kısa hedef adları
+    _KISA_GOVDE = {
+        "ICINDE_KIRMIZI_RENGE_GOC": "KIRMIZIYA GÖÇ",
+        "ICINDE_KIRMIZI_TAKIP":     "KIRMIZI VEYA TAKİP",
+        "TAKIP":                    "TAKİP",
+    }
+    def _kisa_ad(onek):
+        """'3M_ICINDE_KIRMIZI_RENGE_GOC' → '3M KIRMIZIYA GÖÇ'"""
+        _m = re.match(r"(\d+M)_(.+)", onek)
+        if not _m:
+            return onek
+        return f"{_m.group(1)} {_KISA_GOVDE.get(_m.group(2), _m.group(2))}"
+
+    def _norm_ad(x):
+        """Türkçe karakter ve ayraçlardan arınmış büyük harf anahtar.
+        RENGE_GOC eki atılır: klasörde 'RENGE_GOC', Excel başlığında yok."""
+        _s = str(x).upper().translate(str.maketrans("İÇĞÖŞÜ", "ICGOSU"))
+        return re.sub(r"[^A-Z0-9]", "", _s).replace("RENGEGOC", "")
+
+    def _baslik_anahtar(baslik):
+        """'3M_İçinde_Kirmizi - Train: 202504 OOT: 202506' → '3MICINDEKIRMIZI'"""
+        return _norm_ad(re.split(r"\s+-\s+", str(baslik))[0])
+
+    def _renk_kodu(x):
+        _m = re.match(r"\s*(\d+)", str(x))
+        return int(_m.group(1)) if _m else None
+
+    def _sayi_mi(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return False
+        try:
+            float(str(x).strip().replace(",", "."))
+            return True
+        except ValueError:
+            return False
+
+    def _sayiya(seri):
+        """Excel hücresini sayıya çevirir. Metin olarak '98,24%' gibi
+        yazılmışsa da çözer (% → /100, virgül → nokta)."""
+        if seri.dtype != object:
+            return pd.to_numeric(seri, errors="coerce")
+        _s = seri.astype(str).str.strip()
+        _pct = _s.str.endswith("%")
+        _s = _s.str.rstrip("%").str.replace(" ", "", regex=False)
+        _virgul = _s.str.contains(",", regex=False)
+        _s = _s.where(~_virgul,
+                      _s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+        _v = pd.to_numeric(_s, errors="coerce")
+        return _v.where(~_pct, _v / 100.0)
+
+    _klasor_blok_cache = {}
+    def _klasor_bloklari(ek):
+        """Bir model klasöründeki tüm bucket tablolarını okur (cache'li)."""
+        if ek in _klasor_blok_cache:
+            return _klasor_blok_cache[ek]
+        bloklar = []
+        try:
+            _yollar = [p for p in mf.list_paths_in_partition()
+                       if p.startswith(f"/{ek}/") and p.lower().endswith(".xlsx")
+                       and not p.rsplit("/", 1)[-1].startswith("~$")]
+        except Exception as e:
+            print(f"   ⚠ {ek}: klasör listelenemedi ({e})")
+            _yollar = []
+        for _yol in _yollar:
+            try:
+                with mf.get_download_stream(_yol) as _s:
+                    _sheets = pd.read_excel(BytesIO(_s.read()),
+                                            sheet_name=None, header=None)
+            except Exception as e:
+                print(f"   ⚠ {_yol} okunamadı ({e}) → atlandı")
+                continue
+            for _sh, _raw in _sheets.items():
+                _v = _raw.to_numpy(dtype=object)
+                for _i in range(_v.shape[0]):
+                    _hdr = [str(x).strip().lower() if pd.notna(x) else ""
+                            for x in _v[_i]]
+                    if "bucket" not in _hdr or "bad_rate" not in _hdr:
+                        continue
+                    _bi = _hdr.index("bucket")
+                    _j = _i + 1
+                    while _j < _v.shape[0] and _sayi_mi(_v[_j][_bi]):
+                        _j += 1
+                    if _j == _i + 1:
+                        continue
+                    _baslik = ""
+                    if _i > 0:
+                        for x in _v[_i - 1]:
+                            if pd.notna(x) and str(x).strip():
+                                _baslik = str(x).strip()
+                                break
+                    _kol = {}
+                    for _k, _h in enumerate(_hdr):
+                        if _h and _h not in _kol:
+                            _kol[_h] = _k
+                    _d = pd.DataFrame({_h: _v[_i + 1:_j, _k] for _h, _k in _kol.items()})
+                    _d["bucket"] = _sayiya(_d["bucket"]).astype(int)
+                    for _src in MODEL_BUCKET_KOLONLARI:
+                        if _src in _d.columns:
+                            _x = _sayiya(_d[_src])
+                            # yüzde 98,24 gibi 100 tabanında yazılmışsa 0-1'e çek
+                            if _src in _YUZDE_KAYNAK and _x.max(skipna=True) > 1.5:
+                                _x = _x / 100.0
+                            _d[_src] = _x
+                    if "renk" in _d.columns:
+                        _d["_RK"] = _d["renk"].map(_renk_kodu)
+                    else:
+                        _d["_RK"] = _renk_kodu(_sh)
+                    bloklar.append({"dosya": _yol, "sheet": _sh,
+                                    "baslik": _baslik, "veri": _d})
+        _klasor_blok_cache[ek] = bloklar
+        _adlar = sorted({b["baslik"] for b in bloklar})
+        print(f"   {ek}: {len(_yollar)} xlsx, {len(bloklar)} bucket tablosu | adlar: {_adlar}")
+        return bloklar
+
+    _model_tablo_cache = {}
+    def _model_tablosu(ek, onek, rk, tag):
+        """Klasördeki (renk, dönem) bucket tablosu: index = bucket.
+        Bulunamazsa None (rapordaki model kolonları boş kalır)."""
+        _key = (ek, rk, tag)
+        if _key in _model_tablo_cache:
+            return _model_tablo_cache[_key]
+        _aday = []
+        for b in _klasor_bloklari(ek):
+            _d = b["veri"]
+            _m = _d["_RK"] == rk
+            if "kume" in _d.columns:
+                _m &= _d["kume"].astype(str).str.strip().str.upper().str.startswith(tag)
+            elif tag != "OOT":
+                continue
+            if _m.any():
+                _aday.append((b["baslik"], _d.loc[_m]))
+        _sonuc = None
+        if _aday:
+            if len({_baslik_anahtar(t) for t, _ in _aday}) > 1:
+                _hedef = _norm_ad(onek)
+                _aday = [x for x in _aday if _baslik_anahtar(x[0]) == _hedef]
+                if not _aday:
+                    print(f"   ⚠ {ek} / renk {rk} / {tag}: birden fazla tablo var, "
+                          f"hiçbirinin adı '{onek}' ile eşleşmedi → model kolonları boş")
+            if _aday:
+                if len(_aday) > 1:
+                    print(f"   ⚠ {ek} / renk {rk} / {tag}: {len(_aday)} eş tablo, ilki kullanıldı")
+                _sonuc = (_aday[0][1].drop_duplicates(subset="bucket", keep="first")
+                          .set_index("bucket"))
+        else:
+            print(f"   ⓘ {ek} / renk {rk} / {tag}: klasör Excel'inde tablo yok → model kolonları boş")
+        _model_tablo_cache[_key] = _sonuc
+        return _sonuc
+
+    # ================================================================
     # C) KIYAS SKORLARI 20'Lİ BUCKET RAPORU (TRAIN + OOT)
     # ----------------------------------------------------------------
     #   DAVRANIS_SKOR: yüksek = İYİ  → riskli yön = DÜŞÜK (işaret -1)
@@ -354,46 +536,23 @@ if _analiz_hazir:
         edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
         return nb - np.searchsorted(edges[1:-1], r, side="left")
 
-    # ================================================================
-    # PRED kolonu -> aynı hedefin ACT kolonu eşleşmesi
-    # ----------------------------------------------------------------
-    # PRED_<klasör>_OOT###### biçimindeki kolon adından klasör adı
-    # çıkarılır, tablodan karşılık gelen ACT kolonu bulunur.
-    # MODEL_ONEK_ACT'ten türetilir; yeni model orada eklenince burası
-    # kendiliğinden güncellenir.
-    # ================================================================
-    ACT_ESLESME = dict(MODEL_ONEK_ACT)
-
-    def _act_esi(pred_col, act_cols):
-        """PRED_<klasör>_OOT###### -> aynı hedefin ACT kolon adı.
-        Eşleşme yoksa None döner (kolon boş bırakılır, hata vermez)."""
-        _t = pred_col[len("PRED_"):]
-        if "_OOT" in _t:
-            _t = _t.rsplit("_OOT", 1)[0]
-        _a = ACT_ESLESME.get(_t)
-        return _a if (_a is not None and _a in act_cols) else None
-
-    def _bucket_blogu(dsub, etiket, skor_col, isaret, act_cols, pred_cols,
-                      grup_col="RENK_KOD"):
+    def _bucket_blogu(dsub, etiket, skor_col, isaret, model_listesi):
         """Bir kitle için 20 satırlık bucket tablosu + TOPLAM satırı döner.
 
-        Sol taraf  : kıyas skoru (DAVRANIS/MUSTERI) sıralaması
-                     -> ACT (%) + ACT (adet) + PRED (%)
-        Sağ taraf  : MODELİN KENDİ sıralaması, her PRED kolonunun yanında
-                     -> (kendi bucket PRED) (%) : modelin 1 basma oranı
-                     -> (kendi bucket ACT)  (%) : o dilimdeki GERÇEKLEŞME
-
-        Modelin kendi sıralaması, kitlede birden fazla renk varsa
-        (GENEL bloğu) ham skorla değil RENK İÇİ YÜZDELİK RANK ile
-        yapılır: 6 rengin 6 ayrı modeli farklı skor ölçeklerinde
-        olduğu için ham skorlar tek sıralamada kıyaslanamaz.
-        Tek renkli bloklarda rank ham skorla aynı sıralamayı verir."""
+        model_listesi: [(model önek, ACT kolonu, klasör tablosu | None), ...]
+        Her hedef için 5 kolon, karşılaştırılacak iki oran yan yana:
+          SKOR DİLİMİNDE GERÇEKLEŞEN (%)  : kıyas skorunun bucket'ı
+          MODEL DİLİMİNDE GERÇEKLEŞEN (%) : klasör tablosu bad_rate
+          SKOR DİLİMİNDE GERÇEKLEŞEN (adet)
+          MODEL DİLİMİ MÜŞTERİ (adet)     : klasör tablosu n
+          MODEL DİLİMİNDE GERÇEKLEŞEN (adet): klasör tablosu bad
+        Klasör tablosu yoksa (GENEL bloğu ya da Excel'de bulunamadı)
+        model kolonları boş kalır."""
         d = dsub.copy()
         d["_B"] = _bucketla_riskli(isaret * d[skor_col].to_numpy(dtype="float64"))
         _bser = d["_B"]
         _bidx = _bser.value_counts().sort_index().index
-        _yon  = "düşük" if isaret < 0 else "yüksek"
-        _bucket_kolon = f"BUCKET (1=en riskli, {_yon} {skor_col})"
+        _bucket_kolon = "BUCKET (1 = en riskli %5)"
 
         blok = pd.DataFrame({
             "SEGMENT": etiket,
@@ -404,49 +563,6 @@ if _analiz_hazir:
             "SKOR_MAX": d.groupby("_B")[skor_col].max().reindex(_bidx).round(4).values,
         })
 
-        # ---- ACT: kıyas skorunun bucket'ında gerçekleşme ------------
-        for c in act_cols:
-            _num = pd.to_numeric(d[c], errors="coerce")
-            _gc  = _num.groupby(_bser)
-            blok[f"{c} (%)"]    = _gc.mean().reindex(_bidx).round(4).values
-            blok[f"{c} (adet)"] = _gc.sum().reindex(_bidx).fillna(0).astype("int64").values
-
-        # ---- PRED + modelin kendi sıralaması ------------------------
-        for c in pred_cols:
-            _pnum = pd.to_numeric(d[c], errors="coerce")
-            blok[f"{c} (%)"] = _pnum.groupby(_bser).mean().reindex(_bidx).round(4).values
-
-            _skor_c  = "SKOR_" + c[len("PRED_"):]
-            _act_c   = _act_esi(c, act_cols)
-            _kb_pred = [None] * len(_bidx)
-            _kb_act  = [None] * len(_bidx)
-
-            if _skor_c in d.columns:
-                _dm = d[d[_skor_c].notna()]
-                if len(_dm) >= ANALIZ_N_BUCKET:
-                    # sıralama tabanı: çok renkliyse renk içi pct rank
-                    if grup_col in _dm.columns and _dm[grup_col].nunique() > 1:
-                        _taban = (_dm.groupby(grup_col)[_skor_c]
-                                  .rank(pct=True, method="average")
-                                  .to_numpy(dtype="float64"))
-                    else:
-                        _taban = _dm[_skor_c].to_numpy(dtype="float64")
-
-                    _bm = _bucketla_riskli(_taban)
-
-                    _gp = (pd.Series(pd.to_numeric(_dm[c], errors="coerce").to_numpy())
-                           .groupby(_bm).mean().round(4))
-                    _kb_pred = [float(_gp[b]) if b in _gp.index else None for b in _bidx]
-
-                    if _act_c is not None:
-                        _ga = (pd.Series(pd.to_numeric(_dm[_act_c], errors="coerce").to_numpy())
-                               .groupby(_bm).mean().round(4))
-                        _kb_act = [float(_ga[b]) if b in _ga.index else None for b in _bidx]
-
-            blok[f"{c} (kendi bucket PRED) (%)"] = _kb_pred
-            blok[f"{c} (kendi bucket ACT) (%)"]  = _kb_act
-
-        # ---- TOPLAM satırı: segmentin tamamı (bucket'suz) -----------
         _top = {
             "SEGMENT": etiket,
             _bucket_kolon: "TOPLAM",
@@ -455,30 +571,55 @@ if _analiz_hazir:
             "SKOR_ORT": round(float(d[skor_col].mean()), 4),
             "SKOR_MAX": round(float(d[skor_col].max()), 4),
         }
-        for c in act_cols:
-            _v = pd.to_numeric(d[c], errors="coerce")
-            _top[f"{c} (%)"]    = round(float(_v.mean()), 4)
-            _top[f"{c} (adet)"] = int(_v.fillna(0).sum())
 
-        for c in pred_cols:
-            _vp = pd.to_numeric(d[c], errors="coerce")
-            _top[f"{c} (%)"] = round(float(_vp.mean()), 4) if _vp.notna().any() else None
+        def _tablodan(tablo, src):
+            if tablo is None or src not in tablo.columns:
+                return [None] * len(_bidx)
+            return [None if pd.isna(x) else float(x)
+                    for x in tablo[src].reindex(_bidx).to_numpy()]
 
-            _skor_c = "SKOR_" + c[len("PRED_"):]
-            _act_c  = _act_esi(c, act_cols)
-            _kp = _ka = None
-            if _skor_c in d.columns:
-                # TOPLAM'da sağ taraf, model skoru DOLU alt kitlenin
-                # bazını gösterir -> soldaki TOPLAM ile farkı kapsam farkı
-                _dm = d[d[_skor_c].notna()]
-                if len(_dm):
-                    _v1 = pd.to_numeric(_dm[c], errors="coerce")
-                    _kp = round(float(_v1.mean()), 4) if _v1.notna().any() else None
-                    if _act_c is not None:
-                        _v2 = pd.to_numeric(_dm[_act_c], errors="coerce")
-                        _ka = round(float(_v2.mean()), 4) if _v2.notna().any() else None
-            _top[f"{c} (kendi bucket PRED) (%)"] = _kp
-            _top[f"{c} (kendi bucket ACT) (%)"]  = _ka
+        for _onek, _act, _tablo in model_listesi:
+            _k = _kisa_ad(_onek) + " | "
+            _c_sk_o = _k + "SKOR DİLİMİNDE GERÇEKLEŞEN (%)"
+            _c_md_o = _k + "MODEL DİLİMİNDE GERÇEKLEŞEN (%)"
+            _c_sk_a = _k + "SKOR DİLİMİNDE GERÇEKLEŞEN (adet)"
+            _c_md_n = _k + "MODEL DİLİMİ MÜŞTERİ (adet)"
+            _c_md_a = _k + "MODEL DİLİMİNDE GERÇEKLEŞEN (adet)"
+
+            # ---- Sol taraf: kıyas skorunun bucket'ında gerçekleşme --
+            if _act in d.columns:
+                _num = pd.to_numeric(d[_act], errors="coerce")
+                _gc  = _num.groupby(_bser)
+                _sk_o = _gc.mean().reindex(_bidx).round(4).values
+                _sk_a = _gc.sum().reindex(_bidx).fillna(0).astype("int64").values
+                _top_sk_o = round(float(_num.mean()), 4)
+                _top_sk_a = int(_num.fillna(0).sum())
+            else:
+                _sk_o = _sk_a = [None] * len(_bidx)
+                _top_sk_o = _top_sk_a = None
+
+            # ---- Sağ taraf: klasördeki model tablosundan aynen ------
+            blok[_c_sk_o] = _sk_o
+            blok[_c_md_o] = _tablodan(_tablo, "bad_rate")
+            blok[_c_sk_a] = _sk_a
+            blok[_c_md_n] = _tablodan(_tablo, "n")
+            blok[_c_md_a] = _tablodan(_tablo, "bad")
+
+            # TOPLAM: model tarafında n ve bad toplanır, oran = bad / n
+            # (bu oran klasör tablosundaki base_rate'tir).
+            _n_t = _b_t = _o_t = None
+            if _tablo is not None:
+                if "n" in _tablo.columns and _tablo["n"].notna().any():
+                    _n_t = float(_tablo["n"].sum())
+                if "bad" in _tablo.columns and _tablo["bad"].notna().any():
+                    _b_t = float(_tablo["bad"].sum())
+                if _n_t and _b_t is not None:
+                    _o_t = round(_b_t / _n_t, 4)
+            _top[_c_sk_o] = _top_sk_o
+            _top[_c_md_o] = _o_t
+            _top[_c_sk_a] = _top_sk_a
+            _top[_c_md_n] = _n_t
+            _top[_c_md_a] = _b_t
 
         blok = pd.concat([blok, pd.DataFrame([_top])], ignore_index=True)
         return blok
@@ -694,14 +835,12 @@ if _analiz_hazir:
     # ================================================================
     # C-E) HER OOT GRUBU × HER DEĞERLENDİRME DÖNEMİ (TRAIN + OOT)
     # ================================================================
-    bucket_sheetler = {}   # sheet adı → (bloklar, kıyas kolonu, işaret, dönem, tag)
+    bucket_sheetler = {}   # sheet adı → (bloklar, kıyas kolonu, işaret, dönem, tag, oot)
     analiz_ciktilar = {}   # (OOT, tag) → {"kacan","hukum" df + "donem"}
 
+    print("\nModel klasörlerindeki bucket tabloları okunuyor:")
     for _oot, _kls in KLASORLER_OOT.items():
         _kisa = _oot.replace("OOT", "")                    # ör. 202506
-        _act_cols  = [a for _, _, a in _kls]
-        _pred_cols = [f"PRED_{k}" for k, _, _ in _kls
-                      if f"PRED_{k}" in df_analiz.columns]
         _skorm_map = {a: f"SKOR_{k}" for k, _, a in _kls
                       if f"SKOR_{k}" in df_analiz.columns}
         if not _skorm_map:
@@ -725,6 +864,14 @@ if _analiz_hazir:
             _hkm_ek = ("[TRAIN - modelin lehine taraflı, OOT ile doğrulanmalı]"
                        if _tag == "TRAIN" else f"[OOT {_don} - eğitim dışı dönem]")
 
+            # --- Model listeleri: GENEL'de klasör tablosu yok (renk bazlı)
+            _genel_listesi = [(_onek, _act, None) for _ek, _onek, _act in _kls]
+            _renk_listeleri = {
+                _rk: [(_onek, _act, _model_tablosu(_ek, _onek, _rk, _tag))
+                      for _ek, _onek, _act in _kls]
+                for _rk in _SKOR_RENKLER
+            }
+
             # --- Bucket blokları: her kıyas skoru için GENEL + renkler
             for _ad, _col, _isaret in KIYAS_SKORLARI:
                 _dfS = dfA0[dfA0[_col].notna()].copy()
@@ -733,13 +880,13 @@ if _analiz_hazir:
                 if _dfS.empty:
                     continue
                 _bloklar = [_bucket_blogu(_dfS, "GENEL (TÜM PORTFÖY)",
-                                          _col, _isaret, _act_cols, _pred_cols)]
+                                          _col, _isaret, _genel_listesi)]
                 for _rk in _SKOR_RENKLER:
                     _dr = _dfS[_dfS["RENK_KOD"] == _rk]
                     if len(_dr) >= ANALIZ_N_BUCKET:
                         _bloklar.append(_bucket_blogu(
                             _dr, f"{_rk}-{_renk_map.get(_rk, _rk)}",
-                            _col, _isaret, _act_cols, _pred_cols))
+                            _col, _isaret, _renk_listeleri[_rk]))
                     else:
                         print(f"   ⚠ {_ad} / RENK {_rk}: {len(_dr)} satır - bucket için az, atlandı")
                 bucket_sheetler[f"BUCKET20_{_ad}_{_sh_ek(_tag, _don)}"] = \
@@ -992,33 +1139,16 @@ if _analiz_hazir:
             ws = wb[_sheet]
             _yon = ("DÜŞÜK skor = riskli (skor yüksek=iyi)" if _isaret < 0
                     else "YÜKSEK skor = riskli (skor 1'e yaklaştıkça kötü)")
-            _tag_not = ("⚠ TRAIN verisi - model kolonları eğitim dönemi, modelin "
-                        "lehine taraflı." if _tag == "TRAIN"
-                        else "OOT verisi - model kolonları eğitim dışı dönem, tarafsız.")
+            _skor_adi = "DAVRANIŞ SKORU" if _col == "DAVRANIS_SKOR" else "MÜŞTERİ SKORU"
             _notlar_yaz(ws, [
-                (f"{_col} 20'Lİ BUCKET [{_oot_ad} modelleri × {_tag}] - "
-                 f"DONEM={_don}, KK. "
-                 f"BUCKET 1 = en riskli %5 - {_yon}."),
-                ("ACT_ = o bucket'ta GERÇEKLEŞME oranı (bu skor gerçek riski ayrıştırıyor "
-                 "mu); '(adet)' = o bucket'ta gerçekleşen vaka SAYISI. Her segment "
-                 "bloğunun sonundaki TOPLAM satırı dönemin tamamını verir: kaç müşteri "
-                 "vardı, kaçı kırmızıya/takibe geçti (adet + oran). "
-                 "PRED_ = o bucket'ta MODELİN 1 bastığı oran (model bu skorun iyi "
-                 "dediği bucket'larda da risk buluyor mu). "
-                 "'(kendi bucket PRED)' ve '(kendi bucket ACT)' = AYNI kitle bu kez "
-                 f"{_col} yerine MODELİN KENDİ sıralamasına göre 20'ye bölündüğünde o "
-                 "bucket no'daki model işaretleme oranı ve GERÇEKLEŞME oranı. Çok renkli "
-                 "bloklarda (GENEL) model sıralaması renk içi yüzdelik rank ile yapılır; "
-                 "6 modelin ham skorları farklı ölçeklerde olduğu için doğrudan "
-                 "kıyaslanamaz. ASIL OKUMA: aynı satırda soldaki ACT (%) ile sağdaki "
-                 "(kendi bucket ACT) (%) karşılaştırılır - sağdaki belirgin yüksekse "
-                 "model, kıyas skorundan daha iyi sıralıyor demektir. Sağ taraf model "
-                 "skoru dolu alt kitlede hesaplanır, taban soldakiyle birebir aynı "
-                 "değil."),
-                ("OKUMA: ACT_ sadece bucket 1-2'de toplanıyorsa bu skor yeterli iddiası "
-                 "güçlenir; üst bucket'larda hâlâ ACT_/PRED_ kayda değerse modeller kör "
-                 "noktayı yakalıyor demektir. Renk bloklarında bucket renk İÇİNDE kesilir. "
-                 + _tag_not),
+                (f"{_skor_adi} ile MODEL: hangisi riskli müşteriyi daha iyi sıralıyor? "
+                 f"[{_tag}, DONEM={_don}]  ({_yon})"),
+                (f"SKOR DİLİMİ = müşteriler {_skor_adi.lower()}na göre 20 eşit dilime bölündü. "
+                 "MODEL DİLİMİ = model klasöründeki bucket tablosu, aynen alındı. "
+                 "Bucket 1 her iki tarafta da en riskli %5'tir. TOPLAM satırı segmentin tamamıdır."),
+                ("NASIL OKUNUR: her hedefte iki % kolonu yan yana. Üst bucket'larda MODEL "
+                 "oranı daha yüksek, alt bucket'larda daha düşükse model daha iyi sıralıyor. "
+                 "GENEL bloğunda model tablosu yok (modeller renk bazlı)."),
             ])
             _b0 = _bloklar[0]
             for c in range(1, _b0.shape[1] + 1):
