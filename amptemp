@@ -1,15 +1,267 @@
-KATIB’e hoş geldiniz.
+import re
+import time
+import numpy as np
+import pandas as pd
+import dataiku
+from io import BytesIO
+from sklearn.metrics import roc_auc_score
 
-KATIB, veri hazırlığından model geliştirme ve değerlendirmeye kadar tüm süreci tek bir çalışma alanında bir araya getirir.
+# =====================================================================
+# AYARLAR
+# =====================================================================
+MAIN_FOLDER      = "GOC_MODEL_RESULTS"
+CIKTI_DOSYA      = "/oot_bucket20_ilrisk.xlsx"   # kök dizine tek dosya
 
-Neler yapabilirsiniz?
+KLASORLER = [
+    "3M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506",
+    "6M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506",
+    "12M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506",
+    "3M_ICINDE_KIRMIZI_TAKIP_OOT202506",
+    "6M_ICINDE_KIRMIZI_TAKIP_OOT202506",
+    "12M_ICINDE_KIRMIZI_TAKIP_OOT202506",
+    "3M_TAKIP_OOT202506",
+    "6M_TAKIP_OOT202506",
+    "12M_TAKIP_OOT202506",
+]
 
-Verilerinizi analiz edebilir, yeni değişkenler oluşturabilir, değişkenlerin kalitesini ve modele katkısını değerlendirebilir, farklı modellerin performansını karşılaştırabilirsiniz. Tüm bu işlemler, sonuçları ve alınan kararlarıyla birlikte izlenebilir bir çalışma sürecinde yürütülür.
+ILRISK_DATASET   = "MUS_ILRISK_202506_FILTERED"
+ILRISK_KEY_COL   = "MBB_NO"
+ILRISK_COL       = "IL_RISK"
+ILRISK_SIRA      = ["VERY_HIGH", "HIGH", "LOW"]
 
-Nasıl ilerler?
+OOT_SET          = "OOT"
+OOT_DONEM        = 202506
+N_BUCKET         = 20
+CAPTURE_PCT      = 0.10
 
-Her aşamada yapılacak işlemler, değerlendirme sonuçları ve karar gerektiren noktalar açıklanır. Analizler sistem tarafından gerçekleştirilirken önemli seçimler sizin kontrolünüzde kalır. Değişkenlerin kaynağı, uygulanan dönüşümler ve modelleme kararları kayıt altında tutulur; böylece çalışmanıza kaldığınız yerden devam edebilirsiniz.
+# Skor dosyasındaki kolon adları
+SKOR_SET_COL     = "set_adi"
+SKOR_KEY_COL     = "mbb_no"
+SKOR_DONEM_COL   = "donem"
+SKOR_Y_COL       = "target_actual"
+SKOR_SCORE_COL   = "target_score"
 
-Sürecin tamamını üst bölümdeki İş Akışı üzerinden takip edebilirsiniz.
+SKOR_DOSYA_RE    = re.compile(r"^renk_(\d+)_(.+?)_musteri_skorlari\.csv$")
 
-Başlamak için verinizin mevcut durumuna uygun başlangıç seçeneğini belirleyin.
+mf = dataiku.Folder(MAIN_FOLDER)
+_T0 = time.time()
+
+
+def _log(mesaj):
+    """Geçen süreyle birlikte anında ekrana basar."""
+    dk, sn = divmod(int(time.time() - _T0), 60)
+    print(f"[{dk:02d}:{sn:02d}] {mesaj}", flush=True)
+
+
+# =====================================================================
+# YARDIMCILAR
+# =====================================================================
+def _sayi(s):
+    """'182753.0' / 182753 / '182753' değerlerini aynı Int64 değere çevirir."""
+    return pd.to_numeric(s, errors="coerce").round().astype("Int64")
+
+
+def _cocuklar(yol):
+    det = mf.get_path_details(yol) or {}
+    return det.get("children") or []
+
+
+def _dosyalar(klasor):
+    ad = [c["name"] for c in _cocuklar("/" + klasor) if not c.get("directory")]
+    if not ad:
+        on = "/" + klasor + "/"
+        ad = [p[len(on):] for p in mf.list_paths_in_partition()
+              if p.startswith(on) and "/" not in p[len(on):]]
+    return sorted(ad)
+
+
+def _bucket_ata(score, nb):
+    """Bucket raporundaki mantığın aynısı: rank bazlı, 1 = en yüksek skor."""
+    score = np.asarray(score, dtype="float64")
+    n = len(score)
+    order = np.argsort(score, kind="stable")
+    r = np.empty(n, dtype="float64")
+    r[order] = np.arange(1, n + 1, dtype="float64")
+    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
+    return nb - np.searchsorted(edges[1:-1], r, side="left")
+
+
+def _bucket_tablosu(y, score, nb):
+    """Tek bir kitle için bucket tablosu + özet metrikler."""
+    y = np.asarray(y, dtype="float64")
+    score = np.asarray(score, dtype="float64")
+    n = len(y)
+    n_bad = int(y.sum())
+    base = n_bad / n if n else np.nan
+    nb = int(min(nb, n))
+
+    d = pd.DataFrame({"y": y, "score": score})
+    d["bucket"] = _bucket_ata(score, nb)
+    g = (d.groupby("bucket")
+           .agg(n=("y", "size"), bad=("y", "sum"),
+                min_score=("score", "min"), avg_score=("score", "mean"),
+                max_score=("score", "max"))
+           .reset_index().sort_values("bucket"))
+    g["bad"] = g["bad"].astype("int64")
+
+    g["bad_rate"] = g["bad"] / g["n"]
+    tavan = min(1.0 / base, nb) if base > 0 else np.nan
+    g["lift"] = g["bad_rate"] / base if base > 0 else np.nan
+    g["lift_tavan_pct"] = g["lift"] / tavan if np.isfinite(tavan) else np.nan
+    g["cum_bad"] = g["bad"].cumsum()
+    g["capture"] = g["cum_bad"] / n_bad if n_bad > 0 else np.nan
+    g["cum_n_pct"] = g["n"].cumsum() / n
+
+    for c in ["min_score", "avg_score", "max_score", "bad_rate", "lift",
+              "lift_tavan_pct", "capture", "cum_n_pct"]:
+        g[c] = g[c].round(4)
+
+    g.insert(0, "n_bucket", nb)
+    g.insert(1, "base_rate", round(base, 4) if n else np.nan)
+    g.insert(2, "lift_tavan", round(tavan, 2) if np.isfinite(tavan) else np.nan)
+
+    # Özet metrikler
+    mono = float((np.diff(g["bad_rate"].to_numpy()) < 0).mean()) if len(g) > 1 else np.nan
+    k = max(1, int(CAPTURE_PCT * n))
+    top = np.argpartition(-score, min(k, n - 1))[:k] if n > 1 else np.array([0])
+    cap = float(y[top].sum() / n_bad) if n_bad > 0 else np.nan
+    cap_tavan = min(1.0, CAPTURE_PCT / base) if base > 0 else np.nan
+    gini = (2 * roc_auc_score(y, score) - 1) if 0 < n_bad < n else np.nan
+    capN = int(CAPTURE_PCT * 100)
+
+    ozet = {
+        "n": n, "bad": n_bad,
+        "base_rate": round(base, 4) if n else np.nan,
+        "gini": round(gini, 4) if pd.notna(gini) else np.nan,
+        f"capture{capN}": round(cap, 4) if pd.notna(cap) else np.nan,
+        f"capture{capN}_tavan": round(cap_tavan, 4) if pd.notna(cap_tavan) else np.nan,
+        "lift1": g["lift"].iloc[0] if len(g) else np.nan,
+        "lift1_tavan_pct": g["lift_tavan_pct"].iloc[0] if len(g) else np.nan,
+        "monoton_pct": round(mono, 4) if pd.notna(mono) else np.nan,
+        "n_bucket": nb,
+    }
+    return g, ozet
+
+
+def _skor_oku(klasor, dosyalar, kod, renk):
+    """Önce küçük _oot dosyasını, olmazsa tam skor dosyasını okur; OOT + OOT_DONEM filtreler."""
+    gerekli = {SKOR_KEY_COL, SKOR_DONEM_COL, SKOR_Y_COL, SKOR_SCORE_COL}
+    adaylar = [f"renk_{kod}_{renk}_musteri_skorlari_oot.csv",
+               f"renk_{kod}_{renk}_musteri_skorlari.csv"]
+    for ad in adaylar:
+        if ad not in dosyalar:
+            continue
+        with mf.get_download_stream(f"/{klasor}/{ad}") as s:
+            df = pd.read_csv(s, usecols=lambda c: c in gerekli | {SKOR_SET_COL})
+        if not gerekli.issubset(df.columns):
+            _log(f"    ⚠ {ad}: eksik kolon {gerekli - set(df.columns)}, sonraki dosya deneniyor")
+            continue
+        if SKOR_SET_COL in df.columns:
+            df = df[df[SKOR_SET_COL].astype(str).str.strip().str.upper() == OOT_SET]
+        donem = _sayi(df[SKOR_DONEM_COL])
+        diger = int((donem != OOT_DONEM).sum())
+        if diger:
+            _log(f"    ⚠ {ad}: OOT içinde {OOT_DONEM} dışı {diger:,} satır atıldı")
+        df = df[donem == OOT_DONEM]
+        return pd.DataFrame({
+            "_key":   _sayi(df[SKOR_KEY_COL]).to_numpy(),
+            "_y":     pd.to_numeric(df[SKOR_Y_COL], errors="coerce").to_numpy(),
+            "_score": pd.to_numeric(df[SKOR_SCORE_COL], errors="coerce").to_numpy(),
+        }), ad
+    return None, None
+
+
+# =====================================================================
+# IL_RISK YÜKLE
+# =====================================================================
+_log("Başladı")
+il = dataiku.Dataset(ILRISK_DATASET).get_dataframe(columns=[ILRISK_KEY_COL, ILRISK_COL])
+il = pd.DataFrame({
+    "_key":    _sayi(il[ILRISK_KEY_COL]),
+    "IL_RISK": il[ILRISK_COL].astype("string").str.strip().str.upper(),
+}).dropna(subset=["_key"])
+
+cakisan = int(il.groupby("_key")["IL_RISK"].nunique().gt(1).sum())
+if cakisan:
+    _log(f"⚠ {cakisan:,} müşteride birden fazla farklı IL_RISK var; ilk kayıt alındı")
+il = il.drop_duplicates("_key")
+
+beklenmeyen = set(il["IL_RISK"].dropna().unique()) - set(ILRISK_SIRA)
+if beklenmeyen:
+    _log(f"⚠ Beklenmeyen IL_RISK değerleri (hesaba katılmayacak): {sorted(beklenmeyen)}")
+_log(f"IL_RISK hazır: {len(il):,} müşteri")
+print(il["IL_RISK"].value_counts(dropna=False).to_string(), flush=True)
+
+
+# =====================================================================
+# ANA DÖNGÜ (klasörlere yazmaz, sadece okur)
+# =====================================================================
+bucket_parcalari, ozet_satirlari = [], []
+
+for ki, klasor in enumerate(KLASORLER, start=1):
+    dosyalar = _dosyalar(klasor)
+    renkler = sorted({(int(m.group(1)), m.group(2))
+                      for ad in dosyalar if (m := SKOR_DOSYA_RE.match(ad))})
+    if not renkler:
+        _log(f"[{ki}/{len(KLASORLER)}] ⚠ {klasor}: skor dosyası bulunamadı, atlandı")
+        continue
+    _log(f"=== [{ki}/{len(KLASORLER)}] {klasor} ({len(renkler)} renk) ===")
+
+    for kod, renk in renkler:
+        skor, kaynak = _skor_oku(klasor, dosyalar, kod, renk)
+        if skor is None:
+            _log(f"  ⚠ renk_{kod}_{renk}: okunabilir skor dosyası yok, atlandı")
+            continue
+
+        bos_skor = int(skor["_score"].isna().sum() + skor["_y"].isna().sum())
+        if bos_skor:
+            _log(f"  ⚠ renk_{kod}_{renk}: skor veya target boş {bos_skor:,} satır atıldı")
+        skor = skor.dropna(subset=["_score", "_y"])
+        n_oot = len(skor)
+
+        skor = skor.merge(il, on="_key", how="left")
+        eslesmeyen = int(skor["IL_RISK"].isna().sum())
+
+        etiket = {"KLASOR": klasor, "RENK_KOD": kod, "RENK": renk}
+
+        # Referans: bölünmemiş tüm OOT kitlesi (sadece özet sheet'ine)
+        _, oz = _bucket_tablosu(skor["_y"], skor["_score"], N_BUCKET)
+        ozet_satirlari.append({**etiket, "IL_RISK": "TUMU", "kitle_pay": 1.0, **oz})
+
+        dagilim = []
+        for risk in ILRISK_SIRA:
+            alt = skor[skor["IL_RISK"] == risk]
+            if alt.empty:
+                dagilim.append(f"{risk} 0")
+                continue
+            g, oz = _bucket_tablosu(alt["_y"], alt["_score"], N_BUCKET)
+            for i, (k, v) in enumerate({**etiket, "IL_RISK": risk}.items()):
+                g.insert(i, k, v)
+            bucket_parcalari.append(g)
+            ozet_satirlari.append({**etiket, "IL_RISK": risk,
+                                   "kitle_pay": round(len(alt) / n_oot, 4), **oz})
+            dagilim.append(f"{risk} {len(alt):,}")
+
+        _log(f"  renk_{kod}_{renk} ({kaynak}): OOT {n_oot:,} | " + " | ".join(dagilim)
+             + f" | IL_RISK eşleşmeyen {eslesmeyen:,} (%{eslesmeyen / max(n_oot, 1) * 100:.1f})")
+
+
+# =====================================================================
+# TEK EXCEL
+# =====================================================================
+_log("Excel yazılıyor")
+tum = pd.concat(bucket_parcalari, ignore_index=True)
+ozet = pd.DataFrame(ozet_satirlari)
+ozet["IL_RISK"] = pd.Categorical(ozet["IL_RISK"], ["TUMU"] + ILRISK_SIRA, ordered=True)
+ozet = ozet.sort_values(["KLASOR", "RENK_KOD", "IL_RISK"]).reset_index(drop=True)
+ozet["IL_RISK"] = ozet["IL_RISK"].astype(str)
+
+buf = BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+    ozet.to_excel(xl, sheet_name="OZET", index=False)
+    for risk in ILRISK_SIRA:
+        tum[tum["IL_RISK"] == risk].to_excel(xl, sheet_name=f"BUCKET20_{risk}", index=False)
+    tum.to_excel(xl, sheet_name="BUCKET20_TUM", index=False)
+buf.seek(0)
+mf.upload_stream(CIKTI_DOSYA, buf)
+_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | bucket satırı: {len(tum):,} | özet satırı: {len(ozet):,}")
