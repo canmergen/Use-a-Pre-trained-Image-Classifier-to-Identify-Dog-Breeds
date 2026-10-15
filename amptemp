@@ -24,6 +24,7 @@ KLASORLER = [
     "12M_TAKIP_OOT202506",
 ]
 
+FEATURE_COL      = "feature"                       # kalan_featurelar.csv'deki feature adı kolonu
 FEATURE_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_kalan_featurelar\.csv$")
 
 mf = dataiku.Folder(MAIN_FOLDER)
@@ -76,6 +77,11 @@ def _sheet_adi(klasor, kullanilan):
     return aday
 
 
+def _renk_sira(x):
+    """'2-TURUNCU' -> 2 (renk modeli sıralaması için)."""
+    return int(str(x).split("-")[0])
+
+
 # =====================================================================
 # ANA DÖNGÜ (klasörlere yazmaz, sadece okur)
 # =====================================================================
@@ -84,7 +90,7 @@ klasorler = _alt_klasorler() if TUM_KLASORLER else KLASORLER
 _log(f"{len(klasorler)} klasör taranacak")
 
 tum_parcalar, sheetler, icindekiler = [], {}, []
-kullanilan_adlar = {"ICINDEKILER", "OZET", "TUM"}
+kullanilan_adlar = {"ICINDEKILER", "OZET", "UNION", "TUM"}
 
 for ki, klasor in enumerate(klasorler, start=1):
     dosyalar = _dosyalar(klasor)
@@ -98,34 +104,56 @@ for ki, klasor in enumerate(klasorler, start=1):
     for kod, renk, ad in renkler:                       # 1-KIRMIZI ... 6-KOY_YESIL
         with mf.get_download_stream(f"/{klasor}/{ad}") as s:
             df = pd.read_csv(s)
+        if FEATURE_COL not in df.columns:
+            _log(f"  ⚠ {ad}: '{FEATURE_COL}' kolonu yok (kolonlar: {list(df.columns)}), atlandı")
+            continue
         if "sira" in df.columns:
             df = df.sort_values("sira", kind="stable")
         df.insert(0, "KLASOR", klasor)
         df.insert(1, "RENK_MODEL", f"{kod}-{renk}")
         parcalar.append(df)
 
+    if not parcalar:
+        continue
     blok = pd.concat(parcalar, ignore_index=True)
     sh = _sheet_adi(klasor, kullanilan_adlar)
     sheetler[sh] = blok.drop(columns="KLASOR")          # sheet adı zaten klasörü gösteriyor
     tum_parcalar.append(blok)
     icindekiler.append({"sheet": sh, "klasor": klasor,
-                        "renk_model_sayisi": len(renkler), "satir": len(blok)})
-    _log(f"[{ki}/{len(klasorler)}] {klasor}: {len(renkler)} renk modeli | "
+                        "renk_model_sayisi": blok["RENK_MODEL"].nunique(), "satir": len(blok)})
+    _log(f"[{ki}/{len(klasorler)}] {klasor}: {blok['RENK_MODEL'].nunique()} renk modeli | "
          + " | ".join(f"{r}: {n}" for r, n in blok.groupby("RENK_MODEL", sort=False).size().items()))
 
 if not tum_parcalar:
     raise ValueError("Hiçbir klasörde kalan_featurelar dosyası bulunamadı.")
 
 tum = pd.concat(tum_parcalar, ignore_index=True)
+toplam_model = tum[["KLASOR", "RENK_MODEL"]].drop_duplicates().shape[0]
 
-# Klasör x renk modeli feature sayısı
+# --- OZET: klasör x renk modeli feature sayısı ------------------------
 ozet = (tum.pivot_table(index="KLASOR", columns="RENK_MODEL",
-                        values=tum.columns[2], aggfunc="size", fill_value=0)
-           .reindex(columns=sorted(tum["RENK_MODEL"].unique(),
-                                   key=lambda x: int(x.split("-")[0])))
+                        values=FEATURE_COL, aggfunc="count", fill_value=0)
+           .reindex(columns=sorted(tum["RENK_MODEL"].unique(), key=_renk_sira))
            .reindex([k for k in klasorler if k in set(tum["KLASOR"])])
            .reset_index())
 ozet.columns.name = None
+
+# --- UNION: tüm modellerde kullanılan tekil feature'lar ---------------
+u = tum[["KLASOR", "RENK_MODEL", FEATURE_COL]].drop_duplicates()
+union = (u.groupby(FEATURE_COL)
+           .agg(model_sayisi=("RENK_MODEL", "size"),
+                klasor_sayisi=("KLASOR", "nunique"),
+                renk_sayisi=("RENK_MODEL", "nunique"),
+                kullanan_renkler=("RENK_MODEL",
+                                  lambda s: ", ".join(sorted(s.unique(), key=_renk_sira))),
+                kullanan_klasorler=("KLASOR",
+                                    lambda s: ", ".join(k for k in klasorler if k in set(s))))
+           .reset_index())
+union.insert(2, "model_orani", (union["model_sayisi"] / toplam_model).round(4))
+union = union.sort_values(["model_sayisi", FEATURE_COL],
+                          ascending=[False, True]).reset_index(drop=True)
+_log(f"UNION: {len(union):,} tekil feature | {toplam_model} model | "
+     f"tüm modellerde ortak: {int((union['model_sayisi'] == toplam_model).sum())}")
 
 
 # =====================================================================
@@ -136,9 +164,11 @@ buf = BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xl:
     pd.DataFrame(icindekiler).to_excel(xl, sheet_name="ICINDEKILER", index=False)
     ozet.to_excel(xl, sheet_name="OZET", index=False)
+    union.to_excel(xl, sheet_name="UNION", index=False)
     tum.to_excel(xl, sheet_name="TUM", index=False)
     for sh, tablo in sheetler.items():
         tablo.to_excel(xl, sheet_name=sh, index=False)
 buf.seek(0)
 mf.upload_stream(CIKTI_DOSYA, buf)
-_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | {len(sheetler)} klasör | {len(tum):,} feature satırı")
+_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | {len(sheetler)} klasör | "
+     f"{len(tum):,} feature satırı | {len(union):,} tekil feature")
