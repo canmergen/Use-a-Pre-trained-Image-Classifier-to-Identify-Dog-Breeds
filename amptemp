@@ -1,6 +1,5 @@
 import re
 import time
-import numpy as np
 import pandas as pd
 import dataiku
 from io import BytesIO
@@ -8,9 +7,11 @@ from io import BytesIO
 # =====================================================================
 # AYARLAR
 # =====================================================================
-MAIN_FOLDER      = "GOC_MODEL_RESULTS"
-CIKTI_DOSYA      = "/oot_bucket20_ilrisk.xlsx"   # kök dizine tek dosya
+MAIN_FOLDER   = "GOC_MODEL_RESULTS"
+CIKTI_DOSYA   = "/kalan_featurelar_tum.xlsx"     # kök dizine tek dosya
 
+# True: kökteki tüm klasörler taranır | False: sadece aşağıdaki liste
+TUM_KLASORLER = False
 KLASORLER = [
     "3M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506",
     "6M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506",
@@ -23,28 +24,7 @@ KLASORLER = [
     "12M_TAKIP_OOT202506",
 ]
 
-ILRISK_DATASET   = "MUS_ILRISK_202506_FILTERED"
-ILRISK_KEY_COL   = "MBB_NO"
-ILRISK_COL       = "IL_RISK"
-ILRISK_SIRA      = ["VERY_HIGH", "HIGH", "LOW"]
-
-OOT_SET          = "OOT"
-OOT_DONEM        = 202506
-N_BUCKET         = 20
-
-# Limit / risk ve ek flag kolonları df_raw'dan (MBB_NO + DONEM) alınır
-LIMIT_COL        = "KK_LIMIT"
-RISK_COL         = "KK_RISK"
-EK_FLAG_KOLONLARI = []        # örn. ["XXX_YY_12M_FLG"] -> adet + _ORAN kolonları üretilir
-
-# Skor dosyasındaki kolon adları
-SKOR_SET_COL     = "set_adi"
-SKOR_KEY_COL     = "mbb_no"
-SKOR_DONEM_COL   = "donem"
-SKOR_Y_COL       = "target_actual"
-SKOR_SCORE_COL   = "target_score"
-
-SKOR_DOSYA_RE    = re.compile(r"^renk_(\d+)_(.+?)_musteri_skorlari\.csv$")
+FEATURE_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_kalan_featurelar\.csv$")
 
 mf = dataiku.Folder(MAIN_FOLDER)
 _T0 = time.time()
@@ -59,22 +39,17 @@ def _log(mesaj):
 # =====================================================================
 # YARDIMCILAR
 # =====================================================================
-def _sayi(s):
-    """'182753.0' / 182753 / '182753' değerlerini aynı Int64 değere çevirir."""
-    return pd.to_numeric(s, errors="coerce").round().astype("Int64")
-
-
-def _sheet_adi(klasor):
-    """Excel sheet adı 31 karakteri geçemez; klasör adını kısaltır."""
-    s = (klasor.replace("_ICINDE_KIRMIZI_RENGE_GOC", "_KRM_GOC")
-               .replace("_ICINDE_KIRMIZI_TAKIP", "_KRM_TAKIP")
-               .replace("_OOT", "_OOT_"))
-    return s[:31]
-
-
 def _cocuklar(yol):
     det = mf.get_path_details(yol) or {}
     return det.get("children") or []
+
+
+def _alt_klasorler():
+    kl = sorted(c["name"] for c in _cocuklar("/") if c.get("directory"))
+    if not kl:
+        kl = sorted({p.strip("/").split("/")[0]
+                     for p in mf.list_paths_in_partition() if "/" in p.strip("/")})
+    return kl
 
 
 def _dosyalar(klasor):
@@ -86,231 +61,84 @@ def _dosyalar(klasor):
     return sorted(ad)
 
 
-def _bucket_ata(score, nb):
-    """Bucket raporundaki mantığın aynısı: rank bazlı, 1 = en yüksek skor."""
-    score = np.asarray(score, dtype="float64")
-    n = len(score)
-    order = np.argsort(score, kind="stable")
-    r = np.empty(n, dtype="float64")
-    r[order] = np.arange(1, n + 1, dtype="float64")
-    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
-    return nb - np.searchsorted(edges[1:-1], r, side="left")
-
-
-def _bucket_tablosu(d, nb, limit_var):
-    """Orijinal bucket20 raporuyla aynı kolonlar. d: y, score, limit, risk, [flag'ler]"""
-    n = len(d)
-    n_bad = int(d["y"].sum())
-    base = n_bad / n if n else np.nan
-    nb = int(min(nb, n))
-
-    d = d.copy()
-    d["bucket"] = _bucket_ata(d["score"].to_numpy(), nb)
-    d["limit_bad"] = d["limit"] * d["y"]
-    d["risk_bad"] = d["risk"] * d["y"]
-
-    agg = dict(n=("y", "size"), bad=("y", "sum"),
-               min_score=("score", "min"), avg_score=("score", "mean"),
-               max_score=("score", "max"),
-               limit_sum=("limit", "sum"), risk_sum=("risk", "sum"),
-               limit_sum_bad=("limit_bad", "sum"), risk_sum_bad=("risk_bad", "sum"))
-    for f in EK_FLAG_KOLONLARI:
-        if f in d.columns:
-            agg[f] = (f, "sum")
-    g = d.groupby("bucket").agg(**agg).reset_index().sort_values("bucket")
-    g["bad"] = g["bad"].astype("int64")
-
-    if not limit_var:
-        for c in ["limit_sum", "risk_sum", "limit_sum_bad", "risk_sum_bad"]:
-            g[c] = np.nan
-
-    g["bad_rate"] = g["bad"] / g["n"]
-    g["dr_risk"] = g["risk_sum_bad"] / g["risk_sum"].replace(0, np.nan)
-    tavan = min(1.0 / base, nb) if base > 0 else np.nan
-    g["lift"] = g["bad_rate"] / base if base > 0 else np.nan
-    g["lift_tavan_pct"] = g["lift"] / tavan if np.isfinite(tavan) else np.nan
-    g["cum_bad"] = g["bad"].cumsum()
-    g["capture"] = g["cum_bad"] / n_bad if n_bad > 0 else np.nan
-    g["cum_n_pct"] = g["n"].cumsum() / n
-
-    for c in ["min_score", "avg_score", "max_score", "bad_rate", "dr_risk",
-              "lift", "lift_tavan_pct", "capture", "cum_n_pct"]:
-        g[c] = g[c].round(4)
-    for c in ["limit_sum", "risk_sum", "limit_sum_bad", "risk_sum_bad"]:
-        g[c] = g[c].round(0)
-
-    flag_kol = []
-    for f in EK_FLAG_KOLONLARI:
-        if f in g.columns:
-            g[f"{f}_ORAN"] = (g[f] / g["n"]).round(4)
-            flag_kol += [f, f"{f}_ORAN"]
-
-    g.insert(0, "base_rate", round(base, 4) if n else np.nan)
-    g.insert(1, "lift_tavan", round(tavan, 2) if np.isfinite(tavan) else np.nan)
-    g.insert(2, "n_bucket", nb)
-
-    sira = ["base_rate", "lift_tavan", "n_bucket", "bucket", "n", "bad",
-            "min_score", "avg_score", "max_score",
-            "limit_sum", "risk_sum", "limit_sum_bad", "risk_sum_bad",
-            "bad_rate", "dr_risk", "lift", "lift_tavan_pct",
-            "cum_bad", "capture", "cum_n_pct"] + flag_kol
-    return g[sira]
-
-
-def _skor_oku(klasor, dosyalar, kod, renk):
-    """Önce küçük _oot dosyasını, olmazsa tam skor dosyasını okur; OOT + OOT_DONEM filtreler."""
-    gerekli = {SKOR_KEY_COL, SKOR_DONEM_COL, SKOR_Y_COL, SKOR_SCORE_COL}
-    for ad in [f"renk_{kod}_{renk}_musteri_skorlari_oot.csv",
-               f"renk_{kod}_{renk}_musteri_skorlari.csv"]:
-        if ad not in dosyalar:
-            continue
-        with mf.get_download_stream(f"/{klasor}/{ad}") as s:
-            df = pd.read_csv(s, usecols=lambda c: c in gerekli | {SKOR_SET_COL})
-        if not gerekli.issubset(df.columns):
-            _log(f"    ⚠ {ad}: eksik kolon {gerekli - set(df.columns)}, sonraki dosya deneniyor")
-            continue
-        if SKOR_SET_COL in df.columns:
-            df = df[df[SKOR_SET_COL].astype(str).str.strip().str.upper() == OOT_SET]
-        donem = _sayi(df[SKOR_DONEM_COL])
-        df = df[(donem == OOT_DONEM).fillna(False).to_numpy()]
-        return pd.DataFrame({
-            "_key":  _sayi(df[SKOR_KEY_COL]).to_numpy(),
-            "y":     pd.to_numeric(df[SKOR_Y_COL], errors="coerce").to_numpy(),
-            "score": pd.to_numeric(df[SKOR_SCORE_COL], errors="coerce").to_numpy(),
-        }), ad
-    return None, None
-
-
-def _orijinal_badrate(klasor, dosyalar, kod, renk):
-    """Klasördeki orijinal bucket20 xlsx'inden OOT bucket -> bad_rate eşlemesini döner."""
-    ad = f"renk_{kod}_{renk}_bucket{N_BUCKET}_train_val_oot.xlsx"
-    if ad not in dosyalar:
-        _log(f"    ⚠ {ad} yok, bad_rate_orijinal boş kalacak")
-        return {}
-    with mf.get_download_stream(f"/{klasor}/{ad}") as s:
-        sheets = pd.read_excel(BytesIO(s.read()), sheet_name=None)
-    parcalar = []
-    for sh in sheets.values():
-        kol = {str(c).lower(): c for c in sh.columns}
-        if not {"kume", "bucket", "bad_rate"}.issubset(kol):
-            continue
-        t = sh[[kol["kume"], kol["bucket"], kol["bad_rate"]]].copy()
-        t.columns = ["kume", "bucket", "bad_rate"]
-        parcalar.append(t)
-    if not parcalar:
-        _log(f"    ⚠ {ad}: kume/bucket/bad_rate kolonları bulunamadı")
-        return {}
-    t = pd.concat(parcalar, ignore_index=True)
-    t = t[t["kume"].astype(str).str.strip().str.upper() == OOT_SET]
-    t["bucket"] = _sayi(t["bucket"])
-    t = t.dropna(subset=["bucket"]).drop_duplicates("bucket")
-    return dict(zip(t["bucket"].astype(int), pd.to_numeric(t["bad_rate"], errors="coerce")))
-
-
-# =====================================================================
-# EK VERİLER: IL_RISK + df_raw'dan limit/risk/flag
-# =====================================================================
-_log("Başladı")
-il = dataiku.Dataset(ILRISK_DATASET).get_dataframe(columns=[ILRISK_KEY_COL, ILRISK_COL])
-il = pd.DataFrame({
-    "_key":    _sayi(il[ILRISK_KEY_COL]),
-    "IL_RISK": il[ILRISK_COL].astype("string").str.strip().str.upper(),
-}).dropna(subset=["_key"])
-cakisan = int(il.groupby("_key")["IL_RISK"].nunique().gt(1).sum())
-if cakisan:
-    _log(f"⚠ {cakisan:,} müşteride birden fazla farklı IL_RISK var; ilk kayıt alındı")
-il = il.drop_duplicates("_key")
-beklenmeyen = set(il["IL_RISK"].dropna().unique()) - set(ILRISK_SIRA)
-if beklenmeyen:
-    _log(f"⚠ Beklenmeyen IL_RISK değerleri (hesaba katılmayacak): {sorted(beklenmeyen)}")
-_log(f"IL_RISK hazır: {len(il):,} müşteri")
-
-ek = None
-if "df_raw" in globals():
-    ek_kol = [c for c in [LIMIT_COL, RISK_COL] + EK_FLAG_KOLONLARI if c in df_raw.columns]
-    eksik_ek = set([LIMIT_COL, RISK_COL] + EK_FLAG_KOLONLARI) - set(ek_kol)
-    if eksik_ek:
-        _log(f"⚠ df_raw'da bulunamayan kolonlar: {sorted(eksik_ek)}")
-    maske = (_sayi(df_raw["DONEM"]) == OOT_DONEM).fillna(False).to_numpy()
-    ek = df_raw.loc[maske, ["MBB_NO"] + ek_kol].copy()
-    ek["_key"] = _sayi(ek.pop("MBB_NO"))
-    tekrar = int(ek["_key"].duplicated().sum())
-    if tekrar:
-        _log(f"⚠ df_raw {OOT_DONEM}'da tekrar eden {tekrar:,} MBB_NO; ilk kayıt alındı")
-    ek = ek.drop_duplicates("_key").rename(columns={LIMIT_COL: "limit", RISK_COL: "risk"})
-    _log(f"df_raw ek kolonları hazır: {len(ek):,} müşteri | {ek_kol}")
-else:
-    _log("⚠ df_raw bellekte yok: limit/risk kolonları boş kalacak "
-         "(önce RENK_MDL_ALL_INP_2 okuma hücresini çalıştır)")
-LIMIT_VAR = ek is not None and "limit" in ek.columns and "risk" in ek.columns
+def _sheet_adi(klasor, kullanilan):
+    """Excel sheet adı en fazla 31 karakter ve benzersiz olmalı."""
+    s = (klasor.replace("_ICINDE_KIRMIZI_RENGE_GOC", "_KRM_GOC")
+               .replace("_ICINDE_KIRMIZI_TAKIP", "_KRM_TAKIP")
+               .replace("_KIRMIZI_RENGE_GOC", "_RENGE_GOC")
+               .replace("_OOT", "_OOT_"))[:31]
+    aday, i = s, 2
+    while aday in kullanilan:
+        ek = f"_{i}"
+        aday = s[:31 - len(ek)] + ek
+        i += 1
+    kullanilan.add(aday)
+    return aday
 
 
 # =====================================================================
 # ANA DÖNGÜ (klasörlere yazmaz, sadece okur)
 # =====================================================================
-sheetler = {}          # sheet adı -> DataFrame
-icindekiler = []
+_log("Başladı")
+klasorler = _alt_klasorler() if TUM_KLASORLER else KLASORLER
+_log(f"{len(klasorler)} klasör taranacak")
 
-for ki, klasor in enumerate(KLASORLER, start=1):
+tum_parcalar, sheetler, icindekiler = [], {}, []
+kullanilan_adlar = {"ICINDEKILER", "OZET", "TUM"}
+
+for ki, klasor in enumerate(klasorler, start=1):
     dosyalar = _dosyalar(klasor)
-    renkler = sorted({(int(m.group(1)), m.group(2))
-                      for ad in dosyalar if (m := SKOR_DOSYA_RE.match(ad))})
+    renkler = sorted({(int(m.group(1)), m.group(2), ad)
+                      for ad in dosyalar if (m := FEATURE_DOSYA_RE.match(ad))})
     if not renkler:
-        _log(f"[{ki}/{len(KLASORLER)}] ⚠ {klasor}: skor dosyası bulunamadı, atlandı")
+        _log(f"[{ki}/{len(klasorler)}] ⚠ {klasor}: kalan_featurelar dosyası yok, atlandı")
         continue
-    _log(f"=== [{ki}/{len(KLASORLER)}] {klasor} ({len(renkler)} renk) ===")
 
     parcalar = []
-    for kod, renk in renkler:                       # 1-KIRMIZI ... 6-KOY_YESIL sırasıyla
-        skor, kaynak = _skor_oku(klasor, dosyalar, kod, renk)
-        if skor is None:
-            _log(f"  ⚠ renk_{kod}_{renk}: okunabilir skor dosyası yok, atlandı")
-            continue
-        orj_br = _orijinal_badrate(klasor, dosyalar, kod, renk)
+    for kod, renk, ad in renkler:                       # 1-KIRMIZI ... 6-KOY_YESIL
+        with mf.get_download_stream(f"/{klasor}/{ad}") as s:
+            df = pd.read_csv(s)
+        if "sira" in df.columns:
+            df = df.sort_values("sira", kind="stable")
+        df.insert(0, "KLASOR", klasor)
+        df.insert(1, "RENK_MODEL", f"{kod}-{renk}")
+        parcalar.append(df)
 
-        skor = skor.dropna(subset=["score", "y"]).merge(il, on="_key", how="left")
-        if ek is not None:
-            skor = skor.merge(ek, on="_key", how="left")
-        for c in ["limit", "risk"]:
-            if c not in skor.columns:
-                skor[c] = np.nan
+    blok = pd.concat(parcalar, ignore_index=True)
+    sh = _sheet_adi(klasor, kullanilan_adlar)
+    sheetler[sh] = blok.drop(columns="KLASOR")          # sheet adı zaten klasörü gösteriyor
+    tum_parcalar.append(blok)
+    icindekiler.append({"sheet": sh, "klasor": klasor,
+                        "renk_model_sayisi": len(renkler), "satir": len(blok)})
+    _log(f"[{ki}/{len(klasorler)}] {klasor}: {len(renkler)} renk modeli | "
+         + " | ".join(f"{r}: {n}" for r, n in blok.groupby("RENK_MODEL", sort=False).size().items()))
 
-        n_oot = len(skor)
-        eslesmeyen = int(skor["IL_RISK"].isna().sum())
-        dagilim = []
-        for risk in ILRISK_SIRA:                    # her renkte VERY_HIGH, HIGH, LOW alt alta
-            alt = skor[skor["IL_RISK"] == risk]
-            if alt.empty:
-                dagilim.append(f"{risk} 0")
-                continue
-            g = _bucket_tablosu(alt, N_BUCKET, LIMIT_VAR)
-            g.insert(g.columns.get_loc("bad_rate") + 1, "bad_rate_orijinal",
-                     g["bucket"].astype(int).map(orj_br).round(4))
-            g.insert(0, "renk", f"{kod}-{renk}")
-            g.insert(1, "kume", OOT_SET)
-            g.insert(2, "IL_RISK", risk)
-            parcalar.append(g)
-            dagilim.append(f"{risk} {len(alt):,}")
+if not tum_parcalar:
+    raise ValueError("Hiçbir klasörde kalan_featurelar dosyası bulunamadı.")
 
-        _log(f"  {kod}-{renk} ({kaynak}): OOT {n_oot:,} | " + " | ".join(dagilim)
-             + f" | IL_RISK eşleşmeyen {eslesmeyen:,} (%{eslesmeyen / max(n_oot, 1) * 100:.1f})")
+tum = pd.concat(tum_parcalar, ignore_index=True)
 
-    if parcalar:
-        sh = _sheet_adi(klasor)
-        sheetler[sh] = pd.concat(parcalar, ignore_index=True)
-        icindekiler.append({"sheet": sh, "klasor": klasor,
-                            "satir": len(sheetler[sh])})
+# Klasör x renk modeli feature sayısı
+ozet = (tum.pivot_table(index="KLASOR", columns="RENK_MODEL",
+                        values=tum.columns[2], aggfunc="size", fill_value=0)
+           .reindex(columns=sorted(tum["RENK_MODEL"].unique(),
+                                   key=lambda x: int(x.split("-")[0])))
+           .reindex([k for k in klasorler if k in set(tum["KLASOR"])])
+           .reset_index())
+ozet.columns.name = None
 
 
 # =====================================================================
-# TEK EXCEL: her klasör ayrı sheet
+# TEK EXCEL
 # =====================================================================
 _log("Excel yazılıyor")
 buf = BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xl:
     pd.DataFrame(icindekiler).to_excel(xl, sheet_name="ICINDEKILER", index=False)
+    ozet.to_excel(xl, sheet_name="OZET", index=False)
+    tum.to_excel(xl, sheet_name="TUM", index=False)
     for sh, tablo in sheetler.items():
         tablo.to_excel(xl, sheet_name=sh, index=False)
 buf.seek(0)
 mf.upload_stream(CIKTI_DOSYA, buf)
-_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | {len(sheetler)} klasör sheet'i")
+_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | {len(sheetler)} klasör | {len(tum):,} feature satırı")
