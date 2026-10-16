@@ -29,6 +29,8 @@ v13:
   SHAP degerleri LightGBM pred_contrib ile (shap paketi gerekmez).
 - Esik icin notebook'taki find_thresholds (9. hucre) kullanilir; _find_thresholds adi da kabul edilir.
 - Preprocess ve skorlama tablolari tek seferde kurulur (PerformanceWarning: fragmented yok).
+- Capture oncelikli, Gini esitlik bozucu secim (SHAP seti ve Optuna denemesi).
+- HK_* PSI'i val-OOT arasinda (train degerleri OOF oldugu icin).
 
 v12:
 - HK_*_N yerine HK_*_PAY (desenin gorulme payi): OOF ve tam harita ayni olcekte.
@@ -141,6 +143,14 @@ class ShapRFECV:
         return max(min(k, n - self.min_features_to_select), 0)
 
     @staticmethod
+    def _gini(y, p):
+        # AUC sinifa gore alt orneklemeden etkilenmez; agirlik gerekmez.
+        y = np.asarray(y)
+        if len(np.unique(y)) < 2:
+            return np.nan
+        return 2 * roc_auc_score(y, p) - 1
+
+    @staticmethod
     def _shap_degerleri(model, X):
         katki = np.asarray(model.predict(X, pred_contrib=True), dtype='float64')
         if katki.ndim != 2 or katki.shape[1] != X.shape[1] + 1:
@@ -160,7 +170,7 @@ class ShapRFECV:
         while len(mevcut) > self.min_features_to_select:
             mevcut = kalan
             Xc = X[mevcut]
-            shap_parcalar, s_tr, s_va = [], [], []
+            shap_parcalar, s_tr, s_va, g_va = [], [], [], []
             for itr, iva in splits:
                 m = clone(self.model)
                 if sw is None:
@@ -169,6 +179,7 @@ class ShapRFECV:
                     m.fit(Xc.iloc[itr], y.iloc[itr], sample_weight=sw[itr])
                 s_tr.append(self.scorer.score(m, Xc.iloc[itr], y.iloc[itr]))
                 s_va.append(self.scorer.score(m, Xc.iloc[iva], y.iloc[iva]))
+                g_va.append(self._gini(y.iloc[iva], m.predict_proba(Xc.iloc[iva])[:, 1]))
                 shap_parcalar.append(self._shap_degerleri(m, Xc.iloc[iva]))
             onem = np.abs(np.concatenate(shap_parcalar, axis=0)).mean(axis=0)
             sira = np.argsort(-onem, kind='mergesort')
@@ -181,6 +192,7 @@ class ShapRFECV:
                 'eliminated_features': silinen,
                 'train_metric_mean': float(np.mean(s_tr)), 'train_metric_std': float(np.std(s_tr)),
                 'val_metric_mean': float(np.mean(s_va)), 'val_metric_std': float(np.std(s_va)),
+                'val_gini_mean': float(np.nanmean(g_va)), 'val_gini_std': float(np.nanstd(g_va)),
             })
         self.report_df = pd.DataFrame(satirlar, index=range(1, len(satirlar) + 1))
         return self.report_df
@@ -402,6 +414,17 @@ SHAP_SCORE_TOL = 0.003       # Capture 0-1 olceginde tol.; kucuk set onceligi.
 # fold'lar arasi farkin icinde kalan setler "esit" sayilir ve en kucugu secilir.
 # SHAP_TOL_SE_KATSAYI=0 yapilirsa yalnizca taban tol kullanilir.
 SHAP_TOL_SE_KATSAYI = 1.0
+# CAPTURE ONCELIKLI, GINI ESITLIK BOZUCU (SHAP seti ve Optuna denemesi):
+# Capture'i en iyiye istatistiksel olarak esit olanlar arasindan Gini'si de
+# en iyiye yakin olan secilir. SHAP'ta bunlarin EN KUCUK seti, Optuna'da
+# Gini'si EN YUKSEK deneme. Capture farki gercekse secimi yine Capture yapar.
+# SHAP_GINI_ESITLIK=False ve OPTUNA_CAPTURE_SE_KATSAYI=0 eski davranis.
+SHAP_GINI_ESITLIK = True
+SHAP_GINI_TOL = 0.003         # Gini toleransi tabani; 1-SE daha buyukse o kullanilir.
+SHAP_GINI_TOL_MAX = 0.01      # Gini toleransi ust siniri.
+# Optuna'da Capture esitlik bandi = min(1-SE, SHAP_MAX_KAYIP x tavan):
+# az pozitifli renkte SE genis olsa da Capture kaybi tavanin %1'ini gecmez.
+OPTUNA_CAPTURE_SE_KATSAYI = 1.0
 # Taban tol'un rengin Capture@10 tavaniyla (min(1, 0.10/base_rate)) carpilmasi.
 # False: 0.003 tum renklerde aynen kullanilir.
 SHAP_TOL_TAVANA_GORE = False
@@ -614,7 +637,10 @@ def _select_shap_features(X, y, current_features, etiket, basename, source_meta)
              'shap_sample_weight': None,
              'shap_genel_en_iyi_skor': None, 'shap_genel_en_iyi_n': None,
              'shap_kayip_genel': None, 'shap_kayip_esik': None,
-             'shap_performans_ok': None}
+             'shap_performans_ok': None,
+             'shap_gini_esitlik': None, 'shap_gini_tol': None,
+             'shap_secilen_gini': None, 'shap_esit_capture_en_iyi_gini': None,
+             'shap_esit_capture_aday': None}
     if not SHAP_AKTIF:
         print('  SHAPRFECV KAPALI (SHAP_AKTIF=False).')
         bilgi['shap_durum'] = 'kapali'
@@ -703,8 +729,27 @@ def _select_shap_features(X, y, current_features, etiket, basename, source_meta)
                   'shap_tol_1se': round(tol_1se, 6),
                   'shap_tol_taban': round(_tol_taban, 6), 'shap_cv_se': round(_se, 6)})
     near_best = candidates.loc[candidates['val_metric_mean'] >= best_score - tol_eff]
+    bilgi['shap_esit_capture_aday'] = int(len(near_best))
+    _gini_var = ('val_gini_mean' in near_best.columns
+                 and np.isfinite(pd.to_numeric(near_best['val_gini_mean'], errors='coerce')).any())
+    if SHAP_GINI_ESITLIK and _gini_var and len(near_best) > 1:
+        _g = pd.to_numeric(near_best['val_gini_mean'], errors='coerce')
+        _g_best_idx = _g.idxmax()
+        _g_best = float(_g.loc[_g_best_idx])
+        _g_std = float(pd.to_numeric(near_best.loc[_g_best_idx, 'val_gini_std'], errors='coerce'))
+        _g_se = _g_std / np.sqrt(SHAP_CV) if np.isfinite(_g_std) else 0.0
+        _g_tol = min(max(SHAP_GINI_TOL, SHAP_TOL_SE_KATSAYI * _g_se), SHAP_GINI_TOL_MAX)
+        near_best = near_best.loc[_g >= _g_best - _g_tol]
+        bilgi.update({'shap_gini_esitlik': 1, 'shap_gini_tol': round(_g_tol, 6),
+                      'shap_esit_capture_en_iyi_gini': round(_g_best, 5)})
+        print(f'  SHAPRFECV: Capture esit {bilgi["shap_esit_capture_aday"]} set; '
+              f'Gini en iyi={_g_best:.4f}, tol={_g_tol:.4f} -> {len(near_best)} set kaldi.')
+    else:
+        bilgi['shap_gini_esitlik'] = 0
     winner = near_best.sort_values(['num_features', 'val_metric_mean'],
                                    ascending=[True, False]).iloc[0]
+    if 'val_gini_mean' in winner.index and np.isfinite(winner['val_gini_mean']):
+        bilgi['shap_secilen_gini'] = round(float(winner['val_gini_mean']), 5)
     n_win = int(winner['num_features'])
     sec_skor = float(winner['val_metric_mean'])
     kayip = (tam_skor - sec_skor) if np.isfinite(tam_skor) else np.nan
@@ -753,7 +798,9 @@ def _select_shap_features(X, y, current_features, etiket, basename, source_meta)
         if len(selected) != len(chosen) or not selected:
             raise ShapSecimHatasi(f'{etiket}: SHAPRFECV secilen kolon eslestirmesi hatali.')
         bilgi['shap_durum'] = 'secildi'
+    _sg = bilgi.get('shap_secilen_gini')
     print(f'  SHAPRFECV: {len(current_features)} -> {len(selected)} '
+          f'| CV Gini secilen={_sg if _sg is not None else float("nan"):.4f} '
           f'| CV Capture@{CAPTURE_PCT:.0%} secilen={sec_skor:.5f} '
           f'tam_set={tam_skor:.5f} kayip={kayip:+.5f} | tavan={_tavan:.3f} '
           f'tol={tol_eff:.5f}')
@@ -1576,10 +1623,29 @@ for RENK_KOD in MODEL_RENKLER:
     # --- EN İYİ TRIAL: KURALI SAĞLAYANLAR ARASINDAN ---
     _uygun = [t for t in study.trials
               if t.value is not None and t.user_attrs.get('kural_ok')]
+    _esit_trial_no = set()
     if _uygun:
-        best_trial = max(_uygun, key=lambda t: t.user_attrs.get('capture_val', -1))
         print(f'  ✓ Kural (train-val gini <= {_gap_esik}) sağlayan trial: '
               f'{len(_uygun)}/{len([t for t in study.trials if t.value is not None])}')
+        # Capture oncelikli: en iyi Capture'a tol icinde olanlar esit sayilir.
+        # Bunlardan Gini'si en iyiye SHAP_GINI_TOL icinde olanlar kalir; Gini
+        # farki anlamsizsa yine Capture'i en yuksek olan secilir.
+        _cap_best = max(t.user_attrs.get('capture_val', -1) for t in _uygun)
+        _npos_val = max(int(np.asarray(y_val).sum()), 1)
+        _cap_se = float(np.sqrt(max(_cap_best * (1 - _cap_best), 0.0) / _npos_val))
+        _base_val = _npos_val / max(len(y_val), 1)
+        _tavan_val = min(1.0, CAPTURE_PCT / _base_val) if _base_val > 0 else 1.0
+        _cap_tol = min(OPTUNA_CAPTURE_SE_KATSAYI * _cap_se,
+                       SHAP_MAX_KAYIP * (_tavan_val if SHAP_KAYIP_TAVANA_GORE else 1.0))
+        _esit = [t for t in _uygun if t.user_attrs.get('capture_val', -1) >= _cap_best - _cap_tol]
+        _esit_trial_no = {t.number for t in _esit}
+        _g_best = max(t.user_attrs.get('val_gini', -1) for t in _esit)
+        _gini_esit = [t for t in _esit if t.user_attrs.get('val_gini', -1) >= _g_best - SHAP_GINI_TOL]
+        best_trial = max(_gini_esit, key=lambda t: (t.user_attrs.get('capture_val', -1),
+                                                    t.user_attrs.get('val_gini', -1)))
+        print(f'  Secim: Capture en iyi={_cap_best:.4f}, tol={_cap_tol:.4f} -> {len(_esit)} deneme esit; '
+              f'Gini en iyi={_g_best:.4f}, tol={SHAP_GINI_TOL:.4f} -> {len(_gini_esit)} kaldi; '
+              f'aralarindan Capture en yuksek secildi.')
     else:
         best_trial = study.best_trial
         print(f'  ⚠ UYARI: hiçbir trial train-val gini farkı <= {_gap_esik} '
@@ -1603,6 +1669,7 @@ for RENK_KOD in MODEL_RENKLER:
     trial_df = pd.DataFrame(trial_kayitlari)
     if not trial_df.empty:
         trial_df['is_best'] = (trial_df['trial'] == best_trial.number).astype(int)
+        trial_df['capture_esit'] = trial_df['trial'].isin(_esit_trial_no).astype(int)
         trial_df = trial_df.sort_values('trial')
     _model_yaz(f'renk_{RENK_KOD}_{renk_adi}_denenen_modeller.csv', trial_df)
 
@@ -1708,14 +1775,21 @@ for RENK_KOD in MODEL_RENKLER:
 
     # 7b) PSI sadece NIHAI OOT IZLEME/raporu. Hicbir eleme yok.
     print('  ▶ 7b) OOT PSI raporu (feature elemesi yapmaz)...')
-    psi_scores = ({c: _psi(train[c], oot[c]) for c in FEATURES}
+    # HK_* train degerleri 5 parcali (OOF) hesaptan geldigi icin her desen
+    # train'de birkac yakin degere dagilir, OOT'de tek degerdir; train-OOT
+    # PSI'i bu yuzden sisiyordu. HK icin referans, OOT ile ayni tam haritayi
+    # kullanan val (train donemi) seti.
+    def _psi_ref(c):
+        return val[c] if c.startswith('HK_') else train[c]
+    psi_scores = ({c: _psi(_psi_ref(c), oot[c]) for c in FEATURES}
                   if len(oot) else {c: np.nan for c in FEATURES})
     _psi_sirali = sorted(psi_scores.items(), key=lambda kv: kv[1], reverse=True)
     _kaymis = [c for c, v in psi_scores.items() if np.isfinite(v) and v > 0.25]
     _dikkat = [c for c, v in psi_scores.items()
                if np.isfinite(v) and 0.10 < v <= 0.25]
     if _psi_sirali:
-        print(f'  PSI >0.25: {len(_kaymis)}; 0.10-0.25: {len(_dikkat)}')
+        print(f'  PSI >0.25: {len(_kaymis)}; 0.10-0.25: {len(_dikkat)} '
+              f'(HK_* icin referans val, digerleri train)')
         for c, v in _psi_sirali[:10]:
             print(f'    {v:7.4f}  {c}')
     feat_df['psi'] = feat_df['feature'].map(psi_scores).round(4)
@@ -1959,7 +2033,9 @@ for RENK_KOD in MODEL_RENKLER:
             'shap_cv_se',
             'shap_sample_weight',
             'shap_genel_en_iyi_skor', 'shap_genel_en_iyi_n', 'shap_kayip_genel',
-            'shap_kayip_esik', 'shap_performans_ok')},
+            'shap_kayip_esik', 'shap_performans_ok',
+            'shap_gini_esitlik', 'shap_gini_tol', 'shap_secilen_gini',
+            'shap_esit_capture_en_iyi_gini', 'shap_esit_capture_aday')},
         'preprocess_mode':      PREPROCESS_MODU,
         'lgb_surum':          lgb.__version__,
     }
