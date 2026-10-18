@@ -1,495 +1,86 @@
 # ==============================================================
-# RENK BAZLI - TRAIN / VAL / OOT BUCKET RAPORU (EXCEL) + FPD
-# Skorlar pipeline'dan gelir: once bellekteki secilen_modeller,
-# yoksa pipeline'in kaydettigi skor dosyalari. Model YENIDEN EGITILMEZ.
-# 20'lik raporda ilk 4 bucket alt dilimlere bolunur (DETAY sheet'i).
-# FPD hedefleri musteri (MBB) + donem bazinda eslenip her bucket'a eklenir.
+# SECILEN MODELLER -> TRAIN + VAL + OOT SKORLARI -> SCORED tablo
+# Skorlar pipeline'dan gelir (bucket raporu hucresindeki _skorlar):
+# once bellekteki secilen_modeller, yoksa pipeline'in skor dosyalari.
+# Model YENIDEN EGITILMEZ, feature engineering YAPILMAZ.
+# Cikti semasi eskisiyle ayni: renk_kod, renk_adi, donem_tipi, donem,
+# SKOR, TARGET, limit, risk, musteri_id.
 # ==============================================================
-import time
-from io import BytesIO
 import numpy as np
 import pandas as pd
 import dataiku
+from sklearn.metrics import roc_auc_score
 
 MODEL_RENKLER = [1, 2, 3, 4, 5, 6]
 
-LIMIT_COL = 'KK_LIMIT'                 # limit kolonu (ham veride)
-RISK_COL = 'KK_RISK'                   # risk kolonu
-TAKIP_COL = 'AKB_TAKIP_YY_12M_FLG'     # bucket bazinda adet/orani raporlanacak bayrak
+LIMIT_COL = 'KK_LIMIT'
+RISK_COL = 'KK_RISK'
+ID_COL = 'MBB_NO'                      # yoksa otomatik atlanir
 
-# Bucket basina EN AZ bu kadar batan olsun; altina duserse bucket sayisi
-# otomatik iner. 0 = KAPALI, her renk hep istenen bucket sayisini kullanir.
-MIN_BAD_PER_BUCKET = 0
-MIN_BUCKET = 5                         # adaptif acikken bundan asagi inmiyoruz
+SCORED_DATASET = 'RENK_MDL_SCORED'
+SCORED_CSV = 'RENK_MDL_SCORED.csv'
 
-CAPTURE_PCT = 0.10
-BUCKET_DEGERLERI = [20, 100]           # tek run'da hem 20'lik hem 100'luk cikti
+if '_skorlar' not in globals():
+    raise RuntimeError('Once bucket raporu hucresini calistirin (_skorlar orada tanimli).')
 
-# DETAY: DETAY_NB'lik raporda {ana bucket: alt dilim sayisi}.
-# 20'likte bucket 1 (%5) -> 10 x %0.5, bucket 2-3-4 (%5) -> 5 x %1.
-DETAY_NB = 20
-DETAY_BOLME = {1: 10, 2: 5, 3: 5, 4: 5}
-
-# FPD: baska projedeki dataset, "PROJE_KEY.DATASET_ADI"
-FPD_AKTIF = True
-FPD_YENIDEN_OKU = False                # True: bellekteki FPD tablosu yerine yeniden okur
-FPD_DATASET = "BKATBALTERNATIFVERISKORKARTIPROJECT.FPD_CS_MODEL_INPUTS_2025_2026"
-FPD_KEY_COL = "MBB"                    # musteri no (df'deki MBB_NO ile eslesir)
-FPD_DONEM_COL = "PERIOD"               # YYYYMM
-FPD_HEDEFLER = {                       # kisa ad -> kolon adi
-    "TKP_5M90": "TGT_CS_ALL_TKP_5M90",
-    "TKP_ST_5M90": "TGT_CS_ALL_TKP_ST_5M90",
-}
-VERI_KEY_COL = 'MBB_NO'                # df'deki musteri no
-S3_ENDPOINT = "loscdlhp.aknet.akb:9000"
-S3_SCHEME = "https"
-CHUNK = 2_000_000                      # yedek yol (iter_dataframes) icin parca boyu
-
-FPD_OKUNACAK = [FPD_KEY_COL, FPD_DONEM_COL] + list(FPD_HEDEFLER.values())
-_SKOR_ONBELLEK = {}
-
-
-def _log(mesaj):
-    print(f'[{time.strftime("%H:%M:%S")}] {mesaj}', flush=True)
-
-
-def _dosya_adi(fname):
-    _et = str(globals().get('CIKTI_ETIKETI', '') or '').strip()
-    fname = str(fname).lstrip('/')
-    return f'{_et}_{fname}' if _et else fname
-
-
-def _oku_csv(fname, **kw):
-    with mf.get_download_stream(PATH + '/' + _dosya_adi(fname)) as s:
-        return pd.read_csv(s, **kw)
-
-
-def _excel_yaz(fname, sayfalar):
-    """{sayfa_adi: DataFrame} sozlugunu tek Excel olarak PATH alt klasorune yazar."""
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as xl:
-        for ad, frame in sayfalar.items():
-            frame.to_excel(xl, sheet_name=str(ad)[:31], index=False)
-    buf.seek(0)
-    mf.upload_stream(PATH + '/' + _dosya_adi(fname), buf)
-
-
-def _sayi(index, col):
-    if col not in df.columns:
-        return np.full(len(index), np.nan)
-    return pd.to_numeric(df.loc[index, col], errors='coerce').to_numpy(dtype='float64', na_value=np.nan)
-
-
-def _tamsayi(s):
-    """'182753.0' / 182753 / '182753' degerlerini ayni Int64 degere cevirir."""
-    return pd.to_numeric(s, errors='coerce').round().astype('Int64')
-
-
-# ---------------------------------------------------------------- FPD
-def _fpd_oku_s3():
-    """Parquet'i S3'ten pyarrow ile, sadece gereken kolonlari okuyarak getirir."""
-    import pyarrow.fs as pafs
-    import pyarrow.dataset as pads
-    info = dataiku.Dataset(FPD_DATASET).get_location_info(sensitive_info=True)['info']
-    yol = info.get('path', '')
-    if not yol.startswith('s3://'):
-        raise RuntimeError(f"dataset S3'te degil (path: {yol or 'yok'})")
-    cp = info['connectionParams']
-    s3 = pafs.S3FileSystem(access_key=cp['accessKey'], secret_key=cp['secretKey'],
-                           endpoint_override=S3_ENDPOINT, scheme=S3_SCHEME,
-                           force_virtual_addressing=False)
-    dset = pads.dataset(yol.replace('s3://', ''), filesystem=s3, format='parquet')
-    gercek = {n.upper(): n for n in dset.schema.names}
-    eksik = [c for c in FPD_OKUNACAK if c.upper() not in gercek]
-    if eksik:
-        raise RuntimeError(f"parquet'te kolon yok: {eksik}")
-    kolonlar = [gercek[c.upper()] for c in FPD_OKUNACAK]
-    _log(f'   S3 kaynagi: {yol} | {dset.count_rows():,} satir, okunan: {len(kolonlar)} kolon')
-    ham = dset.to_table(columns=kolonlar, use_threads=True).to_pandas(self_destruct=True)
-    ham.columns = FPD_OKUNACAK
-    return ham
-
-
-def _fpd_oku_dataiku():
-    """Yedek yol: Dataiku API ile parca parca okuma."""
-    parcalar = []
-    for i, ch in enumerate(dataiku.Dataset(FPD_DATASET).iter_dataframes(
-            chunksize=CHUNK, columns=FPD_OKUNACAK), start=1):
-        parcalar.append(ch)
-        _log(f'   parca {i}: toplam {sum(len(p) for p in parcalar):,} satir okundu')
-    return pd.concat(parcalar, ignore_index=True)
-
-
-def _fpd_yukle():
-    _log(f'FPD okunuyor: {FPD_DATASET}')
+scored_parts = []
+for RENK_KOD in MODEL_RENKLER:
+    renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
+    etiket = f'{RENK_KOD}-{renk_adi}'
+    print(f'\n=== {etiket} ===')
     try:
-        ham = _fpd_oku_s3()
-        _log('   S3 (pyarrow) ile okundu')
-    except Exception as ex:
-        _log(f'   ⚠ S3 hizli okuma kullanilamadi ({ex}); Dataiku API ile okunuyor')
-        ham = _fpd_oku_dataiku()
-    n_ham = len(ham)
-    f = pd.DataFrame({'_key': _tamsayi(ham[FPD_KEY_COL]),
-                      '_donem': _tamsayi(ham[FPD_DONEM_COL]),
-                      **{ad: pd.to_numeric(ham[kol], errors='coerce') for ad, kol in FPD_HEDEFLER.items()}})
-    del ham
-    eksik = f['_key'].isna() | f['_donem'].isna()
-    if eksik.any():
-        _log(f'⚠ {FPD_KEY_COL} veya {FPD_DONEM_COL} bos olan {int(eksik.sum()):,} satir atildi')
-        f = f[~eksik]
-    for ad, kol in FPD_HEDEFLER.items():
-        gecersiz = f[ad].notna() & ~f[ad].isin([0, 1])
-        if gecersiz.any():
-            _log(f'⚠ {kol}: 0/1 disi {int(gecersiz.sum()):,} deger bos sayildi')
-        f[ad] = f[ad].where(f[ad].isin([0, 1]))
-    # Ayni musterinin ayni donemde birden cok kaydi varsa: biri 1 ise 1
-    tekrar = int(f.duplicated(['_key', '_donem']).sum())
-    f = f.groupby(['_key', '_donem'], as_index=False)[list(FPD_HEDEFLER)].max()
-    _log(f'FPD hazir: {n_ham:,} ham satir | {len(f):,} tekil (mbb, donem) | '
-         f'ayni donemde tekrar eden: {tekrar:,} (MAX ile birlestirildi)')
-    print(f.groupby('_donem').size().rename('adet').to_string(), flush=True)
-    return f
-
-
-def _fpd_tablosu():
-    """FPD tablosu oturum boyunca bellekte tutulur; okuma bir kez yapilir."""
-    if not FPD_AKTIF:
-        return None
-    if globals().get('_FPD_TABLO') is not None and not FPD_YENIDEN_OKU:
-        _log(f"FPD bellekten alindi ({len(globals()['_FPD_TABLO']):,} tekil satir)")
-        return globals()['_FPD_TABLO']
-    try:
-        globals()['_FPD_TABLO'] = _fpd_yukle()
+        kumeler, _kaynak = _skorlar(RENK_KOD, renk_adi)
     except Exception as e:
-        _log(f'⚠ FPD okunamadi ({e}); rapor FPD kolonlari olmadan uretiliyor')
-        return None
-    return globals()['_FPD_TABLO']
+        print(f'  ✗ Skor bulunamadi ({e}); bu renk icin pipeline calistirilmali, atlandi')
+        continue
+    print(f'  ▶ Skor kaynagi: {_kaynak}')
 
-
-def _fpd_degerleri(index, fpd):
-    """Skor satirlarina ayni musteri + ayni donemin FPD degerleri (yoksa NaN)."""
-    if fpd is None or VERI_KEY_COL not in df.columns:
-        return {}
-    anahtar = pd.DataFrame({'_key': _tamsayi(df.loc[index, VERI_KEY_COL]).reset_index(drop=True),
-                            '_donem': _tamsayi(df.loc[index, 'DONEM']).reset_index(drop=True)})
-    m = anahtar.merge(fpd, on=['_key', '_donem'], how='left', validate='many_to_one')
-    if len(m) != len(anahtar):
-        raise RuntimeError('FPD eslesmesi satir sayisini degistirdi')
-    return {ad: m[ad].to_numpy(dtype='float64', na_value=np.nan) for ad in FPD_HEDEFLER}
-
-
-# ------------------------------------------------------------- skorlar
-def _skorlar_bellekten(renk_kod):
-    s = globals().get('secilen_modeller', {}).get(renk_kod, {})
-    gerekli = ('train_prob', 'train_index', 'y_train', 'val_prob', 'val_index', 'y_val',
-               'oot_prob', 'oot_index', 'y_oot')
-    # 'importance' yalnizca pipeline'in kaydinda var; eski SECILEN MODELLER
-    # hucresinin yeniden egittigi modelin skorlari bellekte kalmissa kullanilmaz.
-    if 'importance' not in s or not all(k in s for k in gerekli):
-        return None
-    return [(ad, np.asarray(s[f'y_{k}']), np.asarray(s[f'{k}_prob'], dtype='float64'), s[f'{k}_index'])
-            for ad, k in (('TRAIN', 'train'), ('VAL', 'val'), ('OOT', 'oot'))]
-
-
-def _skorlar_dosyadan(renk_kod, renk_adi):
-    """Pipeline'in musteri_skorlari ve val_index dosyalarindan; satir sirasi dogrulanir."""
-    sk = _oku_csv(f'renk_{renk_kod}_{renk_adi}_musteri_skorlari.csv', dtype={'mbb_no': str})
-    val_idx = pd.Index(_oku_csv(f'renk_{renk_kod}_{renk_adi}_val_index.csv')['idx'])
-    mask = ((df['KK_URUN_FLG'] == 'KK') & (df['RENK'] == renk_kod)
-            & df['DONEM'].isin([TRAIN_DONEM, OOT_DONEM]))
-    df_r = df.loc[mask]
-    train_full = df_r.index[df_r['DONEM'] == TRAIN_DONEM]
-    indeksler = {'train': train_full[~train_full.isin(val_idx)].sort_values(),
-                 'val': val_idx.sort_values(),
-                 'oot': df_r.index[df_r['DONEM'] == OOT_DONEM]}
-    kumeler = []
-    for ad, k in (('TRAIN', 'train'), ('VAL', 'val'), ('OOT', 'oot')):
-        p = sk.loc[sk['set_adi'] == k]
-        ix = indeksler[k]
-        if len(p) != len(ix):
-            raise ValueError(f'{k}: skor dosyasi {len(p):,} satir, veri {len(ix):,} satir')
-        y = p['target_actual'].to_numpy(dtype='int64')
-        if not np.array_equal(pd.to_numeric(df.loc[ix, TARGET]).to_numpy(dtype='int64'), y):
-            raise ValueError(f'{k}: hedef degerleri skor dosyasiyla eslesmiyor')
-        if VERI_KEY_COL in df.columns and not np.array_equal(
-                df.loc[ix, VERI_KEY_COL].astype(str).to_numpy(), p['mbb_no'].astype(str).to_numpy()):
-            raise ValueError(f'{k}: musteri sirasi skor dosyasiyla eslesmiyor')
-        kumeler.append((ad, y, p['target_score'].to_numpy(dtype='float64'), ix))
-    return kumeler
-
-
-def _skorlar(renk_kod, renk_adi):
-    kumeler = _skorlar_bellekten(renk_kod)
-    if kumeler is not None:
-        return kumeler, 'pipeline bellegi'
-    if renk_kod not in _SKOR_ONBELLEK:
-        _SKOR_ONBELLEK[renk_kod] = _skorlar_dosyadan(renk_kod, renk_adi)
-    return _SKOR_ONBELLEK[renk_kod], 'pipeline skor dosyalari'
-
-
-# ------------------------------------------------------------- bucket
-def _nb_sec(kumeler, n_bucket):
-    """Uc kume icin ORTAK bucket sayisi (kumeler arasi karsilastirilabilirlik)."""
-    if MIN_BAD_PER_BUCKET <= 0:
-        return int(n_bucket)
-    _min_bad = min(int(np.asarray(y).sum()) for _, y, _, _ in kumeler
-                   if len(y) and pd.Series(y).nunique() >= 2)
-    return int(min(n_bucket, max(MIN_BUCKET, _min_bad // MIN_BAD_PER_BUCKET)))
-
-
-def _bucket_ata(score, nb):
-    """Rank bazli esit bolme; 1 = en yuksek skor."""
-    score = np.asarray(score, dtype='float64')
-    n = len(score)
-    order = np.argsort(score, kind='stable')
-    r = np.empty(n, dtype='float64')
-    r[order] = np.arange(1, n + 1, dtype='float64')
-    edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
-    return nb - np.searchsorted(edges[1:-1], r, side='left')
-
-
-def _kume_verisi(y, prob, index, fpd):
-    d = pd.DataFrame({'y': np.asarray(y), 'score': np.asarray(prob, dtype='float64'),
-                      'limit': _sayi(index, LIMIT_COL), 'risk': _sayi(index, RISK_COL),
-                      'takip': _sayi(index, TAKIP_COL)})
-    for ad, v in _fpd_degerleri(index, fpd).items():
-        d[f'fpd_{ad}'] = v
-    d['limit_bad'] = d['limit'] * d['y']
-    d['risk_bad'] = d['risk'] * d['y']
-    return d
-
-
-def _fpd_adlari(d):
-    return [ad for ad in FPD_HEDEFLER if f'fpd_{ad}' in d.columns]
-
-
-def _grupla(d, anahtar):
-    agg = dict(n=('y', 'size'), bad=('y', 'sum'),
-               min_score=('score', 'min'), avg_score=('score', 'mean'),
-               max_score=('score', 'max'),
-               limit_sum=('limit', 'sum'), risk_sum=('risk', 'sum'),
-               limit_sum_bad=('limit_bad', 'sum'), risk_sum_bad=('risk_bad', 'sum'),
-               takip_adet=('takip', 'sum'), takip_dolu=('takip', 'count'))
-    for ad in _fpd_adlari(d):
-        agg[f'_fe_{ad}'] = (f'fpd_{ad}', 'count')
-        agg[f'_f1_{ad}'] = (f'fpd_{ad}', 'sum')
-    return d.groupby(anahtar).agg(**agg).reset_index().sort_values(anahtar).reset_index(drop=True)
-
-
-def _metrikler(g, base, n_kume, tot_bad, tavan):
-    g['bad_rate'] = g['bad'] / g['n']
-    g['dr_risk'] = g['risk_sum_bad'] / g['risk_sum'].replace(0, np.nan)
-    g['lift'] = g['bad_rate'] / base if base > 0 else np.nan
-    g['lift_tavan_pct'] = g['lift'] / tavan
-    g['cum_bad'] = g['bad'].cumsum()
-    g['capture'] = g['cum_bad'] / tot_bad if tot_bad > 0 else np.nan
-    g['cum_n_pct'] = g['n'].cumsum() / n_kume
-    for c in ['min_score', 'avg_score', 'max_score', 'bad_rate', 'dr_risk',
-              'lift', 'lift_tavan_pct', 'capture', 'cum_n_pct']:
-        g[c] = g[c].round(4)
-    for c in ['limit_sum', 'risk_sum', 'limit_sum_bad', 'risk_sum_bad']:
-        g[c] = g[c].round(0)
-    return g
-
-
-def _sona_ekle(g):
-    """Takip ve FPD kolonlari tablonun EN SAGINA."""
-    _takip_adet = g.pop('takip_adet')
-    _takip_dolu = g.pop('takip_dolu')
-    g[f'{TAKIP_COL}_ADET'] = _takip_adet.round(0).astype('int64')
-    g[f'{TAKIP_COL}_ORAN'] = (_takip_adet / _takip_dolu.replace(0, np.nan)).round(4)
-    for ad in FPD_HEDEFLER:
-        if f'_fe_{ad}' not in g.columns:
+    _gini = {}
+    for donem_tipi, y_k, p_k, idx_k in kumeler:
+        _n = len(idx_k)
+        if _n == 0:
             continue
-        fe, f1 = g.pop(f'_fe_{ad}'), g.pop(f'_f1_{ad}')
-        g[f'FPD_ESLESEN_ADET_{ad}'] = fe.astype('int64')
-        g[f'FPD_1_ADET_{ad}'] = f1.round(0).astype('int64')
-        g[f'FPD_1_ORAN_{ad}'] = (f1 / fe.replace(0, np.nan)).round(4)
-    return g
+        ham = df.loc[idx_k]
+        out = pd.DataFrame({
+            'renk_kod':   np.full(_n, RENK_KOD, dtype='int16'),
+            'renk_adi':   pd.Categorical([renk_adi] * _n),
+            'donem_tipi': pd.Categorical([donem_tipi] * _n),
+            'donem':      pd.to_numeric(ham['DONEM']).to_numpy(dtype='int32'),
+            'SKOR':       np.asarray(p_k, dtype='float64'),
+            'TARGET':     np.asarray(y_k).astype('int8'),
+            'limit':      ham[LIMIT_COL].to_numpy() if LIMIT_COL in ham else np.nan,
+            'risk':       ham[RISK_COL].to_numpy() if RISK_COL in ham else np.nan,
+        }, index=idx_k)
+        if ID_COL in ham:
+            out['musteri_id'] = ham[ID_COL].to_numpy()
+        scored_parts.append(out)
+        if pd.Series(y_k).nunique() >= 2:
+            _gini[donem_tipi] = 2 * roc_auc_score(y_k, p_k) - 1
 
+    # Hizli kontrol: TRAIN in-sample oldugu icin gini'si VAL'den yuksek cikar;
+    # aradaki fark asiri ogrenmenin dogrudan gostergesi.
+    print('    ' + '  '.join(f'{k.lower()}_gini={v:.4f}' for k, v in _gini.items()))
+    print(f'  ✓ {etiket} skorlandi (train+val+oot)')
 
-def _bucket_tablosu(d, etiket, kume_adi, n_bucket):
-    """Tek bir kume (TRAIN/VAL/OOT) icin bucket tablosu. Bucket 1 = en yuksek skor."""
-    n = len(d)
-    n_bad = int(d['y'].sum())
-    _nb = n_bucket
-    d['bucket'] = _bucket_ata(d['score'].to_numpy(), _nb)
+if not scored_parts:
+    raise RuntimeError('Hic renk skorlanamadi; SCORED tablo yazilmadi.')
 
-    _base = float(d['y'].mean())
-    _tavan = min(1.0 / _base, _nb) if _base > 0 else np.nan
-    g = _metrikler(_grupla(d, 'bucket'), _base, n, n_bad, _tavan)
-    _cap_tavan = min(1.0, CAPTURE_PCT / _base) if _base > 0 else np.nan
+scored = pd.concat(scored_parts, ignore_index=True)
+del scored_parts
+print('\nToplam skorlanan satir:', scored.shape)
+print('Bellek:', f'{scored.memory_usage(deep=True).sum() / 1e6:,.0f} MB')
+print(scored.groupby('donem_tipi', observed=True).size().to_string())
 
-    g.insert(0, 'renk', etiket)
-    g.insert(1, 'kume', kume_adi)
-    g.insert(2, 'base_rate', round(_base, 4))
-    g.insert(3, 'lift_tavan', round(_tavan, 2) if np.isfinite(_tavan) else None)
-    g.insert(4, 'n_bucket', _nb)
-    g = _sona_ekle(g)
+# Dataset varsa guncelle, yoksa folder'a CSV yaz
+_client = dataiku.api_client()
+_project = _client.get_project(dataiku.default_project_key())
+_mevcut = {d['name'] for d in _project.list_datasets()}
 
-    # monotonluk: bad_rate'in dustugu komsu cift orani (1.00 ideal)
-    _mono = float((np.diff(g['bad_rate'].to_numpy()) < 0).mean()) if len(g) > 1 else np.nan
-
-    # capture@pct pipeline ile ayni helper'dan -> pipeline ozetiyle birebir ayni sayi
-    cap10 = float(_capture_at(d['y'].to_numpy(), d['score'].to_numpy(), CAPTURE_PCT)) if n_bad > 0 else np.nan
-    _capN = int(CAPTURE_PCT * 100)
-    ozet = {'renk': etiket, 'kume': kume_adi, 'n': n, 'bad': n_bad,
-            'base_rate': round(_base, 4),
-            'lift_tavan': round(_tavan, 2) if np.isfinite(_tavan) else None,
-            'lift1': g['lift'].iloc[0],
-            'lift1_tavan_pct': g['lift_tavan_pct'].iloc[0],
-            f'capture{_capN}': round(cap10, 4) if pd.notna(cap10) else None,
-            f'capture{_capN}_tavan': round(_cap_tavan, 4) if np.isfinite(_cap_tavan) else None,
-            f'capture{_capN}_tavan_pct': (round(cap10 / _cap_tavan, 4)
-                                          if pd.notna(cap10) and np.isfinite(_cap_tavan)
-                                          and _cap_tavan > 0 else None),
-            'monoton_pct': round(_mono, 4) if np.isfinite(_mono) else None,
-            'n_bucket': _nb}
-    for ad in _fpd_adlari(d):
-        v = d[f'fpd_{ad}']
-        ozet[f'FPD_ESLESME_{ad}'] = round(float(v.notna().mean()), 4)
-        ozet[f'FPD_1_ORAN_{ad}'] = round(float(v.mean()), 4) if v.notna().any() else None
-    return g, ozet
-
-
-def _detay_tablosu(d, etiket, kume_adi, n_bucket):
-    """Ilk bucket'lari DETAY_BOLME'ye gore alt dilimlere boler (d['bucket'] hazir olmali)."""
-    parca = []
-    for ana, k in sorted(DETAY_BOLME.items()):
-        s = d.loc[d['bucket'] == ana]
-        if len(s):
-            parca.append(s.assign(ana_bucket=ana, alt_bucket=_bucket_ata(s['score'].to_numpy(), k)))
-    if not parca:
-        return None
-    n = len(d)
-    n_bad = int(d['y'].sum())
-    _base = float(d['y'].mean())
-    g = _grupla(pd.concat(parca), ['ana_bucket', 'alt_bucket'])
-    _tavan = np.minimum(1.0 / _base, n / g['n']) if _base > 0 else np.nan
-    g = _metrikler(g, _base, n, n_bad, _tavan)
-    g.insert(0, 'renk', etiket)
-    g.insert(1, 'kume', kume_adi)
-    g.insert(2, 'base_rate', round(_base, 4))
-    g.insert(3, 'n_bucket', n_bucket)
-    g.insert(4, 'dilim', [f'{a}.{b:02d}' for a, b in zip(g['ana_bucket'], g['alt_bucket'])])
-    g.insert(7, 'alt_bucket_sayisi', g['ana_bucket'].map(DETAY_BOLME))
-    g.insert(8, 'n_pct', (g['n'] / n).round(4))
-    g['lift_tavan'] = np.round(_tavan, 2)
-    return _sona_ekle(g)
-
-
-def renk_bazli_bucket_raporu(n_bucket_deger, fpd=None):
-    """Tum renkler icin TRAIN/VAL/OOT bucket raporunu uretir ve Excel'e yazar."""
-    bucket_tablolari, detay_tablolari, karsilastirma = {}, {}, []
-    _detay = n_bucket_deger == DETAY_NB and bool(DETAY_BOLME)
-
-    for RENK_KOD in MODEL_RENKLER:
-        renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
-        etiket = f'{RENK_KOD}-{renk_adi}'
-        print(f'\n=== {etiket} (N_BUCKET={n_bucket_deger}) ===')
-
-        # 1) Skorlar: pipeline bellegi, yoksa pipeline dosyalari. Yeniden egitim YOK.
-        try:
-            kumeler, _kaynak = _skorlar(RENK_KOD, renk_adi)
-        except Exception as e:
-            print(f'  ✗ Skor bulunamadi ({e}); bu renk icin pipeline calistirilmali, atlandi')
-            continue
-        print(f'  ▶ 1) Skor kaynagi: {_kaynak} (train={len(kumeler[0][1]):,} '
-              f'val={len(kumeler[1][1]):,} oot={len(kumeler[2][1]):,})')
-
-        # 2) Her kume icin bucket tablosu (+ detay)
-        try:
-            _nb_ortak = _nb_sec(kumeler, n_bucket_deger)
-        except (ValueError, ZeroDivisionError) as e:
-            print(f'  bucket sayisi belirlenemedi ({e}), atlandi'); continue
-        if _nb_ortak != n_bucket_deger:
-            print(f'  ▶ 2) batan sayisi dusuk -> {n_bucket_deger} yerine {_nb_ortak} bucket '
-                  f'(uc kumede de ayni, karsilastirilabilir kalsin diye)')
-        _detay_renk = _detay and _nb_ortak == DETAY_NB
-        if _detay and not _detay_renk:
-            print(f'  ⚠ bucket sayisi {_nb_ortak} oldugu icin detay dilimleri uretilmedi')
-        print(f'  ▶ 2) {_nb_ortak} bucket\'a bolunuyor (TRAIN / VAL / OOT)...')
-        parcalar, detaylar = [], []
-        _cN = int(CAPTURE_PCT * 100)
-        _f = lambda v, f='{:.2f}': (f.format(v) if v is not None and pd.notna(v) else 'NA')
-        _p = lambda v: (f'{v:.0%}' if v is not None and pd.notna(v) else 'NA')
-        for kume_adi, y_k, p_k, idx_k in kumeler:
-            if len(y_k) == 0 or pd.Series(y_k).nunique() < 2:
-                print(f'    {kume_adi}: tek sinif / bos, atlandi'); continue
-            d = _kume_verisi(y_k, p_k, idx_k, fpd)
-            g, ozet = _bucket_tablosu(d, etiket, kume_adi, _nb_ortak)
-            parcalar.append(g)
-            karsilastirma.append(ozet)
-            _fpd_txt = ''.join(
-                f" | {ad} esl={_p(ozet.get(f'FPD_ESLESME_{ad}'))} oran={_f(ozet.get(f'FPD_1_ORAN_{ad}'), '{:.4f}')}"
-                for ad in _fpd_adlari(d))
-            print(f"    {kume_adi:<5} base={ozet['base_rate']:.4f} "
-                  f"lift_tavan={_f(ozet['lift_tavan'])} | lift1={_f(ozet['lift1'])} "
-                  f"({_p(ozet['lift1_tavan_pct'])} tavan) | "
-                  f"cap{_cN}={_f(ozet[f'capture{_cN}'], '{:.4f}')} / "
-                  f"{_f(ozet[f'capture{_cN}_tavan'], '{:.4f}')} "
-                  f"({_p(ozet[f'capture{_cN}_tavan_pct'])} tavan) | "
-                  f"monoton={_p(ozet['monoton_pct'])} | nb={ozet['n_bucket']}{_fpd_txt}")
-            for ad in _fpd_adlari(d):
-                if ozet[f'FPD_ESLESME_{ad}'] == 0:
-                    print(f'      ⚠ {kume_adi}: FPD eslesmesi 0; FPD tablosunda bu donem yok olabilir')
-            if _detay_renk:
-                dt = _detay_tablosu(d, etiket, kume_adi, _nb_ortak)
-                if dt is not None:
-                    detaylar.append(dt)
-                    _r = dt.iloc[0]
-                    print(f"          detay {_r['dilim']} (en riskli {_r['n_pct']:.1%}): "
-                          f"bad_rate={_r['bad_rate']:.4f} lift={_f(_r['lift'])} "
-                          f"capture={_f(_r['capture'], '{:.4f}')}")
-
-        if not parcalar:
-            print('  hic kume uretilemedi, atlandi'); continue
-        g_all = pd.concat(parcalar, ignore_index=True)
-        bucket_tablolari[RENK_KOD] = g_all
-        sayfalar = {renk_adi: g_all}
-        if detaylar:
-            detay_tablolari[RENK_KOD] = pd.concat(detaylar, ignore_index=True)
-            sayfalar[f'{renk_adi}_DETAY'] = detay_tablolari[RENK_KOD]
-
-        # 3) Bu rengin tablosunu Excel'e yaz (kume kolonu ile; detay ayri sheet)
-        _excel_yaz(f'renk_{RENK_KOD}_{renk_adi}_bucket{n_bucket_deger}_train_val_oot.xlsx', sayfalar)
-        print(f'  ✓ {etiket} tamamlandi (excel yazildi)')
-
-    # Tum renkler tek Excel: KARSILASTIRMA + her renk ayri sheet (+ DETAY) + TUM (+ TUM_DETAY)
-    print('\n▶ Tum renkler tek Excel\'e birlestiriliyor...')
-    if bucket_tablolari:
-        kars = pd.DataFrame(karsilastirma)
-        print('\n===== KUME KARSILASTIRMA (teshis tablosu) =====')
-        print(kars.to_string(index=False))
-        print('\n Okuma kilavuzu:')
-        print('   TRAIN de kotu          -> model o bolgede sinyal bulamamis (kapasite/feature)')
-        print('   TRAIN iyi, VAL kotu    -> asiri ogrenme')
-        print('   TRAIN+VAL iyi, OOT kotu-> zamansal bozulma (populasyon kaymasi)')
-        print('   lift1_tavan_pct        -> renkler arasi TEK karsilastirilabilir lift olcusu')
-        print('     tavan = min(1/base_rate, n_bucket) - bucket sayisini GECEMEZ')
-        print('   capture tavani = min(1, pct/base_rate)')
-        print('   monoton_pct < 1.00     -> bucket siralamasi bozuk, is tarafinda guven kaybi')
-        print('   FPD_ESLESME_*          -> skor satirlarinin FPD tablosunda bulunma orani')
-
-        fname = f'renk_bazli_TUM_bucket{n_bucket_deger}_train_val_oot.xlsx'
-        sayfalar = {'KARSILASTIRMA': kars}
-        for RENK_KOD, g in bucket_tablolari.items():
-            _ad = f'{RENK_KOD}_{COLOR_MAP.get(RENK_KOD, str(RENK_KOD))}'
-            sayfalar[_ad] = g
-            if RENK_KOD in detay_tablolari:
-                sayfalar[f'{_ad}_DETAY'] = detay_tablolari[RENK_KOD]
-        sayfalar['TUM'] = pd.concat(bucket_tablolari.values(), ignore_index=True)
-        if detay_tablolari:
-            sayfalar['TUM_DETAY'] = pd.concat(detay_tablolari.values(), ignore_index=True)
-        _excel_yaz(fname, sayfalar)
-        print(f'\n✓ {PATH}/{_dosya_adi(fname)} yazildi ({", ".join(sayfalar)})')
-    else:
-        print('⚠ Hic bucket tablosu uretilemedi')
-
-    return bucket_tablolari, detay_tablolari, karsilastirma
-
-
-fpd = _fpd_tablosu()
-for _n in BUCKET_DEGERLERI:
-    print(f"\n{'=' * 70}\n N_BUCKET = {_n} CALISTIRILIYOR\n{'=' * 70}")
-    renk_bazli_bucket_raporu(_n, fpd)
+if SCORED_DATASET in _mevcut:
+    dataiku.Dataset(SCORED_DATASET).write_with_schema(scored)
+    print(f'✓ {SCORED_DATASET} dataseti guncellendi ({scored.shape[0]:,} satir)')
+else:
+    _yaz(SCORED_CSV, scored, chunk=500_000)       # PATH alt klasorune akitarak yazar
+    print(f'✓ Dataset bulunamadi -> {PATH}/{SCORED_CSV} yazildi ({scored.shape[0]:,} satir)')
+    print(f"  Ipucu: Dataiku UI'da '{SCORED_DATASET}' adli dataset olusturup "
+          'tekrar calistirirsaniz dataset\'e yazilir.')
