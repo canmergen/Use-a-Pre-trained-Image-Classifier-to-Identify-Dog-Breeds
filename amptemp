@@ -43,6 +43,17 @@ v13:
 - SHAPRFECV hiz: SHAP_STEP_ESIK (150) ustunde kaba eleme (SHAP_STEP_UST=0.40),
   SHAP onemi val fold'unun sabit 100k satirinda (SHAP_DEGER_MAX_ROWS), val tahmini
   Capture ve Gini icin tek sefer, train fold skoru istege bagli (SHAP_TRAIN_SKOR).
+- 4b hizlandi: hedef iliskisi kolon basina ~2-3 sn yerine paralel ve ayni sonucla;
+  korelasyon matrisi pandas'in cift bazli yeniden siralamasi (renk basina ~30 dk)
+  yerine bos deseni gruplariyla ve matris carpimiyla; sonuc pandas ile ayni.
+  4a'da tekrar eden nunique kaldirildi; IV yalnizca secilen feature'lar icin.
+- Adim sureleri: her renk sonunda dakika dokumu, renk_bazli_sureler.csv.
+- Denetim duzeltmeleri: korelasyon matrisi tum ciftlerde pandas ile ayni (inf bos
+  sayilir); fold std'si ddof=1 (1-SE); SHAP orneklemi nadir pozitifte tum
+  pozitifler + agirlikli negatifler; sayisal kategori kolonlari '1' / '1.0'
+  farkindan etkilenmez; bolunmesiz nihai modelde SHAP payi hatasi; buyuk kopyalar
+  (reindex, train_full, ara FE tablolari) kaldirildi; SHAP_MAX_ROWS=None ve tam
+  sayi SHAP_STEP kenar durumlari.
 - Otomatik thread secimi (HIZ_TESTI): SHAP ve Optuna oncesi kisa bir LightGBM
   testiyle o anki en hizli n_jobs secilir; node yogunken 48 thread'in birbirini
   beklemesi onlenir. LGB_JOBS_TAVAN aday ust siniri; HIZ_TESTI=False kota tabanli.
@@ -130,6 +141,13 @@ import optuna
 from sklearn.base import clone
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedGroupKFold
+from scipy.stats import rankdata
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+try:
+    from threadpoolctl import threadpool_limits
+except ImportError:
+    threadpool_limits = None
 try:
     from scipy.stats import ConstantInputWarning as _SabitGirdiUyarisi
 except ImportError:
@@ -148,6 +166,12 @@ class Scorer:
 
     def score(self, model, X, y):
         return float(self.scorer(model, X, y))
+
+
+def _orneklem_std(x):
+    """Fold skorlarinin orneklem std'si (ddof=1); 1-SE kuralindaki standart hata bunu kullanir."""
+    x = np.asarray([v for v in x if np.isfinite(v)], dtype='float64')
+    return float(np.std(x, ddof=1)) if len(x) >= 2 else (0.0 if len(x) == 1 else np.nan)
 
 
 class ShapRFECV:
@@ -173,7 +197,9 @@ class ShapRFECV:
         if self.step_ust and self.step_esik and n > self.step_esik:
             # Kaba eleme; esige cok yaklasacaksa dogrudan esige iner.
             k = max(int(np.floor(n * self.step_ust)), 1)
-            if n - k < self.step_esik * (1 + self.step):
+            k_ince = (self.step if isinstance(self.step, int)
+                      else max(int(np.floor(self.step_esik * self.step)), 1))
+            if n - k <= self.step_esik + k_ince:
                 k = n - self.step_esik
         else:
             k = self.step if isinstance(self.step, int) else max(int(np.floor(n * self.step)), 1)
@@ -204,13 +230,23 @@ class ShapRFECV:
         sw = None if sample_weight is None else np.asarray(sample_weight, dtype='float64')
         splits = list(self.cv.split(X, y)) if hasattr(self.cv, 'split') else list(self.cv)
         # SHAP satirlari her fold icin bir kez secilir; tum turlarda ayni satirlar.
+        # Pozitifler orneklemin yarisindan azsa hepsi alinir, negatifler orneklenir
+        # ve agirliklandirilir: ortalama |SHAP| tum fold'un tahminiyle ayni olcekte.
         _rng = np.random.default_rng(self.random_state)
+        _y_np = y.to_numpy()
         shap_satir = []
         for _, iva in splits:
             if self.shap_max_rows is None or len(iva) <= self.shap_max_rows:
-                shap_satir.append(None)
+                shap_satir.append((None, None))
+                continue
+            _yv = _y_np[iva]
+            _pos, _neg = np.flatnonzero(_yv == 1), np.flatnonzero(_yv != 1)
+            if 0 < len(_pos) <= self.shap_max_rows // 2:
+                _n_neg = min(len(_neg), self.shap_max_rows - len(_pos))
+                _sec = np.sort(np.r_[_pos, _rng.choice(_neg, _n_neg, replace=False)])
+                shap_satir.append((_sec, np.where(_yv[_sec] == 1, 1.0, len(_neg) / max(_n_neg, 1))))
             else:
-                shap_satir.append(np.sort(_rng.choice(len(iva), self.shap_max_rows, replace=False)))
+                shap_satir.append((np.sort(_rng.choice(len(iva), self.shap_max_rows, replace=False)), None))
 
         satirlar = []
         _t0 = time.time()
@@ -218,8 +254,8 @@ class ShapRFECV:
         while len(mevcut) > self.min_features_to_select:
             mevcut = kalan
             Xc = X[mevcut]
-            shap_parcalar, s_tr, s_va, g_va = [], [], [], []
-            for (itr, iva), ss in zip(splits, shap_satir):
+            shap_parcalar, shap_agirlik, s_tr, s_va, g_va = [], [], [], [], []
+            for (itr, iva), (ss, ww) in zip(splits, shap_satir):
                 m = clone(self.model)
                 if sw is None:
                     m.fit(Xc.iloc[itr], y.iloc[itr])
@@ -233,7 +269,13 @@ class ShapRFECV:
                             else self.scorer.score(m, X_va, y_va))
                 g_va.append(self._gini(y_va, p_va))
                 shap_parcalar.append(self._shap_degerleri(m, X_va if ss is None else X_va.iloc[ss]))
-            onem = np.abs(np.concatenate(shap_parcalar, axis=0)).mean(axis=0)
+                shap_agirlik.append(ww)
+            if all(w is None for w in shap_agirlik):
+                onem = np.abs(np.concatenate(shap_parcalar, axis=0)).mean(axis=0)
+            else:
+                _W = np.concatenate([np.ones(len(sp)) if w is None else w
+                                     for sp, w in zip(shap_parcalar, shap_agirlik)])
+                onem = (_W @ np.abs(np.concatenate(shap_parcalar, axis=0))) / _W.sum()
             sira = np.argsort(-onem, kind='mergesort')
             k = self._silinecek_sayisi(len(mevcut))
             silinen = [mevcut[i] for i in sira[len(mevcut) - k:]] if k else []
@@ -243,9 +285,9 @@ class ShapRFECV:
                 'num_features': len(mevcut), 'features_set': list(mevcut),
                 'eliminated_features': silinen,
                 'train_metric_mean': float(np.mean(s_tr)) if s_tr else np.nan,
-                'train_metric_std': float(np.std(s_tr)) if s_tr else np.nan,
-                'val_metric_mean': float(np.mean(s_va)), 'val_metric_std': float(np.std(s_va)),
-                'val_gini_mean': float(np.nanmean(g_va)), 'val_gini_std': float(np.nanstd(g_va)),
+                'train_metric_std': _orneklem_std(s_tr),
+                'val_metric_mean': float(np.mean(s_va)), 'val_metric_std': _orneklem_std(s_va),
+                'val_gini_mean': float(np.nanmean(g_va)), 'val_gini_std': _orneklem_std(g_va),
             })
             if globals().get('SHAP_ILERLEME', True):
                 print(f'    tur {len(satirlar):>2}: {len(mevcut):>3} feature | '
@@ -363,16 +405,21 @@ def _model_yaz_pkl(filename, obj):
 # yapıyordu. Kotanın altında kalmak throttling'i tamamen kapatır.
 # 48 tavanı: LightGBM 241 feature'da ~32-48 thread'den sonra doyuma
 # ulaşıyor; daha fazlası senkronizasyon maliyeti ve kotaya yaklaşma riski.
+def _dosya_oku(yol):
+    with open(yol) as f:
+        return f.read()
+
+
 def _cpu_kotasi(tavan=48):
     _q = None
     try:
-        _v = open('/sys/fs/cgroup/cpu.max').read().split()  # cgroup v2
+        _v = _dosya_oku('/sys/fs/cgroup/cpu.max').split()  # cgroup v2
         if _v[0] != 'max':
             _q = int(_v[0]) / int(_v[1])
     except Exception:
         try:
-            _qq = int(open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us').read())  # cgroup v1
-            _pp = int(open('/sys/fs/cgroup/cpu/cpu.cfs_period_us').read())
+            _qq = int(_dosya_oku('/sys/fs/cgroup/cpu/cpu.cfs_quota_us'))  # cgroup v1
+            _pp = int(_dosya_oku('/sys/fs/cgroup/cpu/cpu.cfs_period_us'))
             if _qq > 0:
                 _q = _qq / _pp
         except Exception:
@@ -580,11 +627,10 @@ SHAP_BASE_ROWS = None        # SHAP CV satir sayisi tabani
 SHAP_MAX_ROWS = None         # SHAP CV / importance yedegi ust siniri
 # Feature-feature korelasyon matrisi: 60k stratified orneklemde |r|=0.9 icin
 # standart hata ~ (1-r^2)/sqrt(n) = 0.0008; eleme kararini degistirmez.
-# Tum train'de pandas Spearman (NaN'li ciftlerde yeniden siralama) 597
-# feature icin saatler surer. None = tum train.
+# None = tum train.
 CORR_MAX_ROWS = 60000
 # Hedef iliskisi (tgt_assoc: korelasyonlu ciftten hangisinin kalacagi ve
-# rapor) her feature icin TUM train'de hesaplanir; maliyeti feature basina ~1 sn.
+# rapor) her feature icin TUM train'de hesaplanir (paralel, ~0.03 sn / kolon).
 HEDEF_ILISKI_TUM_VERI = True
 # Nihai modelin SHAP onemi: validation (model gormedi) kumesinde ortalama |SHAP|.
 # None = tum validation; sayi verilirse stratified orneklem.
@@ -618,8 +664,9 @@ def _importance_yedek_secim(X, y, current_features):
     """
     Xc, yc = X[current_features], y
     if SHAP_MAX_ROWS is not None and len(yc) > SHAP_MAX_ROWS:
-        Xc, _, yc, _ = train_test_split(Xc, yc, train_size=SHAP_MAX_ROWS, stratify=yc,
-                                        random_state=RANDOM_STATE)
+        _i = train_test_split(Xc.index, train_size=SHAP_MAX_ROWS, stratify=yc,
+                              random_state=RANDOM_STATE)[0]
+        Xc, yc = Xc.loc[_i], yc.loc[_i]
     _pos = max(int(yc.sum()), 1)
     _neg = max(len(yc) - _pos, 1)
     _spw = min(SHAP_SPW_CAP, max(1/SHAP_SPW_CAP, (_neg / _pos) ** 0.5))
@@ -705,21 +752,22 @@ def _shap_train_sample(X, y):
     gereken = int(np.ceil(hedef_pos / (npos / n)))
     boyut = max(SHAP_BASE_ROWS, gereken)
 
+    _ust = SHAP_MAX_ROWS if SHAP_MAX_ROWS is not None else n
     # (a) Prevalans korunarak hedefe ulasilabiliyor.
-    if boyut <= SHAP_MAX_ROWS or n <= SHAP_MAX_ROWS:
-        boyut = min(boyut, n, SHAP_MAX_ROWS)
+    if boyut <= _ust or n <= _ust:
+        boyut = min(boyut, n, _ust)
         if boyut >= n:
             return X, y, 1.0, 'tum_train'
-        Xs, _, ys, _ = train_test_split(X, y, train_size=boyut, stratify=y,
-                                        random_state=RANDOM_STATE)
-        return Xs.sort_index(), ys.sort_index(), 1.0, 'stratified'
+        _i = train_test_split(X.index, train_size=boyut, stratify=y,
+                              random_state=RANDOM_STATE)[0].sort_values()
+        return X.loc[_i], y.loc[_i], 1.0, 'stratified'
 
     # (b) Nadir renk: tum pozitifler (ust sinirla) + alt orneklenmis negatifler.
     rng = np.random.RandomState(RANDOM_STATE)
     pos_idx = y.index[yy == 1]
     neg_idx = y.index[yy == 0]
-    n_pos_s = min(npos, SHAP_MAX_ROWS // 4)
-    n_neg_s = min(nneg, SHAP_MAX_ROWS - n_pos_s)
+    n_pos_s = min(npos, _ust // 4)
+    n_neg_s = min(nneg, _ust - n_pos_s)
     pos_s = pos_idx if n_pos_s == npos else pos_idx[rng.choice(npos, n_pos_s, replace=False)]
     neg_s = neg_idx[rng.choice(nneg, n_neg_s, replace=False)]
     # Pozitifler de alt orneklendiyse oran duzeltmesi iki tarafa birlikte yapilir.
@@ -733,7 +781,7 @@ def _shap_folds(Xs, ys, source_meta):
     cv = StratifiedKFold(n_splits=SHAP_CV, shuffle=True,
                          random_state=RANDOM_STATE)
     if 'MBB_NO' in source_meta.columns:
-        groups = source_meta.reindex(Xs.index)['MBB_NO']
+        groups = source_meta['MBB_NO'].reindex(Xs.index)
         if groups.isna().any():
             raise ShapSecimHatasi('SHAPRFECV icin MBB_NO eksik grup kimligi var.')
         groups = groups.astype(str)
@@ -967,7 +1015,7 @@ def _select_shap_features(X, y, current_features, etiket, basename, source_meta)
 def _ayir_train_val(df_train_raw, metadata, target):
     """Once ayir; tekrarlanan musterileri train/val arasinda bolme."""
     if 'MBB_NO' in metadata.columns:
-        groups = metadata.reindex(df_train_raw.index)['MBB_NO']
+        groups = metadata['MBB_NO'].reindex(df_train_raw.index)
         if groups.isna().any():
             raise ValueError('MBB_NO var ama eksik. Guvenli group split icin tamamlanmali.')
         groups = groups.astype(str)
@@ -997,6 +1045,18 @@ def _ayir_train_val(df_train_raw, metadata, target):
     return a.sort_index(), b.sort_index()
 
 
+def _kat_metin(s):
+    """Kategori degerlerini metne cevirir. Sayisal kaynakta 1 ve 1.0 ayni metin ('1') olur;
+    kaynak tipi egitim ile skorlama arasinda int / float degisse de kategori eslesir."""
+    if pd.api.types.is_numeric_dtype(s.dtype) and not pd.api.types.is_bool_dtype(s.dtype):
+        v = pd.to_numeric(s, errors='coerce').astype('float64')
+        out = v.astype('string')
+        tam = v.notna() & np.isfinite(v) & (v == np.round(v)) & (v.abs() < 2 ** 53)
+        out[tam] = v[tam].astype('int64').astype('string')
+        return out
+    return s.astype('string')
+
+
 def _fit_train_fitted_native(train_raw, val_raw, oot_raw, features, target):
     """Yalnizca train'de fit edilen dogal LightGBM numerik/kategori donusumu.
 
@@ -1019,7 +1079,7 @@ def _fit_train_fitted_native(train_raw, val_raw, oot_raw, features, target):
             kind = 'numeric' if conversion_rate >= 0.995 else 'category'
         columns[c] = kind
         if kind == 'category':
-            values = series.astype('string').dropna().unique().tolist()
+            values = _kat_metin(series).dropna().unique().tolist()
             schema['categorical'][c] = values
         else:
             schema['numerical'].append(c)
@@ -1033,7 +1093,7 @@ def _fit_train_fitted_native(train_raw, val_raw, oot_raw, features, target):
                 kolonlar[c] = pd.to_numeric(frame[c], errors='coerce')
             else:
                 dtype = pd.CategoricalDtype(categories=schema['categorical'][c])
-                kolonlar[c] = frame[c].astype('string').astype(dtype)
+                kolonlar[c] = _kat_metin(frame[c]).astype(dtype)
         kolonlar[target] = pd.to_numeric(frame[target], errors='coerce')
         return pd.DataFrame(kolonlar, index=frame.index)
 
@@ -1146,6 +1206,146 @@ def _capture_bootstrap(y, p, pct, n_boot, seed):
     return float(np.nanpercentile(res, 2.5)), float(np.nanpercentile(res, 97.5))
 
 
+# --- HIZLI SPEARMAN (4b / 4c) -------------------------------------------------
+# pandas Spearman her kolon / cift icin yeniden siralar: hedef iliskisi tum
+# train'de kolon basina ~2-3 sn, 60k x 600 korelasyon matrisi renk basina
+# ~30-40 dk. Asagidaki hesaplar ayni tanimi (cift bazinda bos satirlar atilir,
+# esitlikte ortalama sira) kullanir.
+def _paralel(fn, ogeler):
+    isci = max(1, min(16, LGB_JOBS))
+    if isci == 1 or len(ogeler) < 2:
+        return [fn(o) for o in ogeler]
+    with ThreadPoolExecutor(max_workers=isci) as ex:
+        return list(ex.map(fn, ogeler))
+
+
+def _pearson(a, b):
+    a = a - a.mean()
+    b = b - b.mean()
+    pay = np.sqrt((a * a).sum() * (b * b).sum())
+    return float((a * b).sum() / pay) if pay > 0 else np.nan
+
+
+def _hedef_spearman(frame, cols, target):
+    """Kolon - hedef |Spearman|; pandas Series.corr(method='spearman') ile ayni (fark ~1e-15).
+
+    Ikili hedefte hedefin sirasi hedefin dogrusal donusumu oldugundan yalnizca
+    kolon siralanir. Donus: (dict, tanimsiz kolonlar)."""
+    y = pd.to_numeric(frame[target], errors='coerce').to_numpy(dtype='float64', na_value=np.nan)
+    y_dolu = ~np.isnan(y)
+    ikili = np.unique(y[y_dolu]).size <= 2
+
+    def _bir(c):
+        x = pd.to_numeric(frame[c], errors='coerce').to_numpy(dtype='float64', na_value=np.nan)
+        m = y_dolu & ~np.isnan(x)
+        if m.sum() < 2:
+            return c, np.nan
+        yy = y[m]
+        return c, _pearson(rankdata(x[m]), yy if ikili else rankdata(yy))
+
+    sonuc, tanimsiz = {}, set()
+    for c, v in _paralel(_bir, list(cols)):
+        if np.isfinite(v):
+            sonuc[c] = abs(v)
+        else:
+            sonuc[c] = 0.0
+            tanimsiz.add(c)
+    return sonuc, tanimsiz
+
+
+def _spearman_matris(frame, cols):
+    """|Spearman| matrisi; pandas DataFrame.corr(method='spearman') ile ayni tanim ve sonuc.
+
+    Bos (NaN / inf) deseni ayni kolonlar gruplanir. Iki grubun ortak dolu
+    satirlarinda kolonlar siralanir ve ciftler matris carpimiyla hesaplanir;
+    her cift kendi ortak satirlarinda siralanmis olur (pandas'in tanimi).
+    Alt kumedeki sira, kolonun tek seferlik siralamasindan O(n) ile cikarilir.
+    Donus: (DataFrame, bos deseni grup sayisi).
+    """
+    A = np.column_stack([pd.to_numeric(frame[c], errors='coerce').to_numpy(dtype='float64', na_value=np.nan)
+                         for c in cols])
+    M = np.isfinite(A)
+    gruplar = {}
+    for j in range(A.shape[1]):
+        gruplar.setdefault(np.packbits(M[:, j]).tobytes(), []).append(j)
+    gruplar = list(gruplar.values())
+    G = [M[:, g[0]] for g in gruplar]
+    n_g = [int(m.sum()) for m in G]
+
+    # Her kolon bir kez siralanir; alt kumedeki sira O(n) ile bu siradan cikarilir
+    # (esitlikte ortalama sira, rankdata ile ayni).
+    def _hazirla(j):
+        sat = np.flatnonzero(M[:, j])
+        o = sat[np.argsort(A[sat, j], kind='mergesort')].astype(np.int32)
+        v = A[o, j]
+        yeni = np.r_[True, v[1:] != v[:-1]]
+        bas = np.flatnonzero(yeni).astype(np.int32)
+        gid = (np.cumsum(yeni) - 1).astype(np.int32)
+        return o, gid, bas, np.r_[bas[1:], len(v)].astype(np.int32)
+
+    sirali = _paralel(_hazirla, list(range(A.shape[1])))
+
+    def _alt_sira(j, satir):
+        o, gid, bas, son = sirali[j]
+        s = satir[o]
+        c = np.cumsum(s)
+        once = c[bas] - s[bas]
+        ort = once + (c[son - 1] - once + 1) / 2.0
+        rr = np.empty(A.shape[0])
+        rr[o[s]] = ort[gid][s]
+        return rr[satir]
+
+    def _sira(js, satir):
+        R = np.column_stack([_alt_sira(j, satir) for j in js])
+        return R - R.mean(axis=0)
+
+    def _kendi(a):
+        return _sira(gruplar[a], G[a]) if n_g[a] >= 2 else None
+
+    kendi = _paralel(_kendi, list(range(len(gruplar))))
+
+    def _blok(ab):
+        a, b = ab
+        if a == b:
+            if kendi[a] is None:
+                return a, b, None
+            Ra = Rb = kendi[a]
+        else:
+            S = G[a] & G[b]
+            ns = int(S.sum())
+            if ns < 2:
+                return a, b, None
+            Ra = kendi[a] if ns == n_g[a] else _sira(gruplar[a], S)
+            Rb = kendi[b] if ns == n_g[b] else _sira(gruplar[b], S)
+        pay = Ra.T @ Rb
+        payda = np.sqrt(np.outer((Ra * Ra).sum(axis=0), (Rb * Rb).sum(axis=0)))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return a, b, np.where(payda > 0, pay / payda, np.nan)
+
+    C = np.full((A.shape[1], A.shape[1]), np.nan)
+    gorevler = [(a, b) for a in range(len(gruplar)) for b in range(a, len(gruplar))]
+    with (threadpool_limits(limits=1, user_api='blas') if threadpool_limits else nullcontext()):
+        sonuclar = _paralel(_blok, gorevler)
+    for a, b, blok in sonuclar:
+        if blok is not None:
+            ia, ib = gruplar[a], gruplar[b]
+            C[np.ix_(ia, ib)] = blok
+            C[np.ix_(ib, ia)] = blok.T
+    return pd.DataFrame(np.abs(C), index=list(cols), columns=list(cols)), len(gruplar)
+
+
+# --- ADIM SURELERI ------------------------------------------------------------
+_SURE = {'ad': None, 't': 0.0, 'dk': {}}
+
+
+def _adim(ad=None):
+    """Onceki adimin suresini yazar, yeni adimi baslatir (ad=None: bitir)."""
+    t = time.time()
+    if _SURE['ad'] is not None:
+        _SURE['dk'][_SURE['ad']] = _SURE['dk'].get(_SURE['ad'], 0.0) + (t - _SURE['t']) / 60
+    _SURE['ad'], _SURE['t'] = ad, t
+
+
 def _hk_dagilim(train, val, oot, cols):
     satir = []
     for c in cols:
@@ -1191,7 +1391,7 @@ def renk_goc_skorla(df_raw, paket, fe_fn=None, renk_kontrol=True):
         if c.startswith('HK_'):
             continue
         if c in schema['categorical']:
-            kolonlar[c] = frame[c].astype('string').astype(
+            kolonlar[c] = _kat_metin(frame[c]).astype(
                 pd.CategoricalDtype(categories=schema['categorical'][c]))
         else:
             kolonlar[c] = pd.to_numeric(frame[c], errors='coerce')
@@ -1275,7 +1475,7 @@ def _hedef_kodla(train, val, oot, target, source_meta):
     cv = StratifiedKFold(n_splits=HK_FOLD, shuffle=True, random_state=RANDOM_STATE)
     splits = None
     if 'MBB_NO' in source_meta.columns:
-        grp = source_meta.reindex(train.index)['MBB_NO'].astype(str)
+        grp = source_meta['MBB_NO'].reindex(train.index).astype(str)
         if grp.duplicated().any():
             splits = list(StratifiedGroupKFold(n_splits=HK_FOLD, shuffle=True,
                                                random_state=RANDOM_STATE).split(train, y, grp))
@@ -1309,11 +1509,14 @@ if SHAP_HATA_MODU not in ('importance_yedek', 'rengi_atla', 'durdur', 'shapsiz_d
     raise ValueError(f'Bilinmeyen SHAP_HATA_MODU: {SHAP_HATA_MODU}')
 
 renk_sonuclari, ozet_satirlari, shap_hatalari, aile_ozet_satirlari, skorlama_sorunlu = {}, [], [], [], []
+sure_satirlari = []
 
 for RENK_KOD in MODEL_RENKLER:
     renk_adi = COLOR_MAP.get(RENK_KOD, str(RENK_KOD))
     etiket = f"{RENK_KOD}-{renk_adi}"
     print(f"\n=== {etiket} ===")
+    _SURE.update(ad=None, dk={})
+    _adim('populasyon')
 
     # 1) Popülasyon: KK + renk + dönemler
     print("  ▶ 1) Popülasyon filtreleniyor...")
@@ -1328,6 +1531,7 @@ for RENK_KOD in MODEL_RENKLER:
     # 2) Feature engineering: yalnizca guvenli ham kaynaklar.
     #    LEAK_COLS sonrasi filtre YETERSIZ; feature'in kendisi leak
     #    kaynaktan uretilirse yeni adiyla yine modele girebilir.
+    _adim('FE')
     print("  ▶ 2) Guvenli kaynaklarla feature engineering...")
     _raw_guvenli = [c for c in dict.fromkeys(RAW_FEATURES)
                     if c in df_r.columns and c not in LEAK_COLS
@@ -1352,13 +1556,14 @@ for RENK_KOD in MODEL_RENKLER:
             df_eng_r[_c] = _eng[_c]
         print(f'  Bilgi: feature_engineering {len(_degisen)} ham kolonu donusturdu; '
               f'donusmus hali kullaniliyor: {_degisen[:10]}')
+    del _fe_in, _eng, df_r
     FEATURES = list(dict.fromkeys(_raw_guvenli + _yeni))
     _id_col = 'MBB_NO' if 'MBB_NO' in df_eng_r.columns else None
     if _id_col is None:
         print('  ⚠ MBB_NO yok: skor veri setinde indeks kullanilacak.')
     print(f'  ✓ Guvenli RAW={len(_raw_guvenli)}, engineered={len(_yeni)}, '
           f'toplam={len(FEATURES)}')
-    _kaynak_disinda = [c for c in df_r.columns if c not in _raw_guvenli]
+    _kaynak_disinda = [c for c in df.columns if c not in _raw_guvenli]
     _audit = pd.concat([
         pd.DataFrame({'feature': _raw_guvenli, 'kaynak_tipi': 'raw_izinli'}),
         pd.DataFrame({'feature': _yeni, 'kaynak_tipi': 'engineered_izinli'}),
@@ -1370,6 +1575,7 @@ for RENK_KOD in MODEL_RENKLER:
         print('  Bilgi: KK_LIMIT/KK_RISK feature aileleri sadece izinli kaynak varsa uretilecek.')
 
     # 3) Once donem sonra train/val ayir; preprocess yalnizca train'den ogren.
+    _adim('bolme_HK')
     print('  ▶ 3) Donem/Train-Val bolunuyor, sonra train-fitted preprocess...')
     _train_raw = df_eng_r.loc[df_eng_r['DONEM'] == TRAIN_DONEM, FEATURES + [TARGET]].copy()
     _oot_raw = df_eng_r.loc[df_eng_r['DONEM'] == OOT_DONEM, FEATURES + [TARGET]].copy()
@@ -1405,7 +1611,7 @@ for RENK_KOD in MODEL_RENKLER:
             raise RuntimeError(f'{etiket}: {_name} preprocess sutun kaybetti.')
         if not _actual[TARGET].equals(_expected[TARGET]):
             raise RuntimeError(f'{etiket}: {_name} preprocess hedefi degistirdi.')
-    train_full = pd.concat([train, val]).sort_index()
+    del _train_raw, _oot_raw, _train_split_raw, _val_split_raw
     print(f'  ✓ Train {len(train):,} / Val {len(val):,} / OOT {len(oot):,}; '
           f'preprocess={PREPROCESS_MODU}')
     if train[TARGET].nunique() < 2 or val[TARGET].nunique() < 2:
@@ -1419,7 +1625,6 @@ for RENK_KOD in MODEL_RENKLER:
     if HK_AKTIF:
         _hk_yeni, _hk_paket = _hedef_kodla(train, val, oot, TARGET, df_eng_r)
         FEATURES = FEATURES + [c for c in _hk_yeni if c not in FEATURES]
-        train_full = pd.concat([train, val]).sort_index()
         print(f'  ✓ Desen hedef kodlamasi: {len(_hk_yeni)} feature (train OOF, {HK_FOLD} fold, m={HK_M})')
         _hkd = _hk_dagilim(train, val, oot, _hk_yeni)
         _model_yaz(f'renk_{RENK_KOD}_{renk_adi}_hk_dagilim.csv', _hkd)
@@ -1434,52 +1639,31 @@ for RENK_KOD in MODEL_RENKLER:
     y = train[TARGET]
     Xf = train[FEATURES]
 
-    # 4a) Sabit / neredeyse sabit
+    # 4a) Sabit / neredeyse sabit (tek degerli kolonda en sik deger payi 1.0)
+    _adim('eleme_4abc')
     print("  ▶ 4a) Sabit / neredeyse sabit değişken elemesi başladı...")
     drop_const = [c for c in FEATURES
-                  if Xf[c].nunique(dropna=False) <= 1
-                  or Xf[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
+                  if Xf[c].value_counts(normalize=True, dropna=False).iloc[0] > 0.99]
     FEATURES = [c for c in FEATURES if c not in drop_const]
     del Xf
     print(f"  ✓ Sabit eleme bitti (elenen {len(drop_const)})")
 
-    # 4b) Hedef iliskisi + korelasyon: train-only, pairwise NaN-safe.
-    # Eski rank+nan_to_num kodunda eksik degerli sutunlar sifira
-    # donusebiliyordu. pandas pairwise Spearman kullaniyoruz.
+    # 4b) Hedef iliskisi + korelasyon: train-only, cift bazinda bos satirlar atilir.
     print('  ▶ 4b) Train-only Spearman / Cramer V hesaplanıyor...')
-    _num_cols = train[FEATURES].select_dtypes(include=np.number).columns.tolist()
+    _t4b = time.time()
+    _num_cols = train.iloc[:0][FEATURES].select_dtypes(include=np.number).columns.tolist()
     _samp = train
     if CORR_MAX_ROWS is not None and len(train) > CORR_MAX_ROWS:
         # DUZELTME: iki dizi verilince train_test_split 4 deger dondurur;
         # '_samp, _ =' ValueError veriyordu. Tek dizi ver, ilk parcayi al.
-        _samp = train_test_split(
-            train, train_size=CORR_MAX_ROWS,
+        _samp = train.loc[train_test_split(
+            train.index, train_size=CORR_MAX_ROWS,
             stratify=train[TARGET], random_state=RANDOM_STATE,
-        )[0].sort_index()
-    _num_corr = pd.concat(
-        [_samp[_num_cols], _samp[[TARGET]].rename(columns={TARGET: '__TARGET_RANK__'})],
-        axis=1,
-    ).corr(method='spearman').abs() if _num_cols else pd.DataFrame()
-    tgt_assoc = {
-        c: float(_num_corr.at[c, '__TARGET_RANK__'])
-        if pd.notna(_num_corr.at[c, '__TARGET_RANK__']) else 0.0
-        for c in _num_cols
-    }
-    _tanimsiz = {c for c in _num_cols if pd.isna(_num_corr.at[c, '__TARGET_RANK__'])}
-    _hedef_kaynak = _samp
-    if HEDEF_ILISKI_TUM_VERI and len(_samp) < len(train):
-        # Ciftteki bos satirlar atilip yeniden siralanir (pandas Spearman ile ayni).
-        _hedef_kaynak = train
-        _tanimsiz = set()
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', _SabitGirdiUyarisi)
-            for c in _num_cols:
-                _v = train[c].corr(train[TARGET], method='spearman')
-                if pd.notna(_v):
-                    tgt_assoc[c] = abs(float(_v))
-                else:
-                    tgt_assoc[c] = 0.0
-                    _tanimsiz.add(c)
+        )[0].sort_values()]
+    _num_corr, _n_desen = (_spearman_matris(_samp, _num_cols)
+                           if _num_cols else (pd.DataFrame(), 0))
+    _hedef_kaynak = train if HEDEF_ILISKI_TUM_VERI else _samp
+    tgt_assoc, _tanimsiz = _hedef_spearman(_hedef_kaynak, _num_cols, TARGET)
     if _tanimsiz:
         # Dolu degerleri tek degerli: Spearman tanimsiz, bilgi yalnizca dolu/bos ayriminda.
         print(f'  Bilgi: {len(_tanimsiz)} kolonda dolu degerler tek degerli; '
@@ -1488,9 +1672,8 @@ for RENK_KOD in MODEL_RENKLER:
     for c in FEATURES:
         if c not in tgt_assoc:
             tgt_assoc[c] = float(_cramers_v(_hedef_kaynak[c], _hedef_kaynak[TARGET]))
-    iv_scores = {c: _quick_iv(train[c], y) for c in FEATURES}
-    print(f'  ✓ Korelasyon matrisi: {len(_samp):,} satir | hedef iliskisi: '
-          f'{len(_hedef_kaynak):,} satir; IV rapor.')
+    print(f'  ✓ Korelasyon matrisi: {len(_samp):,} satir ({_n_desen} bos deseni) | '
+          f'hedef iliskisi: {len(_hedef_kaynak):,} satir | {(time.time() - _t4b) / 60:.1f} dk')
 
     # 4c) Yuksek korelasyon: daha yuksek hedef iliskisi olani tut.
     print(f'  ▶ 4c) Korelasyon elemesi (Spearman |r|>{CORR_ESIK})...')
@@ -1509,6 +1692,7 @@ for RENK_KOD in MODEL_RENKLER:
         print('  tum feature elendi, atlandi'); continue
 
     # 4d) SHAPRFECV: Secim SADECE train uzerinde; val/OOT haric.
+    _adim('SHAP')
     print('  ▶ 4d) SHAPRFECV feature selection...')
     _thread_ayarla('SHAP oncesi')
     _shap_baslangic = len(FEATURES)
@@ -1583,6 +1767,7 @@ for RENK_KOD in MODEL_RENKLER:
     print(f'  ✓ Bölme: train {len(train)} / val {len(val)} / oot {len(oot)}')
 
     print('  ▶ Kalan feature listesi hazırlanıyor...')
+    iv_scores = {c: _quick_iv(train[c], train[TARGET]) for c in FEATURES}
     feat_df = pd.DataFrame([
         {'feature': c,
          'sira': i,
@@ -1599,6 +1784,7 @@ for RENK_KOD in MODEL_RENKLER:
     print(f"  ✓ Matrisler hazır - train {X_tr.shape} / val {X_val.shape} / oot {X_oot.shape}")
 
     # 6) Model + Optuna
+    _adim('Optuna')
     _thread_ayarla('Optuna oncesi')
     print(f"  ▶ 6) Model denemeye başlandı (Optuna, {N_ITER} trial, "
           f"train/val tek fit, LGB n_jobs={LGB_JOBS})...")
@@ -1859,6 +2045,7 @@ for RENK_KOD in MODEL_RENKLER:
     # 7) Threshold - VAL tahminlerinden.
     #    Not: Aynı val setinde seçilen eşik val metriğini iyimser yapabilir;
     #    nihai kaliteyi bağımsız OOT üzerinden raporla.
+    _adim('rapor_yazma')
     print('  ▶ 7) Threshold seçimi (val) + metrik hesabı...')
     val_prob = best.predict_proba(X_val)[:, 1]
     thr = _find_thresholds(y_val, val_prob)['youden_j']
@@ -1877,7 +2064,7 @@ for RENK_KOD in MODEL_RENKLER:
 
     # --- Müşteri bazlı skor dataseti (model bazında) ---
     def _skor_df(idx, y_true, prob, set_adi):
-        _meta = df_eng_r.reindex(idx)
+        _meta = df_eng_r[[c for c in (_id_col, 'DONEM') if c and c in df_eng_r.columns]].reindex(idx)
         _mbb = _meta[_id_col].astype(str) if _id_col else pd.Series(idx, index=idx).astype(str)
         _donem = _meta['DONEM'] if 'DONEM' in _meta.columns else pd.Series([np.nan] * len(_meta), index=idx)
         _p = np.asarray(prob, dtype='float64')
@@ -1902,16 +2089,20 @@ for RENK_KOD in MODEL_RENKLER:
 
     # TRAIN_DONEM ve OOT_DONEM'de ortak müşteriler için karşılaştırmalı skor dataseti
     if _id_col is not None:
-        tr_full_prob = best.predict_proba(train_full[FEATURES])[:, 1]
-        oot_full_prob = best.predict_proba(oot[FEATURES])[:, 1] if len(oot) else np.array([])
+        # train + val skorlari yeniden tahmin edilmeden birlestirilir (ayni model, ayni satirlar).
+        _tv_prob = pd.concat([pd.Series(tr_prob, index=X_tr.index),
+                              pd.Series(val_prob, index=X_val.index)]).sort_index()
+        _tv_y = pd.concat([y_tr, y_val]).sort_index()
+        tr_full_prob = _tv_prob.to_numpy()
+        oot_full_prob = np.asarray(oot_prob, dtype='float64')
 
-        tr_full_mbb = df_eng_r.reindex(train_full.index)[_id_col].astype(str)
-        oot_full_mbb = df_eng_r.reindex(oot.index)[_id_col].astype(str)
+        tr_full_mbb = df_eng_r[_id_col].reindex(_tv_prob.index).astype(str)
+        oot_full_mbb = df_eng_r[_id_col].reindex(oot.index).astype(str)
 
         tr_full_df = pd.DataFrame({
             'mbb_no':             tr_full_mbb.to_numpy(),
-            'donem_train':        train_full['DONEM'].to_numpy() if 'DONEM' in train_full.columns else TRAIN_DONEM,
-            'target_actual_train': np.asarray(train_full[TARGET], dtype='int64'),
+            'donem_train':        TRAIN_DONEM,
+            'target_actual_train': np.asarray(_tv_y, dtype='int64'),
             'target_pred_train': (tr_full_prob >= thr).astype('int64'),
             'target_score_train': tr_full_prob,
         })
@@ -2027,8 +2218,8 @@ for RENK_KOD in MODEL_RENKLER:
     _t_shap = time.time()
     _X_shap, _y_shap = X_val, y_val
     if SHAP_ONEM_MAX_ROWS is not None and len(X_val) > SHAP_ONEM_MAX_ROWS:
-        _X_shap = train_test_split(X_val, train_size=SHAP_ONEM_MAX_ROWS, stratify=y_val,
-                                   random_state=RANDOM_STATE)[0]
+        _X_shap = X_val.loc[train_test_split(X_val.index, train_size=SHAP_ONEM_MAX_ROWS,
+                                             stratify=y_val, random_state=RANDOM_STATE)[0]]
     _katki = np.asarray(best.predict(_X_shap, pred_contrib=True), dtype='float64')
     if _katki.ndim != 2 or _katki.shape[1] != len(_bst_feats) + 1:
         raise RuntimeError(f'{etiket}: pred_contrib boyutu beklenmedik: {_katki.shape}')
@@ -2036,7 +2227,7 @@ for RENK_KOD in MODEL_RENKLER:
     del _katki
     _imp['shap_mean_abs'] = _imp['feature'].map(_shap_ort).round(6)
     _sh_tot = float(_imp['shap_mean_abs'].sum())
-    _imp['shap_pct'] = (_imp['shap_mean_abs'] / _sh_tot if _sh_tot > 0 else 0.0).round(6)
+    _imp['shap_pct'] = (_imp['shap_mean_abs'] / _sh_tot).round(6) if _sh_tot > 0 else 0.0
     _imp['rank_shap'] = _imp['shap_mean_abs'].rank(ascending=False, method='min').astype(int)
     print(f'  SHAP onemi: validation {len(_X_shap):,} satir, {time.time() - _t_shap:.0f} sn')
     _imp['kullanilmadi_flg'] = (_imp['feat_imp_split'] == 0).astype(int)
@@ -2085,8 +2276,8 @@ for RENK_KOD in MODEL_RENKLER:
     # ----------------------------------------------------------------------
     _cat_kategoriler = {}
     for c in CAT_COLS:
-        if c in train_full.columns and str(train_full[c].dtype) == 'category':
-            _cat_kategoriler[c] = list(train_full[c].cat.categories)
+        if c in train.columns and str(train[c].dtype) == 'category':
+            _cat_kategoriler[c] = list(train[c].cat.categories)
 
     _paket = {
         'model':            best,
@@ -2139,7 +2330,7 @@ for RENK_KOD in MODEL_RENKLER:
     if len(X_oot) and PREPROCESS_MODU == 'train_fitted_native':
         try:
             _ornek = X_oot.index[:min(20_000, len(X_oot))]
-            _skor = renk_goc_skorla(df_r.loc[_ornek], _paket)
+            _skor = renk_goc_skorla(df.loc[_ornek], _paket)
             _ref = pd.Series(oot_prob, index=X_oot.index).loc[_ornek]
             _tutarlilik = float(np.abs(_skor.to_numpy() - _ref.to_numpy()).max())
         except Exception as _e:
@@ -2266,6 +2457,12 @@ for RENK_KOD in MODEL_RENKLER:
           f"gap_tr_val={_gap_tr_val:+.4f} | "
           f"psi_max={max((v for v in psi_scores.values() if np.isfinite(v)), default=np.nan):.3f} "
           f"(kullanılmayan feature {_kullanilmayan})")
+    _adim(None)
+    _dk = _SURE['dk']
+    print('  ⏱ Sure (dk): ' + ' | '.join(f'{k} {v:.1f}' for k, v in _dk.items())
+          + f' | toplam {sum(_dk.values()):.1f}')
+    sure_satirlari.append({'renk': etiket, **{f'{k}_dk': round(v, 2) for k, v in _dk.items()},
+                           'toplam_dk': round(sum(_dk.values()), 2)})
 
 # - Tüm renkler tek birleşik özet
 print("\n▶ Tüm renklerin birleşik özeti yazılıyor...")
@@ -2273,6 +2470,11 @@ ozet = pd.DataFrame(ozet_satirlari)
 print("\n===== ÖZET (tüm renkler) =====")
 print(ozet.drop(columns='best_params', errors='ignore').to_string(index=False))
 _model_yaz('renk_bazli_TUM_ozet.csv', ozet)
+if sure_satirlari:
+    _sure_df = pd.DataFrame(sure_satirlari)
+    print('\n===== ADIM SURELERI (dk) =====')
+    print(_sure_df.to_string(index=False))
+    _model_yaz('renk_bazli_sureler.csv', _sure_df)
 if aile_ozet_satirlari:
     _model_yaz('renk_bazli_TUM_aile_ozet.csv', pd.concat(aile_ozet_satirlari, ignore_index=True))
 if skorlama_sorunlu:
