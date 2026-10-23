@@ -1,92 +1,727 @@
 import re
 import time
-import pickle
-import warnings
 import numpy as np
 import pandas as pd
 import dataiku
 from io import BytesIO
-from openpyxl import Workbook
-from openpyxl.formatting.rule import ColorScaleRule
+from copy import copy
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+
+# ==================================================================
+# ÜRETİLEN DEĞİŞKEN AÇIKLAMALARI + MODELE GİRENLERDE EKSİK AÇIKLAMA KONTROLÜ
+# ------------------------------------------------------------------
+# GOC_MODEL_RESULTS ana klasöründeki renk_mdl_alan_aciklamalari.xlsx okunur:
+#   Degiskenler          : ham değişken açıklamaları (elle yazılmış, DOKUNULMAZ)
+#   Üretilen_Degiskenler : bu hücre doldurur. Feature engineering hücresinin (v7) ve
+#                          pipeline'ın desen kodlamasının (DSN_*) ürettiği her değişken için
+#                          Açıklamalar (ne olduğu / nasıl hesaplandığı) ve Anlamı (nasıl okunur).
+#                          Metinler FE kodundaki "Nasıl / Anlamı" notlarından kurallı üretilir.
+#   Modele_Girenler      : son modellere giren tüm feature'lar (model klasörlerindeki
+#                          renk_<kod>_<ad>_kalan_featurelar.csv birleşimi, ARSIV hariç),
+#                          açıklaması ve açıklamanın kaynağı (Degiskenler / üretilen).
+#   Eksik_Aciklamalar    : modele girip açıklaması olmayanlar ve nedeni.
+#   Okuma_Notlari        : isimlendirme kuralları (LM, L3M, AY_, _SERI, renk kodları ...).
+# Dosya aynı adla geri yazılır; yazmadan önce orijinali ARSIV'e yedeklenir.
+# ==================================================================
 
 # ==================================================================
 # AYARLAR
 # ==================================================================
-# Bu hücre İKİ Excel üretir; ikisi de GOC_MODEL_RESULTS ana klasörüne yazılır
-# (model klasörlerinin içine yazılmaz):
-#   1) CIKTI_DOSYA  : kalan feature'lar (ICINDEKILER, OZET, UNION, TUM, klasör başına sheet)
-#   2) BUCKET_DOSYA : her renk segmenti ayrı sheet; modellerin OOT bucket20 tabloları
-#                     3M solda, 6M bir boş kolon sonra, 12M bir boş kolon sonra
-MAIN_FOLDER   = "GOC_MODEL_RESULTS"
-CIKTI_DOSYA   = "/kalan_featurelar_tum.xlsx"
-BUCKET_DOSYA  = "/kirmizigoc_takip_updated.xlsx"
-
-# Model klasörleri ana klasörden KENDİLİĞİNDEN bulunur (elle liste yok):
-#   - HARIC_KLASORLER'deki klasörler (ARSIV) okunmaz
-#   - adı "<X>M_<HEDEF>_OOT<dönem>" kalıbına uymayan klasör okunmaz (ekrana yazılır)
-# Ana klasöre yeni model klasörü eklendiğinde kodda değişiklik gerekmez.
-HARIC_KLASORLER = {"ARSIV"}
-
-# Klasör adındaki HEDEF: (sheet adındaki kısa ad, ICINDEKILER'deki ad, BUCKET_DOSYA'daki blok başlığı)
-HEDEF_AILELERI = {
-    "KIRMIZI_RENGE_GOC":        ("SONRA_KRM_GOC",    "SONRA KIRMIZIYA GÖÇ",       "Sonra_Kırmızı"),
-    "ICINDE_KIRMIZI_RENGE_GOC": ("ICINDE_KRM_GOC",   "İÇİNDE KIRMIZIYA GÖÇ",      "İçinde_Kırmızı"),
-    "TAKIP":                    ("TAKIP",            "TAKİP",                     "Takip"),
-    "ICINDE_KIRMIZI_TAKIP":     ("ICINDE_KRM_TAKIP", "İÇİNDE KIRMIZI VEYA TAKİP", "İçinde_Kırmızı_Takip"),
-    "SONRA_KIRMIZI_VE_TAKIP":   ("SONRA_KRM_TAKIP",  "SONRA KIRMIZI VEYA TAKİP",  "Sonra_Kırmızı_Takip"),
-}
-
-FEATURE_COL      = "feature"                     # kalan_featurelar.csv'deki feature adı kolonu
-FEATURE_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_kalan_featurelar\.csv$")
+MAIN_FOLDER      = "GOC_MODEL_RESULTS"
+ACIKLAMA_DOSYASI = "/renk_mdl_alan_aciklamalari.xlsx"   # okunur ve aynı adla geri yazılır
+HAM_SHEET        = "Degiskenler"
+URETILEN_SHEET   = "Üretilen_Degiskenler"
+YEDEK_KLASORU    = "/ARSIV"                              # None: yedek alınmaz
+FE_ORNEK_N       = 3000        # üretilen değişken listesini çıkarmak için FE'nin çalıştığı satır sayısı
+HARIC_KLASORLER  = {"ARSIV"}
+HEDEF_AILELERI   = ["KIRMIZI_RENGE_GOC", "ICINDE_KIRMIZI_RENGE_GOC", "TAKIP",
+                    "ICINDE_KIRMIZI_TAKIP", "SONRA_KIRMIZI_VE_TAKIP"]
 KLASOR_RE        = re.compile(r"^(\d+)M_(" + "|".join(sorted(HEDEF_AILELERI, key=len, reverse=True))
                               + r")_OOT(\d{6})$")
-
-# ---- 2. Excel (BUCKET_DOSYA) ----
-# Hangi OOT'un klasörleri alınsın (örn. "OOT202506"). None: en çok model klasörü olan OOT
-# (eşitlikte en yenisi).
-BUCKET_OOT = None
-BUCKET_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_bucket20_train_val_oot\.xlsx$")
-# Renk kodu → sheet adı
-BUCKET_SHEET_ADLARI = {1: "1-Kırmızı_UPDT", 2: "2-Turuncu_UPDT", 3: "3-Sari_UPDT",
-                       4: "4-Acik_Yesil_UPDT", 5: "5-Yesil_UPDT", 6: "6-Koyu_Yesil_UPDT"}
-# Bir vade kolonunda blokların yukarıdan aşağı sırası
-BLOK_SIRASI = ["KIRMIZI_RENGE_GOC", "ICINDE_KIRMIZI_RENGE_GOC",
-               "SONRA_KIRMIZI_VE_TAKIP", "ICINDE_KIRMIZI_TAKIP", "TAKIP"]
-# False: her vade kendi bloklarını 1. satırdan başlayarak boşluksuz alt alta dizer
-#        (3M A1'den, 6M AA1'den, 12M BA1'den başlar).
-# True : aynı hedef 3M / 6M / 12M'de aynı satırlarda durur; bir vadede o hedefin modeli
-#        yoksa o yer boş kalır (bu durumda bir vade 1. satırdan başlamayabilir).
-HEDEFE_GORE_HIZALA = False
-# Bucket tablosundan alınan kolonlar (sırasıyla). Dosyadaki diğer kolonlar alınmaz.
-BUCKET_KOLONLARI = [
-    "renk", "kume", "base_rate", "bucket", "n", "bad",
-    "limit_sum", "risk_sum", "limit_sum_bad", "risk_sum_bad",
-    "bad_rate", "dr_risk", "lift", "capture",
-    "AKB_TAKIP_YY_12M_FLG_ADET", "AKB_TAKIP_YY_12M_FLG_ORAN",
-    "train_gini", "val_gini", "oot_gini",
-    "FPD_ESLESEN_ADET_TKP_5M90", "FPD_1_ADET_TKP_5M90", "FPD_1_ORAN_TKP_5M90",
-    "FPD_ESLESEN_ADET_TKP_ST_5M90", "FPD_1_ADET_TKP_ST_5M90", "FPD_1_ORAN_TKP_ST_5M90",
-]
-# Bucket dosyasında yoksa modelin renk_<kod>_<ad>_ozet.csv dosyasından alınır (her satıra aynı değer)
-GINI_KOLONLARI = ["train_gini", "val_gini", "oot_gini"]
-# Her blokta kırmızı (en düşük) → sarı → yeşil (en yüksek) renk skalası
-RENK_SKALASI_KOLONLARI = ["lift", "capture", "AKB_TAKIP_YY_12M_FLG_ORAN",
-                          "FPD_1_ORAN_TKP_5M90", "FPD_1_ORAN_TKP_ST_5M90"]
+FEATURE_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_kalan_featurelar\.csv$")
 
 mf = dataiku.Folder(MAIN_FOLDER)
 _T0 = time.time()
 
 
 def _log(mesaj):
-    """Geçen süreyle birlikte anında ekrana basar."""
     dk, sn = divmod(int(time.time() - _T0), 60)
     print(f"[{dk:02d}:{sn:02d}] {mesaj}", flush=True)
 
 
 # ==================================================================
-# YARDIMCILAR
+# 1) AÇIKLAMA KURALLARI
+# ------------------------------------------------------------------
+# _aciklama(ad) → (aile, açıklama, anlamı) ya da None (kural yoksa).
+# Kaynak: FE v7 kodundaki her ailenin üstündeki "Nasıl / Anlamı" notları ve pipeline'daki
+# DESEN KODLAMASI notu. Ay / pencere / renk sözlükleri aşağıda; aynı kalıptaki aileler
+# (pencere özetleri, <seri>_D_*, OG_*, YB_* ...) şablonla, tekil olanlar tek tek yazılır.
+# ==================================================================
+_AY_NOTU = "Değer olayın kaç ay geride olduğudur: 0 = LM (son ay), 1 = L2M ... 11 = L12M; olay yoksa boş."
+_GECIS_NOTU = "Geçişte değer geçişin yeni ayıdır (ör. 2 = L4M'den L3M'e geçiş)."
+_PENCERE = {                  # pencere → (bulunma hali, kapsadığı aylar)
+    "L3M": ("Son 3 aydaki", "(LM, L2M, L3M)"),
+    "L6M": ("Son 6 aydaki", "(LM..L6M)"),
+    "L12M": ("Son 12 aydaki", "(LM..L12M)"),
+    "L4_6M": ("4-6. aylardaki", "(L4M, L5M, L6M)"),
+    "L6_9M": ("6-9. aylardaki", "(L6M..L9M)"),
+}
+
+
+def _ay_adi(a):
+    return "son ay (LM)" if a == "LM" else f"{a[1:-1]} ay önceki ay ({a})"
+
+
+def _bas(s):
+    return s[:1].upper() + s[1:] if s else s
+
+
+# Pencere özetleri olan değişkenler: önek → (ad, yön, not). Yön: +1 yüksek iyi, -1 yüksek kötü, 0 nötr
+_DEGISKEN = {
+    "RENK":     ("renk kodu", +1, "INAKTIF (0) aylar hesaba girmez."),
+    "DAV":      ("davranış skoru (DAV_SKOR)", +1, ""),
+    "MMS":      ("mevcut müşteri skoru (MMS)", -1, ""),
+    "KKB_SKOR": ("KKB skoru", +1, "Skoru 0 olan ay (sorgu yok) hesaba girmez."),
+    "ODM":      ("Akbank kredi kartı ödeme oranı (KK_ODEME_ORANI, %)", +1, ""),
+    "KK_LIMIT": ("Akbank kredi kartı limiti", 0, ""),
+    "KK_RISK":  ("Akbank kredi kartı bakiyesi (borç)", -1, ""),
+    "KK_LKO":   ("kart kullanım oranı (bakiye / limit)", -1, "Limiti 0 / boş olan ay hesaba girmez."),
+}
+_ISTAT = {"AVG": "ortalama {ad}", "STD": "{ad} standart sapması (n-1)", "MIN": "en düşük {ad}",
+          "MAX": "en yüksek {ad}", "MED": "medyan {ad}"}
+
+
+def _yon_metni(yon, olay="değişim"):
+    if yon > 0:
+        return "Negatif = düşüş (kötüleşme), pozitif = artış (iyileşme)."
+    if yon < 0:
+        return "Pozitif = artış (kötüleşme), negatif = azalış (iyileşme)."
+    return "Pozitif = artış, negatif = azalış (limitte azalış bankanın limiti kıstığını gösterir)."
+
+
+def _ozet_anlam(on, ist):
+    ad, yon, _ = _DEGISKEN[on]
+    if on == "RENK":
+        return {"AVG": "Dönemin ortalama renk seviyesi. Küçük = kötü (1 KIRMIZI ... 6 KOY_YESIL).",
+                "STD": "Renk ne kadar oynak; 0 = dönem boyunca hep aynı renk.",
+                "MIN": "Dönemde görülen en kötü renk.", "MAX": "Dönemde görülen en iyi renk.",
+                "MED": "Uç aylardan etkilenmeyen tipik renk."}[ist]
+    iyi_kotu = {+1: ("en kötü", "en iyi"), -1: ("en iyi", "en kötü"), 0: ("en düşük", "en yüksek")}[yon]
+    yon_cumle = {+1: " Yüksek = iyi.", -1: " Yüksek = kötü.", 0: ""}[yon]
+    return {"AVG": f"Dönemin ortalama seviyesi.{yon_cumle}",
+            "STD": "Dönem içindeki oynaklık; 0 = dönem boyunca hep aynı değer.",
+            "MIN": f"Dönemde görülen {iyi_kotu[0]} değer.",
+            "MAX": f"Dönemde görülen {iyi_kotu[1]} değer.",
+            "MED": "Uç aylardan etkilenmeyen tipik değer."}[ist]
+
+
+_AILE_ADI = {
+    "RENK": "RENK: renk pencere özetleri", "DAV": "DAV: davranış skoru özetleri",
+    "MMS": "MMS: mevcut müşteri skoru özetleri", "KKB_SKOR": "KKB_SKOR: KKB skoru özetleri",
+    "ODM": "ODM: kart ödeme oranı özetleri", "KK_LIMIT": "KK: kart limit / bakiye / kullanım",
+    "KK_RISK": "KK: kart limit / bakiye / kullanım", "KK_LKO": "KK: kart limit / bakiye / kullanım",
+    "ORAN": "Hazır pencere kolonlarından oranlar", "RENK_Y": "RENK_Y: renk yolu",
+    "D": "<seri>_D: seri hareketi (eğim, seri, zirve / dip)", "ESZ": "ESZ: eşzamanlı bozulma",
+    "GIZLI": "GIZLI: renk bozulmadan gelen bozulma", "INT": "INT_*_INTD: INT pencere oranları",
+    "BV": "BV: borç ve varlık", "KK_O": "KK_O: limit aksiyonları ve kullanım eşikleri",
+    "OK": "OK: düşük ödeme + yüksek kullanım (borç sarmalı)", "YB": "YB: yeni başlayan olaylar",
+    "OG": "OG: renk düşüşünden önceki öncü sinyaller", "DS": "DS: hazır skor x renk yolu",
+    "DSN": "DSN: desen kodlaması (pipeline içinde üretilir)",
+}
+
+_RENK_ADLARI = {"INAKTIF": "INAKTIF (0)", "KIRMIZI": "KIRMIZI (1)", "TURUNCU": "TURUNCU (2)",
+                "SARI": "SARI (3)", "ACK_YESIL": "ACK_YESIL (4)", "YESIL": "YESIL (5)",
+                "KOY_YESIL": "KOY_YESIL (6)"}
+
+# Tekil feature'lar: ad → (aile, açıklama, anlamı)
+_SABIT = {
+    # ---- RENK (eski aile) ----
+    "RENK_DELTA_1_3": ("RENK", "Son ay (LM) renk kodu eksi L3M renk kodu.",
+                       "Son iki ayda toplam kaç basamak değişti. Pozitif = iyileşme, negatif = kötüleşme."),
+    "RENK_CNT_RISK": ("RENK", "Son 12 ayda risk renginde (KIRMIZI veya TURUNCU) geçen ay sayısı.",
+                      "12 ayın kaçında risk renginde."),
+    "RENK_CNT_GOOD": ("RENK", "Son 12 ayda renk kodu 4 ve üstü (ACK_YESIL, YESIL, KOY_YESIL) olan ay sayısı.",
+                      "12 ayın kaçında iyi renkte."),
+    "RENK_RISK_RATIO": ("RENK", "Son 12 ayda risk renginde geçen ay sayısı / aktif renkli ay sayısı.",
+                        "Aktif ayların ne kadarı riskte geçti (0-1)."),
+    "RENK_RISK_IN_L3M": ("RENK", "Son 3 ayda (LM, L2M, L3M) en az bir risk rengi (KIRMIZI / TURUNCU) varsa 1, "
+                         "yoksa 0; üç ay da boş / inaktifse boş.", "Müşteri son 3 ayda riske dokundu mu."),
+    "RENK_DECLINING": ("RENK", "LM < L2M < L3M ise 1 (renk iki ay üst üste düşmüş); üç aydan biri boş / inaktifse boş.",
+                       "Üç ay üst üste iki kez kötüleşme."),
+    "RENK_IMPROVING": ("RENK", "LM > L2M > L3M ise 1 (renk iki ay üst üste yükselmiş); üç aydan biri boş / inaktifse boş.",
+                       "Üç ay üst üste iki kez iyileşme."),
+    "RENK_MODE_L12M": ("RENK", "Son 12 ayın en sık görülen renk kodu (INAKTIF dahil; eşitlikte küçük kod).",
+                       "Müşterinin \"normal\" rengi."),
+    # ---- DAV / MMS / ODM / KKB tekilleri ----
+    "DAV_CV_12M": ("DAV", "Son 12 ay davranış skoru standart sapması / ortalaması (değişim katsayısı); ortalama 0 / boşsa -99.",
+                   "Ortalamaya göre oynaklık (ölçekten bağımsız)."),
+    "DAV_RANGE_12M": ("DAV", "Son 12 aydaki en yüksek davranış skoru eksi en düşük davranış skoru.",
+                      "12 aydaki en geniş salınım."),
+    "MMS_CV_12M": ("MMS", "Son 12 ay MMS standart sapması / ortalaması (değişim katsayısı); ortalama 0 / boşsa -99.",
+                   "Ortalamaya göre oynaklık."),
+    "ODM_CV_12M": ("ODM", "Son 12 ay kart ödeme oranı standart sapması / ortalaması; ortalama 0 / boşsa -99.",
+                   "Ödeme davranışının ortalamaya göre oynaklığı."),
+    "ODM_LOW_CNT_L12M": ("ODM", "Son 12 ayda kart ödeme oranı %20'nin altında olan ay sayısı.", "Düşük ödeme sıklığı."),
+    "ODM_FULL_CNT_L12M": ("ODM", "Son 12 ayda kart ödeme oranı %100 ve üstü olan ay sayısı.", "Tam ödeme sıklığı."),
+    "ODM_LOW_RATIO_L12M": ("ODM", "Son 12 ayda ödeme oranı %20'nin altında olan ay sayısı / ödeme oranı dolu ay sayısı.",
+                           "Ödeme yapılan ayların ne kadarı düşük (0-1)."),
+    "ODM_LOW_IN_L3M": ("ODM", "Son 3 ayda en az bir ay ödeme oranı %20'nin altındaysa 1; üç ay da boşsa boş.",
+                       "Son 3 ayda düşük ödeme oldu mu."),
+    "ODM_LM_BELOW_AVG": ("ODM", "Son ay (LM) ödeme oranı son 12 ay ortalamasının altındaysa 1; biri yoksa boş.",
+                         "Bu ayki ödeme müşterinin 12 aylık ortalamasının altında mı."),
+    "ODM_LM_TO_AVG_L12M": ("ODM", "Son ay (LM) ödeme oranı / son 12 ay ortalaması; payda 0 / boşsa -99.",
+                           "Bu ayki ödeme 12 aylık ortalamanın kaç katı; 1 altı = ortalamadan az ödeme."),
+    "ODM_DECLINING_3M": ("ODM", "LM < L2M < L3M ise 1 (ödeme oranı iki ay üst üste düşmüş); biri boşsa boş.",
+                         "Ödeme oranı üst üste iki ay düştü mü."),
+    "KKB_SKOR_DELTA_PCT_1_2": ("KKB_SKOR", "(Son ay KKB skoru - L2M KKB skoru) / L2M KKB skoru; L2M yoksa -99.",
+                               "Son ayki göreli (oransal) değişim; negatif = düşüş."),
+    "KKB_SKOR_DELTA_1_3": ("KKB_SKOR", "Son ay (LM) KKB skoru eksi L3M KKB skoru.",
+                           "Son iki aydaki toplam değişim; negatif = düşüş (kötüleşme)."),
+    "KKB_SKOR_LM_BELOW_AVG12_FLG": ("KKB_SKOR", "Son ay (LM) KKB skoru son 12 ay ortalamasının altındaysa 1; biri yoksa boş.",
+                                    "Bugünkü skor müşterinin 12 aylık ortalamasının altında mı."),
+    "KKB_SKOR_VALID_CNT_L12M": ("KKB_SKOR", "Son 12 ayda geçerli (0 ve boş dışı) KKB skoru olan ay sayısı.",
+                                "Skor geçmişinin ne kadar dolu olduğu."),
+    "KKB_SKOR_ZERO_CNT_L12M": ("KKB_SKOR", "Son 12 ayda KKB skoru tam 0 (sorgu yok) olan ay sayısı.",
+                               "Yüksek = sık sık KKB sorgusu yok."),
+    "KKB_SKOR_NULL_CNT_L12M": ("KKB_SKOR", "Son 12 ayda KKB skoru boş olan ay sayısı.", "Skor geçmişindeki boşluk."),
+    "KKB_SKOR_EVER_QUERIED_FLG": ("KKB_SKOR", "Son 12 ayda en az bir geçerli KKB skoru varsa 1.",
+                                  "Müşterinin 12 ayda hiç geçerli KKB skoru var mı."),
+    # ---- Hazır pencere kolonlarından oranlar ----
+    "TAUM_TREND_3_46": ("ORAN", "Son 3 ay ortalama TAUM tutarı eksi 4-6. aylar ortalama TAUM tutarı "
+                        "(TAUM_TUT_AVG_3M - TAUM_TUT_AVG_4_6M).",
+                        "Varlık (TAUM) son 3 ayda önceki 3 aya göre ne kadar değişti; negatif = azalma."),
+    "TAUM_RATIO_3_6": ("ORAN", "Son 3 ay ortalama TAUM tutarı / son 6 ay ortalama TAUM tutarı "
+                       "(TAUM_TUT_AVG_3M / TAUM_TUT_AVG_6M); geçersiz bölmede -99.",
+                       "1'in altı = son 3 ay ortalaması 6 aylık ortalamanın altında (varlık azalıyor)."),
+    "AKB_TAUM_ORAN": ("ORAN", "SM_AKB_TAUM_TUT_AVG_L3M / TAUM_TUT_AVG_3M; geçersiz bölmede -99.",
+                      "SM_AKB kaleminin toplam varlık içindeki payı."),
+    "ODEME_TREND": ("ORAN", "Son 3 ay ortalama kredi kartı ödeme oranı eksi son 6 ay ortalama kredi kartı ödeme oranı "
+                    "(BRY_KK_TOPLAM_ODEME_ORANI_L3M - BRY_KK_TOPLAM_ODEME_ORANI_L6M).",
+                    "Ödeme oranı son 3 ayda 6 aylık değere göre kaç puan değişti; negatif = düşüş."),
+    "ODEME_AVG": ("ORAN", "(BRY_KK_TOPLAM_ODEME_ORANI_L3M + BRY_KK_TOPLAM_ODEME_ORANI_L6M) / 2.",
+                  "İki pencerenin ortalama kredi kartı ödeme oranı."),
+    "BSVR_RATIO_3_6": ("ORAN", "Son 3 ay başvuru sayısı / son 6 ay başvuru sayısı, Akbank dahil tüm krediler "
+                       "(INT_SDM_BSVR_ADT_L3M / INT_SDM_BSVR_ADT_L6M); geçersiz bölmede -99.",
+                       "6 aylık başvuruların ne kadarı son 3 ayda yapıldı (pencereler kümülatif adetse)."),
+    "SDM_EKOD_DELTA": ("ORAN", "Akbank dahil tüm kredilerde en kötü ödeme durumu: son ay değeri eksi son 3 ay değeri "
+                       "(INT_SDM_A_EKOD_LM - INT_SDM_A_EKOD_L3M).",
+                       "Son ay ile son 3 ay penceresi arasındaki fark; 0 = değişim yok."),
+    "SHM_EKOD_DELTA": ("ORAN", "Akbank hariç tüm kredilerde en kötü ödeme durumu: son ay değeri eksi son 3 ay değeri "
+                       "(INT_SHM_A_EKOD_LM - INT_SHM_A_EKOD_L3M).",
+                       "Son ay ile son 3 ay penceresi arasındaki fark; 0 = değişim yok."),
+    # ---- BV ----
+    "BV_TAUM_DEGISIM_ORAN_3_46": ("BV", "(Son 3 ay ortalama TAUM - 4-6. aylar ortalama TAUM) / 4-6. aylar ortalama TAUM; "
+                                  "payda <= 0 / boşsa boş.", "Varlık son 3 ayda önceki 3 aya göre oransal ne kadar değişti."),
+    "BV_KK_RISK_TAUM_ORAN": ("BV", "Son ay kart bakiyesi (KK_RISK_LM) / son 3 ay ortalama TAUM; payda <= 0 / boşsa boş.",
+                             "Kart borcu varlığın ne kadarı; yüksek = borç varlığa göre büyük."),
+    "BV_BORC_ARTIYOR_VARLIK_AZALIYOR_FLG": ("BV", "KK_RISK_LM > KK_RISK_L3M ve son 3 ay TAUM < 4-6. aylar TAUM ise 1.",
+                                            "Kart borcu artarken varlık eriyor mu."),
+    "BV_KK_RISK_TAUM_ORAN_DEGISIM": ("BV", "BV_KK_RISK_TAUM_ORAN eksi (KK_RISK_L3M / 4-6. aylar ortalama TAUM).",
+                                     "Borç / varlık oranı ne kadar arttı; pozitif = borç varlığa göre büyüyor."),
+    # ---- KK_O tekilleri ----
+    "KK_O_LIMIT_DUSUS_ADET_12M": ("KK_O", "Son 12 ayda kart limitinin bir önceki aya göre düştüğü ay sayısı.",
+                                  "Banka limiti kaç kez kıstı."),
+    "KK_O_LIMIT_ARTIS_ADET_12M": ("KK_O", "Son 12 ayda kart limitinin bir önceki aya göre arttığı ay sayısı.",
+                                  "Banka limiti kaç kez artırdı."),
+    "KK_O_AY_SON_LIMIT_DUSUS": ("KK_O", "En son limit düşüşünün ayı. " + _AY_NOTU, "Son limit kısıntısı ne kadar önce."),
+    "KK_O_AY_SON_LIMIT_ARTIS": ("KK_O", "En son limit artışının ayı. " + _AY_NOTU, "Son limit artışı ne kadar önce."),
+    "KK_O_LIMIT_DEGISIM_ORAN_12M": ("KK_O", "Son ay kart limiti / son 12 aydaki en eski dolu ayın limiti.",
+                                    "1'in altı = limit 12 ayda kısılmış, 1'in üstü = artırılmış."),
+    "KK_O_SIFIR_BORC_ADET_12M": ("KK_O", "Son 12 ayda kart bakiyesi 0 veya altı olan ay sayısı.", "Kartı borçsuz geçen aylar."),
+    "KK_O_AY_SON_SIFIR_BORC": ("KK_O", "Kart bakiyesinin en son 0 veya altı olduğu ay. " + _AY_NOTU,
+                               "En son ne zaman borçsuzdu."),
+    "KK_O_BORC_SIFIRDAN_BASLADI_FLG": ("KK_O", "Son ay (LM) bakiye > 0 ve L2M ya da L3M'de bakiye 0 ise 1; ölçülemezse boş.",
+                                       "Kart borcu yeni başladı."),
+    # ---- OK ----
+    "OK_AY_SON_DUSUK_ODEME_YUKSEK_KULLANIM": ("OK", "En son \"borç sarmalı\" ayı (aynı ayda ödeme oranı < %20 ve kart "
+                                              "kullanımı >= 0.8). " + _AY_NOTU, "Sarmal ne kadar yakın."),
+    "OK_DUSUK_ODEME_YUKSEK_KULLANIM_SERI": ("OK", "Son aydan (LM) geriye kesintisiz \"borç sarmalı\" ayı sayısı "
+                                            "(ödeme oranı < %20 ve kullanım >= 0.8).", "Kaç aydır sarmalda."),
+    "OK_TAM_ODEME_DUSUK_KULLANIM_ADET_12M": ("OK", "Son 12 ayda ödeme oranı >= %100 ve kart kullanımı < 0.3 olan ay sayısı.",
+                                             "Sağlıklı kart kullanımı ayları."),
+    "OK_OLCULEN_AY_12M": ("OK", "Son 12 ayda ödeme oranı ve kart kullanımının ikisinin de dolu olduğu ay sayısı.",
+                          "OK sayımlarının kaç aya dayandığı."),
+    # ---- ESZ ----
+    "ESZ_DIPTE_SINYAL_12M": ("ESZ", "Son ay değeri son 12 ayın en kötü değerinde olan gösterge sayısı (renk, KKB, ödeme oranı, "
+                             "kart kullanımı, DAV, MMS; en az 3 dolu ay ve seri sabit değilse).",
+                             "Kaç gösterge şu an 12 ayın dibinde."),
+    "ESZ_DIPTE_ORAN_12M": ("ESZ", "ESZ_DIPTE_SINYAL_12M / ölçülebilen gösterge sayısı.", "Göstergelerin ne kadarı dipte (0-1)."),
+    # ---- YB ----
+    "YB_YENI_OLAY_SAYISI": ("YB", "YB_*_YENI bayrağı 1 olan olay sayısı (ölçülebilen olaylar içinde).",
+                            "Müşteri için aynı anda kaç yeni sorun başladı."),
+}
+
+# RENK_Y_*: renk yolu (62 feature)
+_RENK_Y = {
+    "GECERLI_AY": ("Son 12 ayda aktif renk kodu (1-6) olan ay sayısı.",
+                   "Renk geçmişinin ne kadarı ölçülebilir; az ise diğer RENK_Y değerleri az aya dayanır."),
+    "INAKTIF_AY_12M": ("Son 12 ayda renk kodu 0 (INAKTIF) olan ay sayısı.", "Müşterinin ne kadar süre inaktif kaldığı."),
+    "AY_SON_INAKTIF": ("Müşterinin en son inaktif olduğu ay. " + _AY_NOTU, "İnaktiflik ne kadar yakın."),
+    "INAKTIFTEN_DONUS_FLG": ("Son ay (LM) aktif ve L2M..L12M arasında en az bir inaktif ay varsa 1.",
+                             "İnaktiflikten yeni dönmüş müşteri."),
+    "EN_KOTU_12M": ("Son 12 ayın en küçük renk kodu.", "12 ayda düştüğü en kötü renk."),
+    "EN_IYI_12M": ("Son 12 ayın en büyük renk kodu.", "12 ayda çıktığı en iyi renk."),
+    "ZIRVEDEN_DUSUS": ("Son 12 aydaki en iyi renk kodu eksi son ay (LM) renk kodu.",
+                       "12 aydaki en iyi halinden kaç basamak aşağıda; 0 = şu an zirvede."),
+    "DIPTEN_UZAKLIK": ("Son ay (LM) renk kodu eksi son 12 aydaki en kötü renk kodu.",
+                       "Dipten ne kadar toparlanmış; 0 = şu an 12 ayın dibinde."),
+    "NET_KOTULESME_12M": ("Son 12 aydaki en eski aktif ayın renk kodu eksi son ay (LM) renk kodu.",
+                          "12 ayda net kaç basamak düştü; pozitif = kötüleşti, negatif = iyileşti."),
+    "NET_KOTULESME_3AY": ("L3M renk kodu eksi son ay (LM) renk kodu; L3M boş / inaktifse boş.",
+                          "Son 3 aylık pencerede net değişim; pozitif = kötüleşme."),
+    "NET_KOTULESME_6AY": ("L6M renk kodu eksi son ay (LM) renk kodu; L6M boş / inaktifse boş.",
+                          "Son 6 aylık pencerede net değişim; pozitif = kötüleşme."),
+    "AY_SON_KIRMIZI": ("Rengin KIRMIZI olduğu en yeni ay. " + _AY_NOTU, "Kırmızılık ne kadar yakın; küçük = yakın."),
+    "AY_SON_RISK": ("Rengin risk (KIRMIZI / TURUNCU) olduğu en yeni ay. " + _AY_NOTU, "Risk ne kadar yakın."),
+    "AY_SON_KOTULESME": ("En yeni renk kötüleşmesinin ayı. " + _AY_NOTU + " " + _GECIS_NOTU, "Son düşüş ne kadar önce."),
+    "AY_SON_IYILESME": ("En yeni renk iyileşmesinin ayı. " + _AY_NOTU + " " + _GECIS_NOTU, "Son toparlanma ne kadar önce."),
+    "KIRMIZI_GORDU_12M": ("Son 12 ayda en az bir KIRMIZI ay varsa 1.", "Son bir yılda kırmızıya düştü mü."),
+    "MEVCUT_RENKTE_SURE": ("Son aydaki (LM) renkte LM dahil kesintisiz kaç ay kaldığı.", "Bugünkü renkte ne kadar zamandır."),
+    "RISK_SERI_SIMDI": ("Son aydan (LM) geriye kesintisiz risk renginde (KIRMIZI / TURUNCU) geçen ay sayısı.",
+                        "Müşteri kaç aydır riskte; 0 = şu an riskte değil."),
+    "RISK_EN_UZUN_SERI": ("Son 12 aydaki en uzun kesintisiz risk rengi serisi (ay).", "En uzun risk dönemi."),
+    "TEK_RISK_DONEMI_FLG": ("Son ay riskte ve 12 aydaki tüm risk ayları LM'den geriye uzanan bu tek seride ise 1.",
+                            "Müşteri bu yıl ilk kez riske girmiş (önceden başka risk dönemi yok)."),
+    "KOTULESME_SERI_SIMDI": ("Son aydan (LM) geriye kesintisiz renk düşüşü olan geçiş sayısı.", "Kaç aydır her ay düşüyor."),
+    "IYILESME_SERI_SIMDI": ("Son aydan (LM) geriye kesintisiz renk yükselişi olan geçiş sayısı.", "Kaç aydır her ay iyileşiyor."),
+    "SON_IYILESMEDEN_BERI_DUSUS": ("Son aydan geriye ilk renk iyileşmesine kadar (aynı kalan aylar dahil) düşülen basamak toplamı.",
+                                   "En son toparlanmadan bu yana ne kadar düştü."),
+    "SON_KOTULESMEDEN_BERI_YUKSELIS": ("Son aydan geriye ilk renk kötüleşmesine kadar çıkılan basamak toplamı.",
+                                       "En son düşüşten bu yana ne kadar toparlandı."),
+    "KOTULESME_ADET_6M": ("Son 6 aydaki 5 aylık geçişte rengin düştüğü geçiş sayısı.", "Yakın dönemde düşüş sıklığı."),
+    "IYILESME_ADET_6M": ("Son 6 aydaki 5 aylık geçişte rengin yükseldiği geçiş sayısı.", "Yakın dönemde toparlanma sıklığı."),
+    "KOTULESME_BASAMAK_6M": ("Son 6 aydaki düşüş geçişlerinde düşülen basamak toplamı.",
+                             "Düşüşün toplam derinliği (3'ten 1'e düşüş 2 basamak sayılır)."),
+    "IYILESME_BASAMAK_6M": ("Son 6 aydaki yükseliş geçişlerinde çıkılan basamak toplamı.", "Toparlanmanın toplam büyüklüğü."),
+    "KOTULESME_ADET_12M": ("Son 12 aydaki 11 aylık geçişte rengin düştüğü geçiş sayısı.", "Bir yıldaki düşüş sıklığı."),
+    "IYILESME_ADET_12M": ("Son 12 aydaki 11 aylık geçişte rengin yükseldiği geçiş sayısı.", "Bir yıldaki toparlanma sıklığı."),
+    "KOTULESME_BASAMAK_12M": ("Son 12 aydaki düşüş geçişlerinde düşülen basamak toplamı.", "Bir yıldaki düşüşün toplam derinliği."),
+    "IYILESME_BASAMAK_12M": ("Son 12 aydaki yükseliş geçişlerinde çıkılan basamak toplamı.",
+                             "Bir yıldaki toparlanmanın toplam büyüklüğü."),
+    "MAX_TEK_DUSUS_12M": ("Son 12 ayda tek bir aydan diğerine en büyük renk düşüşü (basamak).", "En sert tek aylık düşüş."),
+    "DEGISIM_ADET_12M": ("Son 12 ayda rengin değiştiği geçiş sayısı (yön fark etmez).", "Rengin ne kadar hareketli olduğu."),
+    "YON_DEGISIM_12M": ("Son 12 ayda renk değişimlerinin yönü kaç kez tersine döndü (aynı kalan aylar atlanır).",
+                        "İnip çıkan (zikzak) yol mu, tek yönlü mü."),
+    "KIRMIZIYA_GIRIS_12M": ("Son 12 ayda KIRMIZI olmayan bir aydan KIRMIZI'ya geçiş sayısı.", "Kaç kez kırmızıya düştü."),
+    "RISKE_GIRIS_12M": ("Son 12 ayda risk dışından (kod 3 ve üstü) riske (kod 1-2) geçiş sayısı.", "Kaç kez riske girdi."),
+    "RISKTEN_CIKIS_12M": ("Son 12 ayda riskten (kod 1-2) risk dışına geçiş sayısı.", "Kaç kez riskten çıktı."),
+    "RISKE_YENIDEN_GIRIS_12M": ("Son 12 aydaki en eski riskten çıkıştan sonra gerçekleşen riske giriş sayısı.",
+                                "Riskten çıkıp yeniden düşme (nüks)."),
+    "KIRMIZI_SERI_SIMDI": ("Son aydan (LM) geriye kesintisiz KIRMIZI ay sayısı.", "Kaç aydır kırmızı."),
+    "AY_SON_KIRMIZIYA_GIRIS": ("En yeni KIRMIZI'ya giriş geçişinin ayı. " + _AY_NOTU, "Son kırmızıya düşüş ne kadar önce."),
+    "AY_ILK_KIRMIZIYA_GIRIS": ("Son 12 aydaki en eski KIRMIZI'ya giriş geçişinin ayı. " + _AY_NOTU,
+                               "Kırmızı sorunu ne zamandan beri var."),
+    "AY_SON_KIRMIZIDAN_CIKIS": ("En yeni KIRMIZI'dan çıkış geçişinin ayı. " + _AY_NOTU, "Kırmızıdan ne kadar önce çıktı."),
+    "SON_KIRMIZI_DONEM_SURE": ("En yeni KIRMIZI dönemin kaç ay sürdüğü (kırmızı yoksa 0).", "Son kırmızılığın uzunluğu."),
+    "AY_SON_RISKE_GIRIS": ("En yeni riske giriş geçişinin ayı. " + _AY_NOTU, "Son riske düşüş ne kadar önce."),
+    "AY_SON_RISKTEN_CIKIS": ("En yeni riskten çıkış geçişinin ayı. " + _AY_NOTU, "Riskten ne kadar önce çıktı."),
+    "SON_RISK_DONEM_SURE": ("En yeni risk döneminin kaç ay sürdüğü (risk yoksa 0).", "Son risk döneminin uzunluğu."),
+    "KIRMIZI_SONRASI_EN_IYI": ("En yeni KIRMIZI aydan sonraki (daha yeni) aylardaki en iyi renk kodu; son kırmızı LM ise boş.",
+                               "Kırmızıdan sonra nereye kadar toparlandı."),
+    "KIRMIZI_SONRASI_GERI_DUSUS": ("RENK_Y_KIRMIZI_SONRASI_EN_IYI eksi son ay (LM) renk kodu.",
+                                   "Kırmızıdan sonra toparlanıp yeniden düştü mü; 0 = toparlanmayı koruyor."),
+    "RISK_SONRASI_EN_IYI": ("En yeni risk renkli aydan sonraki (daha yeni) aylardaki en iyi renk kodu; son risk ayı LM ise boş.",
+                            "Riskten sonra nereye kadar toparlandı."),
+    "RISK_SONRASI_GERI_DUSUS": ("RENK_Y_RISK_SONRASI_EN_IYI eksi son ay (LM) renk kodu.",
+                                "Riskten sonra toparlanıp yeniden düştü mü; 0 = toparlanmayı koruyor."),
+    "SON_HAREKET": ("En yeni renk değişiminin yönü: +1 kötüleşme, -1 iyileşme, hiç değişim yoksa 0.",
+                    "Son hareket düşüş mü toparlanma mı."),
+    "ONCEKI_HAREKET": ("Son renk değişiminden bir önceki değişimin yönü (+1 kötüleşme, -1 iyileşme, yoksa 0).",
+                       "Son hareketten önceki eğilim."),
+    "AY_SON_HAREKET": ("En yeni renk değişiminin ayı; değişim yoksa boş. " + _AY_NOTU, "Renk en son ne zaman değişti."),
+    "SON_HAREKET_BASAMAK": ("En yeni renk değişiminin büyüklüğü (basamak).", "Son hareketin sertliği."),
+    "NUKS_FLG": ("Son hareket kötüleşme (+1) ve ondan önceki hareket iyileşme (-1) ise 1; aktif ay 3'ten azsa boş.",
+                 "Toparlanıp yeniden kötüleşti (nüks)."),
+    "TOPARLANMA_FLG": ("Son hareket iyileşme (-1) ve ondan önceki hareket kötüleşme (+1) ise 1; aktif ay 3'ten azsa boş.",
+                       "Kötüleşmeden sonra toparlanma başladı."),
+    "ART_ARDA_KOTULESME_FLG": ("Son iki renk değişiminin ikisi de kötüleşme ise 1; aktif ay 3'ten azsa boş.",
+                               "Üst üste iki düşüş."),
+    "ART_ARDA_IYILESME_FLG": ("Son iki renk değişiminin ikisi de iyileşme ise 1; aktif ay 3'ten azsa boş.",
+                              "Üst üste iki toparlanma."),
+    "KOTULESME_HIZLANMA": ("(4-6. aylar renk ortalaması - son 3 ay renk ortalaması) - "
+                           "(7-12. aylar renk ortalaması - 4-6. aylar renk ortalaması).",
+                           "Son dönemdeki düşüş önceki dönemdeki düşüşten büyük mü; pozitif = düşüş hızlanıyor."),
+    "EGIM_6M": ("Son 6 ayın renk kodlarına çizilen en küçük kareler doğrusunun eğimi (basamak / ay); en az 3 aktif ay gerekir.",
+                "Negatif = zamanla düşüş; -0.5 = ayda yarım basamak düşüş."),
+    "EGIM_12M": ("Son 12 ayın renk kodlarına çizilen en küçük kareler doğrusunun eğimi (basamak / ay); en az 3 aktif ay gerekir.",
+                 "Negatif = zamanla düşüş; -0.5 = ayda yarım basamak düşüş."),
+}
+
+# <seri>_D_*: seri hareketi. Seri → (ad, kötü yön: -1 düşüş kötü, +1 artış kötü)
+_SERI_D = {                   # seri → (ad, kötü yön: -1 düşüş kötü, +1 artış kötü, not)
+    "DAV": ("davranış skoru", -1, ""), "MMS": ("MMS", +1, ""),
+    "KKB": ("KKB skoru", -1, " KKB skoru 0 olan ay boş sayılır."),
+    "ODM": ("kart ödeme oranı", -1, ""),
+    "KKU": ("kart kullanım oranı", +1, " Kart kullanım oranı = kart bakiyesi / kart limiti."),
+}
+
+
+def _seri_d(seri, son):
+    ad, kotu, notu = _SERI_D[seri]
+    r = _seri_d_ham(seri, son, ad, kotu)
+    return (r[0] + notu, r[1]) if r else None
+
+
+def _seri_d_ham(seri, son, ad, kotu):
+    kotu_yon = "düşüş kötü" if kotu < 0 else "artış kötü"
+    m = re.match(r"^EGIM_(3|6|12)M$", son)
+    if m:
+        return (f"Son {m.group(1)} ayın {ad} değerlerine çizilen en küçük kareler doğrusunun eğimi (birim / ay); "
+                "en az 3 dolu ay gerekir.", f"Pozitif = zamanla artış, negatif = azalış; {ad} için {kotu_yon}.")
+    tablo = {
+        "GECERLI_AY": (f"Son 12 ayda {ad} dolu olan ay sayısı.", f"Diğer {seri}_D değerlerinin kaç aya dayandığı."),
+        "IVME": (f"{_bas(ad)}: (son 3 ay ort. - 4-6. aylar ort.) - (4-6. aylar ort. - 7-9. aylar ort.).",
+                 "Değişim hızlanıyor mu; " + ("negatif = düşüş hızlanıyor." if kotu < 0 else "pozitif = artış hızlanıyor.")),
+        "ARTIS_SERI": (f"Son aydan (LM) geriye {ad} değerinin kesintisiz arttığı geçiş sayısı.", "Kaç aydır her ay artıyor."),
+        "AZALIS_SERI": (f"Son aydan (LM) geriye {ad} değerinin kesintisiz azaldığı geçiş sayısı.", "Kaç aydır her ay azalıyor."),
+        "ARTIS_ADET_12M": (f"Son 12 aydaki 11 aylık geçişte {ad} değerinin arttığı geçiş sayısı.", "Bir yılda kaç kez arttı."),
+        "AZALIS_ADET_12M": (f"Son 12 aydaki 11 aylık geçişte {ad} değerinin azaldığı geçiş sayısı.", "Bir yılda kaç kez azaldı."),
+        "MAX_AYLIK_ARTIS": (f"Son 12 ayda tek bir aydan diğerine {ad} değerindeki en büyük artış (yoksa 0).",
+                            "En sert aylık artış."),
+        "MAX_AYLIK_AZALIS": (f"Son 12 ayda tek bir aydan diğerine {ad} değerindeki en büyük azalış (yoksa 0).",
+                             "En sert aylık azalış."),
+        "YON_DEGISIM_12M": (f"Son 12 ayda {ad} değerinde artış ile azalış arasında yön kaç kez tersine döndü "
+                            "(sabit aylar atlanır).", "Seri zikzak mı tek yönlü mü."),
+        "ZSKOR_LM": (f"(Son ay {ad} - L2M..L12M ortalaması) / L2M..L12M standart sapması; en az 3 geçmiş ay ve std > 0.",
+                     "Son ay müşterinin kendi geçmişine göre ne kadar sıra dışı; -2 altı = alışılmadık düşük, "
+                     "+2 üstü = alışılmadık yüksek."),
+        "ZIRVEDEN_FARK": (f"Son 12 aydaki en yüksek {ad} eksi son ay (LM) değeri.", "Zirvenin ne kadar altında."),
+        "DIPTEN_FARK": (f"Son ay (LM) {ad} eksi son 12 aydaki en düşük değer.", "Dibin ne kadar üstünde; 0 = şu an dipte."),
+        "AY_SON_ZIRVE": (f"Son 12 ayda en yüksek {ad} değerinin görüldüğü en yeni ay. " + _AY_NOTU, "Zirve ne kadar önceydi."),
+        "AY_SON_DIP": (f"Son 12 ayda en düşük {ad} değerinin görüldüğü en yeni ay. " + _AY_NOTU,
+                       "Dip ne kadar önceydi; 0 = dip bu ay."),
+    }
+    return tablo.get(son)
+
+
+_ESZ_GOSTERGE = {"RENK": "renk", "ODEME": "ödeme oranı", "KKB": "KKB skoru", "KKU": "kart kullanımı",
+                 "DAV": "davranış skoru", "MMS": "MMS"}
+_KK_ESIK = {"80": "0.8", "90": "0.9", "100": "1.0"}
+
+_YB_OLAY = {
+    "RISK": "rengin risk (KIRMIZI / TURUNCU) olduğu ay",
+    "KIRMIZI": "rengin KIRMIZI olduğu ay",
+    "RENK_KOTULESME": "rengin bir önceki aya göre kötüleştiği geçiş",
+    "KKU_90": "kart kullanımının >= 0.9 olduğu ay",
+    "KKU_ASIM": "kart kullanımının >= 1.0 olduğu ay (limit aşımı)",
+    "DUSUK_ODEME": "kart ödeme oranının %20'nin altında olduğu ay",
+    "LIMIT_DUSUS": "kart limitinin bir önceki aya göre düştüğü geçiş",
+    "KKB_SKOR_BOZULMA": "KKB skorunun bir önceki aya göre düştüğü geçiş",
+    "KK_ODEME_ORANI_BOZULMA": "kart ödeme oranının bir önceki aya göre düştüğü geçiş",
+    "KK_KULLANIM_BOZULMA": "kart kullanımının bir önceki aya göre arttığı geçiş",
+    "DAV_SKOR_BOZULMA": "davranış skorunun bir önceki aya göre düştüğü geçiş",
+    "MMS_BOZULMA": "MMS'in bir önceki aya göre arttığı geçiş",
+}
+_YB_DIP = {"KKB_SKOR": ("KKB skoru", "en düşük"), "KK_ODEME_ORANI": ("kart ödeme oranı", "en düşük"),
+           "KK_KULLANIM": ("kart kullanımı", "en yüksek"), "DAV_SKOR": ("davranış skoru", "en düşük"),
+           "MMS": ("MMS", "en yüksek")}
+_YB_NAN = "Son 3 ayda hiç ölçüm yoksa ya da geçmişte 3'ten az ölçülebilir ay varsa boş."
+
+_OG_SERI = {"KKB": "KKB skoru", "ODM": "kart ödeme oranı", "KKU": "kart kullanımı", "DAV": "davranış skoru", "MMS": "MMS"}
+
+_DS_CARPAN = {
+    "RENK_LM": "son ay renk kodu (inaktifse boş)",
+    "NUKS": "RENK_Y_NUKS_FLG (toparlanıp yeniden kötüleşme bayrağı)",
+    "ARTARDA_KOT": "RENK_Y_ART_ARDA_KOTULESME_FLG (üst üste iki renk düşüşü)",
+    "DUSUS": "RENK_Y_SON_IYILESMEDEN_BERI_DUSUS (son toparlanmadan bu yana düşülen basamak)",
+    "RISK_SERI": "RENK_Y_RISK_SERI_SIMDI (kaç aydır risk renginde)",
+    "GIZLI_3M": "GIZLI_KOTULESEN_SINYAL_3M (renk bozulmadan bozulan gösterge sayısı)",
+    "ESZ_3M": "ESZ_KOTULESEN_SINYAL_3M (son 3 ayda birlikte bozulan gösterge sayısı)",
+}
+_DS_PAYDA = {"KK_RISK": "son ay kart bakiyesi (KK_RISK_LM)", "KK_LIMIT": "son ay kart limiti (KK_LIMIT_LM)",
+             "TAUM": "son 3 ay ortalama TAUM tutarı (TAUM_TUT_AVG_3M)"}
+
+_DSN_DESEN = {
+    "RENK3": "son 3 ayın renk kodları (LM|L2M|L3M; 0 = inaktif, X = boş)",
+    "RENK_HAREKET5": "LM..L6M arasındaki 5 aylık renk hareketi (+ yükseldi, - düştü, 0 aynı, X boş)",
+    "KKU3": "son 3 ayın kart kullanım dilimleri (a < 0.3, b 0.3-0.8, c 0.8-0.9, d >= 0.9, X boş)",
+    "ODM3": "son 3 ayın ödeme oranı dilimleri (a < %20, b %20-100, c >= %100, X boş)",
+    "RENK_KKU_ODM_LM": "son ayın renk kodu | kullanım dilimi | ödeme dilimi",
+}
+
+_PENCERE_ADI = {"LM": "son ay", "L3M": "son 3 ay", "L6M": "son 6 ay", "L9M": "son 9 ay", "L12M": "son 12 ay"}
+_INT_AILE_ACIKLAMA = {}      # INT ailesi → açıklama; Degiskenler sheet'inden doldurulur (aşağıda)
+_HAM_ACIKLAMA = {}           # ham kolon → açıklama; Degiskenler sheet'inden doldurulur
+
+
+def _ham_ad(kolon):
+    """Ham kolonun Degiskenler'deki açıklaması (yoksa kolon adı)."""
+    a = _HAM_ACIKLAMA.get(kolon)
+    return f"{kolon} ({a})" if a else kolon
+
+
+def _aciklama(ad):
+    """(aile, açıklama, anlamı) ya da None."""
+    if ad in _SABIT:
+        aile, a, b = _SABIT[ad]
+        return _AILE_ADI[aile], a, b
+
+    # Pencere özetleri: <önek>_<AVG|STD|MIN|MAX|MED>_<pencere>
+    m = re.match(r"^(RENK|DAV|MMS|KKB_SKOR|ODM|KK_LIMIT|KK_RISK|KK_LKO)_(AVG|STD|MIN|MAX|MED)_(L3M|L6M|L12M|L4_6M|L6_9M)$", ad)
+    if m:
+        on, ist, w = m.groups()
+        dad, _, notu = _DEGISKEN[on]
+        p_ad, p_ay = _PENCERE[w]
+        return (_AILE_ADI[on], f"{p_ad} {p_ay} {_ISTAT[ist].format(ad=dad)}." + (f" {notu}" if notu else ""),
+                _ozet_anlam(on, ist))
+
+    m = re.match(r"^(RENK|DAV|MMS|KKB_SKOR|ODM|KK_LIMIT|KK_RISK|KK_LKO)_(TREND_3_46|TREND_6_712|TREND_6_79|DELTA_1_2)$", ad)
+    if m:
+        on, tip = m.groups()
+        dad, yon, _ = _DEGISKEN[on]
+        if tip == "TREND_3_46":
+            a = f"Son 3 ay {dad} ortalaması eksi 4-6. aylar (L4M..L6M) ortalaması."
+        elif tip == "TREND_6_712":
+            a = f"Son 6 ay {dad} ortalaması eksi 7-12. aylar (L7M..L12M) ortalaması."
+        elif tip == "TREND_6_79":
+            a = f"Son 6 ay {dad} ortalaması eksi 7-9. aylar (L7M..L9M) ortalaması."
+        else:
+            a = f"Son ay (LM) {dad} eksi bir önceki ay (L2M) değeri."
+        if on == "RENK":
+            b = ("Pozitif = renk iyileşmiş (kaç basamak), negatif = kötüleşmiş." if tip == "DELTA_1_2"
+                 else "Negatif = yakın dönemde renk kötüleşmiş, pozitif = iyileşmiş.")
+        else:
+            b = _yon_metni(yon)
+        return _AILE_ADI[on], a, b
+
+    m = re.match(r"^KK_(LIMIT|RISK|LKO)_(DELTA_PCT_LM_L2M|INC_LM_L2M_FLG|DEC_LM_L2M_FLG|LM_TO_AVG_L3M)$", ad)
+    if m:
+        on, tip = "KK_" + m.group(1), m.group(2)
+        dad = _DEGISKEN[on][0]
+        a = {"DELTA_PCT_LM_L2M": (f"(Son ay {dad} - L2M değeri) / L2M değeri; L2M 0 / boşsa -99.",
+                                  "Son ayki oransal değişim."),
+             "INC_LM_L2M_FLG": (f"Son ay (LM) {dad} bir önceki aydan (L2M) büyükse 1; iki aydan biri boşsa boş.",
+                                "Son ayda arttı mı."),
+             "DEC_LM_L2M_FLG": (f"Son ay (LM) {dad} bir önceki aydan (L2M) küçükse 1; iki aydan biri boşsa boş.",
+                                "Son ayda azaldı mı."),
+             "LM_TO_AVG_L3M": (f"Son ay (LM) {dad} / son 3 ay ortalaması; payda 0 / boşsa -99.",
+                               "1 üstü = bugünkü değer son 3 ay ortalamasının üstünde.")}[tip]
+        return _AILE_ADI[on], a[0], a[1]
+
+    m = re.match(r"^KK_LKO_(LM|L\d{1,2}M)$", ad)
+    if m:
+        return (_AILE_ADI["KK_LKO"], f"{_bas(_ay_adi(m.group(1)))} kart kullanım oranı: kart bakiyesi / kart limiti "
+                f"(KK_RISK_{m.group(1)} / KK_LIMIT_{m.group(1)}); limit 0 / boşsa boş.",
+                "O ay limitin ne kadarı kullanılmış; 1 = limit dolu, 1 üstü = limit aşılmış.")
+
+    m = re.match(r"^RENK_CNT_(.+)$", ad)
+    if m and m.group(1) in _RENK_ADLARI:
+        return (_AILE_ADI["RENK"], f"Son 12 ayda rengi {_RENK_ADLARI[m.group(1)]} olan ay sayısı.",
+                "Müşterinin 12 ayının renk dağılımı.")
+
+    if ad.startswith("RENK_Y_") and ad[7:] in _RENK_Y:
+        a, b = _RENK_Y[ad[7:]]
+        return _AILE_ADI["RENK_Y"], a, b
+
+    m = re.match(r"^(DAV|MMS|KKB|ODM|KKU)_D_(.+)$", ad)
+    if m:
+        r = _seri_d(m.group(1), m.group(2))
+        if r:
+            return _AILE_ADI["D"], r[0], r[1]
+
+    m = re.match(r"^ESZ_(KOTULESEN_SINYAL|OLCULEN_SINYAL|KOTULESEN_ORAN)_(3|6)M$", ad)
+    if m:
+        tip, n = m.groups()
+        bas = f"Son ay (LM) ile L{n}M karşılaştırması"
+        g = "renk, KKB, ödeme oranı, kart kullanımı, DAV, MMS"
+        a = {"KOTULESEN_SINYAL": (f"{bas}: kötü yöne giden gösterge sayısı ({g}; 0-6); hiç gösterge ölçülemezse boş.",
+                                  "Aynı anda kaç cephede bozulma var."),
+             "OLCULEN_SINYAL": (f"{bas}: iki ayı da dolu olan gösterge sayısı.", "Bozulma sayımının kaç göstergeye dayandığı."),
+             "KOTULESEN_ORAN": (f"ESZ_KOTULESEN_SINYAL_{n}M / ESZ_OLCULEN_SINYAL_{n}M.",
+                                "Ölçülen göstergelerin ne kadarı bozuldu (0-1).")}[tip]
+        return _AILE_ADI["ESZ"], a[0], a[1]
+    m = re.match(r"^ESZ_([A-Z]+)_([A-Z]+)_KOTU_3M$", ad)
+    if m and m.group(1) in _ESZ_GOSTERGE and m.group(2) in _ESZ_GOSTERGE:
+        x, y = _ESZ_GOSTERGE[m.group(1)], _ESZ_GOSTERGE[m.group(2)]
+        return (_AILE_ADI["ESZ"], f"{_bas(x)} ve {y} son ay (LM) ile L3M arasında ikisi birlikte kötüleştiyse 1, "
+                "değilse 0; biri ölçülemezse boş.", f"İki sinyalin aynı anda bozulması ({x} + {y}).")
+
+    m = re.match(r"^GIZLI_(KOTULESEN_SINYAL|KOTULESME_FLG|KOTULESME_GORELI)_(3|6)M$", ad)
+    if m:
+        tip, n = m.groups()
+        on = f"Renk son ay (LM) ile L{n}M arasında kötüleşmemişken"
+        son = " Renk kötüleştiyse 0, renk ölçülemezse boş."
+        g5 = "diğer 5 göstergeden (KKB, ödeme oranı, kart kullanımı, DAV, MMS)"
+        a = {"KOTULESEN_SINYAL": (f"{on} {g5} kötüleşenlerin sayısı." + son,
+                                  "Renk iyi görünürken alttan gelen bozulma; renk düşüşünden önceki uyarı."),
+             "KOTULESME_FLG": (f"{on} {g5} en az biri kötüleştiyse 1." + son, "Gizli bozulma var mı."),
+             "KOTULESME_GORELI": (f"{on} {g5} kötüleşenlerin göreli değişimleri toplamı: |LM - L{n}M| / |L{n}M|." + son,
+                                  "Gizli bozulmanın büyüklüğü; sayımdan farklı olarak bozulmanın ne kadar sert olduğunu "
+                                  "da gösterir.")}[tip]
+        return _AILE_ADI["GIZLI"], a[0], a[1]
+
+    m = re.match(r"^(INT_.+)_INTD_(LM|L3M|L6M|L9M|L12M)_(L3M|L6M|L9M|L12M)$", ad)
+    if m:
+        aile, y, u = m.groups()
+        ia = _INT_AILE_ACIKLAMA.get(aile)
+        ne = f"{aile} ({ia})" if ia else aile
+        return (_AILE_ADI["INT"], f"{ne}: {_PENCERE_ADI[y]} penceresi değeri / {_PENCERE_ADI[u]} penceresi değeri "
+                f"({aile}_{y} / {aile}_{u}); payda 0 veya altı / boşsa boş.",
+                "Pencereler kümülatifse: 1'e yakın = hareketin çoğu yakın dönemde; 0'a yakın = yakın dönemde hareket yok.")
+    m = re.match(r"^(INT_.+)_INTD_DURDU_FLG$", ad)
+    if m:
+        aile = m.group(1)
+        ia = _INT_AILE_ACIKLAMA.get(aile)
+        ne = f"{aile} ({ia})" if ia else aile
+        return (_AILE_ADI["INT"], f"{ne}: en yakın pencere 0 ve daha uzak pencerelerden en az biri 0'dan büyükse 1; "
+                "ölçülemezse boş.", "Önceden olan aktivite son dönemde durdu.")
+
+    m = re.match(r"^KK_O_(KULLANIM_(80|90|100)_USTU_ADET_(12|3)M|AY_SON_KULLANIM_(80|90|100)_USTU|KULLANIM_(80|90|100)_USTU_SERI)$", ad)
+    if m:
+        esik = _KK_ESIK[m.group(2) or m.group(4) or m.group(5)]
+        if m.group(2):
+            n = m.group(3)
+            return (_AILE_ADI["KK_O"], f"Son {n} ayda kart kullanımının (bakiye / limit) {esik} ve üstünde olduğu ay sayısı.",
+                    "Limite ne sık dayanıyor." if n == "12" else "Yakın dönemde limite dayanma.")
+        if m.group(4):
+            return (_AILE_ADI["KK_O"], f"Kart kullanımının {esik} ve üstünde olduğu en yeni ay. " + _AY_NOTU,
+                    "Ne kadar önce eşik üstündeydi.")
+        return (_AILE_ADI["KK_O"], f"Son aydan (LM) geriye kesintisiz kart kullanımı {esik} ve üstü olan ay sayısı.",
+                "Kaç aydır limite dayalı.")
+
+    m = re.match(r"^OK_DUSUK_ODEME_YUKSEK_KULLANIM_ADET_(3|6|12)M$", ad)
+    if m:
+        return (_AILE_ADI["OK"], f"Son {m.group(1)} ayda \"borç sarmalı\" ayı sayısı (aynı ayda ödeme oranı < %20 ve "
+                "kart kullanımı >= 0.8).", "Az ödeyip limite dayanma sıklığı.")
+
+    m = re.match(r"^YB_(.+)_(YENI|TEKRAR)$", ad)
+    if m and m.group(1) in _YB_OLAY:
+        olay = _YB_OLAY[m.group(1)]
+        if m.group(2) == "YENI":
+            return (_AILE_ADI["YB"], f"Olay: {olay}. Olay son 3 ayda (LM..L3M) var, L4M..L12M'de hiç yoksa 1, değilse 0. "
+                    + _YB_NAN, "Olay müşteri için yeni mi başladı (ilk kez).")
+        return (_AILE_ADI["YB"], f"Olay: {olay}. Olay hem son 3 ayda (LM..L3M) hem L4M..L12M'de varsa 1, değilse 0. "
+                + _YB_NAN, "Olay müşteride daha önce de görülmüş (tekrar).")
+    m = re.match(r"^YB_(.+)_YENI_DIP$", ad)
+    if m and m.group(1) in _YB_DIP:
+        s, kotu = _YB_DIP[m.group(1)]
+        return (_AILE_ADI["YB"], f"Son ay (LM) {s} değeri önceki 11 ayın en kötü ({kotu}) değerinden de kötüyse 1; "
+                "önceki ayların en az 3'ü dolu olmalı.", "Gösterge müşteri için yeni bir dip yaptı.")
+
+    m = re.match(r"^OG_(KKB|ODM|KKU|DAV|MMS)_(ONCE_BOZULMA_ADET|ONCU_AY|DESEN_TEKRARI)$", ad)
+    if m:
+        s = _OG_SERI[m.group(1)]
+        nan = " Renk 12 ayda hiç kötüleşmediyse boş."
+        a = {"ONCE_BOZULMA_ADET": (f"Müşterinin en son renk kötüleşmesinden önceki 3 aylık geçişte {s} değerinin kötü yöne "
+                                   "gittiği geçiş sayısı (0-3)." + nan,
+                                   "Renk düşmeden önce bu gösterge uyarı vermiş mi; 3 = her ay uyarmış."),
+             "ONCU_AY": (f"Son renk düşüşüne en yakın {s} bozulması kaç geçiş önceydi (1-3); bozulma yoksa boş." + nan,
+                         "Gösterge renkten kaç ay önce sinyal veriyor."),
+             "DESEN_TEKRARI": (f"OG_{m.group(1)}_ONCE_BOZULMA_ADET > 0, son 2 geçişte {s} yine kötü yöne gitti ve renk son 2 "
+                               "geçişte kötüleşmedi ise 1." + nan,
+                               "Geçen sefer renk düşüşünden önce görülen sinyal şimdi yine var, ama renk henüz düşmedi.")}[m.group(2)]
+        return _AILE_ADI["OG"], a[0], a[1]
+
+    m = re.match(r"^DS_EXPECTED_LOSS_(KK_RISK|KK_LIMIT|TAUM)_ORAN$", ad)
+    if m:
+        return (_AILE_ADI["DS"], f"{_ham_ad('EXPECTED_LOSS')} / {_DS_PAYDA[m.group(1)]}; payda 0 veya altı / boşsa boş.",
+                "Beklenen kaybın borca / limite / varlığa oranı.")
+    m = re.match(r"^DS_(.+)_X_(RENK_LM|NUKS|ARTARDA_KOT|DUSUS|RISK_SERI|GIZLI_3M|ESZ_3M)$", ad)
+    if m:
+        skor, k = m.groups()
+        if k == "RENK_LM":
+            anlam = ("Hazır skoru son ay renk koduyla tek değerde birleştirir; aynı skorda renk kodu küçükse "
+                     "(kötü renk) değer de küçük.")
+        else:
+            anlam = ("Hazır skoru müşterinin renk yolu durumuyla birleştirir; bayrak / sayaç 0 ise değer 0, "
+                     "sayaç büyüdükçe skorun ağırlığı artar.")
+        return _AILE_ADI["DS"], f"Hazır skor {_ham_ad(skor)} x {_DS_CARPAN[k]}.", anlam
+
+    m = re.match(r"^DSN_(RENK3|RENK_HAREKET5|KKU3|ODM3|RENK_KKU_ODM_LM)_(KOT_ORAN|PAY)$", ad)
+    if m:
+        d, tip = m.groups()
+        if tip == "KOT_ORAN":
+            return (_AILE_ADI["DSN"], f"Pipeline'da üretilir. Müşterinin bugünkü deseni: {_DSN_DESEN[d]}. Değer: train'de aynı "
+                    "desende olan müşterilerin rengi bir sonraki ay kötüleşen payı (LM rengi L2M'den kötü); 100'den az "
+                    "müşterili desenler tek bir \"nadir\" grupta birleşir. Hedef (TARGET) kullanılmaz.",
+                    "Yüksek = bu desen genelde renk düşüşüyle devam ediyor.")
+        return (_AILE_ADI["DSN"], f"Pipeline'da üretilir. Müşterinin bugünkü deseninin ({_DSN_DESEN[d]}) train tablosundaki payı: "
+                "desendeki müşteri / tablodaki tüm müşteri; train'de görülmemiş desen 0.",
+                "Desen ne kadar yaygın; küçük pay = aynı desenin KOT_ORAN değeri az gözleme dayanır.")
+    return None
+
+
+DSN_FEATURELARI = [f"DSN_{d}_{t}" for d in _DSN_DESEN for t in ("KOT_ORAN", "PAY")]
+
+OKUMA_NOTLARI = [
+    ("Aylar", "LM = model ayından 1 ay önce (en yeni ay), L2M = 2 ay önce ... L12M = 12 ay önce."),
+    ("Pencereler", "L3M / L6M / L12M = LM dahil son 3 / 6 / 12 ay. 4_6 veya L4_6M = L4M..L6M, 7_12 = L7M..L12M, "
+                   "6_9 = L6M..L9M."),
+    ("_TREND_", "Yakın pencere ortalaması eksi uzak pencere ortalaması (ör. TREND_3_46 = son 3 ay ort. - 4-6. aylar ort.)."),
+    ("_DELTA_1_2 / _DELTA_1_3", "Son ay değeri eksi L2M / L3M değeri."),
+    ("AY_*", _AY_NOTU + " " + _GECIS_NOTU),
+    ("_ADET", "Sayım (kaç ay / kaç geçiş)."),
+    ("_SERI / _SERI_SIMDI", "Son aydan (LM) geriye kesintisiz ay / geçiş sayısı; 0 = son ayda o durum yok."),
+    ("_FLG", "0/1 bayrak; ölçülemiyorsa boş."),
+    ("Geçiş", "Bir aydan sonraki aya değişim; 12 ayda 11 geçiş var."),
+    ("Renk kodları", "Küçük = kötü: 1 KIRMIZI, 2 TURUNCU, 3 SARI, 4 ACK_YESIL, 5 YESIL, 6 KOY_YESIL. 0 = INAKTIF, renk sayılmaz. "
+                     "Risk rengi = KIRMIZI veya TURUNCU."),
+    ("Yön", "Renk, KKB, DAV ve ödeme oranında düşüş kötü; MMS ve kart kullanımında (KKU = KK_RISK / KK_LIMIT) artış kötü."),
+    ("Eksik değer", "Ölçülemeyen değer boş kalır; oranlar 12'ye değil geçerli ay sayısına bölünür. Eski ailelerde (RENK, DAV, MMS, "
+                    "KKB_SKOR, ODM, KK, oranlar) geçersiz bölme -99; yeni ailelerde boş."),
+    ("Kaynak", "Üretilen değişkenler her müşterinin yalnızca kendi geçmişinden sabit kurallarla hesaplanır; hedef (TARGET) "
+               "kullanılmaz. Tek istisna DSN_* desen kodlaması: train'deki gerçek müşterilerden kurulan bir tablodan okunur, "
+               "o da hedefi değil bir sonraki aydaki renk değişimini kullanır."),
+]
+
+
+# ==================================================================
+# 2) MEVCUT AÇIKLAMA DOSYASI
+# ==================================================================
+_log("Başladı")
+with mf.get_download_stream(ACIKLAMA_DOSYASI) as s:
+    _orijinal_bayt = s.read()
+_ham_df = pd.read_excel(BytesIO(_orijinal_bayt), sheet_name=HAM_SHEET)
+_ham_df.columns = [str(c).strip() for c in _ham_df.columns]
+_alan_k = next((c for c in _ham_df.columns if c.upper() == "ALAN"), _ham_df.columns[0])
+_acik_k = next((c for c in _ham_df.columns if c.upper().startswith("AÇIKLAMA") or c.upper().startswith("ACIKLAMA")),
+               _ham_df.columns[1])
+for _a, _b in zip(_ham_df[_alan_k], _ham_df[_acik_k]):
+    if pd.notna(_a) and str(_a).strip():
+        _HAM_ACIKLAMA[str(_a).strip()] = (str(_b).strip() if pd.notna(_b) else "")
+_log(f"{HAM_SHEET}: {len(_HAM_ACIKLAMA):,} ham değişken açıklaması okundu")
+
+# INT ailelerinin açıklaması: aynı ailenin bir pencere kolonunun açıklamasından pencere ifadesi atılır
+# (ör. INT_SDM_BSVR_ADT_L3M "Başvuru Sayısı Akbank Dâhil Tüm Krediler Son 3 Ay" → "... Tüm Krediler")
+for _k, _v in _HAM_ACIKLAMA.items():
+    _m = re.match(r"^(INT_.+)_(LM|L3M|L6M|L9M|L12M)$", _k)
+    if _m and _v and _m.group(1) not in _INT_AILE_ACIKLAMA:
+        _INT_AILE_ACIKLAMA[_m.group(1)] = re.sub(r"\s*Son\s*\d*\s*Ay\s*$", "", _v, flags=re.I).strip()
+
+
+# ==================================================================
+# 3) ÜRETİLEN DEĞİŞKEN LİSTESİ (FE bir örnek üzerinde çalıştırılır)
+# ------------------------------------------------------------------
+# Pipeline'daki gibi FE'ye yalnızca ham kolonlar verilir; böylece veride hangi INT / hazır skor
+# kolonları varsa onların feature'ları da listeye girer. FE yoksa yalnızca modeldekiler kullanılır.
+# ==================================================================
+_fe_liste, _fe_not = [], ""
+if "feature_engineering" in globals():
+    _kaynak = globals().get("df", globals().get("df_raw"))
+    if _kaynak is not None:
+        _sizinti = set(globals().get("LEAK_COLS", [])) | {"TARGET", "MBB_NO", "DONEM", "TARIH"}
+        if "RAW_FEATURES" in globals():
+            _ham_kol = [c for c in dict.fromkeys(RAW_FEATURES) if c in _kaynak.columns and c not in _sizinti]
+        elif "df_raw" in globals():
+            _ham_kol = [c for c in _kaynak.columns if c in df_raw.columns and c not in _sizinti]
+        else:
+            _ham_kol = [c for c in _kaynak.columns if c not in _sizinti]
+        try:
+            _, _fe_liste = feature_engineering(_kaynak[_ham_kol].head(FE_ORNEK_N).copy())
+            _log(f"Feature engineering {min(FE_ORNEK_N, len(_kaynak)):,} satırda çalıştı: {len(_fe_liste):,} üretilen değişken")
+        except Exception as e:
+            _fe_not = f"feature_engineering çalışmadı ({type(e).__name__}: {str(e)[:150]})"
+    else:
+        _fe_not = "df / df_raw bellekte yok"
+else:
+    _fe_not = "feature_engineering hücresi çalıştırılmamış"
+if _fe_not:
+    _log(f"⚠ {_fe_not}; üretilen değişken listesi yalnızca modele girenlerden kurulacak")
+
+
+# ==================================================================
+# 4) MODELLERE GİREN FEATURE'LAR (ana klasördeki model klasörleri, ARSIV hariç)
 # ==================================================================
 def _cocuklar(yol):
     det = mf.get_path_details(yol) or {}
@@ -96,8 +731,7 @@ def _cocuklar(yol):
 def _alt_klasorler():
     kl = sorted(c["name"] for c in _cocuklar("/") if c.get("directory"))
     if not kl:
-        kl = sorted({p.strip("/").split("/")[0]
-                     for p in mf.list_paths_in_partition() if "/" in p.strip("/")})
+        kl = sorted({p.strip("/").split("/")[0] for p in mf.list_paths_in_partition() if "/" in p.strip("/")})
     return kl
 
 
@@ -105,398 +739,156 @@ def _dosyalar(klasor):
     ad = [c["name"] for c in _cocuklar("/" + klasor) if not c.get("directory")]
     if not ad:
         on = "/" + klasor + "/"
-        ad = [p[len(on):] for p in mf.list_paths_in_partition()
-              if p.startswith(on) and "/" not in p[len(on):]]
+        ad = [p[len(on):] for p in mf.list_paths_in_partition() if p.startswith(on) and "/" not in p[len(on):]]
     return sorted(ad)
 
 
-def _model_klasorleri():
-    """Ana klasördeki model klasörleri (ARSIV hariç); hedef sırası (NO:1 → NO:5), vade ve OOT'a göre.
-    Dönen: [{'klasor', 'vade', 'aile', 'oot'}, ...]"""
-    haric = {h.upper() for h in HARIC_KLASORLER}
-    bulunan, taninmayan = [], []
-    for ad in _alt_klasorler():
-        if ad.upper() in haric:
+_haric = {h.upper() for h in HARIC_KLASORLER}
+_klasorler = [k for k in _alt_klasorler() if k.upper() not in _haric and KLASOR_RE.match(k)]
+_kullanim = []
+for _kl in _klasorler:
+    for _ad in _dosyalar(_kl):
+        _m = FEATURE_DOSYA_RE.match(_ad)
+        if not _m:
             continue
-        m = KLASOR_RE.match(ad)
-        if not m:
-            taninmayan.append(ad)
-            continue
-        bulunan.append({"klasor": ad, "vade": int(m.group(1)), "aile": m.group(2),
-                        "oot": int(m.group(3))})
-    if taninmayan:
-        _log(f"ⓘ Adı tanınmayan klasör (okunmadı): {taninmayan}")
-    _sira = list(HEDEF_AILELERI)
-    return sorted(bulunan, key=lambda k: (_sira.index(k["aile"]), k["vade"], k["oot"]))
-
-
-def _sheet_adi(m, kullanilan):
-    """Excel sheet adı en fazla 31 karakter ve benzersiz olmalı.
-    Örn. 12M_ICINDE_KIRMIZI_RENGE_GOC_OOT202506 → 12M_ICINDE_KRM_GOC_OOT_202506"""
-    s = f"{m['vade']}M_{HEDEF_AILELERI[m['aile']][0]}_OOT_{m['oot']}"[:31]
-    aday, i = s, 2
-    while aday in kullanilan:
-        ek = f"_{i}"
-        aday = s[:31 - len(ek)] + ek
-        i += 1
-    kullanilan.add(aday)
-    return aday
-
-
-def _renk_sira(x):
-    """'2-TURUNCU' -> 2 (renk modeli sıralaması için)."""
-    return int(str(x).split("-")[0])
-
-
-# ==================================================================
-# MODEL KLASÖRLERİ (ana klasörden, ARSIV hariç)
-# ==================================================================
-_log("Başladı")
-MODEL_KLASORLERI = _model_klasorleri()
-klasorler = [m["klasor"] for m in MODEL_KLASORLERI]
-if not klasorler:
-    raise ValueError(f"{MAIN_FOLDER} ana klasöründe model klasörü bulunamadı.")
-_log(f"{len(klasorler)} klasör taranacak: " + ", ".join(klasorler))
-
-
-# ==================================================================
-# 1. EXCEL: KALAN FEATURE'LAR (klasörlere yazmaz, sadece okur)
-# ==================================================================
-tum_parcalar, sheetler, icindekiler = [], {}, []
-kullanilan_adlar = {"ICINDEKILER", "OZET", "UNION", "TUM"}
-
-for ki, m_kl in enumerate(MODEL_KLASORLERI, start=1):
-    klasor = m_kl["klasor"]
-    dosyalar = _dosyalar(klasor)
-    renkler = sorted({(int(m.group(1)), m.group(2), ad)
-                      for ad in dosyalar if (m := FEATURE_DOSYA_RE.match(ad))})
-    if not renkler:
-        _log(f"[{ki}/{len(klasorler)}] ⚠ {klasor}: kalan_featurelar dosyası yok, atlandı")
-        continue
-
-    parcalar = []
-    for kod, renk, ad in renkler:                          # 1-KIRMIZI ... 6-KOY_YESIL
-        with mf.get_download_stream(f"/{klasor}/{ad}") as s:
+        with mf.get_download_stream(f"/{_kl}/{_ad}") as s:
             _kf = pd.read_csv(s)
-        if FEATURE_COL not in _kf.columns:
-            _log(f"   ⚠ {ad}: '{FEATURE_COL}' kolonu yok (kolonlar: {list(_kf.columns)}), atlandı")
+        if "feature" not in _kf.columns:
             continue
-        if "sira" in _kf.columns:
-            _kf = _kf.sort_values("sira", kind="stable")
-        _kf.insert(0, "KLASOR", klasor)
-        _kf.insert(1, "RENK_MODEL", f"{kod}-{renk}")
-        parcalar.append(_kf)
-
-    if not parcalar:
-        continue
-    blok = pd.concat(parcalar, ignore_index=True)
-    sh = _sheet_adi(m_kl, kullanilan_adlar)
-    sheetler[sh] = blok.drop(columns="KLASOR")              # sheet adı zaten klasörü gösteriyor
-    tum_parcalar.append(blok)
-    icindekiler.append({"sheet": sh, "klasor": klasor,
-                        "hedef": f"{m_kl['vade']}M {HEDEF_AILELERI[m_kl['aile']][1]}",
-                        "renk_model_sayisi": blok["RENK_MODEL"].nunique(), "satir": len(blok)})
-    _log(f"[{ki}/{len(klasorler)}] {klasor}: {blok['RENK_MODEL'].nunique()} renk modeli | "
-         + " | ".join(f"{r}: {n}" for r, n in blok.groupby("RENK_MODEL", sort=False).size().items()))
-
-if not tum_parcalar:
-    raise ValueError("Hiçbir klasörde kalan_featurelar dosyası bulunamadı.")
-
-tum = pd.concat(tum_parcalar, ignore_index=True)
-toplam_model = tum[["KLASOR", "RENK_MODEL"]].drop_duplicates().shape[0]
-
-# --- OZET: klasör x renk modeli feature sayısı ------------------------
-ozet = (tum.pivot_table(index="KLASOR", columns="RENK_MODEL",
-                        values=FEATURE_COL, aggfunc="count", fill_value=0)
-          .reindex(columns=sorted(tum["RENK_MODEL"].unique(), key=_renk_sira))
-          .reindex([k for k in klasorler if k in set(tum["KLASOR"])])
-          .reset_index())
-ozet.columns.name = None
-
-# --- UNION: tüm modellerde kullanılan tekil feature'lar ---------------
-u = tum[["KLASOR", "RENK_MODEL", FEATURE_COL]].drop_duplicates()
-union = (u.groupby(FEATURE_COL)
-          .agg(model_sayisi=("RENK_MODEL", "size"),
-               klasor_sayisi=("KLASOR", "nunique"),
-               renk_sayisi=("RENK_MODEL", "nunique"),
-               kullanan_renkler=("RENK_MODEL",
-                                 lambda s: ", ".join(sorted(s.unique(), key=_renk_sira))),
-               kullanan_klasorler=("KLASOR",
-                                   lambda s: ", ".join(k for k in klasorler if k in set(s))))
-          .reset_index())
-union.insert(2, "model_orani", (union["model_sayisi"] / toplam_model).round(4))
-union = union.sort_values(["model_sayisi", FEATURE_COL],
-                          ascending=[False, True]).reset_index(drop=True)
-_log(f"UNION: {len(union):,} tekil feature | {toplam_model} model | "
-     f"tüm modellerde ortak: {int((union['model_sayisi'] == toplam_model).sum())}")
-
-_log("Excel yazılıyor (kalan feature'lar)")
-buf = BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-    pd.DataFrame(icindekiler).to_excel(xl, sheet_name="ICINDEKILER", index=False)
-    ozet.to_excel(xl, sheet_name="OZET", index=False)
-    union.to_excel(xl, sheet_name="UNION", index=False)
-    tum.to_excel(xl, sheet_name="TUM", index=False)
-    for sh, tablo in sheetler.items():
-        tablo.to_excel(xl, sheet_name=sh, index=False)
-buf.seek(0)
-mf.upload_stream(CIKTI_DOSYA, buf)
-_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | {len(sheetler)} klasör | "
-     f"{len(tum):,} feature satırı | {len(union):,} tekil feature")
+        for _f in _kf["feature"].dropna().astype(str):
+            _kullanim.append((_f, _kl, f"{_m.group(1)}-{_m.group(2)}"))
+_kullanim = pd.DataFrame(_kullanim, columns=["Alan", "KLASOR", "RENK_MODEL"]).drop_duplicates()
+_toplam_model = int(_kullanim[["KLASOR", "RENK_MODEL"]].drop_duplicates().shape[0]) if len(_kullanim) else 0
+_log(f"{len(_klasorler)} model klasörü | {_toplam_model} renk modeli | {_kullanim['Alan'].nunique():,} tekil feature")
 
 
 # ==================================================================
-# 2. EXCEL: RENK BAZLI OOT BUCKET20 TABLOLARI (BUCKET_DOSYA)
-# ------------------------------------------------------------------
-# Her model klasöründen renk_<kod>_<ad>_bucket20_train_val_oot.xlsx okunur,
-# yalnızca kume = OOT satırları ve BUCKET_KOLONLARI alınır (değer hesaplanmaz).
-# Her renk ayrı sheet. Vadeler yan yana (3M | boş kolon | 6M | boş kolon | 12M),
-# her vadede modeller BLOK_SIRASI'na göre alt alta; bloklar arasında bir boş satır.
-# Blok başlığı: "<X>M_<hedef> - Train: <train dönemi> OOT: <OOT dönemi>"
-# (dönemler modelin model.pkl dosyasındaki train_donem / oot_donem'den).
+# 5) TABLOLAR
 # ==================================================================
-def _donem_metni(x):
-    if x is None:
-        return "?"
-    if isinstance(x, (list, tuple, set, np.ndarray, pd.Index)):
-        return ", ".join(sorted({_donem_metni(i) for i in x}))
+def _renk_sira(x):
     try:
-        return str(int(float(x)))
-    except (TypeError, ValueError):
-        return str(x)
+        return int(str(x).split("-")[0])
+    except ValueError:
+        return 99
 
 
-def _donemler(klasor, dosyalar, oot_klasor):
-    """Klasördeki ilk model.pkl'den (train dönemi, OOT dönemi) metni."""
-    for ad in dosyalar:
-        if not re.match(r"^renk_\d+_.+_model\.pkl$", ad):
-            continue
-        try:
-            with mf.get_download_stream(f"/{klasor}/{ad}") as s:
-                ham = s.read()
-            # sklearn sürümü farklıysa çıkan "Trying to unpickle estimator" uyarısı (yalnızca o) kapatılır
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=r"Trying to unpickle estimator")
-                paket = pickle.loads(ham)
-            return (_donem_metni(paket.get("train_donem")),
-                    _donem_metni(paket.get("oot_donem", oot_klasor)))
-        except Exception as e:
-            _log(f"   ⚠ {klasor}/{ad} okunamadı ({type(e).__name__}); başlıkta Train dönemi '?' yazılacak")
-            break
-    return "?", str(oot_klasor)
+# Üretilen_Degiskenler: FE çıktısı (FE sırasıyla) + DSN + modelde olup FE listesinde olmayan üretilenler
+_model_feat = list(dict.fromkeys(_kullanim["Alan"])) if len(_kullanim) else []
+_uretilen = list(dict.fromkeys(
+    _fe_liste + DSN_FEATURELARI +
+    [f for f in _model_feat if f not in _HAM_ACIKLAMA and (_aciklama(f) is not None or f.startswith("DSN_"))]))
+_satir = []
+for _f in _uretilen:
+    _r = _aciklama(_f)
+    _satir.append({"Alan": _f, "Açıklamalar": _r[1] if _r else "AÇIKLAMA YOK (kural bulunamadı)",
+                   "Anlamı": _r[2] if _r else "", "Aile": _r[0] if _r else ""})
+uretilen_df = pd.DataFrame(_satir, columns=["Alan", "Açıklamalar", "Anlamı", "Aile"])
+_kuralsiz = uretilen_df.loc[uretilen_df["Aile"] == "", "Alan"].tolist()
+_log(f"Üretilen_Degiskenler: {len(uretilen_df):,} değişken"
+     + (f" | ⚠ kuralı olmayan {len(_kuralsiz)}: {_kuralsiz[:10]}" if _kuralsiz else " | hepsinin açıklaması var"))
+
+# Modele_Girenler
+_klasor_sira = {k: i for i, k in enumerate(_klasorler)}
+_mg = []
+for _f, _g in (_kullanim.groupby("Alan", sort=False) if len(_kullanim) else []):
+    if _f in _HAM_ACIKLAMA and _HAM_ACIKLAMA[_f]:
+        kaynak, acik, anlam, durum, neden = "HAM (Degiskenler)", _HAM_ACIKLAMA[_f], "", "VAR", ""
+    elif _f in _HAM_ACIKLAMA:
+        kaynak, acik, anlam, durum, neden = "HAM (Degiskenler)", "", "", "EKSİK", "Degiskenler'de var ama açıklaması boş"
+    elif _aciklama(_f) is not None:
+        _r = _aciklama(_f)
+        kaynak = "ÜRETİLEN (pipeline DSN)" if _f.startswith("DSN_") else "ÜRETİLEN (FE)"
+        acik, anlam, durum, neden = _r[1], _r[2], "VAR", ""
+    elif _f in set(_fe_liste) or _f.startswith("DSN_"):
+        kaynak, acik, anlam, durum, neden = "ÜRETİLEN", "", "", "EKSİK", "Üretilen değişken; açıklama kuralı yok"
+    else:
+        kaynak, acik, anlam, durum, neden = ("HAM (muhtemel)", "", "", "EKSİK",
+                                             "Ham kolon gibi; Degiskenler sheet'inde yok")
+    _mg.append({
+        "Alan": _f, "Açıklamalar": acik, "Anlamı": anlam, "Kaynak": kaynak, "Durum": durum, "Neden": neden,
+        "Model Sayısı": int(_g[["KLASOR", "RENK_MODEL"]].drop_duplicates().shape[0]),
+        "Model Oranı": round(_g[["KLASOR", "RENK_MODEL"]].drop_duplicates().shape[0] / max(_toplam_model, 1), 4),
+        "Kullanan Renkler": ", ".join(sorted(_g["RENK_MODEL"].unique(), key=_renk_sira)),
+        "Kullanan Klasörler": ", ".join(sorted(_g["KLASOR"].unique(), key=lambda k: _klasor_sira.get(k, 999))),
+    })
+modele_girenler_df = pd.DataFrame(_mg, columns=["Alan", "Açıklamalar", "Anlamı", "Kaynak", "Durum", "Neden",
+                                                "Model Sayısı", "Model Oranı", "Kullanan Renkler", "Kullanan Klasörler"])
+if len(modele_girenler_df):
+    # EKSİK olanlar en üstte, sonra en çok modelde kullanılanlar
+    modele_girenler_df = modele_girenler_df.sort_values(["Durum", "Model Sayısı", "Alan"],
+                                                        ascending=[True, False, True]).reset_index(drop=True)
+eksik_df = modele_girenler_df.loc[modele_girenler_df["Durum"] == "EKSİK",
+                                  ["Alan", "Kaynak", "Neden", "Model Sayısı", "Kullanan Renkler", "Kullanan Klasörler"]]
+_log(f"Modele_Girenler: {len(modele_girenler_df):,} feature | açıklaması eksik: {len(eksik_df):,}")
+if len(eksik_df):
+    _log("   eksik olanlar: " + ", ".join(eksik_df["Alan"].head(30)) + (" ..." if len(eksik_df) > 30 else ""))
+okuma_df = pd.DataFrame(OKUMA_NOTLARI, columns=["Konu", "Açıklama"])
 
 
-def _kolon_bul(kolmap, ad):
-    """Büyük / küçük harf duyarsız kolon eşleme; '<X>_ADET' yoksa eki olmayan '<X>' de denenir."""
-    u = ad.upper()
-    if u in kolmap:
-        return kolmap[u]
-    if u.endswith("_ADET") and u[:-5] in kolmap:
-        return kolmap[u[:-5]]
-    return None
+# ==================================================================
+# 6) EXCEL: orijinal dosya açılır, Degiskenler'e dokunulmaz; diğer sheet'ler yeniden yazılır.
+#    Biçim Degiskenler sheet'inden kopyalanır (başlık rengi, kenarlık, yazı tipi, kolon genişliği).
+# ==================================================================
+wb = load_workbook(BytesIO(_orijinal_bayt))
+_ref = wb[HAM_SHEET]
+_bas_h, _gov_h = _ref.cell(row=1, column=1), _ref.cell(row=2, column=1)
+_ince = Side(style="thin", color="808080")
+_kenar_yedek = Border(left=_ince, right=_ince, top=_ince, bottom=_ince)
+_gen_a = _ref.column_dimensions["A"].width or 45
+_gen_b = _ref.column_dimensions["B"].width or 90
 
 
-def _sayiya(s):
-    """Metin olarak yazılmış sayıları ('0.6133') sayıya çevirir; çevrilemeyen varsa dokunmaz."""
-    v = pd.to_numeric(s, errors="coerce")
-    return v if int(v.notna().sum()) == int(pd.Series(s).notna().sum()) else s
+def _stil_kopyala(hedef, kaynak, wrap=False, yatay=None, dikey=None):
+    hedef.font = copy(kaynak.font)
+    hedef.fill = copy(kaynak.fill)
+    hedef.border = copy(kaynak.border) if kaynak.border and kaynak.border.left.style else _kenar_yedek
+    hedef.number_format = kaynak.number_format
+    al = copy(kaynak.alignment)
+    hedef.alignment = Alignment(horizontal=yatay or al.horizontal, vertical=dikey or "top",
+                                wrap_text=wrap or al.wrap_text)
 
 
-def _bucket_blogu(klasor, dosyalar, kod, ad):
-    """Bir model klasörünün bir rengi için OOT bucket satırları (BUCKET_KOLONLARI sırasıyla).
-    Dönen: (tablo | None, eksik kolonlar)"""
-    dosya = f"renk_{kod}_{ad}_bucket20_train_val_oot.xlsx"
-    with mf.get_download_stream(f"/{klasor}/{dosya}") as s:
-        sayfalar = pd.read_excel(BytesIO(s.read()), sheet_name=None)
-    tablo, kolmap = None, None
-    for sh_ad, sh in sayfalar.items():                     # DETAY sheet'i değil, ana tablo
-        km = {str(c).strip().upper(): c for c in sh.columns}
-        if str(sh_ad).upper().endswith("_DETAY") or not {"KUME", "BUCKET"} <= set(km):
-            continue
-        tablo, kolmap = sh, km
-        break
-    if tablo is None:
-        return None, ["kume / bucket kolonları"]
-    tablo = tablo[tablo[kolmap["KUME"]].astype(str).str.strip().str.upper() == "OOT"]
-    tablo = (tablo.assign(_b=pd.to_numeric(tablo[kolmap["BUCKET"]], errors="coerce"))
-                  .sort_values("_b", kind="stable"))
-    cikti, eksik = pd.DataFrame(index=range(len(tablo))), []
-    for k in BUCKET_KOLONLARI:
-        c = _kolon_bul(kolmap, k)
-        if c is None:
-            cikti[k] = np.nan
-            eksik.append(k)
-        else:
-            v = tablo[c].reset_index(drop=True)
-            cikti[k] = v if k.lower() in ("renk", "kume") else _sayiya(v)
-
-    g_eksik = [k for k in eksik if k in GINI_KOLONLARI]
-    oz = f"renk_{kod}_{ad}_ozet.csv"
-    if g_eksik and oz in dosyalar and len(cikti):
-        with mf.get_download_stream(f"/{klasor}/{oz}") as s:
-            o = pd.read_csv(s)
-        okol = {str(c).strip().upper(): c for c in o.columns}
-        for k in g_eksik:
-            if k.upper() in okol and len(o):
-                cikti[k] = pd.to_numeric(o[okol[k.upper()]], errors="coerce").iloc[0]
-                eksik.remove(k)
-    return cikti, eksik
+def _sheet_yaz(ad, tablo, genislikler, sira):
+    if ad in wb.sheetnames:
+        sira = wb.sheetnames.index(ad)
+        wb.remove(wb[ad])
+    ws = wb.create_sheet(ad, sira)
+    for j, k in enumerate(tablo.columns, start=1):
+        h = ws.cell(row=1, column=j, value=k)
+        _stil_kopyala(h, _bas_h, yatay="center", dikey="center")
+    for i, row in enumerate(tablo.itertuples(index=False), start=2):
+        for j, v in enumerate(row, start=1):
+            if isinstance(v, float) and np.isnan(v):
+                v = None
+            h = ws.cell(row=i, column=j, value=v)
+            _stil_kopyala(h, _gov_h, wrap=str(tablo.columns[j - 1]) in ("Açıklamalar", "Anlamı", "Açıklama", "Neden",
+                                                                         "Kullanan Klasörler"))
+    for j, w in enumerate(genislikler, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = w
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = ws.dimensions
+    return ws
 
 
-_K = len(BUCKET_KOLONLARI)
-_INCE = Side(style="thin", color="BFBFBF")
-_KENAR = Border(left=_INCE, right=_INCE, top=_INCE, bottom=_INCE)
-_BASLIK_DOLGU = PatternFill("solid", fgColor="C00000")
-_KOLON_DOLGU = PatternFill("solid", fgColor="F2F2F2")
-_SKALA = dict(start_type="min", start_color="F8696B",
-              mid_type="percentile", mid_value=50, mid_color="FFEB84",
-              end_type="max", end_color="63BE7B")
+_i0 = wb.sheetnames.index(HAM_SHEET) + 1
+_sheet_yaz(URETILEN_SHEET, uretilen_df, [_gen_a, _gen_b, 70, 38], _i0)
+_sheet_yaz("Modele_Girenler", modele_girenler_df, [_gen_a, _gen_b, 60, 22, 10, 36, 13, 12, 34, 70], _i0 + 1)
+_sheet_yaz("Eksik_Aciklamalar", eksik_df.reset_index(drop=True), [_gen_a, 22, 50, 13, 34, 70], _i0 + 2)
+_sheet_yaz("Okuma_Notlari", okuma_df, [28, 120], _i0 + 3)
+ws = wb["Modele_Girenler"]
+_durum_j = list(modele_girenler_df.columns).index("Durum") + 1
+_oran_j = list(modele_girenler_df.columns).index("Model Oranı") + 1
+for _r in range(2, len(modele_girenler_df) + 2):
+    _h = ws.cell(row=_r, column=_durum_j)
+    _h.fill = PatternFill("solid", fgColor="C6EFCE" if _h.value == "VAR" else "FFC7CE")
+    ws.cell(row=_r, column=_oran_j).number_format = "0.00%"
 
-
-def _bicim(ad):
-    u = ad.upper()
-    if u in ("RENK", "KUME"):
-        return None
-    if u in ("BAD_RATE", "CAPTURE") or "_ORAN" in u:      # ..._ORAN ve FPD_1_ORAN_...
-        return "0.00%"
-    if u in ("BUCKET", "N", "BAD", "LIMIT_SUM", "RISK_SUM", "LIMIT_SUM_BAD", "RISK_SUM_BAD") or "_ADET" in u:
-        return "0"
-    return "0.0000"
-
-
-def _genislik(ad):
-    """Kolon genişliği: başlık sığsın; limit / risk toplamları (10-11 hane) ### görünmesin."""
-    w = round(len(ad) * 1.15) + 2
-    if ad.upper() in ("LIMIT_SUM", "RISK_SUM", "LIMIT_SUM_BAD", "RISK_SUM_BAD"):
-        w = max(w, 14)
-    return max(9, min(40, w))
-
-
-def _hucre(v):
-    """Excel'e yazılacak değer: NaN → boş, numpy tipleri → Python tipleri."""
-    try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(v, np.integer):
-        return int(v)
-    if isinstance(v, np.floating):
-        return float(v)
-    return v
-
-
-def _blok_yaz(ws, r0, c0, baslik, tablo):
-    """r0: başlık satırı, c0: bloğun ilk kolonu. Başlık + kolon adları + bucket satırları."""
-    ws.merge_cells(start_row=r0, start_column=c0, end_row=r0, end_column=c0 + _K - 1)
-    h = ws.cell(row=r0, column=c0, value=baslik)
-    h.fill = _BASLIK_DOLGU
-    h.font = Font(bold=True, color="FFFFFF")
-    h.alignment = Alignment(horizontal="center", vertical="center")
-    for j, ad in enumerate(BUCKET_KOLONLARI):
-        c = ws.cell(row=r0 + 1, column=c0 + j, value=ad)
-        c.fill, c.font, c.border = _KOLON_DOLGU, Font(bold=True), _KENAR
-        c.alignment = Alignment(horizontal="center")
-        _fmt = _bicim(ad)
-        for i, v in enumerate(tablo[ad].tolist()):
-            hc = ws.cell(row=r0 + 2 + i, column=c0 + j, value=_hucre(v))
-            hc.border = _KENAR
-            if _fmt:
-                hc.number_format = _fmt
-    if len(tablo):
-        for ad in RENK_SKALASI_KOLONLARI:
-            if ad in BUCKET_KOLONLARI:
-                L = get_column_letter(c0 + BUCKET_KOLONLARI.index(ad))
-                ws.conditional_formatting.add(f"{L}{r0 + 2}:{L}{r0 + 1 + len(tablo)}",
-                                              ColorScaleRule(**_SKALA))
-
-
-_oot_say = pd.Series([m["oot"] for m in MODEL_KLASORLERI]).value_counts()
-_oot_sec = (int(str(BUCKET_OOT).upper().replace("OOT", "")) if BUCKET_OOT
-            else max(_oot_say.index, key=lambda o: (_oot_say[o], o)))
-_bkl = [m for m in MODEL_KLASORLERI if m["oot"] == _oot_sec]
-_disarida = [m["klasor"] for m in MODEL_KLASORLERI if m["oot"] != _oot_sec]
-_log(f"=== {BUCKET_DOSYA.lstrip('/')}: OOT{_oot_sec} | {len(_bkl)} model klasörü ===")
-if _disarida:
-    _log(f"ⓘ OOT{_oot_sec} olmayan klasörler bu Excel'e alınmadı: {_disarida}")
-
-_bloklar, _renk_adlari, _eksik_say = {}, {}, {}      # renk kodu → {(vade, aile): (başlık, tablo)}
-for m_kl in _bkl:
-    klasor = m_kl["klasor"]
-    dosyalar = _dosyalar(klasor)
-    _tr, _oot = _donemler(klasor, dosyalar, m_kl["oot"])
-    _baslik = f"{m_kl['vade']}M_{HEDEF_AILELERI[m_kl['aile']][2]} - Train: {_tr} OOT: {_oot}"
-    _renkler = sorted({(int(r.group(1)), r.group(2)) for ad in dosyalar if (r := BUCKET_DOSYA_RE.match(ad))})
-    if not _renkler:
-        _log(f"   ⚠ {klasor}: bucket20 dosyası yok, atlandı")
-        continue
-    for kod, ad in _renkler:
-        try:
-            tablo, eksik = _bucket_blogu(klasor, dosyalar, kod, ad)
-        except Exception as e:
-            _log(f"   ⚠ {klasor}/renk_{kod}_{ad}: okunamadı ({type(e).__name__}: {str(e)[:120]}), atlandı")
-            continue
-        if tablo is None or tablo.empty:
-            _log(f"   ⚠ {klasor}/renk_{kod}_{ad}: OOT bucket satırı yok, atlandı")
-            continue
-        for k in eksik:
-            _eksik_say[k] = _eksik_say.get(k, 0) + 1
-        _bloklar.setdefault(kod, {})[(m_kl["vade"], m_kl["aile"])] = (_baslik, tablo)
-        _renk_adlari[kod] = ad
-    _log(f"   {klasor}: {_baslik} | {len(_renkler)} renk")
-if _eksik_say:
-    _log(f"⚠ Bucket dosyalarında bulunamayan kolonlar (boş yazıldı): "
-         + ", ".join(f"{k} ({n} tabloda)" for k, n in _eksik_say.items()))
-
-if not _bloklar:
-    _log(f"⚠ Hiç bucket20 tablosu okunamadı; {BUCKET_DOSYA} yazılmadı")
-else:
-    _vadeler = sorted({v for bl in _bloklar.values() for v, _ in bl})
-    _aile_sira = [a for a in BLOK_SIRASI if any(a == x for bl in _bloklar.values() for _, x in bl)]
-    _aile_sira += [a for a in HEDEF_AILELERI if a not in _aile_sira
-                   and any(a == x for bl in _bloklar.values() for _, x in bl)]
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    for kod in sorted(_bloklar):
-        bl = _bloklar[kod]
-        ws = wb.create_sheet(str(BUCKET_SHEET_ADLARI.get(kod, f"{kod}-{_renk_adlari[kod]}"))[:31])
-
-        # Her bloğun dikey yeri (slot)
-        if HEDEFE_GORE_HIZALA:
-            yer = {k: _aile_sira.index(k[1]) for k in bl}
-        else:
-            yer = {}
-            for v in _vadeler:
-                for i, a in enumerate([a for a in _aile_sira if (v, a) in bl]):
-                    yer[(v, a)] = i
-        n_slot = max(yer.values()) + 1
-        yukseklik = [0] * n_slot
-        dolu = [False] * n_slot
-        for k, (_, t) in bl.items():
-            yukseklik[yer[k]] = max(yukseklik[yer[k]], len(t))
-            dolu[yer[k]] = True
-        satir, bas = 1, {}
-        for i in range(n_slot):
-            if dolu[i]:
-                bas[i] = satir
-                satir += 2 + yukseklik[i] + 1               # başlık + kolon adları + satırlar + boş satır
-
-        for vi, v in enumerate(_vadeler):
-            c0 = 1 + vi * (_K + 1)                          # vadeler arasında bir boş kolon
-            for k, (baslik, t) in bl.items():
-                if k[0] == v:
-                    _blok_yaz(ws, bas[yer[k]], c0, baslik, t)
-            for j, ad in enumerate(BUCKET_KOLONLARI):
-                ws.column_dimensions[get_column_letter(c0 + j)].width = (
-                    12 if ad.lower() == "renk" else _genislik(ad))
-            if vi < len(_vadeler) - 1:
-                ws.column_dimensions[get_column_letter(c0 + _K)].width = 3
-
-    buf2 = BytesIO()
-    wb.save(buf2)
-    buf2.seek(0)
-    mf.upload_stream(BUCKET_DOSYA, buf2)
-    _log(f"✓ {MAIN_FOLDER}{BUCKET_DOSYA} yazıldı | {len(_bloklar)} renk sheet'i | vadeler: "
-         + ", ".join(f"{v}M" for v in _vadeler) + " | blok sırası: "
-         + ", ".join(HEDEF_AILELERI[a][2] for a in _aile_sira))
+if YEDEK_KLASORU:
+    _yedek = f"{YEDEK_KLASORU.rstrip('/')}/{ACIKLAMA_DOSYASI.strip('/').rsplit('.', 1)[0]}_yedek_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    mf.upload_stream(_yedek, BytesIO(_orijinal_bayt))
+    _log(f"Orijinal dosya yedeklendi: {MAIN_FOLDER}{_yedek}")
+_buf = BytesIO()
+wb.save(_buf)
+_buf.seek(0)
+mf.upload_stream(ACIKLAMA_DOSYASI, _buf)
+_log(f"✓ {MAIN_FOLDER}{ACIKLAMA_DOSYASI} yazıldı | sheet'ler: {', '.join(wb.sheetnames)}")
