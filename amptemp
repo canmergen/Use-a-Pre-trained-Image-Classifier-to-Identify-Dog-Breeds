@@ -1,1325 +1,1925 @@
-# ==============================================================
-# MODEL GEREKLİLİK ANALİZİ
-# --------------------------------------------------------------
-# SORU: Bankada zaten DAVRANIŞ SKORU ve MÜŞTERİ SKORU var. Bunlar
-# varken renk göçü / takip modellerine gerçekten ihtiyaç var mı?
-#
-# YÖNTEM: Sadece OOT dönemi (modelin eğitimde görmediği dönem)
-# kullanılır. Aynı müşteriler için üç sıralama karşılaştırılır:
-# Davranış skoru, Müşteri skoru ve model skoru. Hangisi gerçekte
-# kırmızıya geçen / takibe düşen müşterileri daha üste koyuyorsa o
-# daha iyi skordur.
-#
-# KİTLE TANIMLARI (rapordaki her metrik bunlardan birine aittir):
-#   TÜM KİTLE    : OOT dönemindeki KK ürünlü müşteriler (skor şartı yok)
-#   ORTAK KİTLE  : TÜM KİTLE'den Davranış skoru ve Müşteri skoru dolu olanlar.
-#   MODELİN KİTLESİ: ORTAK KİTLE'den o modelin hedef tanımına giren ve model
-#                  skoru dolu olanlar. Her model kendi kitlesinde ölçülür; üç skor
-#                  (Davranış, Müşteri, model) her zaman aynı kişiler üzerindedir.
-#                  Neden model başına: NO:1 ve NO:2 tanımları X içinde takibe
-#                  düşenleri kitleden çıkarır. Tek bir ortak kitle (tüm modellerin
-#                  skoru dolu) kurulsaydı bu müşteriler TAKİP modellerinin kıyasından
-#                  da düşerdi; takip modelleri vakasız kalırdı.
-#   MODEL KİTLESİ (klasör): model klasöründeki bucket tablosunun kendi kitlesi
-#                  (rapordan bağımsız, sadece BUCKET20'nin MODEL tarafı)
-#
-# ÇIKTI: MODEL_RESULTS kökünde kiyas_skorlari_vs_modeller_bucket20.xlsx
-# Her sheet'te solda madde madde açıklama + kolon sözlüğü, sağda tablo.
-#   1) OZET_ADETLER                 : kitle hunisi (tüm → ortak), FPD kesişen kitle,
-#                                     hedef oranları ve TOPLAM satırı (İLK SHEET)
-#   2) HUKUM_OOT_<dönem>            : cevap. Her renk x hedef için
-#                                     MODEL GEREKLİ / SINIRDA / DAVRANIŞ SKORU YETER / MÜŞTERİ SKORU YETER
-#                                     (EN İYİ MEVCUT SKOR kolonu modelin hangi skorla kıyaslandığını yazar)
-#   3) KONTROLLER                   : rapora güvenmeden önce bakılacak veri
-#                                     ve eşleşme kontrolleri (OK / UYARI / YOK)
-#   4) BUCKET20_DAVRANIS_OOT_<dönem>: skorun 20'li bucket'ları (ortak kitle) ile
-#      BUCKET20_MUSTERI_OOT_<dönem> : modelin klasördeki 20'li bucket'ları yan yana
-#   5) KACAN_DILIM_OOT_<dönem>      : iki skor farklı kişileri riskli
-#                                     dediğinde hangisi haklı
-#   6) YAKALAMA_OOT_<dönem>         : her renk x hedef için model, Davranış ve Müşteri skorunun
-#                                     yakalama eğrisi (%5, %10 ... %100); üçü de HÜKÜM ile aynı
-#                                     kitlede. %20 kolonu HÜKÜM'deki YAKALAMA ile aynı sayıdır.
-#
-# MODELLER: GOC_MODEL_RESULTS ana klasöründeki model klasörleri KENDİLİĞİNDEN
-# bulunur (ARSIV ve adı tanınmayan klasörler okunmaz). Klasör adı
-# "<X>M_<HEDEF>_OOT<dönem>" olmalı; HEDEF bölüm 4'teki beş tanımdan biri:
-#   NO:1 X_KIRMIZI_RENGE_GOC        X sonunda kırmızı   (X içinde takibe düşen kitlede yok)
-#   NO:2 X_ICINDE_KIRMIZI_RENGE_GOC X içinde kırmızı    (X içinde takibe düşen kitlede yok)
-#   NO:3 X_TAKIP                    X içinde takip
-#   NO:4 X_ICINDE_KIRMIZI_TAKIP     X içinde kırmızı veya X içinde takip
-#   NO:5 X_SONRA_KIRMIZI_VE_TAKIP   X sonunda kırmızı veya X içinde takip
-# Yeni bir model ya da OOT klasörü eklendiğinde kodda değişiklik gerekmez.
-# Hedefler bu tanımlarla df_raw'dan üretilir ve her modelin klasöründeki
-# target_actual ile karşılaştırılır (KONTROLLER 1).
-#
-# ÇALIŞMA KOŞULU: MODEL_GEREKLILIK_ANALIZI == True ve en az bir model
-# klasörü mevcut. Eksik dosya analizi durdurmaz; o model / renk atlanır.
-# ==============================================================
-
 import re
-import textwrap
+import time
+import zipfile
+import numpy as np
+import pandas as pd
+import dataiku
 from io import BytesIO
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as _xml_kacis
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, Reference, ScatterChart, Series
+from openpyxl.chart.label import DataLabel, DataLabelList
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.filters import AutoFilter, FilterColumn, Filters
+from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
 
-# ==============================================================
-# 0) AYARLAR - değiştirilecek her şey burada
-# ==============================================================
-if 'MODEL_GEREKLILIK_ANALIZI' not in globals():
-    MODEL_GEREKLILIK_ANALIZI = False
+# ==================================================================
+# RENK MODEL SONUÇLARI: sunuma hazır tek Excel
+# ------------------------------------------------------------------
+# GOC_MODEL_RESULTS ana klasörüne /RENK_Model_Sonuclar.xlsx yazar (varsa önce ARSIV'e yedeklenir).
+# Sheet'ler (bu sırayla):
+#   Yönetici Özeti            : öne çıkan bulgular (verilerden otomatik), renk segmenti bazında özet,
+#                               "Model mi, mevcut skor mu?" dağılım grafiği (tüm modeller tek resimde), sayfa rehberi
+#   Kapsam                    : kapsam, hedef tanımları, okuma notları, kavramlar (sade dille), değişkenlerin
+#                               hangi veriden nasıl üretildiği (kolon adı ve formül yok), sonuç özeti
+#   Gerçekleşen Özet          : OOT kitlesi ve her modelin kitlesinde gerçekleşen hedef adet / oranları (14 OZET_ADETLER)
+#   Model Sonuçları           : 6 renk segmentinin tüm modelleri tek tabloda; üstteki renk dilimleyicisi sekme gibi
+#                               çalışır (açılışta Kırmızı seçili). Model ve Hedef Süre dilimleyicileriyle bir ya da
+#                               birden çok model seçilir; altındaki 4 etiketli çubuk grafik yalnızca seçilenleri çizer.
+#                               En altta seçimdeki ilk modelin yakalama eğrisi (model, Davranış, Müşteri; aynı kitle).
+#   Mevcut Skor Karşılaştırma : model ile mevcut skor farklı müşterileri riskli dediğinde hangisi haklı
+#                               (14 KAÇAN DİLİM): sade açıklama + açıklama görseli + sonuç matrisi + 2 grafik
+#                               (ayrışan müşterilerde hedef oranı, model lehine net ek vaka) + detay tablo.
+#   Grafik Verisi (gizli)     : grafiklerin yardımcı verisi; açmaya gerek yok.
+# Kaynaklar (hepsi ana klasörden, ARSIV okunmaz):
+#   <model klasörü>/renk_bazli_train_val_oot_ozet.csv   → kitle, hedef oranları, Train / Val / OOT Gini
+#   <model klasörü>/renk_<kod>_<ad>_bucket100_...xlsx   → Top %1 / %5 / %10 yakalama (OOT, kümülatif capture)
+#   <model klasörü>/renk_<kod>_<ad>_bucket20_...xlsx    → bucket hedef oranları (OOT); bucket100 yoksa Top %5 / %10
+#   /kiyas_skorlari_vs_modeller_bucket20.xlsx           → HUKUM_OOT_, KACAN_DILIM_OOT_, OZET_ADETLER, YAKALAMA_OOT_
+#                                                          (14 ANALİZ; YAKALAMA_OOT_ sheet'i 14'ün v5 sürümünde)
+#   /karsilastirma_model_aciklama.png                   → Karşılaştırma sayfasındaki açıklama görseli
+# Bulunamayan değer boş bırakılır (özet tablolarda "...").
+# ==================================================================
 
-# Ana klasörde okunmayacak klasörler (büyük / küçük harf fark etmez).
+# ==================================================================
+# AYARLAR
+# ==================================================================
+MAIN_FOLDER     = "GOC_MODEL_RESULTS"
+CIKTI_DOSYA     = "/RENK_Model_Sonuclar.xlsx"
+YEDEK_KLASORU   = "/ARSIV"           # çıktı dosyası zaten varsa önce buraya yedeklenir; None: yedek yok
+KIYAS_RAPORU    = "/kiyas_skorlari_vs_modeller_bucket20.xlsx"   # 14 ANALİZ çıktısı
+KIYAS_RISKLI_YZD = 20                # 14 ANALİZ'deki RISKLI_DILIM_PCT (en riskli dilim, %)
+KIYAS_GEREKLI_PUAN = 0.05            # 14 ANALİZ'deki ESIK_GINI_GEREKLI (yalnızca açıklama metninde)
+KIYAS_BERABER_PUAN = 0.01            # 14 ANALİZ'deki ESIK_BERABER_PUAN (yalnızca açıklama metninde)
+KARARLILIK_ESIK = 0.05               # Yönetici Özeti: Train - OOT Gini kaybı bundan büyük olan modeller sayılır
+GORSEL_DOSYA    = "/karsilastirma_model_aciklama.png"   # Karşılaştırma sayfasındaki görsel; None: eklenmez
+GORSEL_GENISLIK_PX = 620             # görselin sayfadaki genişliği (piksel)
+DILIMLEYICI_EKLE = True              # Excel dilimleyicileri (slicer). Excel açarken onarım uyarısı verirse False yap.
+DILIMLEYICI_STIL = "SlicerStyleLight2"
+ACILIS_RENGI    = 1                  # Model Sonuçları açıldığında seçili renk (renk kodu); None: hepsi açık
+OZET_SAYFA, KAPSAM_SAYFA, GERCEKLESEN_SAYFA = "Yönetici Özeti", "Kapsam", "Gerçekleşen Özet"
+VERI_SAYFA      = "Grafik Verisi"    # grafiklerin yardımcı verisi (gizli sheet)
+YAKALAMA_NOKTALARI = list(range(5, 101, 5))   # yakalama eğrisinin noktaları (%), 14'teki YAKALAMA sheet'i ile aynı
+MODEL_SAYFA, KARSILASTIRMA_SAYFA = "Model Sonuçları", "Mevcut Skor Karşılaştırma"
+AKBANK_KIRMIZI  = "DC0005"           # bölüm ve tablo başlığı zemini (kurumsal kılavuzdaki kod farklıysa değiştir)
+BASLIK_YAZI     = "FFFFFF"
+ALT_BASLIK      = "F2F2F2"           # tablo ara başlıkları
+MODEL_DONEMI    = "Nisan 2025"
+OOT_DONEMI      = "Haziran 2025"
+OOT_KLASOR      = None               # ör. "OOT202506"; None: en çok model klasörü olan OOT
 HARIC_KLASORLER = {"ARSIV"}
-# Yalnızca ana klasör listelenemezse kullanılır: bu OOT'lar için olası tüm klasör
-# adları tek tek denenir.
-OOT_DONEMLER = ["OOT202506"]
-VADE_ADAYLARI = [3, 6, 12]
+YAZI_TIPI       = "Calibri"
 
-# Hedef aileleri (bölüm 4 Target Tanımlama ile birebir). Değer:
-# (NO, X içinde takibe düşen kitleden çıkar mı, rapordaki kısa ad)
-HEDEF_AILELERI = {
-    "KIRMIZI_RENGE_GOC":        ("NO:1", True,  "SONRA KIRMIZIYA GÖÇ"),
-    "ICINDE_KIRMIZI_RENGE_GOC": ("NO:2", True,  "İÇİNDE KIRMIZIYA GÖÇ"),
-    "TAKIP":                    ("NO:3", False, "TAKİP"),
-    "ICINDE_KIRMIZI_TAKIP":     ("NO:4", False, "İÇİNDE KIRMIZI VEYA TAKİP"),
-    "SONRA_KIRMIZI_VE_TAKIP":   ("NO:5", False, "SONRA KIRMIZI VEYA TAKİP"),
+RENKLER = [(1, "KIRMIZI", "Kırmızı"), (2, "TURUNCU", "Turuncu"), (3, "SARI", "Sarı"),
+           (4, "ACK_YESIL", "Açık Yeşil"), (5, "YESIL", "Yeşil"), (6, "KOY_YESIL", "Koyu Yeşil")]
+# (klasör adındaki hedef, model adı, hedef = 1 olduğunda, kitle), tablolardaki sırayla
+HEDEFLER = [
+    ("KIRMIZI_RENGE_GOC", "Kırmızı Olma", "X. ayın sonunda renk Kırmızı",
+     "X ay içinde takibe düşenler ve takip bilgisi boş olanlar çıkarılır"),
+    ("ICINDE_KIRMIZI_RENGE_GOC", "Kırmızıya Dokunma", "Sonraki X ayın en az birinde renk Kırmızı",
+     "X ay içinde takibe düşenler ve takip bilgisi boş olanlar çıkarılır"),
+    ("TAKIP", "Takip", "X ay içinde takibe düşme (stresli yapılandırma dahil)",
+     "Tüm müşteriler; takip bilgisi boşsa \"takip değil\" sayılır"),
+    ("ICINDE_KIRMIZI_TAKIP", "Kırmızıya Dokunma veya Takip", "X ay içinde en az bir ay Kırmızı ya da X ay içinde takip",
+     "Tüm müşteriler; takip bilgisi boşsa \"takip değil\" sayılır"),
+    ("SONRA_KIRMIZI_VE_TAKIP", "Kırmızı Olma veya Takip", "X. ayın sonunda Kırmızı ya da X ay içinde takip",
+     "Tüm müşteriler; takip bilgisi boşsa \"takip değil\" sayılır"),
+]
+VADELER = [3, 6, 12]
+# 14 ANALİZ'in HEDEF etiketi → klasör hedefi (eski sürümün etiketleri de tanınır)
+KIYAS_HEDEF = {
+    "SONRA KIRMIZIYA GÖÇ": "KIRMIZI_RENGE_GOC", "İÇİNDE KIRMIZIYA GÖÇ": "ICINDE_KIRMIZI_RENGE_GOC",
+    "KIRMIZIYA GÖÇ": "ICINDE_KIRMIZI_RENGE_GOC", "TAKİP": "TAKIP",
+    "İÇİNDE KIRMIZI VEYA TAKİP": "ICINDE_KIRMIZI_TAKIP", "KIRMIZI VEYA TAKİP": "ICINDE_KIRMIZI_TAKIP",
+    "SONRA KIRMIZI VEYA TAKİP": "SONRA_KIRMIZI_VE_TAKIP",
 }
 
-# OZET_ADETLER'deki FPD KESİŞEN KİTLE: model klasöründeki bucket20 tablosunun bu
-# kolonunun OOT satırlarındaki (20 bucket) toplamı.
-FPD_KOLON = "FPD_ESLESEN_ADET_TKP_ST_5M90"
+mf = dataiku.Folder(MAIN_FOLDER)
+_T0 = time.time()
 
-ANALIZ_AYAR = {
-    # --- Karar eşikleri ---
-    # Model Gini'si, iki mevcut skordan iyi olanının Gini'sinden en az
-    # bu kadar yüksekse MODEL GEREKLİ (0,05 = 5 puan).
-    "ESIK_GINI_GEREKLI": 0.05,
-    # "En riskli dilim" tanımı: kitlenin en riskli %20'si.
-    # Hem HÜKÜM'deki yakalama oranında hem KAÇAN DİLİM'de kullanılır.
-    "RISKLI_DILIM_PCT": 0.20,
-    # KAÇAN DİLİM: "sadece model riskli" ile "sadece mevcut skor riskli"
-    # gruplarının hedef oranı farkı bu kadardan küçükse BERABER (0,01 = 1 puan).
-    "ESIK_BERABER_PUAN": 0.01,
 
-    # Bir segmentte vaka ya da vaka olmayan müşteri sayısı bundan azsa
-    # Gini güvenilmez; hüküm YETERSİZ VAKA yazılır.
-    "ESIK_MIN_VAKA": 30,
+def _log(mesaj):
+    dk, sn = divmod(int(time.time() - _T0), 60)
+    print(f"[{dk:02d}:{sn:02d}] {mesaj}", flush=True)
 
-    # --- Kontrol eşikleri (KONTROLLER sheet'i) ---
-    # Modelin hedef tanımına giren OOT müşterilerinde model skoru bulunan pay
-    # en az bu kadar olmalı.
-    "ESIK_SKOR_ESLESME": 0.95,
-    # Klasör tablosundaki müşteri sayısı ile rapordaki müşteri sayısı
-    # arasındaki fark (oransal) en fazla bu kadar olmalı.
-    "ESIK_MUSTERI_FARK": 0.02,
-    # Klasör tablosundaki hedef oranı ile rapordaki hedef oranı arasındaki
-    # fark en fazla bu kadar olmalı (0,005 = 0,5 puan). Aşılırsa rapordaki
-    # hedef tanımı modelin hedef tanımıyla tutmuyor olabilir.
-    "ESIK_HEDEF_ORANI_FARK": 0.005,
-    # Klasör tablosunda bad_rate, bad / n ile en fazla bu kadar farklı olabilir.
-    "ESIK_BADRATE_TUTARLILIK": 0.001,
-    # Rapordaki hedef ile klasördeki target_actual aynı müşteride en az bu oranda
-    # aynı olmalı (1,0 = birebir).
-    "ESIK_HEDEF_UYUM": 1.0,
-}
 
-ANALIZ_N_BUCKET = 20
+def _sayi(x):
+    v = pd.to_numeric(x, errors="coerce")
+    return float(v) if pd.notna(v) else np.nan
 
-# ==============================================================
-# 1) MODEL KLASÖRLERİNİ BUL
-# ==============================================================
-def _analiz_klasor_var(yol):
-    """mf içinde bu adla bir klasör var mı (dosya değil)."""
+
+def _sonlu(x):
+    return isinstance(x, (int, float, np.integer, np.floating)) and np.isfinite(x)
+
+
+def _yuzde(x):
+    return f"%{x * 100:.1f}".replace(".", ",")
+
+
+def _adet(x):
+    return f"{int(round(x)):,}".replace(",", ".")
+
+
+def _ondalik(x, n=2):
+    return f"{x:.{n}f}".replace(".", ",")
+
+
+# ==================================================================
+# 1) MODEL KLASÖRLERİ VE SONUÇLAR
+# ==================================================================
+_AILE_SIRA = [h[0] for h in HEDEFLER]
+_MODEL_ADI = {h[0]: h[1] for h in HEDEFLER}
+_RENK_ADI = {k: a for k, _, a in RENKLER}
+KLASOR_RE = re.compile(r"^(\d+)M_(" + "|".join(sorted(_AILE_SIRA, key=len, reverse=True)) + r")_OOT(\d{6})$")
+MODEL_DOSYA_RE = re.compile(r"^renk_(\d+)_(.+?)_(model\.pkl|kalan_featurelar\.csv|musteri_skorlari\.csv)$")
+_SKOR_ADI = {"DAVRANIŞ SKORU": "Davranış Skoru", "MÜŞTERİ SKORU": "Müşteri Skoru"}
+
+
+def _seg_etiket(kod):
+    return f"{kod}-{_RENK_ADI.get(kod, kod)}"
+
+
+def _cocuklar(yol):
+    det = mf.get_path_details(yol) or {}
+    return det.get("children") or []
+
+
+def _alt_klasorler():
+    kl = sorted(c["name"] for c in _cocuklar("/") if c.get("directory"))
+    if not kl:
+        kl = sorted({p.strip("/").split("/")[0] for p in mf.list_paths_in_partition() if "/" in p.strip("/")})
+    return kl
+
+
+def _dosyalar(klasor):
+    ad = [c["name"] for c in _cocuklar("/" + klasor) if not c.get("directory")]
+    if not ad:
+        on = "/" + klasor + "/"
+        ad = [p[len(on):] for p in mf.list_paths_in_partition() if p.startswith(on) and "/" not in p[len(on):]]
+    return sorted(ad)
+
+
+def _csv(klasor, ad):
+    with mf.get_download_stream(f"/{klasor}/{ad}") as s:
+        return pd.read_csv(s)
+
+
+def _ham_oku(yol):
     try:
-        d = mf.get_path_details("/" + str(yol).lstrip("/"))
-    except Exception:
-        return False
-    if not isinstance(d, dict) or d.get("exists") is False:
-        return False
-    return bool(d.get("directory", False))
+        with mf.get_download_stream(yol) as s:
+            return s.read()
+    except Exception as e:
+        _log(f"⚠ {yol} okunamadı ({type(e).__name__})")
+        return None
 
 
-def _analiz_kok_klasorleri():
-    """Ana klasördeki alt klasör adları. list_paths_in_partition bu klasörde boş
-    döndüğü için önce get_path_details("/") içindeki 'children' kullanılır."""
-    adlar = set()
+def _bucket_oot(klasor, ad):
+    """bucket xlsx'in ana sheet'inden OOT satırları (bucket'a göre sıralı), kolon adları küçük harf."""
+    with mf.get_download_stream(f"/{klasor}/{ad}") as s:
+        sayfalar = pd.read_excel(BytesIO(s.read()), sheet_name=None)
+    for sh_ad, t in sayfalar.items():
+        t.columns = [str(c).strip().lower() for c in t.columns]
+        if str(sh_ad).upper().endswith("_DETAY") or not {"kume", "bucket"} <= set(t.columns):
+            continue
+        t = t[t["kume"].astype(str).str.strip().str.upper() == "OOT"].copy()
+        for c in ("bucket", "n", "bad", "bad_rate", "capture", "cum_n_pct"):
+            if c in t.columns:
+                t[c] = pd.to_numeric(t[c], errors="coerce")
+        t = t.dropna(subset=["bucket"]).sort_values("bucket")
+        if "bad_rate" not in t.columns and {"n", "bad"} <= set(t.columns):
+            t["bad_rate"] = t["bad"] / t["n"]
+        elif "bad_rate" in t.columns and t["bad_rate"].max(skipna=True) > 1.5:
+            t["bad_rate"] = t["bad_rate"] / 100.0             # 98,24 yazılmışsa 0,9824'e çek
+        return t
+    return None
+
+
+def _yakalama(t, pay):
+    """En riskli 'pay' kadar müşterideki kümülatif yakalama. Tablonun kümülatif kitle payı
+    (cum_n_pct ya da n'den) 'pay'a denk gelen bir dilim sınırı yoksa boş döner (tahmin yapılmaz)."""
+    if t is None or "capture" not in t.columns or not len(t):
+        return np.nan
+    if "cum_n_pct" in t.columns and t["cum_n_pct"].notna().all():
+        x = t["cum_n_pct"].to_numpy(dtype=float)
+    elif "n" in t.columns and t["n"].notna().all() and t["n"].sum() > 0:
+        x = (t["n"].cumsum() / t["n"].sum()).to_numpy(dtype=float)
+    else:
+        x = (t["bucket"] / t["bucket"].max()).to_numpy(dtype=float)
+    i = int(np.argmin(np.abs(x - pay)))
+    return _sayi(t["capture"].iloc[i]) if abs(x[i] - pay) <= 0.0025 else np.nan
+
+
+def _performans(klasor, dosyalar):
+    """Renk kodu → {kitle, tr_oran, oot_oran, tr_gini, val_gini, oot_gini, top1, top5, top10, bucket(20)}."""
+    sonuc = {}
+    ozet = {}
+    if "renk_bazli_train_val_oot_ozet.csv" in dosyalar:
+        t = _csv(klasor, "renk_bazli_train_val_oot_ozet.csv")
+        for _, r in t.iterrows():
+            try:
+                ozet[int(str(r["renk"]).split("-")[0])] = r
+            except (ValueError, KeyError):
+                pass
+    for kod, ad, _ in RENKLER:
+        r = ozet.get(kod)
+        if r is None and f"renk_{kod}_{ad}_ozet.csv" in dosyalar:
+            o = _csv(klasor, f"renk_{kod}_{ad}_ozet.csv")
+            r = o.iloc[0] if len(o) else None
+        g = (lambda k: _sayi(r.get(k)) if r is not None else np.nan)
+        d = {"kitle": g("n_oot"), "tr_oran": g("target_rate"), "oot_oran": g("oot_target_rate"),
+             "tr_gini": g("train_gini"), "val_gini": g("val_gini"), "oot_gini": g("oot_gini"),
+             "top1": np.nan, "top5": np.nan, "top10": np.nan, "bucket": [np.nan] * 20}
+        b20 = f"renk_{kod}_{ad}_bucket20_train_val_oot.xlsx"
+        b100 = f"renk_{kod}_{ad}_bucket100_train_val_oot.xlsx"
+        t20 = _bucket_oot(klasor, b20) if b20 in dosyalar else None
+        if t20 is not None and len(t20):
+            if "bad_rate" in t20.columns:
+                br = dict(zip(t20["bucket"].astype(int), t20["bad_rate"]))
+                d["bucket"] = [_sayi(br.get(i)) for i in range(1, 21)]
+            if not np.isfinite(d["oot_oran"]) and {"n", "bad"} <= set(t20.columns):
+                n = t20["n"].sum()
+                d["oot_oran"] = t20["bad"].sum() / n if n else np.nan
+            if not np.isfinite(d["kitle"]) and "n" in t20.columns:
+                d["kitle"] = float(t20["n"].sum())
+        t100 = _bucket_oot(klasor, b100) if b100 in dosyalar else None
+        for anahtar, pay in (("top1", 0.01), ("top5", 0.05), ("top10", 0.10)):
+            d[anahtar] = _yakalama(t100, pay)
+            if not np.isfinite(d[anahtar]):                   # bucket100 yoksa bucket20 (%5 ve %10 dilim sınırı)
+                d[anahtar] = _yakalama(t20, pay)
+        sonuc[kod] = d
+    return sonuc
+
+
+def _rapor_tablosu(ham, onek, oot, ilk="SEGMENT", ikinci="HEDEF"):
+    """14 ANALİZ sheet'inden tablo. Başlık satırı: 'ilk' ve hemen sağında 'ikinci' yazan hücre çifti
+    (sol paneldeki kolon sözlüğünde de "SEGMENT" geçtiği için tek kelimeye bakılmaz)."""
+    sayfalar = pd.ExcelFile(BytesIO(ham)).sheet_names
+    sh = f"{onek}OOT_{oot}" if f"{onek}OOT_{oot}" in sayfalar else next((s for s in sayfalar if s.startswith(onek)), None)
+    if sh is None:
+        _log(f"⚠ {KIYAS_RAPORU}: {onek}... sheet'i yok")
+        return None, None
+    t = pd.read_excel(BytesIO(ham), sheet_name=sh, header=None)
+    yer = [(i, j) for i in range(min(15, len(t))) for j in range(t.shape[1] - 1)
+           if str(t.iat[i, j]).strip() == ilk and str(t.iat[i, j + 1]).strip() == ikinci]
+    if not yer:
+        _log(f"⚠ {KIYAS_RAPORU}/{sh}: {ilk} | {ikinci} başlığı bulunamadı")
+        return None, sh
+    i0, j0 = yer[0]
+    bas = [str(x).strip() for x in t.iloc[i0, j0:]]
+    veri = t.iloc[i0 + 1:, j0:j0 + len(bas)].copy()
+    veri.columns = bas
+    return veri[veri[ilk].notna()], sh
+
+
+def _anahtar(r):
+    """14 satırının SEGMENT / HEDEF'inden (vade, hedef, renk kodu); tanınmazsa None."""
+    m_s = re.match(r"^(\d+)-", str(r["SEGMENT"]))
+    m_h = re.match(r"^(\d+)M (.+)$", str(r["HEDEF"]).strip())
+    if not (m_s and m_h) or m_h.group(2).strip() not in KIYAS_HEDEF:
+        return None
+    return int(m_h.group(1)), KIYAS_HEDEF[m_h.group(2).strip()], int(m_s.group(1))
+
+
+def _kiyas_oku(ham, oot):
+    """14 ANALİZ HÜKÜM sheet'i → (vade, hedef, renk kodu) → karşılaştırma değerleri."""
+    if ham is None:
+        return {}
+    veri, sh = _rapor_tablosu(ham, "HUKUM_", oot)
+    if veri is None:
+        return {}
+    bas = list(veri.columns)
+
+    def kol(on):
+        return next((c for c in bas if c.upper().startswith(on)), None)
+    K = {"kitle": kol("KİTLE (ADET)"), "vaka": kol("KİTLE VAKA"), "oran": kol("HEDEF ORANI"),
+         "g_dav": kol("GINI: DAVRANIŞ"), "g_mus": kol("GINI: MÜŞTERİ"), "g_mod": kol("GINI: MODEL"),
+         "fark": kol("GINI FARKI"), "hukum": kol("HÜKÜM"), "en_iyi": kol("EN İYİ MEVCUT"),
+         "y_dav": kol("YAKALAMA: DAVRANIŞ"), "y_mus": kol("YAKALAMA: MÜŞTERİ"), "y_mod": kol("YAKALAMA: MODEL"),
+         "aciklama": kol("AÇIKLAMA")}
+    sonuc = {}
+    for _, r in veri.iterrows():
+        an = _anahtar(r)
+        if an is None:
+            continue
+        d = {k: (r[c] if c else np.nan) for k, c in K.items()}
+        for k in ("kitle", "vaka", "oran", "g_dav", "g_mus", "g_mod", "fark", "y_dav", "y_mus", "y_mod"):
+            d[k] = _sayi(d[k])
+        gd, gm, go = d["g_dav"], d["g_mus"], d["g_mod"]
+        if pd.notna(d["en_iyi"]) and str(d["en_iyi"]).strip().upper() in _SKOR_ADI:      # 14'ün kendi kolonu
+            d["en_iyi"] = _SKOR_ADI[str(d["en_iyi"]).strip().upper()]
+        else:                                                                         # yoksa Gini'den
+            d["en_iyi"] = (None if not (np.isfinite(gd) or np.isfinite(gm)) else
+                           "Davranış Skoru" if np.nan_to_num(gd, nan=-9) >= np.nan_to_num(gm, nan=-9) else "Müşteri Skoru")
+        hk = str(d["hukum"]).strip() if pd.notna(d["hukum"]) else None
+        if hk and hk.endswith("YETER"):        # MEVCUT SKOR YETER / DAVRANIŞ SKORU YETER / MÜŞTERİ SKORU YETER
+            yeter = [ad for ad, g in (("Davranış Skoru", gd), ("Müşteri Skoru", gm))
+                     if np.isfinite(g) and np.isfinite(go) and g >= go]
+            hk = f"MEVCUT SKOR YETER: {' ve '.join(yeter) if yeter else d['en_iyi']}"
+        d["hukum"] = hk
+        d["aciklama"] = str(d["aciklama"]) if pd.notna(d["aciklama"]) else None
+        sonuc[an] = d
+    _log(f"{KIYAS_RAPORU} / {sh}: {len(sonuc)} hüküm satırı okundu")
+    return sonuc
+
+
+_G_SM, _G_SV = "SADECE MODEL RİSKLİ DİYOR", "SADECE MEVCUT SKOR RİSKLİ DİYOR"
+_G_IR, _G_IT = "İKİSİ DE RİSKLİ DİYOR", "İKİSİ DE TEMİZ DİYOR"
+_SONUC_ADI = {"MODEL": "Model daha isabetli", "MEVCUT SKOR": "Mevcut skor daha isabetli",
+              "BERABER": "Fark yok", "VAKA YOK": "Vaka yok"}
+
+
+def _kacan_oku(ham, oot):
+    """14 ANALİZ KAÇAN DİLİM sheet'i → satır listesi (her satır: renk x hedef-vade x mevcut skor)."""
+    if ham is None:
+        return []
+    veri, sh = _rapor_tablosu(ham, "KACAN_DILIM_", oot)
+    if veri is None:
+        return []
+    kol = set(veri.columns)
+    g = (lambda r, ad: _sayi(r[ad]) if ad in kol else np.nan)
+    sonuc = []
+    for _, r in veri.iterrows():
+        an = _anahtar(r)
+        skor = _SKOR_ADI.get(str(r.get("MEVCUT SKOR", "")).strip().upper()) if "MEVCUT SKOR" in kol else None
+        if an is None or skor is None:
+            continue
+        kz = str(r["KAZANAN"]).strip() if "KAZANAN" in kol and pd.notna(r["KAZANAN"]) else None
+        d = {"vade": an[0], "aile": an[1], "kod": an[2], "skor": skor, "kazanan": kz,
+             "n": g(r, "KİTLE (adet)"), "v": g(r, "KİTLE VAKA (adet)"), "o": g(r, "KİTLE HEDEF ORANI (%)"),
+             "fark": g(r, "ORAN FARKI: MODEL GRUBU - MEVCUT GRUBU (%)"), "net": g(r, "NET EK VAKA: MODEL LEHİNE (adet)"),
+             "ort": g(r, "RİSKLİ LİSTE ÖRTÜŞMESİ (%)")}
+        for on, grup in (("sm", _G_SM), ("sv", _G_SV), ("ir", _G_IR), ("it", _G_IT)):
+            d[f"{on}_n"] = g(r, f"{grup} (adet)")
+            d[f"{on}_v"] = g(r, f"{grup}: VAKA (adet)")
+            d[f"{on}_o"] = g(r, f"{grup}: HEDEF ORANI (%)")
+        sonuc.append(d)
+    _log(f"{KIYAS_RAPORU} / {sh}: {len(sonuc)} kaçan dilim satırı okundu")
+    return sonuc
+
+
+def _ozet_oku(ham, oot):
+    """14 ANALİZ OZET_ADETLER → {"kitle": {kod | "TOPLAM": {...}}, "hedef": {(vade, aile, kod | "TOPLAM"): (vaka, oran)}}."""
+    if ham is None:
+        return None
+    veri, sh = _rapor_tablosu(ham, "OZET_ADETLER", oot, ilk="DONEM", ikinci="SEGMENT")
+    if veri is None:
+        return None
+    don = pd.to_numeric(veri["DONEM"], errors="coerce")
+    if (don == oot).any():
+        veri = veri[don == oot]
+    elif don.notna().any():                                  # bu OOT yoksa son dönem
+        veri = veri[don == don.max()]
+    kol = set(veri.columns)
+    g = (lambda r, ad: _sayi(r[ad]) if ad in kol else np.nan)
+    hedef_kol = {}
+    for c in veri.columns:
+        m = re.match(r"^(\d+)M (.+): (VAKA \(adet\)|ORAN \(%\))$", str(c))
+        if m and m.group(2).strip() in KIYAS_HEDEF:
+            hedef_kol[c] = (int(m.group(1)), KIYAS_HEDEF[m.group(2).strip()], "vaka" if m.group(3).startswith("VAKA") else "oran")
+    sonuc = {"kitle": {}, "hedef": {}}
+    for _, r in veri.iterrows():
+        seg = str(r["SEGMENT"]).strip()
+        m = re.match(r"^(\d+)-", seg)
+        kod = "TOPLAM" if seg.upper() == "TOPLAM" else (int(m.group(1)) if m else None)
+        if kod is None:
+            continue
+        sonuc["kitle"][kod] = {"tum": g(r, "TÜM KİTLE (adet)"), "ortak": g(r, "ORTAK KİTLE (adet)"),
+                               "ortak_pay": g(r, "ORTAK KİTLE PAYI (%)"), "fpd": g(r, "FPD KESİŞEN KİTLE (adet)"),
+                               "fpd_pay": g(r, "FPD KESİŞEN KİTLE PAYI (%)")}
+        for c, (v, aile, tur) in hedef_kol.items():
+            sonuc["hedef"].setdefault((v, aile, kod), {})[tur] = g(r, c)
+    _log(f"{KIYAS_RAPORU} / {sh}: {len(sonuc['kitle'])} segment satırı okundu")
+    return sonuc
+
+
+def _yakalama_egrisi_oku(ham, oot):
+    """14 ANALİZ YAKALAMA sheet'i → (vade, hedef, renk kodu) → {"MODEL" | "Davranış Skoru" | "Müşteri Skoru": [20 değer]}.
+    Üç skor HÜKÜM ile aynı kitlede ölçülür; sheet yoksa (14'ün eski sürümü) boş döner."""
+    if ham is None:
+        return {}
+    veri, sh = _rapor_tablosu(ham, "YAKALAMA_", oot)
+    if veri is None:
+        _log("ℹ Yakalama eğrisi için 14 ANALİZ v5 çıktısı (YAKALAMA_OOT_ sheet'i) gerekli; grafik yerine not yazılacak")
+        return {}
+    kol = [f"%{p} (%)" for p in YAKALAMA_NOKTALARI]
+    if not all(k in veri.columns for k in kol):
+        _log(f"⚠ {KIYAS_RAPORU}/{sh}: %5 ... %100 kolonları eksik; yakalama eğrisi çizilmeyecek")
+        return {}
+    adlar = {"MODEL": "MODEL", **_SKOR_ADI}
+    sonuc = {}
+    for _, r in veri.iterrows():
+        an = _anahtar(r)
+        sk = adlar.get(str(r.get("SKOR", "")).strip().upper())
+        if an is None or sk is None:
+            continue
+        sonuc.setdefault(an, {})[sk] = [_sayi(r[k]) for k in kol]
+    _log(f"{KIYAS_RAPORU} / {sh}: {len(sonuc)} model için yakalama eğrisi okundu")
+    return sonuc
+
+
+_log("Başladı")
+_haric = {h.upper() for h in HARIC_KLASORLER}
+_bulunan = []
+for _ad in _alt_klasorler():
+    _m = KLASOR_RE.match(_ad)
+    if _ad.upper() in _haric or not _m:
+        continue
+    _bulunan.append({"klasor": _ad, "vade": int(_m.group(1)), "aile": _m.group(2), "oot": int(_m.group(3))})
+if not _bulunan:
+    raise RuntimeError(f"{MAIN_FOLDER} ana klasöründe model klasörü bulunamadı.")
+_oot_say = pd.Series([k["oot"] for k in _bulunan]).value_counts()
+_oot = (int(str(OOT_KLASOR).upper().replace("OOT", "")) if OOT_KLASOR
+        else max(_oot_say.index, key=lambda o: (_oot_say[o], o)))
+MODELLER = {}                               # (vade, aile) → {klasor, renkler, perf: {kod: {...}}}
+for k in _bulunan:
+    if k["oot"] != _oot:
+        continue
+    dos = _dosyalar(k["klasor"])
+    renkler = sorted({int(m.group(1)) for d in dos if (m := MODEL_DOSYA_RE.match(d))})
+    MODELLER[(k["vade"], k["aile"])] = {"klasor": k["klasor"], "renkler": renkler, "perf": _performans(k["klasor"], dos)}
+    _log(f"   {k['klasor']}: {len(renkler)} renk modeli")
+_KIYAS_HAM = _ham_oku(KIYAS_RAPORU)
+KIYAS = _kiyas_oku(_KIYAS_HAM, _oot)
+KACAN = _kacan_oku(_KIYAS_HAM, _oot)
+OZET = _ozet_oku(_KIYAS_HAM, _oot)
+EGRI = _yakalama_egrisi_oku(_KIYAS_HAM, _oot)
+
+_vadeler = [v for v in VADELER if any(k[0] == v for k in MODELLER)]
+_hv = [(v, a) for v in _vadeler for a in _AILE_SIRA if (v, a) in MODELLER]       # satır sırası
+N_HV, N_RENK = len(_hv), len(RENKLER)
+N_MODEL = sum(len(MODELLER[k]["renkler"]) for k in _hv)
+
+
+def _model_var(v, aile, kod):
+    p = MODELLER[(v, aile)]["perf"].get(kod, {})
+    return kod in MODELLER[(v, aile)]["renkler"] or np.isfinite(p.get("oot_gini", np.nan))
+
+
+TUM_MODELLER = [(kod, v, aile) for kod, _, _ in RENKLER for v, aile in _hv if _model_var(v, aile, kod)]
+_log(f"OOT{_oot}: {N_HV} hedef-vade | {N_MODEL} model")
+
+
+# ==================================================================
+# 2) BİÇİM YARDIMCILARI
+# ==================================================================
+wb = Workbook()
+_BOLUM = PatternFill("solid", fgColor=AKBANK_KIRMIZI)
+_ALT = PatternFill("solid", fgColor=ALT_BASLIK)
+_VAR = PatternFill("solid", fgColor="C6EFCE")
+_YOK = PatternFill("solid", fgColor="EDEDED")
+_BOS = PatternFill("solid", fgColor="FAFAFA")
+_INCE = Side(style="thin", color="7F7F7F")
+_BEYAZ = Side(style="thin", color="FFFFFF")
+_KENAR = Border(left=_INCE, right=_INCE, top=_INCE, bottom=_INCE)
+_KENAR_B = Border(left=_BEYAZ, right=_BEYAZ, top=_BEYAZ, bottom=_BEYAZ)
+_HUKUM_RENK = {"MODEL GEREKLİ": "C6EFCE", "SINIRDA": "FFEB84", "MEVCUT SKOR YETER": "EDEDED",
+               "YETERSİZ VAKA": "D9D9D9", "HESAPLANAMADI": "D9D9D9"}
+_SONUC_RENK = {"Model daha isabetli": "C6EFCE", "Fark yok": "FFEB84", "Mevcut skor daha isabetli": "EDEDED",
+               "Vaka yok": "D9D9D9"}
+DILIMLEYICI_PLANI = []        # dosya yazıldıktan sonra eklenecek dilimleyiciler (8. bölüm)
+
+
+class Sayfa:
+    """Bir sheet'e hücre / birleşik hücre / bölüm başlığı yazan küçük yardımcı."""
+    def __init__(self, ws, son):
+        self.ws, self.son = ws, son
+
+    def hucre(self, r, c, v=None, bold=False, fill=None, wrap=True, h="left", italic=False, renk="000000",
+              size=11, fmt=None, kenar=_KENAR, dikey=None):
+        x = self.ws.cell(r, c, v)
+        x.font = Font(name=YAZI_TIPI, bold=bold, italic=italic, color=renk, size=size)
+        x.alignment = Alignment(wrap_text=wrap, vertical=dikey or ("center" if h == "center" else "top"),
+                                horizontal=h)
+        if fill:
+            x.fill = fill
+        if fmt:
+            x.number_format = fmt
+        if kenar:
+            x.border = kenar
+        return x
+
+    def birlestir(self, r, c1, c2, v=None, **k):
+        for c in range(c1, c2 + 1):
+            self.hucre(r, c, None, fill=k.get("fill"), kenar=k.get("kenar", _KENAR))
+        if c2 > c1:
+            self.ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+        return self.hucre(r, c1, v, **k)
+
+    def baslik(self, r, metin, c1=2, c2=None):
+        self.birlestir(r, c1, c2 or self.son, metin, bold=True, fill=_BOLUM, renk=BASLIK_YAZI, size=12)
+        self.ws.row_dimensions[r].height = 20
+
+    def satir(self, r, etiket, metin, yuk=18, c_metin=3):
+        if c_metin > 3:
+            self.birlestir(r, 2, c_metin - 1, etiket, bold=True, dikey="center")
+        else:
+            self.hucre(r, 2, etiket, bold=True, dikey="center")
+        self.birlestir(r, c_metin, self.son, metin, dikey="center")
+        self.ws.row_dimensions[r].height = yuk
+
+    def not_satiri(self, r, metin, c1=2, c2=None, yuk=16):
+        self.birlestir(r, c1, c2 or self.son, metin, italic=True, renk="595959", size=10, kenar=None)
+        self.ws.row_dimensions[r].height = yuk
+
+
+def _yeni_sayfa(ad, genislikler, ilk=False):
+    ws = wb.active if ilk else wb.create_sheet(ad)
+    ws.title = ad
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = AKBANK_KIRMIZI
+    ws.column_dimensions["A"].width = 2
+    for c, w in genislikler.items():
+        ws.column_dimensions[get_column_letter(c)].width = w
+    return ws
+
+
+def _yazdir(ws, yatay=True):
+    ws.page_setup.orientation = "landscape" if yatay else "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def _tablo_ekle(ws, ad, r0, rs, c1, basliklar):
+    """Excel tablosu; kolon kimlikleri 1..n (dilimleyici bu kimliklerle tabloya bağlanır)."""
+    ref = f"{get_column_letter(c1)}{r0}:{get_column_letter(c1 + len(basliklar) - 1)}{rs}"
+    tab = Table(displayName=ad, ref=ref)
+    tab.tableColumns = [TableColumn(id=i, name=b) for i, b in enumerate(basliklar, start=1)]
+    tab.autoFilter = AutoFilter(ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=False)
+    ws.add_table(tab)
+    return tab
+
+
+def _dilimleyici_alani(ws, tablo, r_ust, dilimler):
+    """Dilimleyici planı: dilimler = [(kolon başlığı, görünen ad, ilk kolon, son kolon, satır sayısı, buton kolon sayısı)].
+    Kolonlar 1 tabanlı; dilimleyici r_ust satırından başlar."""
+    if not DILIMLEYICI_EKLE:
+        return
+    DILIMLEYICI_PLANI.append({
+        "sayfa": ws.title, "tablo": tablo,
+        "dilimler": [(kolon, ad, (c1 - 1, r_ust - 1, c2, r_ust - 1 + n_satir), n_kol)
+                     for kolon, ad, c1, c2, n_satir, n_kol in dilimler]})
+
+
+def _yazi(boyut):
+    cp = CharacterProperties(sz=int(boyut * 100))
+    return RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=cp), endParaRPr=cp)])
+
+
+def _eksen_siniri(degerler, pay=1.15, adim=0.05, ust_sinir=1.0):
+    """Değer ekseninin alt / üst sınırı; üstte etiketlerin sığacağı kadar pay bırakır."""
+    v = [x for x in degerler if _sonlu(x)]
+    if not v:
+        return 0.0, 1.0
+    alt = min(0.0, float(np.floor(min(v) / adim) * adim))
+    ust = float(np.ceil(max(v) * pay / adim) * adim)
+    if ust_sinir is not None and max(v) <= ust_sinir:        # Gini ve oranlar 1'i geçmez; eksen %100'de dursun
+        ust = min(ust, ust_sinir)
+    return alt, max(ust, adim)
+
+
+def _cubuk_grafik(ws, baslik, seriler, kat_kol, r0, rs, eksen_fmt, etiket_fmt, en, boy, eksen, ust_uste=False):
+    """Tablo satırlarına bağlı, değer etiketli yatay çubuk grafik. Seçilmeyen (gizlenen) satırlar çizilmez.
+    seriler: [(kolon no, seri adı ya da None = başlık hücresi, renk)]; eksen: (alt, üst) ya da None (otomatik);
+    ust_uste: seriler aynı çubuk yerinde (her satırda yalnızca biri dolu olan artı / eksi kolonlar için)."""
+    ch = BarChart()
+    ch.type = "bar"
+    ch.grouping = "clustered"
+    ch.gapWidth = 60
+    if ust_uste:
+        ch.overlap = 100
+    ch.title = baslik
+    ch.width, ch.height = en, boy
+    ch.style = 10
+    ch.legend.position = "b"
+    ch.y_axis.numFmt = eksen_fmt
+    ch.y_axis.majorGridlines = None
+    if eksen is not None:                                     # None: Excel görünen verilere göre ölçekler
+        ch.y_axis.scaling.min, ch.y_axis.scaling.max = eksen
+    ch.x_axis.scaling.orientation = "maxMin"                  # tablodaki sırayla yukarıdan aşağı
+    ch.x_axis.tickLblPos = "low"                              # model adları eksi çubukların üstüne binmesin
+    ch.y_axis.crosses = "max"                                 # değer ekseni altta kalsın
+    for kol, ad, rk in seriler:
+        if ad is None:
+            s = Series(Reference(ws, min_col=kol, min_row=r0, max_row=rs), title_from_data=True)
+        else:
+            s = Series(Reference(ws, min_col=kol, min_row=r0 + 1, max_row=rs), title=ad)
+        s.graphicalProperties.solidFill = rk
+        s.graphicalProperties.line.solidFill = rk
+        ch.series.append(s)
+    ch.set_categories(Reference(ws, min_col=kat_kol, min_row=r0 + 1, max_row=rs))
+    ch.x_axis.tickLblSkip = 1                                 # her modelin adı yazsın
+    ch.x_axis.txPr = _yazi(8)
+    ch.y_axis.txPr = _yazi(8)
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.dataLabels = DataLabelList()                           # değer etiketleri
+    ch.dataLabels.showVal = True
+    ch.dataLabels.showSerName = ch.dataLabels.showCatName = False
+    ch.dataLabels.showLegendKey = ch.dataLabels.showPercent = False
+    ch.dataLabels.position = "outEnd"
+    ch.dataLabels.numFmt = etiket_fmt
+    ch.dataLabels.txPr = _yazi(7.5)
+    ch.visible_cells_only = True
+    return ch
+
+
+def _cm_satir(cm):
+    """cm yüksekliğindeki bir grafiğin kapladığı varsayılan satır sayısı (15 pt = 0,53 cm)."""
+    return int(np.ceil(cm / 0.53)) + 2
+
+
+_VERI_WS = []
+
+
+def _veri_sayfasi():
+    """Grafiklerin yardımcı verisi için gizli sheet (kaydetmeden önce dosyanın sonuna taşınır)."""
+    if not _VERI_WS:
+        w = wb.create_sheet(VERI_SAYFA)
+        w.sheet_state = "hidden"
+        _VERI_WS.append(w)
+    return _VERI_WS[0]
+
+
+# ==================================================================
+# 3) YÖNETİCİ ÖZETİ (verilerden otomatik; ilk sayfa)
+# ==================================================================
+def _model_etiket(kod, v, aile):
+    return f"{_RENK_ADI[kod]} | {v}M {_MODEL_ADI[aile]}"
+
+
+def _hukum_sinifi(hk):
+    return str(hk).split(":")[0].strip() if hk else None
+
+
+def _dagilim_bolumu(ws, S, r):
+    """"Model mi, mevcut skor mu?" dağılım grafiği: her nokta bir model; yatay eksen en iyi mevcut skorun Gini'si,
+    dikey eksen modelin Gini'si (14 HÜKÜM, aynı müşteriler). Bir sonraki boş satırı döner."""
+    noktalar = []
+    for kod, v, a in TUM_MODELLER:
+        kk = KIYAS.get((v, a, kod), {})
+        mev = [g for g in (kk.get("g_dav", np.nan), kk.get("g_mus", np.nan)) if _sonlu(g)]
+        sinif = _hukum_sinifi(kk.get("hukum"))
+        if _sonlu(kk.get("g_mod", np.nan)) and mev and sinif in ("MODEL GEREKLİ", "SINIRDA", "MEVCUT SKOR YETER"):
+            noktalar.append((sinif, max(mev), kk["g_mod"], _model_etiket(kod, v, a)))
+    if not noktalar:
+        return r
+    S.baslik(r, "Model mi, mevcut skor mu? (OOT Gini, aynı müşteriler üzerinde)")
+    r += 1
+    wv = _veri_sayfasi()
+    for c, metin in enumerate(["Model", "Hüküm", "En iyi mevcut skor Gini", "Model Gini", "", "Eşitlik x", "Eşitlik y",
+                               "Eşik x", "Eşik y"], start=1):
+        wv.cell(1, c, metin)
+    siniflar = [("MODEL GEREKLİ", "Model gerekli", "4CAF50"), ("SINIRDA", "Sınırda", "FFC000"),
+                ("MEVCUT SKOR YETER", "Mevcut skor yeter", "7F7F7F")]
+    satir, araliklar = 2, []
+    for kod_s, ad_s, rk in siniflar:
+        nl = sorted((n for n in noktalar if n[0] == kod_s), key=lambda n: n[1])
+        if not nl:
+            continue
+        r1 = satir
+        for n in nl:
+            for c, deger in enumerate((n[3], ad_s, float(n[1]), float(n[2])), start=1):
+                wv.cell(satir, c, deger)
+            satir += 1
+        araliklar.append((ad_s, rk, r1, satir - 1, len(nl)))
+    tum = [n[1] for n in noktalar] + [n[2] for n in noktalar]
+    alt = min(0.0, float(np.floor(min(tum) * 10) / 10))
+    ust = min(1.0, float(np.ceil(max(tum) * 10) / 10))
+    ust = max(ust, alt + 0.1)
+    e = KIYAS_GEREKLI_PUAN
+    for i, (ex, ey, kx, ky) in enumerate([(alt, alt, alt, alt + e), (ust, ust, ust - e, ust)]):
+        for c, deger in zip((6, 7, 8, 9), (ex, ey, kx, ky)):
+            wv.cell(2 + i, c, float(deger))
+    sc = ScatterChart()
+    sc.title = "Model Gini'si ve en iyi mevcut skorun Gini'si"
+    sc.style = 13
+    sc.width, sc.height = 15.0, 13.0
+    sc.legend.position = "b"
+    sc.x_axis.title = "En iyi mevcut skorun Gini'si (Davranış ya da Müşteri)"
+    sc.y_axis.title = "Modelin Gini'si"
+    for ax in (sc.x_axis, sc.y_axis):
+        ax.scaling.min, ax.scaling.max = alt, ust
+        ax.majorUnit = 0.1
+        ax.numFmt = "0%"
+        ax.majorGridlines = None
+        ax.delete = False
+        ax.txPr = _yazi(8)
+    for ad_s, rk, r1, r2, n in araliklar:
+        s = Series(Reference(wv, min_col=4, min_row=r1, max_row=r2), Reference(wv, min_col=3, min_row=r1, max_row=r2),
+                   title=f"{ad_s} ({n})")
+        s.marker = Marker(symbol="circle", size=7)
+        s.marker.graphicalProperties = GraphicalProperties(solidFill=rk)
+        s.marker.graphicalProperties.line.solidFill = "FFFFFF"
+        s.graphicalProperties.line.noFill = True               # noktalar arasında çizgi yok
+        sc.series.append(s)
+    for cx, cy, ad_c, stil in [(6, 7, "Eşitlik: model = mevcut skor", "dash"),
+                               (8, 9, f"Model gerekli eşiği (+{_adet(e * 100)} puan)", "sysDot")]:
+        s = Series(Reference(wv, min_col=cy, min_row=2, max_row=3), Reference(wv, min_col=cx, min_row=2, max_row=3), title=ad_c)
+        s.marker = Marker(symbol="none")
+        s.graphicalProperties.line.solidFill = "404040"
+        s.graphicalProperties.line.dashStyle = stil
+        s.graphicalProperties.line.width = 15000
+        sc.series.append(s)
+    sc.visible_cells_only = False                             # veri gizli sheet'te
+    ws.add_chart(sc, f"B{r}")
+    n_ust = sum(1 for n in noktalar if n[2] > n[1])
+    n_esik = sum(1 for n in noktalar if n[0] == "MODEL GEREKLİ")
+    yuk = 0
+    for i, (metin, y, kalin) in enumerate([
+        ("Nasıl okunur?", 20, True),
+        ("Her nokta bir model (renk x hedef-vade). İki eksen de aynı müşteriler üzerinde ölçülen OOT Gini'dir.", 46, False),
+        ("Kesikli çizginin üstündeki modeller, iki mevcut skordan iyi olanından daha iyi ayırıyor; altındakilerde mevcut "
+         "skor daha iyi.", 46, False),
+        (f"Noktalı çizginin üstü: fark {_adet(e * 100)} puan ve üstü, yani Hüküm \"Model gerekli\".", 32, False),
+        ("Renk Hüküm'ü gösterir: yeşil model gerekli, sarı sınırda, gri mevcut skor yeter.", 32, False),
+        (f"{len(noktalar)} modelin {n_ust} tanesi kesikli çizginin, {n_esik} tanesi noktalı çizginin üstünde.", 32, True),
+    ]):
+        S.birlestir(r + i, 7, 10, metin, bold=kalin, dikey="center", kenar=None, fill=_ALT if i == 0 else None)
+        ws.row_dimensions[r + i].height = y
+        yuk += y
+    grafik_pt = 13.0 / 2.54 * 72
+    return r + 6 + int(np.ceil(max(0.0, grafik_pt - yuk) / 15.0)) + 2
+
+
+def _yonetici_ozeti():
+    ws = _yeni_sayfa(OZET_SAYFA, {2: 24, 3: 11, 4: 11, 5: 11, 6: 34, 7: 11, 8: 11, 9: 12, 10: 18}, ilk=True)
+    S = Sayfa(ws, 10)
+    S.baslik(2, "Yönetici Özeti: Kırmızı Renge Göç ve Takip Modelleri")
+    S.not_satiri(3, f"Model dönemi: {MODEL_DONEMI} | Sonuçlar: {OOT_DONEMI} (OOT, modelin görmediği dönem) | "
+                    "Bu sayfadaki tüm sayılar sonraki sayfalardaki tablolardan otomatik hesaplanır.")
+    perf = [(kod, v, a, MODELLER[(v, a)]["perf"].get(kod, {})) for kod, v, a in TUM_MODELLER]
+    gini = sorted([(p["oot_gini"], kod, v, a) for kod, v, a, p in perf if _sonlu(p.get("oot_gini"))])
+    kayip = sorted([(p["tr_gini"] - p["oot_gini"], kod, v, a) for kod, v, a, p in perf
+                    if _sonlu(p.get("tr_gini")) and _sonlu(p.get("oot_gini"))])
+    hk = [_hukum_sinifi(KIYAS.get((v, a, kod), {}).get("hukum")) for kod, v, a in TUM_MODELLER]
+    say = {s: hk.count(s) for s in ("MODEL GEREKLİ", "SINIRDA", "MEVCUT SKOR YETER")}
+    diger = sum(1 for h in hk if h and h not in say)
+    kc = [_SONUC_ADI.get(d["kazanan"], d["kazanan"]) for d in KACAN]
+    satirlar = [("Ne yapıldı", f"Kredi kartı müşterileri için 6 renk segmentinde, 3 / 6 / 12 aylık vadede kırmızıya geçme ve "
+                               f"takibe düşme riskini tahmin eden {len(TUM_MODELLER)} model kuruldu ({N_HV} hedef-vade x "
+                               f"{N_RENK} renk segmenti). Tüm sonuçlar modelin eğitimde görmediği {OOT_DONEMI} dönemindendir.", 32)]
+    if gini:
+        med = float(np.median([g[0] for g in gini]))
+        satirlar.append(("Ayırma gücü", f"OOT Gini {_ondalik(gini[0][0])} ile {_ondalik(gini[-1][0])} arasında, ortanca "
+                                        f"{_ondalik(med)}. En yüksek: {_model_etiket(*gini[-1][1:])} ({_ondalik(gini[-1][0])}); "
+                                        f"en düşük: {_model_etiket(*gini[0][1:])} ({_ondalik(gini[0][0])}).", 32))
+    if kayip:
+        med = float(np.median([k[0] for k in kayip]))
+        n_fazla = sum(1 for k in kayip if k[0] > KARARLILIK_ESIK)
+        satirlar.append(("Yeni dönemde tutarlılık",
+                         f"Train'den OOT'ye Gini kaybı ortanca {_ondalik(med)}; {len(kayip)} modelin {n_fazla} tanesinde "
+                         f"{_ondalik(KARARLILIK_ESIK)}'ten büyük. En büyük kayıp: {_model_etiket(*kayip[-1][1:])} "
+                         f"({_ondalik(kayip[-1][0])}).", 32))
+    if any(hk):
+        satirlar.append(("Mevcut skorlara göre",
+                         f"Davranış ve Müşteri skoruyla aynı müşteriler üzerinde kıyaslandığında: {say['MODEL GEREKLİ']} modelde "
+                         f"model gerekli (Gini farkı {_adet(KIYAS_GEREKLI_PUAN * 100)} puan ve üstü), {say['SINIRDA']} modelde "
+                         f"sınırda, {say['MEVCUT SKOR YETER']} modelde mevcut skor yeterli"
+                         + (f"; {diger} modelde vaka yetersiz ya da hesaplanamadı" if diger else "")
+                         + (f"; {hk.count(None)} modelin kıyas sonucu yok" if None in hk else "") + ".", 32))
+    if kc:
+        satirlar.append(("Ayrışan müşterilerde",
+                         f"Model ile mevcut skorun farklı müşterileri riskli dediği {len(kc)} karşılaştırmanın "
+                         f"{kc.count('Model daha isabetli')} tanesinde model, {kc.count('Mevcut skor daha isabetli')} tanesinde "
+                         f"mevcut skor daha isabetli; {kc.count('Fark yok')} tanesinde fark yok.", 32))
+    if OZET and "TOPLAM" in OZET["kitle"]:
+        t = OZET["kitle"]["TOPLAM"]
+        if _sonlu(t["tum"]):
+            satirlar.append(("Kitle", f"{OOT_DONEMI} döneminde {_adet(t['tum'])} KK müşterisi; bunların "
+                                      + (f"{_adet(t['ortak'])} tanesinin ({_yuzde(t['ortak_pay'])}) Davranış ve Müşteri skoru dolu "
+                                         "(karşılaştırmalar bu ortak kitlede)." if _sonlu(t["ortak"]) and _sonlu(t["ortak_pay"])
+                                         else "skor kapsaması 14 raporunda yok."), 32))
+    r = 5
+    S.baslik(r, "Öne çıkanlar")
+    r += 1
+    for e, m, y in satirlar:
+        S.satir(r, e, m, y)
+        r += 1
+    r += 1
+    S.baslik(r, "Renk segmenti bazında")
+    r += 1
+    for c, metin in enumerate(["Renk segmenti", "Model sayısı", "OOT Gini (ortanca)", "En yüksek OOT Gini",
+                               "En yüksek Gini'li model", "Model gerekli", "Sınırda", "Mevcut skor yeter",
+                               "Ayrışan müşterilerde model daha isabetli"], start=2):
+        S.hucre(r, c, metin, bold=True, fill=_ALT, h="center", size=10)
+    ws.row_dimensions[r].height = 32
+    r += 1
+    for kod, _, rad in RENKLER:
+        ml = [(v, a) for k2, v, a in TUM_MODELLER if k2 == kod]
+        gl = [(MODELLER[(v, a)]["perf"][kod]["oot_gini"], v, a) for v, a in ml
+              if _sonlu(MODELLER[(v, a)]["perf"].get(kod, {}).get("oot_gini"))]
+        hs = [_hukum_sinifi(KIYAS.get((v, a, kod), {}).get("hukum")) for v, a in ml]
+        kk = [_SONUC_ADI.get(d["kazanan"], d["kazanan"]) for d in KACAN if d["kod"] == kod]
+        en = max(gl) if gl else None
+        for c, deger, fmt in [(2, rad, None), (3, len(ml), "0"),
+                              (4, float(np.median([g[0] for g in gl])) if gl else "...", "0.00"),
+                              (5, en[0] if en else "...", "0.00"),
+                              (6, f"{en[1]}M {_MODEL_ADI[en[2]]}" if en else "...", None),
+                              (7, hs.count("MODEL GEREKLİ") if any(hs) else "...", "0"),
+                              (8, hs.count("SINIRDA") if any(hs) else "...", "0"),
+                              (9, hs.count("MEVCUT SKOR YETER") if any(hs) else "...", "0"),
+                              (10, f"{kk.count('Model daha isabetli')} / {len(kk)}" if kk else "...", None)]:
+            S.hucre(r, c, deger, fmt=fmt, h="left" if c in (2, 6) else "center", dikey="center", bold=c == 2)
+        ws.row_dimensions[r].height = 18
+        r += 1
+    S.not_satiri(r, "Model gerekli / Sınırda / Mevcut skor yeter: Mevcut Skorlarla Karşılaştırma (Hüküm) kolonundan. Son kolon: "
+                    f"{KARSILASTIRMA_SAYFA} sayfasındaki karşılaştırmalarda (Davranış ve Müşteri ayrı sayılır) model daha "
+                    "isabetli olanların sayısı / karşılaştırma sayısı.", yuk=30)
+    r = _dagilim_bolumu(ws, S, r + 2)
+    S.baslik(r, "Bu dosyada")
+    r += 1
+    _secim = "renk sekmesinden" if DILIMLEYICI_EKLE else "Renk Segmenti filtresinden"
+    for e, m, y in [
+        (KAPSAM_SAYFA, "Kapsam, hedef tanımları, okurken dikkat edilecekler, kavramlar (sade dille), değişkenlerin hangi veriden "
+                       "nasıl üretildiği ve renk x model sonuç özeti.", 32),
+        (GERCEKLESEN_SAYFA, "OOT kitlesi ve her modelin kitlesinde gerçekleşen hedef adet / oranları (model tahmini değil, "
+                            "gerçekte olan).", 32),
+        (MODEL_SAYFA, f"Tüm modellerin performansı, mevcut skorlarla karşılaştırma (Hüküm), etiketli grafikler ve yakalama "
+                      f"eğrisi. Üstteki {_secim} renk, dilimleyicilerden bir ya da birden çok model seçilir.", 32),
+        (KARSILASTIRMA_SAYFA, "Model ile mevcut skor farklı müşterileri riskli dediğinde hangisinin haklı çıktığı: açıklama, "
+                              "görsel, sonuç matrisi, iki grafik ve detay tablo.", 32),
+    ]:
+        S.satir(r, e, m, y)
+        r += 1
+    _yazdir(ws, yatay=False)
+    ws.print_area = f"A1:K{r}"
+    _log(f"   {OZET_SAYFA}: {len(satirlar)} öne çıkan madde")
+
+
+_yonetici_ozeti()
+
+
+# ==================================================================
+# 4) KAPSAM SAYFASI
+# ==================================================================
+# "Değişkenler: hangi veriden, nasıl üretildi?" tablosu (sunum dili; kolon adı ve formül yok).
+# (veri alanı, bu alandan neler ürettik, neyi yakalamaya çalışıyor). Metni buradan değiştirebilirsin.
+DEGISKEN_ALANLARI = [
+    ("Renk geçmişi",
+     "Son 3, 6 ve 12 ayın ortalama, en kötü ve en iyi rengi; rengin kaç kez ve kaç basamak düştüğü ya da yükseldiği; kaç aydır "
+     "aynı renkte ya da risk renginde (Kırmızı / Turuncu) olduğu; risk rengine en son ne zaman girip çıktığı; toparlandıktan "
+     "sonra yeniden kötüleşip kötüleşmediği.",
+     "Rengin yönü ve hızı: müşteri kötüleşiyor mu, toparlanıyor mu, riskte ne kadar kaldı."),
+    ("Davranış skoru ve müşteri skoru",
+     "Dönem ortalamaları ve en kötü değer; skorun yönü ve hızı (hızlanıyor mu, yavaşlıyor mu); üst üste kaç ay kötüleştiği; "
+     "son ayın 12 ayın en kötü seviyesine inip inmediği.",
+     "Bankanın mevcut skorlarında bozulmanın başlayıp başlamadığı ve sürüp sürmediği."),
+    ("KKB skoru",
+     "Davranış skorundaki soruların aynısı; skoru oluşmamış aylar ayrı tutulur.",
+     "Müşterinin diğer bankalardaki kredi davranışının yansıması; banka dışında başlayan bozulma."),
+    ("Kart limiti, borcu ve kullanımı",
+     "Kartın ne kadar dolu kullanıldığı (borç / limit) ve bunun yönü; kullanımın %80, %90 ve limitin üzerine çıktığı ay "
+     "sayıları; bankanın limiti düşürüp düşürmediği ya da artırdığı; borcun sıfırlandığı aylar.",
+     "Kartın ne kadar sıkıştığı ve bankanın limit aksiyonları."),
+    ("Kart ödemeleri",
+     "Ekstreye göre ödenen tutar oranının ortalaması ve düşüşü; düşük ödeme yapılan ay sayısı.",
+     "Müşterinin borcunu çevirebilme gücü."),
+    ("Bankadaki varlık",
+     "Varlığın son 3 ayda önceki döneme göre değişimi; kart borcunun varlığa oranı.",
+     "Birikimin erimesi ve borcun varlığa göre ağırlığı."),
+    ("Bankanın hazır pencere bilgileri",
+     "Bankanın son 1, 3, 6, 9 ve 12 ay için hazır tuttuğu bilgilerde yakın dönemin uzak döneme oranı; daha önce olan bir "
+     "hareketin son dönemde durup durmadığı.",
+     "Hareketin yakın dönemde yoğunlaşması ya da kesilmesi."),
+    ("Hazır skorlar",
+     "Bankada hâlihazırda üretilen risk skorları, beklenen kayıp ve müşteri değeri bilgilerinin renk gidişatıyla (ör. kaç aydır "
+     "riskte olduğu) birlikte okunması; beklenen kaybın kart borcuna, limite ve varlığa oranı.",
+     "Hazır skorların müşterinin bugünkü gidişatıyla birlikte ne söylediği."),
+    ("Birden çok alan birlikte",
+     "Aynı dönemde kaç göstergenin birlikte bozulduğu; renk henüz bozulmamışken diğer göstergelerin bozulması; aynı ayda düşük "
+     "ödeme ve yüksek kart kullanımı (borç sarmalı); son renk düşüşünden önce görülen öncü sinyallerin şimdi tekrar edip "
+     "etmediği; müşteri için ilk kez görülen olaylar (ilk kez riske girmek, ilk kez limiti aşmak gibi).",
+     "Tek göstergede görünmeyen birleşik ve erken uyarı sinyalleri."),
+    ("Desen",
+     "Müşterinin son aylardaki renk, kart kullanımı ve ödeme deseni kısa bir koda çevrilir; eğitim döneminde aynı desendeki "
+     "müşterilerin ne kadarının bir sonraki ay renk kaybettiği ve desenin ne kadar yaygın olduğu eklenir. Modelin hedefi bu "
+     "hesapta kullanılmaz.",
+     "\"Bu gidişata benzeyen müşteriler genelde nasıl devam ediyor\" bilgisi."),
+]
+ws = _yeni_sayfa(KAPSAM_SAYFA, {2: 26, 3: 30, 4: 30, **{i: 9 for i in range(5, 17)}})
+S = Sayfa(ws, 16)
+_kirmizi_oran = MODELLER.get((3, "ICINDE_KIRMIZI_RENGE_GOC"), {}).get("perf", {}).get(1, {}).get("oot_oran", np.nan)
+_kirmizi_not = f" (3M OOT {_yuzde(_kirmizi_oran)})" if np.isfinite(_kirmizi_oran) else ""
+_model_sayisi_metni = (f"{N_MODEL} = {N_HV} hedef-vade x {N_RENK} renk segmenti (vadelere göre dağılım aşağıdaki tabloda)"
+                       if N_MODEL == N_HV * N_RENK else
+                       f"{N_MODEL} ({N_HV} hedef-vade; bazı renk segmentlerinde model dosyası yok, dağılım aşağıdaki tabloda)")
+r = 2
+S.baslik(r, "Kırmızı Renge Göç ve Takip Modelleri")
+r += 1
+for e, m, y in [
+    ("Amaç", "Renk segmenti bazında, Akbank kredi kartı olan müşterilerin önümüzdeki 3 / 6 / 12 ayda kırmızı renge geçme "
+             "ya da takibe düşme olasılığını tahmin eden modeller.", 32),
+    ("Kitle", "KK ürünlü müşteriler. Her renk segmenti (Kırmızı, Turuncu, Sarı, Açık Yeşil, Yeşil, Koyu Yeşil) için ayrı "
+              "model kurulur; İnaktif segment modellenmez.", 32),
+    ("Model dönemi", f"{MODEL_DONEMI} (validation bu dönemden ayrılır)", 18),
+    ("OOT dönemi", f"{OOT_DONEMI} (modelin eğitimde görmediği dönem; sonuçlar bu dönem üzerinden raporlanır)", 18),
+    ("Model sayısı", _model_sayisi_metni, 18),
+    ("Yöntem", "LightGBM; parametre arama Optuna ile, değişken seçimi SHAP-RFECV ile. Hedefle ilişkili ya da hedeften "
+               "türetilmiş değişken kullanılmaz.", 32),
+]:
+    S.satir(r, e, m, y)
+    r += 1
+r += 1
+S.baslik(r, "Hedef Tanımları")
+r += 1
+_vade_kol = {3: (5, 6), 6: (7, 8), 12: (9, 10)}
+for c1, c2, v in [(2, 2, "Model"), (3, 3, "Hedef = 1 olduğunda"), (4, 4, "Kitle"), (5, 6, "3M"), (7, 8, "6M"),
+                  (9, 10, "12M"), (11, 16, "Teknik ad (klasör)")]:
+    S.birlestir(r, c1, c2, v, bold=True, fill=_ALT, h="center")
+ws.row_dimensions[r].height = 18
+r += 1
+for aile, ad, olay, kitle in HEDEFLER:
+    S.hucre(r, 2, ad, bold=True)
+    S.hucre(r, 3, olay)
+    S.hucre(r, 4, kitle)
+    for v in VADELER:
+        c1, c2 = _vade_kol[v]
+        var = (v, aile) in MODELLER
+        S.birlestir(r, c1, c2, "Var" if var else "Yok", fill=_VAR if var else _YOK, h="center",
+                    renk="006100" if var else "7F7F7F", bold=var)
+    S.birlestir(r, 11, 16, f"X_{aile}", renk="404040")
+    ws.row_dimensions[r].height = 32
+    r += 1
+S.hucre(r, 2, f"Model sayısı (x {N_RENK} renk)", bold=True, fill=_ALT)
+S.birlestir(r, 3, 4, f"Toplam {N_MODEL} model", bold=True, fill=_ALT)
+for v in VADELER:
+    c1, c2 = _vade_kol[v]
+    S.birlestir(r, c1, c2, sum(len(MODELLER[k]["renkler"]) for k in _hv if k[0] == v), bold=True, fill=_ALT, h="center")
+S.birlestir(r, 11, 16, "X = 3, 6 veya 12 (ör. 3M_TAKIP)", fill=_ALT, renk="404040")
+ws.row_dimensions[r].height = 18
+r += 2
+S.baslik(r, "Okurken Dikkat Edilecekler")
+r += 1
+for e, m, y in [
+    ("\"İçinde\" ve \"sonunda\"", "İçinde = model ayından sonraki 1. aydan X. aya kadar herhangi bir ay. Sonunda = yalnızca "
+                                  "X. ayın rengi.", 18),
+    ("Takip bilgisi boş", "Kırmızı Olma ve Kırmızıya Dokunma modellerinde kitleden çıkar; diğer üç modelde kitlede kalır ve "
+                          "\"takip değil\" sayılır.", 32),
+    ("Kırmızı segmenti", "Bu segmentte \"Kırmızıya Dokunma\" pratikte \"kırmızıdan çıkamama\" demektir ve hedef oranı çok "
+                         f"yüksektir{_kirmizi_not}. Bu segmentin sonuçları diğer renklerle aynı ölçekte okunmamalıdır.", 32),
+    ("Değişkenler", "Tüm değişkenler müşterinin kendi geçmişinden hesaplanır. Hangi veriden nasıl üretildikleri aşağıdaki "
+                    "\"Değişkenler: hangi veriden, nasıl üretildi?\" bölümünde; tek tek açıklamaları "
+                    "renk_mdl_alan_aciklamalari.xlsx dosyasında (Degiskenler, Üretilen_Degiskenler).", 32),
+]:
+    S.satir(r, e, m, y)
+    r += 1
+r += 1
+S.baslik(r, "Kavramlar (sade dille)")
+r += 1
+for e, m, y in [
+    ("Gini", "Skorun hedefe düşecek müşteriyi düşmeyecek müşteriden ne kadar iyi ayırdığı. 0 = rastgele sıralama, 1 (%100) = "
+             "kusursuz sıralama; eksi değer ters sıraladığını gösterir. Yüksek olması iyidir.", 32),
+    ("Train / Validation / OOT", "Train: modelin öğrendiği müşteriler. Validation: aynı dönemden ayrılıp eğitimde kullanılmayan "
+                                 "kontrol grubu. OOT: modelin hiç görmediği sonraki dönem; gerçek performansın en dürüst ölçüsü.", 32),
+    ("Gini kaybı", "Train Gini - OOT Gini. Küçükse model yeni dönemde de aynı başarıyı koruyor; büyükse modelin öğrendiği "
+                   "ilişkiler yeni dönemde zayıflamış olabilir.", 32),
+    ("Hedef oranı", "Kitlede hedefin gerçekleştiği müşteri payı (ör. 3 ay içinde kırmızıya dokunanlar / kitle).", 18),
+    ("Bucket (dilim)", "Müşteriler skora göre en riskliden en az riskliye sıralanıp eşit büyüklükte 20 dilime ayrılır. "
+                       "B1 = en riskli %5, B20 = en az riskli %5. İyi bir modelde hedef oranı B1'den B20'ye düzenli azalır.", 32),
+    ("Yakalama (Top %X)", "En riskli %X müşteriye bakıldığında tüm vakaların yüzde kaçının bu grupta olduğu. Ör. Top %10 "
+                          "yakalama %40 ise, müşterilerin %10'una odaklanarak vakaların %40'ı bulunur.", 32),
+    ("Mevcut skorlar", "Bankada hâlihazırda kullanılan Davranış Skoru ve Müşteri Skoru. Modeller bu skorlarla aynı müşteriler "
+                       "üzerinde (ikisi de dolu olan ortak kitle) karşılaştırılır.", 32),
+    ("Hüküm", f"Model Gini'si iki mevcut skordan iyi olanı {_adet(KIYAS_GEREKLI_PUAN * 100)} puan ve üstü geçiyorsa \"Model "
+              "gerekli\"; 0 ile bu eşik arasındaysa \"Sınırda\"; geçemiyorsa \"Mevcut skor yeter\" (hangi skorun yettiği yazılır).", 32),
+]:
+    S.satir(r, e, m, y)
+    r += 1
+r += 1
+S.baslik(r, "Değişkenler: hangi veriden, nasıl üretildi?")
+r += 1
+for metin, y in [
+    ("Modeller ham verinin kendisinden çok, müşterinin son 12 ayındaki gidişatını özetleyen değişkenlerle kurulur. Her değişken "
+     "yalnızca müşterinin kendi geçmişinden, sabit kurallarla hesaplanır; modelin hedefi hiçbir değişkenin hesabında kullanılmaz.", 32),
+    ("Her veri alanına aynı sorular sorulur: son 1, 3, 6 ve 12 ayda seviye ne; en kötü değer ne zaman ve ne kadar kötüydü; yakın "
+     "dönem öncesine göre iyileşiyor mu, kötüleşiyor mu; kaç aydır aynı yönde gidiyor; bu durum müşteri için yeni mi.", 32),
+]:
+    S.birlestir(r, 2, 16, metin, dikey="center")
+    ws.row_dimensions[r].height = y
+    r += 1
+S.hucre(r, 2, "Veri alanı", bold=True, fill=_ALT, h="center")
+S.birlestir(r, 3, 9, "Bu alandan neler ürettik", bold=True, fill=_ALT, h="center")
+S.birlestir(r, 10, 16, "Neyi yakalamaya çalışıyor", bold=True, fill=_ALT, h="center")
+ws.row_dimensions[r].height = 18
+r += 1
+for alan, ne, neden in DEGISKEN_ALANLARI:
+    S.hucre(r, 2, alan, bold=True, dikey="center")
+    S.birlestir(r, 3, 9, ne, dikey="center")
+    S.birlestir(r, 10, 16, neden, dikey="center")
+    ws.row_dimensions[r].height = 15 * max(int(np.ceil(len(ne) / 100)), int(np.ceil(len(neden) / 58)), 1) + 4
+    r += 1
+S.birlestir(r, 2, 16, "Bunlara ek olarak ham alanların bir kısmı da olduğu gibi kullanılır. Her değişkenin tek tek açıklaması "
+            "renk_mdl_alan_aciklamalari.xlsx dosyasındadır (Degiskenler, Üretilen_Degiskenler).",
+            italic=True, renk="595959", size=10, kenar=None)
+ws.row_dimensions[r].height = 18
+r += 2
+S.baslik(r, f"Sonuç Özeti (OOT, {OOT_DONEMI})")
+r += 1
+S.birlestir(r, 2, 4, "Model", bold=True, fill=_ALT)
+for i, (_, _, rad) in enumerate(RENKLER):
+    S.birlestir(r, 5 + 2 * i, 6 + 2 * i, rad, bold=True, fill=_ALT, h="center")
+ws.row_dimensions[r].height = 18
+r += 1
+S.birlestir(r, 2, 4, "", fill=_ALT)
+for i in range(N_RENK):
+    S.hucre(r, 5 + 2 * i, "Oran", bold=True, fill=_ALT, h="center", size=10)
+    S.hucre(r, 6 + 2 * i, "Gini", bold=True, fill=_ALT, h="center", size=10)
+ws.row_dimensions[r].height = 16
+r += 1
+_dolu = 0
+for v, aile in _hv:
+    S.birlestir(r, 2, 4, f"{v}M {_MODEL_ADI[aile]}")
+    for i, (kod, _, _) in enumerate(RENKLER):
+        p = MODELLER[(v, aile)]["perf"].get(kod, {})
+        for j, (deger, fmt) in enumerate(((p.get("oot_oran", np.nan), "0.0%"), (p.get("oot_gini", np.nan), "0.00"))):
+            if np.isfinite(deger):
+                S.hucre(r, 5 + 2 * i + j, float(deger), h="center", size=10, fmt=fmt)
+                _dolu += 1
+            else:
+                S.hucre(r, 5 + 2 * i + j, "...", fill=_BOS, h="center", renk="A6A6A6", size=10)
+    ws.row_dimensions[r].height = 16
+    r += 1
+S.birlestir(r, 2, 16, "Oran = OOT hedef oranı, Gini = OOT Gini; kaynak her model klasöründeki "
+            "renk_bazli_train_val_oot_ozet.csv. Değeri bulunamayan hücrede \"...\" yazar.",
+            italic=True, renk="595959", size=10)
+ws.row_dimensions[r].height = 30
+r += 1
+_yazdir(ws, yatay=False)                                      # genişlik tek sayfa, uzunluk gerektiği kadar sayfa
+ws.print_area = f"A1:Q{r}"
+
+
+# ==================================================================
+# 5) GERÇEKLEŞEN ÖZET (14 OZET_ADETLER, sunum düzeninde)
+# ==================================================================
+def _gerceklesen_sayfasi():
+    n_kol = 2 * (N_RENK + 1)                                  # 6 renk + toplam, her biri vaka | oran
+    ws = _yeni_sayfa(GERCEKLESEN_SAYFA, {2: 31, **{3 + i: 11 for i in range(n_kol)}})
+    son = 2 + n_kol
+    S = Sayfa(ws, son)
+    S.baslik(2, f"Gerçekleşen Hedef Adet ve Oranları (OOT, {OOT_DONEMI})")
+    S.not_satiri(3, "Kaynak: 14 ANALİZ, OZET_ADETLER. Bu sayfa model tahmini değil, OOT döneminden sonra gerçekte olanı gösterir.")
+    r = 5
+    S.baslik(r, "Bu sayfa ne gösteriyor?")
+    r += 1
+    for e, m, y in [
+        ("Tüm kitle", f"{OOT_DONEMI} döneminde KK ürünlü müşteriler (skor şartı yok).", 18),
+        ("Ortak kitle", "Bunlardan Davranış ve Müşteri skoru dolu olanlar. Mevcut skorlarla karşılaştırmalar bu kitlede yapılır.", 18),
+        ("FPD kesişen kitle", "FPD verisiyle eşleşen müşteri sayısı (model klasörlerindeki bucket20 tablolarından).", 18),
+        ("Vaka ve oran", "Her modelin kendi kitlesinde (ortak kitlede, hedef tanımına giren ve model skoru dolu müşteriler) hedefi "
+                         "gerçekleşen müşteri sayısı ve oranı. Boş hücre: o vadenin gerçekleşme penceresi bu dönem için henüz "
+                         "kapanmamış ya da 14 raporunda değer yok.", 32),
+    ]:
+        S.satir(r, e, m, y)
+        r += 1
+    r += 1
+    if not OZET or not OZET["kitle"]:
+        S.not_satiri(r, f"⚠ {KIYAS_RAPORU} içinde OZET_ADETLER okunamadı; önce 14 ANALİZ'i çalıştırın.")
+        _yazdir(ws)
+        return
+    # ---- Kitle hunisi ----
+    S.baslik(r, "Kitle", c2=7)
+    r += 1
+    for c, metin in enumerate(["Renk segmenti", "Tüm kitle", "Ortak kitle", "Ortak kitle payı", "FPD kesişen kitle",
+                               "FPD kesişen kitle payı"], start=2):
+        S.hucre(r, c, metin, bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", size=10, kenar=_KENAR_B)
+    ws.row_dimensions[r].height = 30
+    r += 1
+    for kod in [k for k, _, _ in RENKLER] + ["TOPLAM"]:
+        t = OZET["kitle"].get(kod)
+        if t is None:
+            continue
+        toplam = kod == "TOPLAM"
+        S.hucre(r, 2, "Toplam" if toplam else _RENK_ADI[kod], bold=True, fill=_ALT if toplam else None, dikey="center")
+        for c, (anahtar, fmt) in enumerate([("tum", "#,##0"), ("ortak", "#,##0"), ("ortak_pay", "0.0%"),
+                                            ("fpd", "#,##0"), ("fpd_pay", "0.0%")], start=3):
+            deger = t[anahtar]
+            S.hucre(r, c, float(deger) if _sonlu(deger) else "...", fmt=fmt, h="center", dikey="center",
+                    bold=toplam, fill=_ALT if toplam else None)
+        ws.row_dimensions[r].height = 18
+        r += 1
+    S.not_satiri(r, "Toplam satırında adetler segmentlerin toplamı; oranlar toplam adetlerden yeniden hesaplanır.", c2=7)
+    r += 2
+    # ---- Hedef gerçekleşmeleri: satır = model, kolon = renk (vaka | oran) ----
+    S.baslik(r, "Modelin kitlesinde gerçekleşen hedef (ortak kitle)")
+    r += 1
+    S.hucre(r, 2, "Model", bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B)
+    kodlar = [k for k, _, _ in RENKLER] + ["TOPLAM"]
+    for i, kod in enumerate(kodlar):
+        S.birlestir(r, 3 + 2 * i, 4 + 2 * i, "Toplam" if kod == "TOPLAM" else _RENK_ADI[kod], bold=True, fill=_BOLUM,
+                    renk=BASLIK_YAZI, h="center", kenar=_KENAR_B)
+    ws.row_dimensions[r].height = 18
+    r += 1
+    S.hucre(r, 2, "", fill=_BOLUM, kenar=_KENAR_B)
+    for i in range(len(kodlar)):
+        S.hucre(r, 3 + 2 * i, "Vaka", bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", size=10, kenar=_KENAR_B)
+        S.hucre(r, 4 + 2 * i, "Oran", bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", size=10, kenar=_KENAR_B)
+    ws.row_dimensions[r].height = 16
+    r += 1
+    r_ilk = r
+    for v, aile in _hv:
+        S.hucre(r, 2, f"{v}M {_MODEL_ADI[aile]}", dikey="center")
+        for i, kod in enumerate(kodlar):
+            h = OZET["hedef"].get((v, aile, kod), {})
+            for j, (anahtar, fmt) in enumerate((("vaka", "#,##0"), ("oran", "0.0%"))):
+                deger = h.get(anahtar, np.nan)
+                S.hucre(r, 3 + 2 * i + j, float(deger) if _sonlu(deger) else "...", fmt=fmt, h="center", dikey="center",
+                        size=10, bold=kod == "TOPLAM", fill=_ALT if kod == "TOPLAM" else None)
+        ws.row_dimensions[r].height = 18
+        r += 1
+    for i in range(len(kodlar)):                              # her rengin oran kolonunda açık kırmızı ısı
+        c = get_column_letter(4 + 2 * i)
+        ws.conditional_formatting.add(f"{c}{r_ilk}:{c}{r - 1}", ColorScaleRule(start_type="min", start_color="FFFFFF",
+                                                                                end_type="max", end_color="F4B6B7"))
+    S.not_satiri(r, "Vaka = hedefi gerçekleşen müşteri sayısı; Oran = vaka / o modelin ortak kitledeki müşteri sayısı (Model "
+                    "Sonuçları'ndaki Hedef Oranı ile aynı). Kırmızı Olma ve Kırmızıya Dokunma modellerinde X ay içinde takibe "
+                    "düşenler kitlede yoktur; diğerlerinde vardır.", yuk=30)
+    _yazdir(ws)
+    _log(f"   {GERCEKLESEN_SAYFA}: {len(OZET['kitle'])} segment satırı")
+
+
+_gerceklesen_sayfasi()
+
+
+# ==================================================================
+# 6) MODEL SONUÇLARI (tek sayfa; renk dilimleyicisi sekme gibi)
+# ------------------------------------------------------------------
+# Tek Excel tablosu: Renk + Model | Model Performansı | Mevcut Skorlarla Karşılaştırma | Bucket B1..B20.
+# Grafikler doğrudan tablonun satırlarına bağlıdır ve yalnızca görünen hücreleri çizer: dilimleyiciden
+# ya da tablo filtresinden seçilen modeller grafiklerde görünür. Excel grafiği seçime göre kendiliğinden
+# büyütüp küçültmez; bu yüzden grafikler bir renkteki TÜM modeller seçiliyken de okunacak boyutta çizilir.
+# ==================================================================
+_YZD = f"%{KIYAS_RISKLI_YZD}"
+KOLONLAR = [   # (grup, başlık, biçim, genişlik, değer anahtarı)
+    ("M", "Renk Segmenti", None, 13, "seg"),
+    ("M", "Model Adı", None, 31, "ad"), ("M", "Model", None, 27, "model"), ("M", "Hedef Süre", "0", 8, "vade"),
+    ("P", "Model Kitle Adet (OOT)", "#,##0", 12, "kitle"), ("P", "Train Hedef Oran", "0%", 9, "tr_oran"),
+    ("P", "OOT Hedef Oran", "0%", 9, "oot_oran"), ("P", "Train Gini", "0.00", 8, "tr_gini"),
+    ("P", "Val Gini", "0.00", 8, "val_gini"), ("P", "OOT Gini", "0.00", 8, "oot_gini"),
+    ("P", "Gini Kaybı (Train - OOT)", "0.00", 10, "kayip"), ("P", "Top %1 Yakalama", "0.0%", 9, "top1"),
+    ("P", "Top %5 Yakalama", "0.0%", 9, "top5"), ("P", "Top %10 Yakalama", "0.0%", 9, "top10"),
+    ("K", "Kitle (adet)", "#,##0", 12, "k_kitle"), ("K", "Vaka (adet)", "#,##0", 12, "k_vaka"),
+    ("K", "Hedef Oranı", "0.0%", 9, "k_oran"), ("K", "Gini: Davranış Skoru", "0.0%", 10, "g_dav"),
+    ("K", "Gini: Müşteri Skoru", "0.0%", 10, "g_mus"), ("K", "Gini: Model", "0.0%", 9, "g_mod"),
+    ("K", "En İyi Mevcut Skor", None, 15, "en_iyi"), ("K", "Gini Farkı (Model - En İyi Mevcut)", "0.0%", 12, "fark"),
+    ("K", "Hüküm", None, 26, "hukum"), ("K", f"Yakalama {_YZD}: Davranış", "0.0%", 10, "y_dav"),
+    ("K", f"Yakalama {_YZD}: Müşteri", "0.0%", 10, "y_mus"), ("K", f"Yakalama {_YZD}: Model", "0.0%", 10, "y_mod"),
+    ("K", "Açıklama", None, 62, "aciklama"),
+] + [("B", f"B{i}", "0.0%", 7, f"b{i}") for i in range(1, 21)]
+GRUP_ADI = {"M": "Model", "P": "Model Performansı (pipeline, OOT)",
+            "K": "Mevcut Skorlarla Karşılaştırma (OOT; Davranış ve Müşteri skoru dolu ortak kitle, 14 ANALİZ)",
+            "B": "Bucket Hedef Oranı (OOT; B1 = en riskli %5)"}
+_C = {k[4]: 2 + i for i, k in enumerate(KOLONLAR)}            # değer anahtarı → kolon no
+_SON_KOL = 1 + len(KOLONLAR)
+_GRAFIK_EN = 17.0                                             # cm; iki grafik yan yana (B ve I kolonlarından)
+_MODEL_BASINA_CM = 1.3                                        # bir modelin üç çubuğu + etiketleri için yükseklik
+
+
+def _grafik_boyut(n):
+    """n model için grafik yüksekliği (cm) ve kapladığı satır sayısı."""
+    h = max(8.0, 3.4 + _MODEL_BASINA_CM * n)
+    return h, _cm_satir(h)
+
+
+def _grafik(ws, baslik, seriler, r0, rs, eksen_fmt, etiket_fmt, renkler, hgt, satirlar):
+    """Model Sonuçları tablosuna bağlı etiketli çubuk grafik; kategori = Model Adı, seri = verilen kolonlar."""
+    return _cubuk_grafik(ws, baslik, [(_C[k], None, rk) for k, rk in zip(seriler, renkler)], _C["ad"], r0, rs,
+                         eksen_fmt, etiket_fmt, _GRAFIK_EN, hgt, _eksen_siniri([d.get(k) for d in satirlar for k in seriler]))
+
+
+def _yakalama_egrisi(ws, S, satirlar, R0, r):
+    """Seçimdeki ilk görünen modelin yakalama eğrisi (model, Davranış, Müşteri ve rastgele sıralama).
+    Gizli veri sheet'inde her tablo satırının eğrisi durur; SUBTOTAL ile ilk görünen satır bulunur ve
+    grafik o satırın değerlerini çizer. Bir sonraki boş satırı döner."""
+    L = get_column_letter
+    S.baslik(r, "Yakalama eğrisi: en riskli %X müşteriye bakınca vakaların yüzde kaçı bulunuyor?", c2=_C["aciklama"])
+    if not EGRI:
+        S.not_satiri(r + 1, "Bu grafik için 14 ANALİZ'in v5 sürümü gerekiyor (YAKALAMA_OOT_ sheet'i); mevcut 14 raporunda yok. "
+                            "14'ü v5 ile çalıştırıp bu kodu yeniden çalıştırın.", c2=_C["aciklama"])
+        return r + 3
+    wv = _veri_sayfasi()
+    kc, gc, v0 = 12, 13, 14                                   # L: model, M: görünür mü, N..: 3 x 20 değer
+    n_n = len(YAKALAMA_NOKTALARI)
+    wv.cell(1, kc, "Model (Model Sonuçları satır sırası)")
+    wv.cell(1, gc, "Görünür")
+    for j, sk in enumerate(("Model", "Davranış Skoru", "Müşteri Skoru")):
+        for p_i, p in enumerate(YAKALAMA_NOKTALARI):
+            wv.cell(1, v0 + n_n * j + p_i, f"{sk} %{p}")
+    n_veri = 0
+    for i, d in enumerate(satirlar):
+        rv = 2 + i
+        wv.cell(rv, kc, f"{_RENK_ADI[d['kod']]} | {d['ad']}")
+        wv.cell(rv, gc, f"=SUBTOTAL(103,'{ws.title}'!${L(_C['ad'])}${R0 + 1 + i})")
+        eg = EGRI.get((d["vade"], d["_aile"], d["kod"]), {})
+        n_veri += bool(eg)
+        for j, sk in enumerate(("MODEL", "Davranış Skoru", "Müşteri Skoru")):
+            for p_i, deger in enumerate(eg.get(sk, [])):
+                if _sonlu(deger):
+                    wv.cell(rv, v0 + n_n * j + p_i, float(deger))
+    son = 1 + len(satirlar)
+    h0 = son + 3
+    idx = f"${L(gc)}${h0}"
+    wv.cell(h0, kc, "Seçili satır (ilk görünen)")
+    wv.cell(h0, gc, f"=IFERROR(MATCH(1,${L(gc)}$2:${L(gc)}${son},0),0)")
+    wv.cell(h0 + 1, kc, "Eğri")
+    for p_i, p in enumerate(YAKALAMA_NOKTALARI):
+        wv.cell(h0 + 1, v0 + p_i, f"%{p}")
+    for j, ad_s in enumerate(("Model", "Davranış Skoru", "Müşteri Skoru")):
+        wv.cell(h0 + 2 + j, kc, ad_s)
+        for p_i in range(n_n):
+            col = L(v0 + n_n * j + p_i)
+            rng = f"${col}$2:${col}${son}"
+            wv.cell(h0 + 2 + j, v0 + p_i, f'=IF({idx}=0,NA(),IF(INDEX({rng},{idx})="",NA(),INDEX({rng},{idx})))')
+    wv.cell(h0 + 5, kc, "Rastgele sıralama")
+    for p_i, p in enumerate(YAKALAMA_NOKTALARI):
+        wv.cell(h0 + 5, v0 + p_i, p / 100.0)
+    for rr in range(h0 + 2, h0 + 6):                          # grafik etiketleri hücre biçimini de kullanır
+        for p_i in range(n_n):
+            wv.cell(rr, v0 + p_i).number_format = "0%"
+    S.not_satiri(r + 1, "Seçimdeki ilk model çizilir; başka bir model için dilimleyiciden yalnızca onu seçin. Üç skor aynı müşteriler "
+                        f"üzerinde ölçülür (14 ANALİZ); %{KIYAS_RISKLI_YZD} noktası \"En riskli %{KIYAS_RISKLI_YZD} yakalama\" "
+                        "grafiğiyle aynı sayıdır. Model çizgisi diğerlerinin ne kadar üstündeyse model aynı sayıda müşteriye "
+                        "bakarak o kadar çok vaka buluyor; gri kesikli çizgi rastgele seçimdir.", c2=_C["aciklama"], yuk=30)
+    S.birlestir(r + 2, 2, 12, f'="Grafikteki model: "&IF(\'{VERI_SAYFA}\'!{idx}=0,"seçili model yok",'
+                              f'INDEX(\'{VERI_SAYFA}\'!${L(kc)}$2:${L(kc)}${son},\'{VERI_SAYFA}\'!{idx}))',
+                bold=True, renk=AKBANK_KIRMIZI, kenar=None, dikey="center")
+    ws.row_dimensions[r + 2].height = 20
+    lc = LineChart()
+    lc.title = "Yakalama eğrisi (OOT, aynı müşteriler)"
+    lc.width, lc.height = 22.0, 12.0
+    lc.style = 10
+    lc.legend.position = "b"
+    lc.y_axis.numFmt = "0%"
+    lc.y_axis.scaling.min, lc.y_axis.scaling.max = 0.0, 1.0
+    lc.y_axis.majorUnit = 0.2
+    lc.x_axis.title = "Skora göre en riskliden sıralanan müşteri payı"
+    lc.y_axis.title = "Yakalanan vaka payı"
+    k_etiket = YAKALAMA_NOKTALARI.index(KIYAS_RISKLI_YZD) if KIYAS_RISKLI_YZD in YAKALAMA_NOKTALARI else 3
+    for j, (ad_s, rk, kalin, stil) in enumerate([("Model", AKBANK_KIRMIZI, 32000, "solid"),
+                                                  ("Davranış Skoru", "404040", 22000, "solid"),
+                                                  ("Müşteri Skoru", "8C8C8C", 22000, "solid"),
+                                                  ("Rastgele sıralama", "BFBFBF", 15000, "dash")]):
+        s = Series(Reference(wv, min_col=v0, max_col=v0 + n_n - 1, min_row=h0 + 2 + j, max_row=h0 + 2 + j), title=ad_s)
+        s.graphicalProperties.line.solidFill = rk
+        s.graphicalProperties.line.width = kalin
+        s.graphicalProperties.line.dashStyle = stil
+        s.marker = Marker(symbol="none")
+        s.smooth = False
+        if j < 3:                                             # yalnızca %20 noktasında değer etiketi
+            s.dLbls = DataLabelList(dLbl=[DataLabel(idx=k_etiket, showVal=True, showSerName=False, showCatName=False,
+                                                    showLegendKey=False, showPercent=False, numFmt="0%",
+                                                    dLblPos=("t", "b", "r")[j], txPr=_yazi(8))],
+                                    showVal=False, showSerName=False, showCatName=False, showLegendKey=False,
+                                    showPercent=False)
+        lc.series.append(s)
+    lc.set_categories(Reference(wv, min_col=v0, max_col=v0 + n_n - 1, min_row=h0 + 1, max_row=h0 + 1))
+    lc.x_axis.txPr = _yazi(8)
+    lc.y_axis.txPr = _yazi(8)
+    lc.x_axis.delete = False
+    lc.y_axis.delete = False
+    lc.visible_cells_only = False                             # veri gizli sheet'te
+    ws.add_chart(lc, f"B{r + 4}")
+    _log(f"   {MODEL_SAYFA}: yakalama eğrisi verisi olan model {n_veri} / {len(satirlar)}")
+    return r + 4 + _cm_satir(12.0)
+
+
+def _model_sayfasi():
+    ws = _yeni_sayfa(MODEL_SAYFA, {2 + i: k[3] for i, k in enumerate(KOLONLAR)})
+    S = Sayfa(ws, _SON_KOL)
+    satirlar = []
+    for kod, v, aile in TUM_MODELLER:
+        p = MODELLER[(v, aile)]["perf"].get(kod, {})
+        kk = KIYAS.get((v, aile, kod), {})
+        d = {"kod": kod, "seg": _seg_etiket(kod), "ad": f"{v}M {_MODEL_ADI[aile]}", "model": _MODEL_ADI[aile], "vade": v,
+             "_aile": aile,
+             **{k: p.get(k, np.nan) for k in ("kitle", "tr_oran", "oot_oran", "tr_gini", "val_gini", "oot_gini",
+                                               "top1", "top5", "top10")},
+             "kayip": p.get("tr_gini", np.nan) - p.get("oot_gini", np.nan),
+             "k_kitle": kk.get("kitle", np.nan), "k_vaka": kk.get("vaka", np.nan), "k_oran": kk.get("oran", np.nan),
+             **{k: kk.get(k, np.nan) for k in ("g_dav", "g_mus", "g_mod", "fark", "y_dav", "y_mus", "y_mod")},
+             "en_iyi": kk.get("en_iyi"), "hukum": kk.get("hukum"), "aciklama": kk.get("aciklama")}
+        for i, b in enumerate(p.get("bucket", [np.nan] * 20), start=1):
+            d[f"b{i}"] = b
+        satirlar.append(d)
+    if not satirlar:
+        return
+    n_max = max(sum(1 for d in satirlar if d["kod"] == k) for k, _, _ in RENKLER)
+    acilis = ACILIS_RENGI if any(d["kod"] == ACILIS_RENGI for d in satirlar) else None
+
+    S.baslik(2, "Model Sonuçları (OOT): renk segmenti, performans ve mevcut skorlarla karşılaştırma", c2=_C["aciklama"])
+    _secim = ("Üstteki Renk Segmenti dilimleyicisi sekme gibi çalışır: bir renge tıklayın. Model ve Hedef Süre "
+              "dilimleyicilerinden bir ya da birden çok model seçin (birden çok seçim için Ctrl ile tıklayın)."
+              if DILIMLEYICI_EKLE else
+              "Tablonun Renk Segmenti, Model ve Hedef Süre filtre oklarından seçim yapın (birden çok seçilebilir).")
+    S.not_satiri(3, f"Model dönemi: {MODEL_DONEMI} | OOT: {OOT_DONEMI} | {len(satirlar)} model | {_secim} "
+                    "Tablo ve grafikler yalnızca seçilen modelleri gösterir."
+                    + (f" Açılışta {_RENK_ADI[acilis]} seçili." if acilis else ""), c2=_C["aciklama"], yuk=30)
+    R_GRUP = 13 if DILIMLEYICI_EKLE else 6                    # 5-10. satırlar dilimleyici alanı
+    S.not_satiri(R_GRUP - 2, "Okuma: OOT Gini yüksek = model riskli müşteriyi daha iyi ayırıyor | Gini kaybı küçük = yeni dönemde "
+                             "de tutarlı | Hüküm = mevcut skorlara göre modelin gerekliliği | B1..B20 = en riskliden en az riskliye "
+                             "dilimlerde gerçekleşen hedef oranı.", c2=_C["aciklama"], yuk=18)
+    R0 = R_GRUP + 1
+    for g in ("M", "P", "K", "B"):                            # grup başlık bandı
+        cs = [2 + i for i, k in enumerate(KOLONLAR) if k[0] == g]
+        S.birlestir(R_GRUP, cs[0], cs[-1], GRUP_ADI[g], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, size=11,
+                    h="center", kenar=_KENAR_B)
+    ws.row_dimensions[R_GRUP].height = 20
+    for i, k in enumerate(KOLONLAR):                          # tablo başlığı
+        S.hucre(R0, 2 + i, k[1], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B)
+    ws.row_dimensions[R0].height = 46
+    for i, d in enumerate(satirlar):
+        rr = R0 + 1 + i
+        for k in KOLONLAR:
+            v = d.get(k[4])
+            if isinstance(v, float) and not np.isfinite(v):
+                v = None
+            x = S.hucre(rr, _C[k[4]], v, fmt=k[2], wrap=k[4] in ("aciklama",), dikey="center",
+                        h="left" if k[4] in ("seg", "ad", "model", "aciklama") else "center")
+            if k[4] == "hukum" and isinstance(v, str):
+                x.fill = PatternFill("solid", fgColor=_HUKUM_RENK.get(v.split(":")[0], "FFFFFF"))
+                x.font = Font(name=YAZI_TIPI, bold=True, size=10)
+                x.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        ws.row_dimensions[rr].height = 30
+        if acilis and d["kod"] != acilis:                     # açılışta yalnızca seçili renk görünür
+            ws.row_dimensions[rr].hidden = True
+    RS = R0 + len(satirlar)
+    tab = _tablo_ekle(ws, "Model_Sonuclari", R0, RS, 2, [k[1] for k in KOLONLAR])
+    if acilis:
+        tab.autoFilter.filterColumn.append(FilterColumn(colId=0, filters=Filters(filter=[_seg_etiket(acilis)])))
+    _dilimleyici_alani(ws, "Model_Sonuclari", 5, [
+        ("Renk Segmenti", "Renk Segmenti", _C["seg"], _C["kitle"], 4, N_RENK),
+        ("Model", "Model", _C["tr_oran"], _C["top5"], 6, 2),
+        ("Hedef Süre", "Hedef Süre", _C["top10"], _C["k_oran"], 4, 3)])
+    L = get_column_letter
+    ws.conditional_formatting.add(f"{L(_C['oot_gini'])}{R0+1}:{L(_C['oot_gini'])}{RS}",
+                                  ColorScaleRule(start_type="min", start_color="F8696B", mid_type="percentile",
+                                                 mid_value=50, mid_color="FFEB84", end_type="max", end_color="63BE7B"))
+    ws.conditional_formatting.add(f"{L(_C['fark'])}{R0+1}:{L(_C['fark'])}{RS}",
+                                  ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF",
+                                                 end_type="num", end_value=0.3, end_color="63BE7B"))
+    for rr in range(R0 + 1, RS + 1):                          # bucket satırı ısı haritası (her model kendi içinde)
+        ws.conditional_formatting.add(f"{L(_C['b1'])}{rr}:{L(_C['b20'])}{rr}",
+                                      ColorScaleRule(start_type="min", start_color="FFFFFF", end_type="max",
+                                                     end_color="F8696B"))
+    ws.freeze_panes = "D1"                                    # Renk ve Model Adı kolonları sabit
+
+    # ---- Grafikler ----
+    r = RS + 2
+    S.baslik(r, "Grafikler (seçilen modeller)", c2=_C["aciklama"])
+    S.not_satiri(r + 1, "Grafikler yalnızca seçilen modelleri çizer; her çubuğun değeri ucunda yazar. Boyutları bir renkteki "
+                        f"tüm modeller (en çok {n_max}) seçildiğinde de okunacak şekilde ayarlıdır; az model seçildiğinde çubuklar "
+                        "kalınlaşır. Birden çok renk seçilirse model adları renk sayısı kadar tekrar eder.",
+                 c2=_C["aciklama"], yuk=30)
+    hgt, adim = _grafik_boyut(n_max)
+    a1 = r + 3
+    a2 = a1 + adim
+    sag = L(_C["tr_gini"])
+    for (baslik, seriler, e_fmt, l_fmt, renk), yer in zip([
+        ("Gini (pipeline): Train / Val / OOT", ["tr_gini", "val_gini", "oot_gini"], "0.0", "0.00",
+         ("DC0005", "A6A6A6", "404040")),
+        ("OOT Gini: model ve mevcut skorlar", ["g_dav", "g_mus", "g_mod"], "0%", "0%",
+         ("A6A6A6", "404040", "DC0005")),
+        (f"En riskli {_YZD} yakalama (OOT): model ve mevcut skorlar", ["y_dav", "y_mus", "y_mod"], "0%", "0%",
+         ("A6A6A6", "404040", "DC0005")),
+        ("Top %1 / %5 / %10 yakalama (pipeline, OOT)", ["top1", "top5", "top10"], "0%", "0.0%",
+         ("F4B6B7", "EA5A5C", "DC0005")),
+    ], [f"B{a1}", f"{sag}{a1}", f"B{a2}", f"{sag}{a2}"]):
+        ws.add_chart(_grafik(ws, baslik, seriler, R0, RS, e_fmt, l_fmt, renk, hgt, satirlar), yer)
+    _yakalama_egrisi(ws, S, satirlar, R0, a2 + adim)
+    _yazdir(ws)
+    _log(f"   {MODEL_SAYFA}: {len(satirlar)} model | hükmü olan: {sum(1 for d in satirlar if d.get('hukum'))} | "
+         f"açılış rengi: {_RENK_ADI.get(acilis, 'hepsi')}")
+
+
+_model_sayfasi()
+
+
+# ==================================================================
+# 7) MEVCUT SKOR KARŞILAŞTIRMA SAYFASI (üst yönetim için sade dil, bilgi kaybı yok)
+# ------------------------------------------------------------------
+# 14 ANALİZ'in KAÇAN DİLİM sheet'indeki her kolon burada da var, adları sadeleştirildi:
+#   SADECE MODEL RİSKLİ DİYOR        → Sadece Model (mevcut skorun kaçırdığı müşteriler)
+#   SADECE MEVCUT SKOR RİSKLİ DİYOR  → Sadece Mevcut Skor (modelin kaçırdığı müşteriler)
+#   İKİSİ DE TEMİZ DİYOR             → İkisi de Risksiz
+#   ORAN FARKI (%)                   → Oran Farkı (puan)  [aynı sayı x 100]
+#   KAZANAN MODEL / MEVCUT SKOR / BERABER → Model daha isabetli / Mevcut skor daha isabetli / Fark yok
+# ==================================================================
+KK_KOLONLAR = [   # (grup, başlık, biçim, genişlik, anahtar); D..O kolonları sonuç matrisinde de kullanılır
+    ("M", "Renk Segmenti", None, 13, "seg"), ("M", "Model Adı", None, 30, "ad"),
+    ("M", "Karşılaştırılan Skor", None, 13, "skor"),
+    ("K", "Kişi", "#,##0", 11, "n"), ("K", "Vaka", "#,##0", 11, "v"), ("K", "Hedef Oranı", "0.0%", 11, "o"),
+    ("SM", "Sadece Model: Kişi", "#,##0", 11, "sm_n"), ("SM", "Sadece Model: Vaka", "#,##0", 11, "sm_v"),
+    ("SM", "Sadece Model: Hedef Oranı", "0.0%", 11, "sm_o"),
+    ("SV", "Sadece Mevcut Skor: Kişi", "#,##0", 11, "sv_n"), ("SV", "Sadece Mevcut Skor: Vaka", "#,##0", 11, "sv_v"),
+    ("SV", "Sadece Mevcut Skor: Hedef Oranı", "0.0%", 11, "sv_o"),
+    ("S", "Oran Farkı (puan)", "+0.0;-0.0;0.0", 11, "fark_p"), ("S", "Model Lehine Net Ek Vaka", "+#,##0;-#,##0;0", 11, "net"),
+    ("S", "Sonuç", None, 24, "sonuc"),
+    ("A", "İkisi de Riskli: Kişi", "#,##0", 11, "ir_n"), ("A", "İkisi de Riskli: Vaka", "#,##0", 11, "ir_v"),
+    ("A", "İkisi de Riskli: Hedef Oranı", "0.0%", 11, "ir_o"),
+    ("A", "İkisi de Risksiz: Kişi", "#,##0", 11, "it_n"), ("A", "İkisi de Risksiz: Vaka", "#,##0", 11, "it_v"),
+    ("A", "İkisi de Risksiz: Hedef Oranı", "0.0%", 11, "it_o"),
+    ("A", "Riskli Liste Örtüşmesi", "0.0%", 11, "ort"),
+    ("Y", "Yorum", None, 85, "yorum"),
+    ("F", "Model", None, 27, "model"), ("F", "Hedef Süre", "0", 9, "vade"),
+    ("F", "Grafik: Model Lehine", "+#,##0;-#,##0;0", 11, "net_pos"),
+    ("F", "Grafik: Mevcut Skor Lehine", "+#,##0;-#,##0;0", 11, "net_neg"),
+]
+KK_GRUP = {"M": "Model ve karşılaştırılan skor", "K": "Kitle (bu modelin kitlesi)",
+           "SM": "Sadece model riskli diyor (mevcut skorun kaçırdığı)",
+           "SV": "Sadece mevcut skor riskli diyor (modelin kaçırdığı)", "S": "Sonuç",
+           "A": "İki skorun aynı kararı verdiği müşteriler", "Y": "Yorum", "F": "Seçim ve grafik kolonları"}
+_KC = {k[4]: 2 + i for i, k in enumerate(KK_KOLONLAR)}
+_KK_SON = 1 + len(KK_KOLONLAR)
+
+
+def _yorum(d):
+    sk = d["skor"].lower()                                    # "davranış skoru" / "müşteri skoru"
+    if d["kazanan"] == "VAKA YOK":
+        return "Bu kitlede hedefi gerçekleşen müşteri yok; karşılaştırma yapılamaz."
+    if not (_sonlu(d["sm_o"]) and _sonlu(d["sv_o"])):
+        return f"Model ile {sk} riskli listede aynı müşterileri gösteriyor; ayrışan müşteri yok."
+    metin = (f"{sk.capitalize()}nun kaçırdığı, modelin riskli dediği {_adet(d['sm_n'])} kişide hedef oranı "
+             f"{_yuzde(d['sm_o'])}; modelin kaçırdığı, {sk}nun riskli dediği {_adet(d['sv_n'])} kişide {_yuzde(d['sv_o'])}.")
+    net = d["net"] if _sonlu(d["net"]) else 0
+    if d["kazanan"] == "MODEL":
+        return metin + f" Model {_adet(abs(net))} vakayı fazladan yakalıyor."
+    if d["kazanan"] == "MEVCUT SKOR":
+        return metin + f" {sk.capitalize()} {_adet(abs(net))} vakayı fazladan yakalıyor."
+    return metin + f" Fark {_adet(KIYAS_BERABER_PUAN * 100)} puandan küçük; iki skor eşit isabetli sayılır."
+
+
+def _gorsel_ekle(ws, hucre):
+    """GOC_MODEL_RESULTS'taki açıklama görselini ekler; eklenen yüksekliği (punto) döner."""
+    if not GORSEL_DOSYA:
+        return 0
+    ham = _ham_oku(GORSEL_DOSYA)
+    if ham is None:
+        return 0
     try:
-        d = mf.get_path_details("/")
-        for c in (d or {}).get("children", []) or []:
-            if c.get("directory"):
-                ad = c.get("name") or str(c.get("fullPath", "")).strip("/").split("/")[-1]
-                if ad:
-                    adlar.add(str(ad).strip("/"))
+        from PIL import Image as PILImage
+        from openpyxl.drawing.image import Image as XLImage
+        im = PILImage.open(BytesIO(ham))
+        en, boy = im.size
+        if en > 2 * GORSEL_GENISLIK_PX:                       # dosya küçülsün, ekranda net kalsın (2x çözünürlük)
+            im = im.resize((2 * GORSEL_GENISLIK_PX, int(boy * 2 * GORSEL_GENISLIK_PX / en)), PILImage.LANCZOS)
+        buf = BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        img = XLImage(buf)
+        img.width, img.height = GORSEL_GENISLIK_PX, int(boy * GORSEL_GENISLIK_PX / en)
+        ws.add_image(img, hucre)
+        return img.height * 0.75
+    except Exception as e:
+        _log(f"⚠ Görsel eklenemedi ({type(e).__name__}: {e}); sayfa görselsiz yazılacak")
+        return 0
+
+
+def _karsilastirma_sayfasi():
+    ws = _yeni_sayfa(KARSILASTIRMA_SAYFA, {2 + i: k[3] for i, k in enumerate(KK_KOLONLAR)})
+    S = Sayfa(ws, _KK_SON)
+    L = get_column_letter
+    _puan = _adet(KIYAS_BERABER_PUAN * 100)
+    _ilk = KIYAS_RISKLI_YZD // 5
+
+    S.baslik(2, f"Model ve Mevcut Skor Karşılaştırması (OOT, {OOT_DONEMI})", c2=_KC["ort"])
+    S.not_satiri(3, "Kaynak: 14 ANALİZ, KAÇAN DİLİM. Model ile mevcut skor farklı müşterileri riskli dediğinde hangisinin "
+                    "haklı çıktığını gösterir.", c2=_KC["ort"])
+
+    # ---- 1) Nasıl okunur (sol: açıklama, sağ: görsel) ----
+    r = 5
+    S.baslik(r, "Bu karşılaştırma nasıl yapıldı?", c2=_KC["net"])
+    r += 1
+    r_gorsel = r
+    yuk_toplam = 0
+    for e, m, y in [
+        ("Sorulan soru", "Model ile mevcut skor (Davranış Skoru ya da Müşteri Skoru) farklı müşterileri riskli dediğinde "
+                         "hangisi haklı çıkıyor?", 32),
+        ("Kimler üzerinde", f"{OOT_DONEMI} döneminde kredi kartı olan, Davranış ve Müşteri skoru dolu müşteriler. Her model "
+                            "kendi hedef tanımına giren müşterilerle ölçülür; üç skor aynı kişiler üzerinde karşılaştırılır.", 32),
+        ("Riskli kime denir", f"Her skor müşterileri en riskliden en az riskliye sıralar. İlk %{KIYAS_RISKLI_YZD} "
+                              f"(20'lik dilimde 1-{_ilk}. dilim) riskli, kalan %{100 - KIYAS_RISKLI_YZD} risksiz sayılır. "
+                              "Eşik ya da evet / hayır tahmini kullanılmaz, yalnızca sıralama kullanılır.", 32),
+        ("Dört grup", "İkisi de riskli diyor | Sadece model riskli diyor (mevcut skorun kaçırdığı müşteriler) | Sadece mevcut "
+                      "skor riskli diyor (modelin kaçırdığı müşteriler) | İkisi de risksiz diyor.", 32),
+        ("Nasıl karar verilir", "İki skorun riskli listesi aynı büyüklükte olduğu için \"sadece model\" ve \"sadece mevcut skor\" "
+                                "grupları eşit sayıdadır. Bu iki grupta hedefi gerçekleşen müşteri oranı karşılaştırılır: oranı "
+                                "yüksek olan grup, haklı çıkan skoru gösterir.", 46),
+        ("Sonuç", f"Oran farkı {_puan} puandan küçükse \"Fark yok\"; model grubunun oranı daha yüksekse \"Model daha isabetli\", "
+                  "daha düşükse \"Mevcut skor daha isabetli\". Kural segmentin hedef oranından bağımsızdır; Kırmızı gibi oranı "
+                  "yüksek segmentlerde de aynı şekilde çalışır.", 46),
+        ("Model lehine net ek vaka", "Sadece modelin riskli dediği gruptaki vaka sayısı eksi sadece mevcut skorun riskli dediği "
+                                     "gruptaki vaka sayısı. Artı ise model, aynı sayıda müşteriyi işaretleyerek bu kadar fazla "
+                                     "vakayı yakalıyor.", 46),
+        ("Riskli liste örtüşmesi", "İki skorun riskli listelerinde ortak olan müşterilerin payı (ikisi de riskli / mevcut skorun "
+                                   "riskli listesi). Yüksekse iki skor büyük ölçüde aynı kişileri gösteriyor; düşükse model farklı "
+                                   "bir risk bilgisi taşıyor.", 46),
+    ]:
+        S.birlestir(r, 2, 3, e, bold=True, dikey="center")
+        S.birlestir(r, 4, _KC["net"], m, dikey="center")
+        ws.row_dimensions[r].height = y
+        yuk_toplam += y
+        r += 1
+    gorsel_yuk = _gorsel_ekle(ws, f"{L(_KC['sonuc'] + 1)}{r_gorsel}")
+    if gorsel_yuk > yuk_toplam:                               # görsel metinden uzunsa altındaki bölüm üstüne binmesin
+        r += int(np.ceil((gorsel_yuk - yuk_toplam) / 15.0))
+    r += 1
+
+    # ---- 2) Sonuç özeti matrisi: satır = model, kolon = renk x mevcut skor ----
+    S.baslik(r, "Sonuç Özeti: hangi skor daha isabetli?", c2=_KC["net"])
+    r += 1
+    S.birlestir(r, 2, 3, "Renkler:", bold=True, kenar=None, dikey="center")
+    for (c1, c2), metin in zip([(4, 6), (7, 9), (10, 12)], ["Model daha isabetli", "Fark yok", "Mevcut skor daha isabetli"]):
+        S.birlestir(r, c1, c2, metin, fill=PatternFill("solid", fgColor=_SONUC_RENK[metin]), h="center", bold=True, size=10)
+    S.birlestir(r, 13, _KC["net"], "Hücredeki sayı: oran farkı (puan); artı = model lehine", italic=True, renk="595959",
+                size=10, kenar=None, dikey="center")
+    ws.row_dimensions[r].height = 30
+    r += 2
+    S.birlestir(r, 2, 3, "Model", bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B)
+    for i, (_, _, rad) in enumerate(RENKLER):
+        S.birlestir(r, 4 + 2 * i, 5 + 2 * i, rad, bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B)
+    ws.row_dimensions[r].height = 18
+    r += 1
+    S.birlestir(r, 2, 3, "", fill=_BOLUM, kenar=_KENAR_B)
+    for i in range(N_RENK):
+        for j, sk in enumerate(("Davranış", "Müşteri")):
+            S.hucre(r, 4 + 2 * i + j, sk, bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", size=10, kenar=_KENAR_B)
+    ws.row_dimensions[r].height = 16
+    r += 1
+    kacan = {(d["vade"], d["aile"], d["kod"], d["skor"]): d for d in KACAN}
+    sayac = {}
+    for v, aile in _hv:
+        S.birlestir(r, 2, 3, f"{v}M {_MODEL_ADI[aile]}", dikey="center")
+        for i, (kod, _, _) in enumerate(RENKLER):
+            for j, sk in enumerate(("Davranış Skoru", "Müşteri Skoru")):
+                d = kacan.get((v, aile, kod, sk))
+                c = 4 + 2 * i + j
+                if d is None:
+                    S.hucre(r, c, "...", fill=_BOS, h="center", renk="A6A6A6", size=10)
+                    continue
+                sonuc = _SONUC_ADI.get(d["kazanan"], d["kazanan"])
+                dolgu = PatternFill("solid", fgColor=_SONUC_RENK.get(sonuc, "FFFFFF"))
+                if d["kazanan"] == "VAKA YOK" or not _sonlu(d["fark"]):
+                    S.hucre(r, c, sonuc, fill=dolgu, h="center", size=9)
+                else:
+                    S.hucre(r, c, round(d["fark"] * 100, 1), fill=dolgu, h="center", size=10, fmt="+0.0;-0.0;0.0")
+                sayac[(c, sonuc)] = sayac.get((c, sonuc), 0) + 1
+        ws.row_dimensions[r].height = 16
+        r += 1
+    for metin in ("Model daha isabetli", "Fark yok", "Mevcut skor daha isabetli"):
+        S.birlestir(r, 2, 3, f"{metin} (model sayısı)", bold=True, fill=_ALT, dikey="center")
+        for c in range(4, 4 + 2 * N_RENK):
+            S.hucre(r, c, sayac.get((c, metin), 0), bold=True, fill=_ALT, h="center", size=10)
+        ws.row_dimensions[r].height = 16
+        r += 1
+    toplam = {m: sum(v for (c, s), v in sayac.items() if s == m) for m in _SONUC_RENK}
+    S.not_satiri(r, f"Toplam {sum(toplam.values())} karşılaştırma: model daha isabetli {toplam['Model daha isabetli']} | "
+                    f"fark yok {toplam['Fark yok']} | mevcut skor daha isabetli {toplam['Mevcut skor daha isabetli']}"
+                    + (f" | vaka yok {toplam['Vaka yok']}" if toplam["Vaka yok"] else "") + ". \"...\" = 14 raporunda satır yok.",
+                 c2=_KC["net"], yuk=18)
+    r += 2
+
+    # ---- 3) Detay: dilimleyiciler → iki grafik → tablo ----
+    _aile_no = {a: i for i, a in enumerate(_AILE_SIRA)}
+    satirlar = sorted(KACAN, key=lambda d: (d["kod"], d["vade"], _aile_no.get(d["aile"], 9), d["skor"]))
+    acilis = ACILIS_RENGI if any(d["kod"] == ACILIS_RENGI for d in satirlar) else None
+    acilis_skor = "Davranış Skoru" if any(d["skor"] == "Davranış Skoru" for d in satirlar) else None
+    S.baslik(r, "Detay: renk ve skor seçerek inceleyin", c2=_KC["yorum"])
+    r += 1
+    S.not_satiri(r, ("Aşağıdaki dilimleyicilerden renk, model, hedef süre ve skor seçebilirsiniz (birden çok seçim için Ctrl). "
+                     if DILIMLEYICI_EKLE else "Tablonun filtre oklarından renk, model, hedef süre ve skor seçebilirsiniz. ")
+                 + "Grafikler için bir renk ve bir skor seçin"
+                 + (f" (açılışta {_RENK_ADI[acilis]} ve Davranış Skoru seçili)" if acilis and acilis_skor else "")
+                 + ". Kişi ve vaka adetleri, oranlar ve sonuç 14 ANALİZ KAÇAN DİLİM sheet'iyle birebir aynıdır.",
+                 c2=_KC["yorum"], yuk=30)
+    r += 1
+    r_dilim = r + 1
+    if DILIMLEYICI_EKLE:
+        r += 8                                                # dilimleyici alanı (6 satır + boşluk)
+    # grafik alanı: bir renk ve bir skor seçildiğinde en çok N model (genelde 13)
+    n_max = max([sum(1 for d in satirlar if d["kod"] == k and d["skor"] == sk) for k, _, _ in RENKLER
+                 for sk in ("Davranış Skoru", "Müşteri Skoru")] + [1])
+    hgt = max(8.0, 3.4 + 1.0 * n_max)
+    r_grafik = r
+    if satirlar:
+        S.not_satiri(r_grafik, "Sol: iki grup eşit büyüklüktedir; çubuğu uzun olan grubu riskli diyen skor haklıdır (karar kuralı). "
+                               "Sağ: aynı farkın vaka adedi karşılığı; sağa uzayan çubuk modelin fazladan yakaladığı vaka, sola "
+                               "uzayan mevcut skorun fazladan yakaladığıdır.", c2=_KC["yorum"], yuk=30)
+        r += 2 + _cm_satir(hgt)
+    r_grup, r0 = r, r + 1
+    for g in KK_GRUP:
+        cs = [2 + i for i, k in enumerate(KK_KOLONLAR) if k[0] == g]
+        S.birlestir(r_grup, cs[0], cs[-1], KK_GRUP[g], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, size=10,
+                    h="center", kenar=_KENAR_B)
+    ws.row_dimensions[r_grup].height = 30
+    for i, k in enumerate(KK_KOLONLAR):
+        S.hucre(r0, 2 + i, k[1], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B, size=10)
+    ws.row_dimensions[r0].height = 46
+    for i, d in enumerate(satirlar):
+        rr = r0 + 1 + i
+        net = d["net"] if _sonlu(d["net"]) else None
+        deger = {**d, "seg": _seg_etiket(d["kod"]), "ad": f"{d['vade']}M {_MODEL_ADI[d['aile']]}",
+                 "model": _MODEL_ADI[d["aile"]], "fark_p": round(d["fark"] * 100, 2) if _sonlu(d["fark"]) else None,
+                 "sonuc": _SONUC_ADI.get(d["kazanan"], d["kazanan"]), "yorum": _yorum(d),
+                 "net_pos": net if net is not None and net > 0 else None,
+                 "net_neg": net if net is not None and net < 0 else None}
+        for k in KK_KOLONLAR:
+            v = deger.get(k[4])
+            if isinstance(v, float) and not np.isfinite(v):
+                v = None
+            x = S.hucre(rr, _KC[k[4]], v, fmt=k[2], wrap=k[4] == "yorum", dikey="center", size=10,
+                        h="left" if k[4] in ("seg", "ad", "skor", "yorum", "model") else "center")
+            if k[4] == "sonuc" and v:
+                x.fill = PatternFill("solid", fgColor=_SONUC_RENK.get(v, "FFFFFF"))
+                x.font = Font(name=YAZI_TIPI, bold=True, size=10)
+        ws.row_dimensions[rr].height = 30
+        if acilis and acilis_skor and (d["kod"] != acilis or d["skor"] != acilis_skor):
+            ws.row_dimensions[rr].hidden = True               # açılışta yalnızca seçili renk ve skor görünür
+    if satirlar:
+        rs = r0 + len(satirlar)
+        tab = _tablo_ekle(ws, "Karsilastirma_Detay", r0, rs, 2, [k[1] for k in KK_KOLONLAR])
+        if acilis and acilis_skor:
+            tab.autoFilter.filterColumn.append(FilterColumn(colId=0, filters=Filters(filter=[_seg_etiket(acilis)])))
+            tab.autoFilter.filterColumn.append(FilterColumn(colId=_KC["skor"] - 2, filters=Filters(filter=[acilis_skor])))
+        _dilimleyici_alani(ws, "Karsilastirma_Detay", r_dilim,
+                           [("Renk Segmenti", "Renk Segmenti", _KC["seg"], _KC["v"], 4, N_RENK),
+                            ("Model", "Model", _KC["o"], _KC["sv_n"], 6, 2),
+                            ("Hedef Süre", "Hedef Süre", _KC["sv_v"], _KC["fark_p"], 4, 3),
+                            ("Karşılaştırılan Skor", "Karşılaştırılan Skor", _KC["net"], _KC["sonuc"], 4, 2)])
+        ws.conditional_formatting.add(f"{L(_KC['fark_p'])}{r0+1}:{L(_KC['fark_p'])}{rs}",
+                                      ColorScaleRule(start_type="min", start_color="BFBFBF", mid_type="num", mid_value=0,
+                                                     mid_color="FFFFFF", end_type="max", end_color="63BE7B"))
+        # ---- iki grafik (tablonun satırlarına bağlı; yalnızca görünen satırlar) ----
+        oranlar = [d.get(k) for d in satirlar for k in ("sm_o", "sv_o")]
+        ws.add_chart(_cubuk_grafik(
+            ws, "Ayrışan müşterilerde hedef oranı",
+            [(_KC["sm_o"], "Sadece modelin riskli dediği müşteriler", AKBANK_KIRMIZI),
+             (_KC["sv_o"], "Sadece mevcut skorun riskli dediği müşteriler", "A6A6A6")],
+            _KC["ad"], r0, rs, "0%", "0.0%", 17.0, hgt, _eksen_siniri(oranlar)), f"B{r_grafik + 1}")
+        ws.add_chart(_cubuk_grafik(                           # eksen otomatik: renkler arasında vaka sayısı çok farklı
+            ws, "Model lehine net ek vaka",
+            [(_KC["net_pos"], "Model fazladan yakalıyor", AKBANK_KIRMIZI),
+             (_KC["net_neg"], "Mevcut skor fazladan yakalıyor", "A6A6A6")],
+            _KC["ad"], r0, rs, "#,##0", "+#,##0;-#,##0", 17.0, hgt, None, ust_uste=True),
+            f"{L(_KC['sm_v'])}{r_grafik + 1}")
+    else:
+        S.not_satiri(r0 + 1, f"⚠ {KIYAS_RAPORU} içinde KACAN_DILIM sheet'i okunamadı; önce 14 ANALİZ'i çalıştırın.",
+                     c2=_KC["yorum"])
+    _yazdir(ws)
+    _log(f"   {KARSILASTIRMA_SAYFA}: {len(satirlar)} karşılaştırma satırı | görsel: {'var' if gorsel_yuk else 'yok'}")
+
+
+_karsilastirma_sayfasi()
+
+
+# ==================================================================
+# 8) DİLİMLEYİCİLER (slicer)
+# ------------------------------------------------------------------
+# openpyxl dilimleyici yazamadığı için kaydedilen xlsx'e Excel'in kendi biçimiyle eklenir
+# (Excel 2013 ve sonrası; tablo dilimleyicisi). Her dilimleyici bir tablo kolonuna bağlıdır ve
+# seçim o tablonun filtresini değiştirir; grafikler de bu filtreye göre çizilir.
+# Bir hata olursa dosya dilimleyicisiz yazılır (tablo filtreleri yine çalışır).
+# ==================================================================
+_NS_M = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_NS_X14 = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+_NS_X15 = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"
+_NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_PR = "http://schemas.openxmlformats.org/package/2006/relationships"
+_REL_CIZIM = _NS_R + "/drawing"
+_REL_DILIM = "http://schemas.microsoft.com/office/2007/relationships/slicer"
+_REL_DILIM_ON = "http://schemas.microsoft.com/office/2007/relationships/slicerCache"
+_URI_KITAP = "{46BE6895-7355-4a93-B00E-2C351335B9C9}"   # workbook extLst: x15:slicerCaches (tablo dilimleyicileri)
+_URI_SAYFA = "{3A4CF648-6AED-40f4-86FF-DC5316D8AED3}"   # worksheet extLst: x14:slicerList (tablo dilimleyicileri)
+_URI_ON = "{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}"      # slicerCacheDefinition extLst: x15:tableSlicerCache
+_XML_BAS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+
+
+def _q(s):
+    return _xml_kacis(str(s), {'"': "&quot;"})
+
+
+def _parca_yolu(kaynak, hedef):
+    """rels Target'ını zip içi yola çevirir (mutlak '/xl/..' ya da göreli '../..')."""
+    if hedef.startswith("/"):
+        return hedef.lstrip("/")
+    parca = kaynak.split("/")[:-1]
+    for p in hedef.split("/"):
+        if p == "..":
+            parca.pop()
+        elif p not in (".", ""):
+            parca.append(p)
+    return "/".join(parca)
+
+
+def _rels_yolu(parca):
+    d, ad = parca.rsplit("/", 1)
+    return f"{d}/_rels/{ad}.rels"
+
+
+def _kok_onek(s, etiket):
+    m = re.search(r"<(\w+:)?" + etiket + r"[\s>]", s)
+    return (m.group(1) or "") if m else ""
+
+
+def _once_ekle(s, desenler, ek):
+    """s içinde desenlerden en önce eşleşenin önüne ek'i koyar."""
+    konum = [m.start() for d in desenler for m in [re.search(d, s)] if m]
+    if not konum:
+        raise ValueError("XML içinde ekleme yeri bulunamadı")
+    k = min(konum)
+    return s[:k] + ek + s[k:]
+
+
+def _capa(no, ad, baslik, c1, r1, c2, r2):
+    """Çizim (drawing) içindeki dilimleyici yeri; Excel 2010 ve öncesi ile diğer programlar yedek kutuyu gösterir."""
+    return (f'<xdr:twoCellAnchor xmlns:xdr="{_NS_XDR}" xmlns:a="{_NS_A}" editAs="oneCell">'
+            f'<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            f'<xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+            f'<mc:AlternateContent xmlns:mc="{_NS_MC}">'
+            '<mc:Choice xmlns:sle15="http://schemas.microsoft.com/office/drawing/2012/slicer" Requires="sle15">'
+            f'<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{no}" name="{_q(ad)}"/><xdr:cNvGraphicFramePr/>'
+            '</xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>'
+            '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2010/slicer">'
+            f'<sle:slicer xmlns:sle="http://schemas.microsoft.com/office/drawing/2010/slicer" name="{_q(ad)}"/>'
+            '</a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice>'
+            '<mc:Fallback><xdr:sp macro="" textlink="">'
+            f'<xdr:nvSpPr><xdr:cNvPr id="{no}" name="{_q(ad)}"/><xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr>'
+            '<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="900000"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="F2F2F2"/></a:solidFill>'
+            '<a:ln w="9525"><a:solidFill><a:srgbClr val="A6A6A6"/></a:solidFill></a:ln></xdr:spPr>'
+            '<xdr:txBody><a:bodyPr vertOverflow="clip" horzOverflow="clip"/><a:lstStyle/><a:p><a:r>'
+            f'<a:rPr lang="tr-TR" sz="1000"/><a:t>Dilimleyici: {_q(baslik)} (Excel 2013 ve sonrasında görünür)</a:t>'
+            '</a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent><xdr:clientData/></xdr:twoCellAnchor>')
+
+
+def _dilimleyici_ekle(veri, plan):
+    zin = zipfile.ZipFile(BytesIO(veri))
+    sira = [i.filename for i in zin.infolist()]
+    z = {ad: zin.read(ad) for ad in sira}
+    oku = (lambda p: z[p].decode("utf-8"))
+
+    def rels(parca):
+        yol = _rels_yolu(parca)
+        if yol not in z:
+            return []
+        return [(e.get("Id"), e.get("Type"), _parca_yolu(parca, e.get("Target"))) for e in ET.fromstring(z[yol])]
+
+    def rel_ekle(parca, tip, hedef, on):
+        yol = _rels_yolu(parca)
+        if yol not in z:
+            z[yol] = (_XML_BAS + f'<Relationships xmlns="{_NS_PR}"></Relationships>').encode("utf-8")
+            sira.append(yol)
+        mevcut = {i for i, _, _ in rels(parca)}
+        k = 1
+        while f"{on}{k}" in mevcut:
+            k += 1
+        rid = f"{on}{k}"
+        ek = f'<Relationship Id="{rid}" Type="{tip}" Target="/{hedef}"/>'
+        s = oku(yol)
+        s = (s.replace("</Relationships>", ek + "</Relationships>") if "</Relationships>" in s else
+             re.sub(r"<Relationships([^>]*)/>", lambda m: f"<Relationships{m.group(1)}>{ek}</Relationships>", s))
+        z[yol] = s.encode("utf-8")
+        return rid
+
+    def yeni_parca(kalip, icerik, tur):
+        k = 1
+        while kalip.format(k) in z:
+            k += 1
+        yol = kalip.format(k)
+        z[yol] = icerik.encode("utf-8")
+        sira.append(yol)
+        tipler.append((yol, tur))
+        return yol
+
+    tipler, onbellekler = [], []
+    wb_kok = ET.fromstring(z["xl/workbook.xml"])
+    sayfa_rid = {e.get("name"): e.get(f"{{{_NS_R}}}id") for e in wb_kok.iter(f"{{{_NS_M}}}sheet")}
+    wb_hedef = {i: h for i, _, h in rels("xl/workbook.xml")}
+    for p in plan:
+        sayfa_yol = wb_hedef[sayfa_rid[p["sayfa"]]]
+        srels = rels(sayfa_yol)
+        tablo_id, kolon_id = None, {}
+        for _, t, h in srels:
+            if t.endswith("/table"):
+                tk = ET.fromstring(z[h])
+                if tk.get("displayName") == p["tablo"]:
+                    tablo_id = tk.get("id")
+                    kolon_id = {c.get("name"): c.get("id") for c in tk.iter(f"{{{_NS_M}}}tableColumn")}
+        if tablo_id is None:
+            raise ValueError(f"{p['sayfa']}: {p['tablo']} tablosu bulunamadı")
+        s_ws = oku(sayfa_yol)
+        on = _kok_onek(s_ws, "worksheet")
+        cizim = next((h for _, t, h in srels if t == _REL_CIZIM), None)
+        if cizim is None:                                     # sayfada çizim yoksa boş bir çizim parçası aç
+            cizim = yeni_parca("xl/drawings/drawing{}.xml", _XML_BAS + f'<xdr:wsDr xmlns:xdr="{_NS_XDR}" xmlns:a="{_NS_A}"></xdr:wsDr>',
+                               "application/vnd.openxmlformats-officedocument.drawing+xml")
+            rid = rel_ekle(sayfa_yol, _REL_CIZIM, cizim, "rIdCizim")
+            s_ws = _once_ekle(s_ws, [rf"<{on}(?:legacyDrawing|legacyDrawingHF|picture|oleObjects|controls|webPublishItems|"
+                                     rf"tableParts|extLst)\b", rf"</{on}worksheet>"],
+                              f'<{on}drawing xmlns:r="{_NS_R}" r:id="{rid}"/>')
+        s_cz = oku(cizim)
+        no = max([int(x) for x in re.findall(r'<(?:\w+:)?cNvPr[^>]*?\sid="(\d+)"', s_cz)] + [0]) + 1
+        dilim_xml, capalar = [], []
+        for j, (kolon, baslik, (c1, r1, c2, r2), n_kol) in enumerate(p["dilimler"], start=1):
+            if kolon not in kolon_id:
+                raise ValueError(f"{p['tablo']}: '{kolon}' kolonu yok")
+            ad = f"Dilim_{p['tablo']}_{j}"
+            on_ad = f"Slicer_{p['tablo']}_{j}"
+            ob = yeni_parca("xl/slicerCaches/slicerCache{}.xml",
+                            _XML_BAS + f'<slicerCacheDefinition xmlns="{_NS_X14}" xmlns:mc="{_NS_MC}" mc:Ignorable="x" '
+                            f'xmlns:x="{_NS_M}" name="{on_ad}" sourceName="{_q(kolon)}"><extLst>'
+                            f'<x:ext uri="{_URI_ON}" xmlns:x15="{_NS_X15}"><x15:tableSlicerCache tableId="{tablo_id}" '
+                            f'column="{kolon_id[kolon]}"/></x:ext></extLst></slicerCacheDefinition>',
+                            "application/vnd.ms-excel.slicerCache+xml")
+            onbellekler.append((on_ad, rel_ekle("xl/workbook.xml", _REL_DILIM_ON, ob, "rIdDilimOn")))
+            dilim_xml.append(f'<slicer name="{_q(ad)}" cache="{on_ad}" caption="{_q(baslik)}" columnCount="{n_kol}" '
+                             f'style="{DILIMLEYICI_STIL}" rowHeight="241300"/>')
+            capalar.append(_capa(no, ad, baslik, c1, r1, c2, r2))
+            no += 1
+        dl = yeni_parca("xl/slicers/slicer{}.xml",
+                        _XML_BAS + f'<slicers xmlns="{_NS_X14}" xmlns:mc="{_NS_MC}" mc:Ignorable="x" xmlns:x="{_NS_M}">'
+                        + "".join(dilim_xml) + "</slicers>", "application/vnd.ms-excel.slicer+xml")
+        rid_dl = rel_ekle(sayfa_yol, _REL_DILIM, dl, "rIdDilim")
+        ext = (f'<{on}ext uri="{_URI_SAYFA}" xmlns:x15="{_NS_X15}"><x14:slicerList xmlns:x14="{_NS_X14}">'
+               f'<x14:slicer xmlns:r="{_NS_R}" r:id="{rid_dl}"/></x14:slicerList></{on}ext>')
+        if re.search(rf"</{on}extLst>\s*</{on}worksheet>\s*$", s_ws):
+            s_ws = _once_ekle(s_ws, [rf"</{on}extLst>\s*</{on}worksheet>\s*$"], ext)
+        else:
+            s_ws = _once_ekle(s_ws, [rf"</{on}worksheet>\s*$"], f"<{on}extLst>{ext}</{on}extLst>")
+        z[sayfa_yol] = s_ws.encode("utf-8")
+        z[cizim] = _once_ekle(s_cz, [r"</(?:\w+:)?wsDr>\s*$"], "".join(capalar)).encode("utf-8")
+
+    s_wb = oku("xl/workbook.xml")
+    on = _kok_onek(s_wb, "workbook")
+    adlar = "".join(f'<{on}definedName name="{a}">#N/A</{on}definedName>' for a, _ in onbellekler)
+    if re.search(rf"</{on}definedNames>", s_wb):
+        s_wb = _once_ekle(s_wb, [rf"</{on}definedNames>"], adlar)
+    elif re.search(rf"<{on}definedNames\s*/>", s_wb):
+        s_wb = re.sub(rf"<{on}definedNames\s*/>", f"<{on}definedNames>{adlar}</{on}definedNames>", s_wb, count=1)
+    else:
+        s_wb = _once_ekle(s_wb, [rf"<{on}calcPr\b", rf"<{on}oleSize\b", rf"<{on}customWorkbookViews\b",
+                                 rf"<{on}pivotCaches\b", rf"<{on}extLst\b", rf"</{on}workbook>"],
+                          f"<{on}definedNames>{adlar}</{on}definedNames>")
+    ext = (f'<{on}ext uri="{_URI_KITAP}" xmlns:x15="{_NS_X15}"><x15:slicerCaches xmlns:x14="{_NS_X14}">'
+           + "".join(f'<x14:slicerCache xmlns:r="{_NS_R}" r:id="{rid}"/>' for _, rid in onbellekler)
+           + f"</x15:slicerCaches></{on}ext>")
+    if re.search(rf"</{on}extLst>\s*</{on}workbook>\s*$", s_wb):
+        s_wb = _once_ekle(s_wb, [rf"</{on}extLst>\s*</{on}workbook>\s*$"], ext)
+    else:
+        s_wb = _once_ekle(s_wb, [rf"</{on}workbook>\s*$"], f"<{on}extLst>{ext}</{on}extLst>")
+    z["xl/workbook.xml"] = s_wb.encode("utf-8")
+    s_ct = oku("[Content_Types].xml")
+    z["[Content_Types].xml"] = s_ct.replace("</Types>", "".join(
+        f'<Override PartName="/{yol}" ContentType="{tur}"/>' for yol, tur in tipler) + "</Types>").encode("utf-8")
+    for ad in z:                                              # tüm XML parçaları hâlâ düzgün mü
+        if ad.endswith((".xml", ".rels")):
+            ET.fromstring(z[ad])
+    cikti = BytesIO()
+    with zipfile.ZipFile(cikti, "w", zipfile.ZIP_DEFLATED) as zo:
+        for ad in sira:
+            zo.writestr(ad, z[ad])
+    return cikti.getvalue(), len(onbellekler)
+
+
+# ==================================================================
+# 9) YAZ
+# ==================================================================
+try:
+    _eski = mf.get_path_details(CIKTI_DOSYA)
+except Exception:
+    _eski = None
+if YEDEK_KLASORU and isinstance(_eski, dict) and _eski.get("exists") is not False and not _eski.get("directory"):
+    try:
+        with mf.get_download_stream(CIKTI_DOSYA) as s:
+            _b = s.read()
+        _yedek = f"{YEDEK_KLASORU.rstrip('/')}/{CIKTI_DOSYA.strip('/').rsplit('.', 1)[0]}_yedek_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        mf.upload_stream(_yedek, BytesIO(_b))
+        _log(f"Önceki dosya yedeklendi: {MAIN_FOLDER}{_yedek}")
     except Exception:
         pass
-    if not adlar:
-        try:
-            for p in mf.list_paths_in_partition():
-                parca = str(p).strip("/").split("/")
-                if len(parca) > 1:
-                    adlar.add(parca[0])
-        except Exception:
-            pass
-    if not adlar:
-        # Listeleme yoksa olası tüm adlar tek tek denenir
-        for _oot in OOT_DONEMLER:
-            for _n in VADE_ADAYLARI:
-                for _aile in HEDEF_AILELERI:
-                    _ad = f"{_n}M_{_aile}_{_oot}"
-                    if _analiz_klasor_var("/" + _ad):
-                        adlar.add(_ad)
-    return sorted(adlar)
-
-
-_KLASOR_DESENI = re.compile(
-    r"^(\d+)M_(" + "|".join(sorted(HEDEF_AILELERI, key=len, reverse=True)) + r")_(OOT\d{6})$")
-
-
-def _onek_coz(onek):
-    """'3M_ICINDE_KIRMIZI_TAKIP' → (3, 'ICINDE_KIRMIZI_TAKIP')"""
-    _m = re.match(r"^(\d+)M_(.+)$", onek)
-    return int(_m.group(1)), _m.group(2)
-
-
-# OOT → [(klasör adı, model öneki, ACT kolonu), ...]  (sadece var olanlar)
-KLASORLER_OOT = {}
-_taninmayan = []
-if MODEL_GEREKLILIK_ANALIZI:
-    for _ad in _analiz_kok_klasorleri():
-        if _ad.upper() in {h.upper() for h in HARIC_KLASORLER}:
-            continue
-        _m = _KLASOR_DESENI.match(_ad)
-        if not _m:
-            _taninmayan.append(_ad)
-            continue
-        _onek = f"{_m.group(1)}M_{_m.group(2)}"
-        KLASORLER_OOT.setdefault(_m.group(3), []).append((_ad, _onek, f"ACT_{_onek}"))
-    for _oot in KLASORLER_OOT:
-        KLASORLER_OOT[_oot].sort(key=lambda t: (list(HEDEF_AILELERI).index(_onek_coz(t[1])[1]),
-                                                _onek_coz(t[1])[0]))
-    for _oot, _lst in sorted(KLASORLER_OOT.items()):
-        print(f"✓ {_oot}: {len(_lst)} model klasörü bulundu → " + ", ".join(k for k, _, _ in _lst))
-    if _taninmayan:
-        print(f"ⓘ Adı tanınmayan klasör (okunmadı): {_taninmayan}")
-
-TUM_KLASORLER = [k for _lst in KLASORLER_OOT.values() for k, _, _ in _lst]
-# (model öneki, gerçekleşme kolonu), her model bir kez
-MODEL_ONEK_ACT = list(dict.fromkeys((o, a) for _lst in KLASORLER_OOT.values() for _, o, a in _lst))
-_analiz_hazir = MODEL_GEREKLILIK_ANALIZI and len(TUM_KLASORLER) > 0
-
-if not MODEL_GEREKLILIK_ANALIZI:
-    print("ⓘ MODEL_GEREKLILIK_ANALIZI=False → analiz atlandı.")
-elif not TUM_KLASORLER:
-    print("ⓘ Hiçbir model klasörü bulunamadı → analiz atlandı.")
-
-if _analiz_hazir:
-    if 'df_raw' not in globals():
-        raise RuntimeError("df_raw bellekte yok, analiz kurulamaz.")
-
-    # Ayarları kısa adlara aç
-    ESIK_GINI_GEREKLI       = float(ANALIZ_AYAR["ESIK_GINI_GEREKLI"])
-    RISKLI_DILIM_PCT        = float(ANALIZ_AYAR["RISKLI_DILIM_PCT"])
-    ESIK_BERABER_PUAN       = float(ANALIZ_AYAR["ESIK_BERABER_PUAN"])
-    ESIK_MIN_VAKA           = int(ANALIZ_AYAR["ESIK_MIN_VAKA"])
-    ESIK_SKOR_ESLESME       = float(ANALIZ_AYAR["ESIK_SKOR_ESLESME"])
-    ESIK_MUSTERI_FARK       = float(ANALIZ_AYAR["ESIK_MUSTERI_FARK"])
-    ESIK_HEDEF_ORANI_FARK   = float(ANALIZ_AYAR["ESIK_HEDEF_ORANI_FARK"])
-    ESIK_BADRATE_TUTARLILIK = float(ANALIZ_AYAR["ESIK_BADRATE_TUTARLILIK"])
-    ESIK_HEDEF_UYUM         = float(ANALIZ_AYAR["ESIK_HEDEF_UYUM"])
-
-    # Riskli dilim = bucket 1..RISKLI_UST (20 bucket'ta %20 → B1-B4)
-    RISKLI_UST   = max(1, min(ANALIZ_N_BUCKET, int(np.ceil(ANALIZ_N_BUCKET * RISKLI_DILIM_PCT))))
-    _RISKLI_YZD  = int(round(RISKLI_DILIM_PCT * 100))
-
-    _SKOR_RENKLER = MODEL_RENKLER if 'MODEL_RENKLER' in globals() else [1, 2, 3, 4, 5, 6]
-    _renk_map     = COLOR_MAP if 'COLOR_MAP' in globals() else {}
-
-    def _renk_etiket(rk):
-        return f"{rk}-{_renk_map.get(rk, rk)}"
-
-    # Rapordaki kısa hedef adları
-    _KISA_GOVDE = {aile: v[2] for aile, v in HEDEF_AILELERI.items()}
-
-    def _kisa_ad(ad):
-        """'3M_ICINDE_KIRMIZI_RENGE_GOC' veya 'ACT_3M_...' → '3M İÇİNDE KIRMIZIYA GÖÇ'"""
-        _s = ad[4:] if ad.startswith("ACT_") else ad
-        _m = re.match(r"(\d+M)_(.+)", _s)
-        if not _m:
-            return _s
-        return f"{_m.group(1)} {_KISA_GOVDE.get(_m.group(2), _m.group(2))}"
-
-    # Kontrol tabloları bu listelerde birikir, en sonda KONTROLLER sheet'ine yazılır
-    _ktrl_hedef, _ktrl_skor_dosya, _ktrl_model_tablo, _ktrl_kapsama = [], [], [], []
-    _ktrl_fpd = []
-
-    # ==============================================================
-    # A) GERÇEKLEŞME HEDEFLERİ ve KIYAS SKORLARI (df_raw'dan)
-    # --------------------------------------------------------------
-    # ACT_ kolonları "gerçekte ne oldu" bilgisidir, model tahmini değil.
-    # Bölüm 4 (Target Tanımlama) ile birebir aynı tanımlar:
-    #   NO:1 ACT_<n>M_KIRMIZI_RENGE_GOC        = RENK_<n>M_SONRASI == '1-Kırmızı'
-    #   NO:2 ACT_<n>M_ICINDE_KIRMIZI_RENGE_GOC = n ay içinde herhangi bir ay kırmızı
-    #        NO:1 ve NO:2'de AKB_TAKIP_YY_<n>M_FLG == 0 olmayan müşteri kitlede yoktur:
-    #        ACT boş (NaN) bırakılır, bu hedefin hiçbir hesabına girmez.
-    #   NO:3 ACT_<n>M_TAKIP                    = AKB_TAKIP_YY_<n>M_FLG == 1
-    #   NO:4 ACT_<n>M_ICINDE_KIRMIZI_TAKIP     = n ay içinde kırmızı VEYA takip
-    #   NO:5 ACT_<n>M_SONRA_KIRMIZI_VE_TAKIP   = RENK_<n>M_SONRASI kırmızı VEYA takip
-    # Kıyas skorları: DAV_SKOR → DAVRANIS_SKOR, MMS → MUSTERI_SKOR
-    # ==============================================================
-    JOIN_KEYS       = ["DONEM", "MBB_NO"]
-    VADELER         = sorted({_onek_coz(o)[0] for o, _ in MODEL_ONEK_ACT})
-    TARGET_COLS     = [a for _, a in MODEL_ONEK_ACT]
-    _KIRMIZI_ETIKET = "1-Kırmızı"
-
-    df_analiz = df_raw[list(dict.fromkeys(list(df_raw.columns)))].copy()
-
-    _dfraw_kiyas_haritasi = {"DAV_SKOR": "DAVRANIS_SKOR", "MMS": "MUSTERI_SKOR"}
-    _eksik = [c for c in _dfraw_kiyas_haritasi if c not in df_analiz.columns]
-    if _eksik:
-        raise KeyError(f"df_raw'da kıyas skoru kolonu yok: {_eksik}")
-    _cakisma = [(s, d) for s, d in _dfraw_kiyas_haritasi.items()
-                if s in df_analiz.columns and d in df_analiz.columns]
-    if _cakisma:
-        raise KeyError(f"df_raw'da hem eski hem yeni skor adı var: {_cakisma}. "
-                       "Tek isme düşürüp tekrar çalıştırın.")
-    df_analiz = df_analiz.rename(columns=_dfraw_kiyas_haritasi)
-
-    _eksik = [c for c in JOIN_KEYS + [f"AKB_TAKIP_YY_{n}M_FLG" for n in VADELER]
-              if c not in df_analiz.columns]
-    if _eksik:
-        raise KeyError(f"df_raw'da eksik kolon: {_eksik}")
-    for col in JOIN_KEYS:
-        df_analiz[col] = pd.to_numeric(df_analiz[col], errors="coerce").astype("Int64")
-
-    # RENK etiketi ('1-Kırmızı') → sayısal kod (1)
-    if "RENK" in df_analiz.columns:
-        df_analiz["RENK_KOD"] = pd.to_numeric(
-            df_analiz["RENK"].astype(str).str.split("-").str[0].str.strip(),
-            errors="coerce").astype("Int64")
-    else:
-        df_analiz["RENK_KOD"] = pd.array([pd.NA] * len(df_analiz), dtype="Int64")
-        print("⚠ df_raw'da RENK kolonu yok → renk blokları üretilemeyecek")
-
-    # _ACT_KAYNAK_MAP: her ACT'nin dayandığı ham kolonlar. Kaynak kolon
-    # o dönemde tamamen boşsa gerçekleşme penceresi henüz kapanmamıştır;
-    # OZET'te sahte %0 yerine boş yazılır.
-    # _ACT_KITLE: hedefin kitlesi (NO:1 / NO:2'de X içinde takibe düşenler yok).
-    _ACT_KAYNAK_MAP, _ACT_TANIM, _ACT_KITLE = {}, {}, {}
-    _ic_onbellek = {}
-
-    def _icinde_kirmizi(n):
-        """n ay içinde herhangi bir ay kırmızı: (seri, kaynak kolonlar, tanım metni)."""
-        if n in _ic_onbellek:
-            return _ic_onbellek[n]
-        _ic = f"{n}M_ICINDE_KIRMIZI"
-        _snk = ["RENK_SONRAKI_AY"] + [f"RENK_SONRAKI_{k}AY" for k in range(2, n + 1)]
-        if _ic in df_analiz.columns:
-            _sonuc = (pd.to_numeric(df_analiz[_ic], errors="coerce").fillna(0) == 1, [_ic], f"{_ic} == 1")
-        else:
-            _eks = [c for c in _snk if c not in df_analiz.columns]
-            if _eks:
-                raise KeyError(f"{_ic} yok ve türetmek için gereken kolonlar eksik: {_eks}")
-            _sonuc = ((df_analiz[_snk] == _KIRMIZI_ETIKET).any(axis=1), _snk,
-                      f"{_snk[0]} .. {_snk[-1]} içinde '{_KIRMIZI_ETIKET}' var")
-        _ic_onbellek[n] = _sonuc
-        return _sonuc
-
-    for _onek, _act in MODEL_ONEK_ACT:
-        _n, _aile = _onek_coz(_onek)
-        _no, _kitle_filtresi, _ = HEDEF_AILELERI[_aile]
-        _tk = f"AKB_TAKIP_YY_{_n}M_FLG"
-        _flg = pd.to_numeric(df_analiz[_tk], errors="coerce")
-        _tk_seri = _flg == 1
-        _son_kol = f"RENK_{_n}M_SONRASI"
-        if _aile in ("KIRMIZI_RENGE_GOC", "SONRA_KIRMIZI_VE_TAKIP"):
-            if _son_kol not in df_analiz.columns:
-                raise KeyError(f"{_act} için {_son_kol} df_raw'da yok")
-            _son_seri = df_analiz[_son_kol] == _KIRMIZI_ETIKET
-            _son_not = f"{_son_kol} == '{_KIRMIZI_ETIKET}'"
-
-        if _aile == "KIRMIZI_RENGE_GOC":
-            _seri, _kaynak, _tanim = _son_seri, [_son_kol], _son_not
-        elif _aile == "ICINDE_KIRMIZI_RENGE_GOC":
-            _seri, _kaynak, _tanim = _icinde_kirmizi(_n)
-        elif _aile == "TAKIP":
-            _seri, _kaynak, _tanim = _tk_seri, [_tk], f"{_tk} == 1"
-        elif _aile == "ICINDE_KIRMIZI_TAKIP":
-            _ic_s, _ic_k, _ic_n = _icinde_kirmizi(_n)
-            _seri, _kaynak, _tanim = _ic_s | _tk_seri, _ic_k + [_tk], f"{_ic_n} VEYA {_tk} == 1"
-        else:                                   # SONRA_KIRMIZI_VE_TAKIP
-            _seri, _kaynak, _tanim = _son_seri | _tk_seri, [_son_kol, _tk], f"{_son_not} VEYA {_tk} == 1"
-
-        _deger = _seri.astype("float32")
-        if _kitle_filtresi:
-            _deger = _deger.where(_flg == 0)    # takibe düşen (ya da bayrağı boş) kitlede yok
-        df_analiz[_act] = _deger
-        _ACT_KAYNAK_MAP[_act] = list(dict.fromkeys(_kaynak + ([_tk] if _kitle_filtresi else [])))
-        _ACT_TANIM[_act] = f"{_no}: {_tanim}"
-        _ACT_KITLE[_act] = (f"{_tk} == 0 olanlar (X içinde takibe düşen yok)" if _kitle_filtresi
-                            else "tüm KK müşteriler")
-    del _flg, _tk_seri, _seri, _deger
-    _ic_onbellek.clear()
-
-    ortak_donemler = sorted(df_analiz["DONEM"].dropna().unique())
-    print(f"✓ Gerçekleşme hedefleri hazır: {len(df_analiz):,} satır | dönemler: {ortak_donemler}")
-
-    # ==============================================================
-    # B) MODEL SKORLARI (her model klasöründeki 6 renk CSV'si)
-    # --------------------------------------------------------------
-    # renk_{kod}_{ad}_musteri_skorlari.csv → SKOR_<klasör> ve PRED_<klasör>
-    # kolonları; klasördeki hedef (target_actual) HDF_<klasör> olarak
-    # yalnızca kontrol için alınır (KONTROLLER 1).
-    # Sol birleştirme: df_analiz'in satır sayısı değişmez.
-    # ==============================================================
-    SKOR_KOLON = ["mbb_no", "donem", "target_actual", "target_pred", "target_score"]
-
-    for _ek in TUM_KLASORLER:
-        _parcalar, _okunan = [], 0
-        for _rk in _SKOR_RENKLER:
-            _yol = f"/{_ek}/renk_{_rk}_{_renk_map.get(_rk, _rk)}_musteri_skorlari.csv"
-            try:
-                with mf.get_download_stream(_yol) as _s:
-                    _parcalar.append(pd.read_csv(_s, usecols=SKOR_KOLON))
-                _okunan += 1
-            except Exception as e:
-                print(f"   ⚠ {_yol} okunamadı ({e})")
-        _ktrl = {"MODEL": _ek, "OKUNAN RENK DOSYASI": f"{_okunan} / {len(_SKOR_RENKLER)}",
-                 "MÜKERRER SATIR (adet)": None}
-        _ktrl_skor_dosya.append(_ktrl)
-        if not _parcalar:
-            continue
-        _sc = pd.concat(_parcalar, ignore_index=True)
-        del _parcalar
-        _sc["mbb_no"] = pd.to_numeric(_sc["mbb_no"], errors="coerce").astype("Int64")
-        _sc["donem"]  = pd.to_numeric(_sc["donem"],  errors="coerce").astype("Int64")
-        _sc = _sc.dropna(subset=["mbb_no", "donem"])
-        _dup = int(_sc.duplicated(subset=["mbb_no", "donem"]).sum())
-        _ktrl["MÜKERRER SATIR (adet)"] = _dup
-        if _dup:
-            _sc = _sc.drop_duplicates(subset=["mbb_no", "donem"], keep="first")
-        _sc["target_actual"] = pd.to_numeric(_sc["target_actual"], errors="coerce").astype("float32")
-        _sc["target_pred"] = pd.to_numeric(_sc["target_pred"], errors="coerce").astype("float32")
-        _sc = _sc.rename(columns={"target_score": f"SKOR_{_ek}", "target_pred": f"PRED_{_ek}",
-                                  "target_actual": f"HDF_{_ek}",
-                                  "mbb_no": "MBB_NO", "donem": "DONEM"})
-        _n_once = len(df_analiz)
-        df_analiz = df_analiz.merge(_sc, on=JOIN_KEYS, how="left", validate="m:1")
-        assert len(df_analiz) == _n_once, f"{_ek}: birleştirme satır sayısını değiştirdi"
-        del _sc
-        print(f"   ✓ {_ek}: model skoru eklendi")
-
-    # ==============================================================
-    # C) MODEL KLASÖRÜNDEKİ 20'Lİ BUCKET TABLOLARI (Excel'den, aynen)
-    # --------------------------------------------------------------
-    # Her model klasöründe her renk için TEK dosya okunur:
-    #   /<klasör>/renk_{kod}_{ad}_bucket20_train_val_oot.xlsx
-    # (bucket100 dosyaları ve diğer xlsx'ler okunmaz.)
-    # Dosyadaki tablo TRAIN, VAL ve OOT satırlarını alt alta içerir;
-    # SADECE kume == 'OOT' olan 20 satır alınır. Hiçbir değer yeniden
-    # hesaplanmaz. Alınan kolonlar:
-    #   n        → MODEL DİLİMİ MÜŞTERİ
-    #   bad      → MODEL DİLİMİNDE GERÇEKLEŞEN (adet)
-    #   bad_rate → MODEL DİLİMİNDE GERÇEKLEŞEN (%)  (dosyada yoksa bad / n)
-    #   lift     → MODEL DİLİMİ LIFT  (dosyada yoksa bad_rate / OOT toplam oranı)
-    #   FPD_ESLESEN_ADET_TKP_ST_5M90 → OZET'teki FPD KESİŞEN KİTLE (20 bucket toplamı)
-    # ==============================================================
-    _FPD_KOLON_K = FPD_KOLON.lower()
-
-    def _sayiya(seri):
-        """Excel hücresini sayıya çevirir; '98,24%' gibi metinleri de çözer."""
-        if seri.dtype != object:
-            return pd.to_numeric(seri, errors="coerce")
-        _s = seri.astype(str).str.strip()
-        _pct = _s.str.endswith("%")
-        _s = _s.str.rstrip("%").str.replace(" ", "", regex=False)
-        _virgul = _s.str.contains(",", regex=False)
-        _s = _s.where(~_virgul, _s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-        _v = pd.to_numeric(_s, errors="coerce")
-        return _v.where(~_pct, _v / 100.0)
-
-    def _model_tablosu(ek, onek, rk):
-        """(model klasörü, renk) için OOT bucket tablosu, index = bucket.
-        Bulunamazsa (None, neden) döner; neden KONTROLLER'e yazılır."""
-        _dosya = f"renk_{rk}_{_renk_map.get(rk, rk)}_bucket20_train_val_oot.xlsx"
-        _yol = f"/{ek}/{_dosya}"
-        try:
-            with mf.get_download_stream(_yol) as _s:
-                _d = pd.read_excel(BytesIO(_s.read()), sheet_name=0)
-        except Exception as e:
-            return None, f"{_dosya} okunamadı ({type(e).__name__})"
-        _d.columns = [str(c).strip().lower() for c in _d.columns]
-        _eksik = [c for c in ("kume", "bucket", "n", "bad") if c not in _d.columns]
-        if _eksik:
-            return None, f"{_dosya}: kolon eksik {_eksik}"
-        _d = _d[_d["kume"].astype(str).str.strip().str.upper() == "OOT"].copy()
-        if _d.empty:
-            return None, f"{_dosya}: kume = OOT satırı yok"
-        for _c in ("bucket", "n", "bad", "bad_rate", _FPD_KOLON_K):
-            if _c in _d.columns:
-                _d[_c] = _sayiya(_d[_c])
-        if "bad_rate" not in _d.columns:
-            _d["bad_rate"] = _d["bad"] / _d["n"]
-        elif _d["bad_rate"].max(skipna=True) > 1.5:
-            _d["bad_rate"] = _d["bad_rate"] / 100.0        # 98,24 yazılmışsa 0,9824'e çek
-        if "lift" in _d.columns:
-            _d["lift"] = _sayiya(_d["lift"])
-        else:
-            _base = _d["bad"].sum() / _d["n"].sum() if _d["n"].sum() else np.nan
-            _d["lift"] = _d["bad_rate"] / _base
-        _d["bucket"] = _d["bucket"].astype(int)
-        return _d.drop_duplicates(subset="bucket", keep="first").set_index("bucket"), _dosya
-
-    def _fpd_degeri(liste):
-        """Bir rengin model tablolarından FPD KESİŞEN KİTLE.
-        liste: [(model öneki, ACT, SKOR kolonu, klasör tablosu | None), ...]
-        Dönen: (değer, kaynak model, en az, en çok, FPD kolonu olan tablo sayısı).
-        Modellerin kitlesi farklı olabilir (NO:1 / NO:2 takibe düşenleri çıkarır);
-        TÜM KİTLE'ye en yakın olan en geniş kitleli modelin değeri kullanılır."""
-        _deg = []
-        for _onek, _act, _sc, _tablo in liste:
-            if _tablo is not None and _FPD_KOLON_K in _tablo.columns:
-                _deg.append((float(_tablo["n"].sum()), int(round(_tablo[_FPD_KOLON_K].fillna(0).sum())), _onek))
-        if not _deg:
-            return None, None, None, None, 0
-        _deg.sort(key=lambda t: t[0], reverse=True)
-        _vals = [v for _, v, _ in _deg]
-        return _deg[0][1], _deg[0][2], min(_vals), max(_vals), len(_deg)
-
-    # ==============================================================
-    # D) METRİK FONKSİYONLARI
-    # --------------------------------------------------------------
-    # Kıyas skorlarının yönü:
-    #   DAVRANIS_SKOR: yüksek = iyi müşteri → riskli taraf DÜŞÜK skor (işaret -1)
-    #   MUSTERI_SKOR : yüksek = kötü müşteri → riskli taraf YÜKSEK skor (işaret +1)
-    # Skor işaretle çarpılınca hepsinde "büyük = riskli" olur.
-    # ==============================================================
-    KIYAS_SKORLARI = [                        # (kısa ad, kolon, işaret, rapordaki ad)
-        ("DAVRANIS", "DAVRANIS_SKOR", -1.0, "DAVRANIŞ SKORU"),
-        ("MUSTERI",  "MUSTERI_SKOR",  +1.0, "MÜŞTERİ SKORU"),
-    ]
-
-    _kitle_cache = {}
-    def _kitle(don):
-        """Bir dönemin analiz kitlesi: o dönemdeki KK ürünlü müşteriler."""
-        if don not in _kitle_cache:
-            _m = df_analiz["DONEM"] == don
-            if "KK_URUN_FLG" in df_analiz.columns:
-                _m &= (df_analiz["KK_URUN_FLG"] == "KK")
-            _kitle_cache[don] = df_analiz.loc[_m].copy()
-        return _kitle_cache[don]
-
-    def _bucketla_riskli(skor_riskli_buyuk, nb=ANALIZ_N_BUCKET):
-        """Eşit adetli 20 dilim. Skor 'büyük = riskli' verilmeli; bucket 1 = en riskli %5."""
-        s = np.asarray(skor_riskli_buyuk, dtype="float64"); n = len(s)
-        order = np.argsort(s, kind="stable")
-        r = np.empty(n, dtype="float64"); r[order] = np.arange(1, n + 1)
-        edges = 1.0 + np.arange(nb + 1) * (n - 1) / nb
-        return nb - np.searchsorted(edges[1:-1], r, side="left")
-
-    def _gini(y, skor_riskli_buyuk):
-        """Gini = 2 x AUC - 1. 0 = rastgele, 1 = kusursuz, eksi = ters sıralıyor."""
-        y = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").to_numpy(dtype="float64")
-        s = np.asarray(skor_riskli_buyuk, dtype="float64")
-        ok = np.isfinite(y) & np.isfinite(s)
-        y, s = y[ok], s[ok]
-        if len(y) == 0 or len(np.unique(y)) < 2:
-            return np.nan
-        return float(2.0 * roc_auc_score(y, s) - 1.0)
-
-    def _yakalama(y, skor_riskli_buyuk, pct=RISKLI_DILIM_PCT):
-        """En riskli %pct dilimdeki vakanın toplam vakaya oranı."""
-        y = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").to_numpy(dtype="float64")
-        s = np.asarray(skor_riskli_buyuk, dtype="float64")
-        ok = np.isfinite(y) & np.isfinite(s)
-        y, s = y[ok], s[ok]
-        if len(y) == 0 or y.sum() <= 0:
-            return np.nan
-        k = max(1, int(pct * len(y)))
-        top = np.argpartition(-s, min(k, len(y) - 1))[:k]
-        return float(y[top].sum() / y.sum())
-
-    def _r4(x):
-        return round(float(x), 4) if x is not None and np.isfinite(x) else None
-
-    # ==============================================================
-    # E) BUCKET20 BLOĞU (bir segment için 20 satır + TOPLAM)
-    # --------------------------------------------------------------
-    # Her hedef için 5 kolon; karşılaştırılacak iki oran bitişik:
-    #   SKOR DİLİMİNDE GERÇEKLEŞEN (%)    : kıyas skorunun bucket'ında
-    #   MODEL DİLİMİNDE GERÇEKLEŞEN (%)   : klasör tablosundaki bad_rate
-    #   SKOR DİLİMİNDE GERÇEKLEŞEN (adet)
-    #   MODEL DİLİMİ MÜŞTERİ (adet)       : klasör tablosundaki n
-    #   MODEL DİLİMİNDE GERÇEKLEŞEN (adet): klasör tablosundaki bad
-    # Aynı satırdaki iki bucket'ta farklı müşteriler vardır: solda kıyas
-    # skorunun en riskli %5'i, sağda modelin en riskli %5'i.
-    # SKOR tarafında her hedef yalnızca o modelin kitlesindeki müşterilerle
-    # hesaplanır (hedefin tanımına girmeyen müşteri o hedefin oranına girmez).
-    # ==============================================================
-    _BUCKET_KOLON = "BUCKET (1 = en riskli %5)"
-
-    def _bucket_blogu(dsub, etiket, skor_col, isaret, model_listesi):
-        """model_listesi: [(model öneki, ACT kolonu, SKOR kolonu, klasör tablosu | None), ...]"""
-        d = dsub.copy()
-        d["_B"] = _bucketla_riskli(isaret * d[skor_col].to_numpy(dtype="float64"))
-        _bser = d["_B"]
-        _bidx = _bser.value_counts().sort_index().index
-        _gs = d.groupby("_B")[skor_col]
-
-        blok = pd.DataFrame({
-            "SEGMENT": etiket,
-            _BUCKET_KOLON: _bidx,
-            "MÜŞTERİ (adet)": _bser.value_counts().sort_index().values,
-            "SKOR_MIN": _gs.min().reindex(_bidx).round(4).values,
-            "SKOR_ORT": _gs.mean().reindex(_bidx).round(4).values,
-            "SKOR_MAX": _gs.max().reindex(_bidx).round(4).values,
-        })
-        _top = {"SEGMENT": etiket, _BUCKET_KOLON: "TOPLAM", "MÜŞTERİ (adet)": int(len(d)),
-                "SKOR_MIN": _r4(d[skor_col].min()), "SKOR_ORT": _r4(d[skor_col].mean()),
-                "SKOR_MAX": _r4(d[skor_col].max())}
-
-        def _tablodan(tablo, src):
-            if tablo is None or src not in tablo.columns:
-                return [None] * len(_bidx)
-            return [None if pd.isna(x) else float(x) for x in tablo[src].reindex(_bidx).to_numpy()]
-
-        for _onek, _act, _skor_m, _tablo in model_listesi:
-            _k = _kisa_ad(_onek) + " | "
-            _c_sk_o = _k + "SKOR DİLİMİNDE GERÇEKLEŞEN (%)"
-            _c_md_o = _k + "MODEL DİLİMİNDE GERÇEKLEŞEN (%)"
-            _c_sk_l = _k + "SKOR DİLİMİ LIFT"
-            _c_md_l = _k + "MODEL DİLİMİ LIFT"
-            _c_sk_a = _k + "SKOR DİLİMİNDE GERÇEKLEŞEN (adet)"
-            _c_md_n = _k + "MODEL DİLİMİ MÜŞTERİ (adet)"
-            _c_md_a = _k + "MODEL DİLİMİNDE GERÇEKLEŞEN (adet)"
-
-            _num = pd.to_numeric(d[_act], errors="coerce")
-            if _skor_m in d.columns:                      # yalnızca modelin kitlesi
-                _num = _num.where(d[_skor_m].notna())
-            _gc  = _num.groupby(_bser)
-            blok[_c_sk_o] = _gc.mean().reindex(_bidx).round(4).values
-            blok[_c_md_o] = _tablodan(_tablo, "bad_rate")
-            _ort = _num.mean()
-            blok[_c_sk_l] = (_gc.mean().reindex(_bidx) / _ort).round(4).values if _ort else [None] * len(_bidx)
-            blok[_c_md_l] = [None if x is None else round(x, 4) for x in _tablodan(_tablo, "lift")]
-            blok[_c_sk_a] = _gc.sum().reindex(_bidx).fillna(0).astype("int64").values
-            blok[_c_md_n] = _tablodan(_tablo, "n")
-            blok[_c_md_a] = _tablodan(_tablo, "bad")
-
-            # TOPLAM: model tarafında n ve bad toplanır, oran = bad / n (= base_rate)
-            _n_t = _b_t = _o_t = None
-            if _tablo is not None and {"n", "bad"} <= set(_tablo.columns):
-                _n_t, _b_t = float(_tablo["n"].sum()), float(_tablo["bad"].sum())
-                _o_t = _r4(_b_t / _n_t) if _n_t > 0 else None
-            _top[_c_sk_o] = _r4(_num.mean())
-            _top[_c_md_o] = _o_t
-            _top[_c_sk_l] = 1.0 if _ort else None
-            _top[_c_md_l] = 1.0 if _o_t else None          # toplamın lift'i tanım gereği 1
-            _top[_c_sk_a] = int(_num.fillna(0).sum())
-            _top[_c_md_n] = _n_t
-            _top[_c_md_a] = _b_t
-
-        return pd.concat([blok, pd.DataFrame([_top])], ignore_index=True)
-
-    # ==============================================================
-    # F) HÜKÜM ve KAÇAN DİLİM (bir renk segmenti için)
-    # --------------------------------------------------------------
-    # dsub ORTAK KİTLE'dir (Davranış ve Müşteri skoru dolu). Her hedef, bu
-    # kitlenin içinde o modelin kitlesiyle ölçülür: hedef tanımına giren ve
-    # model skoru dolu müşteriler. Böylece üç skor AYNI KİŞİLER üzerinde
-    # ölçülür; karşılaştırma adildir.
-    #
-    # HÜKÜM kuralı: GINI FARKI = model Gini - iki mevcut skordan iyi olanın Gini'si
-    #   ≥ ESIK_GINI_GEREKLI → MODEL GEREKLİ
-    #   0 < fark < eşik     → SINIRDA
-    #   ≤ 0                 → <EN İYİ MEVCUT SKOR> YETER (DAVRANIŞ SKORU YETER ya da MÜŞTERİ SKORU YETER)
-    #   EN İYİ MEVCUT SKOR = iki mevcut skordan Gini'si yüksek olan; model bununla kıyaslanır.
-    #   vaka ya da vaka olmayan < ESIK_MIN_VAKA → YETERSİZ VAKA (Gini güvenilmez)
-    # Yakalama oranı karara girmez, destek bilgisidir.
-    #
-    # KAÇAN DİLİM: iki skor da kitlenin en riskli %20'sini "riskli" sayar.
-    # Kişiler 4 gruba ayrılır:
-    #   SADECE MODEL RİSKLİ  : mevcut skor temiz, model riskli (mevcudun kaçırdığı)
-    #   SADECE MEVCUT RİSKLİ : mevcut skor riskli, model temiz (modelin kaçırdığı)
-    #   İKİSİ DE RİSKLİ / İKİSİ DE TEMİZ: iki skorun anlaştığı kişiler
-    # İki riskli liste eşit büyüklükte olduğu için ilk iki grup da (neredeyse)
-    # eşit büyüklüktedir; hangisinde daha çok vaka varsa o skor haklıdır.
-    # Tanım eşiksizdir: PRED (0/1) değil, model skorunun sıralaması kullanılır.
-    # ==============================================================
-    _G_SADECE_MODEL  = "SADECE MODEL RİSKLİ DİYOR"
-    _G_SADECE_MEVCUT = "SADECE MEVCUT SKOR RİSKLİ DİYOR"
-    _G_IKISI_RISKLI  = "İKİSİ DE RİSKLİ DİYOR"
-    _G_IKISI_TEMIZ   = "İKİSİ DE TEMİZ DİYOR"
-    _C_NET           = "NET EK VAKA: MODEL LEHİNE (adet)"
-    _C_ORAN_FARK     = "ORAN FARKI: MODEL GRUBU - MEVCUT GRUBU (%)"
-    _C_KAZANAN       = "KAZANAN"
-
-    _YAKALAMA_YUZDELER = list(range(5, 101, 5))     # yakalama eğrisinin noktaları (%)
-
-    def _segment_isle(dsub, etiket, skorm_map, kacan_l, hukum_l, yakalama_l=None):
-        """dsub: bir renk segmentinin ORTAK KİTLE'si. skorm_map: ACT kolonu → model SKOR kolonu.
-        yakalama_l verilirse her hedef için üç skorun yakalama eğrisi (aynı kitle) buraya eklenir."""
-        for _a, _skor_m in skorm_map.items():
-            _dm = dsub.loc[dsub[_a].notna() & dsub[_skor_m].notna()]      # modelin kitlesi
-            _y = pd.to_numeric(_dm[_a], errors="coerce").fillna(0).to_numpy()
-            _n, _v = len(_y), int(_y.sum())
-            if _n == 0:
-                continue
-            _az = min(_v, _n - _v) < ESIK_MIN_VAKA
-
-            # ---- üç skorun Gini ve yakalama oranı (aynı kitle) ----
-            _met = {}
-            for _ad, _col, _isaret, _ in KIYAS_SKORLARI:
-                _s = _isaret * _dm[_col].to_numpy(dtype="float64")
-                _met[_ad] = (_gini(_y, _s), _yakalama(_y, _s))
-            _s_m = _dm[_skor_m].to_numpy(dtype="float64")
-            _met["MODEL"] = (_gini(_y, _s_m), _yakalama(_y, _s_m))
-            _mod_r = _bucketla_riskli(_s_m) <= RISKLI_UST
-
-            # ---- YAKALAMA EĞRİSİ: üç skor, aynı kitle, %20 noktası HÜKÜM ile aynı fonksiyon ----
-            if yakalama_l is not None and _v > 0:
-                _skorlar = [("MODEL", _s_m)] + [(_t, _i * _dm[_c].to_numpy(dtype="float64"))
-                                                for _, _c, _i, _t in KIYAS_SKORLARI]
-                for _sk_ad, _sk in _skorlar:
-                    _ys = {"SEGMENT": etiket, "HEDEF": _kisa_ad(_a), "SKOR": _sk_ad,
-                           "KİTLE (adet)": _n, "KİTLE VAKA (adet)": _v}
-                    for _p in _YAKALAMA_YUZDELER:
-                        _ys[f"%{_p} (%)"] = _r4(_yakalama(_y, _sk, _p / 100.0))
-                    yakalama_l.append(_ys)
-
-            # ---- KAÇAN DİLİM: her mevcut skor için model ile 2x2 ----
-            for _ad, _col, _isaret, _ad_tr in KIYAS_SKORLARI:
-                _mev_r = _bucketla_riskli(_isaret * _dm[_col].to_numpy(dtype="float64")) <= RISKLI_UST
-                _gruplar = {
-                    _G_SADECE_MODEL:  ~_mev_r & _mod_r,
-                    _G_SADECE_MEVCUT: _mev_r & ~_mod_r,
-                    _G_IKISI_RISKLI:  _mev_r & _mod_r,
-                    _G_IKISI_TEMIZ:   ~_mev_r & ~_mod_r,
-                }
-                _net = int(_y[_gruplar[_G_SADECE_MODEL]].sum() - _y[_gruplar[_G_SADECE_MEVCUT]].sum())
-                # KAZANAN: iki "sadece" grubun hedef oranı farkı (puan). Gruplar eşit
-                # büyüklükte olduğu için oranı yüksek olan grup daha çok vaka taşır.
-                _o_mod = _y[_gruplar[_G_SADECE_MODEL]].mean() if _gruplar[_G_SADECE_MODEL].any() else np.nan
-                _o_mev = _y[_gruplar[_G_SADECE_MEVCUT]].mean() if _gruplar[_G_SADECE_MEVCUT].any() else np.nan
-                _ofark = _o_mod - _o_mev
-                if _v == 0:
-                    _kazanan = "VAKA YOK"
-                elif not np.isfinite(_ofark):
-                    _kazanan = "BERABER"                    # iki skor aynı listeyi vermiş
-                elif abs(_ofark) < ESIK_BERABER_PUAN:
-                    _kazanan = "BERABER"
-                else:
-                    _kazanan = "MODEL" if _ofark > 0 else "MEVCUT SKOR"
-
-                _satir = {"SEGMENT": etiket, "HEDEF": _kisa_ad(_a), "MEVCUT SKOR": _ad_tr,
-                          "KİTLE (adet)": _n, "KİTLE VAKA (adet)": _v,
-                          "KİTLE HEDEF ORANI (%)": _r4(_y.mean()) if _n else None}
-
-                def _grup_yaz(ad):
-                    _m = _gruplar[ad]
-                    _satir[f"{ad} (adet)"] = int(_m.sum())
-                    _satir[f"{ad}: VAKA (adet)"] = int(_y[_m].sum())
-                    _satir[f"{ad}: HEDEF ORANI (%)"] = _r4(_y[_m].mean()) if _m.any() else None
-
-                _grup_yaz(_G_SADECE_MODEL)
-                _grup_yaz(_G_SADECE_MEVCUT)
-                _satir[_C_ORAN_FARK] = _r4(_ofark)
-                _satir[_C_NET] = _net
-                _satir[_C_KAZANAN] = _kazanan
-                _grup_yaz(_G_IKISI_RISKLI)
-                _grup_yaz(_G_IKISI_TEMIZ)
-                _satir["RİSKLİ LİSTE ÖRTÜŞMESİ (%)"] = (
-                    _r4(_gruplar[_G_IKISI_RISKLI].sum() / _mev_r.sum()) if _mev_r.any() else None)
-                kacan_l.append(_satir)
-
-            # ---- HÜKÜM ----
-            _gin_md, _yak_md = _met["MODEL"]
-            _mevcutlar = {k: v for k, v in _met.items() if k != "MODEL" and np.isfinite(v[0])}
-            _tr = lambda x: f"{x * 100:.1f}".replace(".", ",")
-            _ad_tr = {a: t for a, _, _, t in KIYAS_SKORLARI}
-            _en_iyi = max(_mevcutlar, key=lambda k: _mevcutlar[k][0]) if _mevcutlar else None
-            _en_iyi_tr = _ad_tr[_en_iyi] if _en_iyi else None
-            if _az:
-                _fark, _hkm = np.nan, "YETERSİZ VAKA"
-                _acik = (f"Vaka {_v:,}, vaka olmayan {_n - _v:,}; ikisinden biri {ESIK_MIN_VAKA}'dan az "
-                         "olduğu için Gini güvenilir değil.")
-            elif _mevcutlar and np.isfinite(_gin_md):
-                _gin_iyi, _yak_iyi = _mevcutlar[_en_iyi]
-                _fark = _gin_md - _gin_iyi
-                _hkm = ("MODEL GEREKLİ" if _fark >= ESIK_GINI_GEREKLI else
-                        "SINIRDA" if _fark > 0 else f"{_en_iyi_tr} YETER")
-                _acik = (f"Model, iyi olan mevcut skordan ({_en_iyi_tr}) "
-                         f"{_tr(abs(_fark))} puan {'daha iyi' if _fark > 0 else 'daha kötü'} sıralıyor. "
-                         f"En riskli %{_RISKLI_YZD}'lik dilimdeki yakalama: model %{_tr(_yak_md)}, "
-                         f"{_en_iyi_tr} %{_tr(_yak_iyi)}.")
-            else:
-                _fark, _hkm = np.nan, "HESAPLANAMADI"
-                _acik = "Gini hesaplanamadı: kitlede hedefin iki sınıfı birden yok."
-
-            _oran = _y.mean() if _n else np.nan
-            hukum_l.append({
-                "SEGMENT": etiket,
-                "HEDEF": _kisa_ad(_a),
-                "KİTLE (adet)": _n,
-                "KİTLE VAKA (adet)": _v,
-                "HEDEF ORANI (%)": _r4(_oran),
-                "GINI: DAVRANIŞ SKORU (%)": _r4(_met["DAVRANIS"][0]),
-                "GINI: MÜŞTERİ SKORU (%)": _r4(_met["MUSTERI"][0]),
-                "GINI: MODEL (%)": _r4(_gin_md),
-                "EN İYİ MEVCUT SKOR": _en_iyi_tr,
-                "GINI FARKI: MODEL - EN İYİ MEVCUT (%)": _r4(_fark),
-                "HÜKÜM": _hkm,
-                f"YAKALAMA: DAVRANIŞ SKORU (%)": _r4(_met["DAVRANIS"][1]),
-                f"YAKALAMA: MÜŞTERİ SKORU (%)": _r4(_met["MUSTERI"][1]),
-                f"YAKALAMA: MODEL (%)": _r4(_yak_md),
-                "YAKALAMA ÜST SINIRI (%)": _r4(min(1.0, RISKLI_DILIM_PCT / _oran)) if _oran and _oran > 0 else None,
-                "AÇIKLAMA": _acik,
-            })
-
-    # ==============================================================
-    # G) ANA DÖNGÜ: her OOT için kitle, bucket, hüküm, kaçan dilim, kontroller
-    # --------------------------------------------------------------
-    # KİTLE TANIMLARI (raporun her yerinde bu adlardan biri geçer):
-    #   TÜM KİTLE      : OOT dönemindeki KK ürünlü müşteriler (skor şartı yok)
-    #   ORTAK KİTLE    : TÜM KİTLE'den Davranış ve Müşteri skoru dolu olanlar.
-    #   MODELİN KİTLESİ: ORTAK KİTLE'den hedef tanımına giren ve o modelin skoru
-    #                    dolu olanlar. HÜKÜM, KAÇAN DİLİM ve BUCKET20'nin SKOR
-    #                    tarafı her hedef için bununla hesaplanır.
-    #   MODEL KİTLESİ (klasör): model klasöründeki bucket tablosunun kendi kitlesi.
-    #                    Rapordan BAĞIMSIZ kurulmuştur; BUCKET20'nin MODEL tarafı
-    #                    buradan gelir. Rapordaki kitleyle ne kadar örtüştüğü
-    #                    KONTROLLER'de ölçülür.
-    # ==============================================================
-    bucket_sheetler = {}    # sheet adı → (bloklar, kıyas kolonu, işaret, rapordaki ad, dönem)
-    analiz_ciktilar = {}    # dönem → {"hukum": df, "kacan": df}
-    ozet_satirlar   = []
-    _oot_donemleri  = []
-
-    for _oot, _kls in KLASORLER_OOT.items():
-        _don = int(_oot.replace("OOT", ""))
-        dfA0 = _kitle(_don)                                          # TÜM KİTLE
-        print(f"\n===== OOT {_don} | tüm kitle: {len(dfA0):,} müşteri =====")
-        if dfA0.empty:
-            print(f"⚠ OOT {_don}: kitle boş → atlandı")
-            continue
-        _skorm_map = {a: f"SKOR_{k}" for k, _, a in _kls if f"SKOR_{k}" in df_analiz.columns}
-
-        # ---- Kontrol: model skoru, modelin tanım kitlesinin ne kadarında var ----
-        _bu_oot = {k: a for k, _, a in _kls}
-        for _r in _ktrl_skor_dosya:
-            if _r["MODEL"] in _bu_oot:
-                _a = _bu_oot[_r["MODEL"]]
-                _c = f"SKOR_{_r['MODEL']}"
-                _tanim = dfA0[_a].notna()
-                _r["TANIM KİTLESİ (adet)"] = int(_tanim.sum())
-                if _c in dfA0.columns:
-                    _r["TANIM KİTLESİNDE SKORU OLAN (%)"] = (
-                        _r4(dfA0.loc[_tanim, _c].notna().mean()) if _tanim.any() else None)
-                    _r["SKORU OLUP TANIM KİTLESİ DIŞINDA (adet)"] = int((dfA0[_c].notna() & ~_tanim).sum())
-                else:
-                    _r["TANIM KİTLESİNDE SKORU OLAN (%)"] = 0.0
-                    _r["SKORU OLUP TANIM KİTLESİ DIŞINDA (adet)"] = 0
-
-        if not _skorm_map:
-            print(f"⚠ OOT {_don}: hiç model skoru yok → atlandı")
-            continue
-        _oot_donemleri.append(_don)
-
-        # ---- ORTAK KİTLE ----
-        _ortak_m = dfA0["DAVRANIS_SKOR"].notna() & dfA0["MUSTERI_SKOR"].notna()
-        dfO = dfA0.loc[_ortak_m]
-        print(f"   ortak kitle: {len(dfO):,} müşteri ({len(dfO) / len(dfA0):.1%})")
-
-        # ---- Klasör tabloları + tablo kontrolleri ----
-        # Model kitlesi, rapordaki "model skoru olan TÜM KİTLE" ile karşılaştırılır
-        # (iki mevcut skor şartı yok; modelin kendi kitlesiyle aynı tanım).
-        _renk_listeleri = {}
-        for _rk in _SKOR_RENKLER:
-            _ta = dfA0[dfA0["RENK_KOD"] == _rk]
-            _liste = []
-            for _ek, _onek, _act in _kls:
-                _tablo, _bilgi = _model_tablosu(_ek, _onek, _rk)
-                _sc = f"SKOR_{_ek}"
-                _liste.append((_onek, _act, _sc, _tablo))
-                _dm = _ta[_ta[_sc].notna()] if _sc in _ta.columns else _ta.iloc[0:0]
-                _ktrl = {"MODEL": _kisa_ad(_onek), "SEGMENT": _renk_etiket(_rk),
-                         "OKUNAN DOSYA": _bilgi if _tablo is not None else None,
-                         "BUCKET SAYISI": None, "BAD_RATE = BAD / N": None,
-                         "MODEL KİTLESİ (adet)": None,
-                         "RAPORDA MODEL SKORU OLAN (adet)": int(len(_dm)),
-                         "KİTLE FARKI (%)": None,
-                         "MODEL KİTLESİ HEDEF ORANI (%)": None,
-                         "RAPORDA MODEL SKORU OLANLARIN HEDEF ORANI (%)": _r4(_dm[_act].mean()) if len(_dm) else None,
-                         "HEDEF ORANI FARKI (%)": None,
-                         "_not": None if _tablo is not None else _bilgi}
-                if _tablo is not None:
-                    _tn, _tb = float(_tablo["n"].sum()), float(_tablo["bad"].sum())
-                    _sapma = (_tablo["bad_rate"] - _tablo["bad"] / _tablo["n"]).abs().max()
-                    _ktrl["BUCKET SAYISI"] = int(len(_tablo))
-                    _ktrl["BAD_RATE = BAD / N"] = "EVET" if _sapma <= ESIK_BADRATE_TUTARLILIK else "HAYIR"
-                    _ktrl["MODEL KİTLESİ (adet)"] = int(_tn)
-                    _ktrl["MODEL KİTLESİ HEDEF ORANI (%)"] = _r4(_tb / _tn) if _tn else None
-                    if len(_dm):
-                        _ktrl["KİTLE FARKI (%)"] = _r4((_tn - len(_dm)) / len(_dm))
-                    _a1, _a2 = _ktrl["MODEL KİTLESİ HEDEF ORANI (%)"], _ktrl["RAPORDA MODEL SKORU OLANLARIN HEDEF ORANI (%)"]
-                    if _a1 is not None and _a2 is not None:
-                        _ktrl["HEDEF ORANI FARKI (%)"] = _r4(_a1 - _a2)
-                _ktrl_model_tablo.append(_ktrl)
-            _renk_listeleri[_rk] = _liste
-
-        # ---- ÖZET: segment bazında kitle hunisi + FPD + modelin kitlesinde hedef oranları ----
-        _ozet_bu = []
-        for _rk in _SKOR_RENKLER:
-            _ta = dfA0[dfA0["RENK_KOD"] == _rk]
-            _to = dfO[dfO["RENK_KOD"] == _rk]
-            if not len(_ta):
-                continue
-            _fpd, _fpd_model, _fpd_min, _fpd_max, _fpd_n = _fpd_degeri(_renk_listeleri.get(_rk, []))
-            _r = {"DONEM": _don, "SEGMENT": _renk_etiket(_rk),
-                  "TÜM KİTLE (adet)": int(len(_ta)), "ORTAK KİTLE (adet)": int(len(_to)),
-                  "ORTAK KİTLE PAYI (%)": _r4(len(_to) / len(_ta)),
-                  "FPD KESİŞEN KİTLE (adet)": _fpd,
-                  "FPD KESİŞEN KİTLE PAYI (%)": _r4(_fpd / len(_ta)) if _fpd is not None else None}
-            for _a, _skor_m in _skorm_map.items():
-                _var = any(k in _ta.columns and _ta[k].notna().any() for k in _ACT_KAYNAK_MAP[_a])
-                _mk = _to[_a].notna() & _to[_skor_m].notna()
-                _r[f"{_kisa_ad(_a)}: VAKA (adet)"] = int(_to.loc[_mk, _a].sum()) if _var else None
-                _r[f"{_kisa_ad(_a)}: ORAN (%)"] = (_r4(_to.loc[_mk, _a].mean())
-                                                   if _var and _mk.any() else None)
-            _ozet_bu.append(_r)
-            _ktrl_fpd.append({
-                "DONEM": _don, "SEGMENT": _renk_etiket(_rk),
-                "FPD KOLONU OLAN TABLO (adet)": _fpd_n,
-                "KULLANILAN MODEL (en geniş kitle)": _kisa_ad(_fpd_model) if _fpd_model else None,
-                "FPD KESİŞEN KİTLE (adet)": _fpd,
-                "MODELLER ARASI EN AZ (adet)": _fpd_min,
-                "MODELLER ARASI EN ÇOK (adet)": _fpd_max,
-                "DURUM": "OK" if _fpd is not None else "YOK",
-                "NOT": ("" if _fpd is None or _fpd_min == _fpd_max else
-                        "Modellerin kitlesi farklı (NO:1 / NO:2 X içinde takibe düşenleri çıkarır); "
-                        "en geniş kitleli modelin değeri yazıldı.")
-                       if _fpd is not None else f"Bu renkte hiçbir bucket20 tablosunda {FPD_KOLON} yok.",
-            })
-        if _ozet_bu:
-            # TOPLAM satırı: adetler toplanır, oranlar toplamlardan yeniden hesaplanır
-            _segs = [_rk for _rk in _SKOR_RENKLER if (dfA0["RENK_KOD"] == _rk).any()]
-            _ta = dfA0[dfA0["RENK_KOD"].isin(_segs)]
-            _to = dfO[dfO["RENK_KOD"].isin(_segs)]
-            _fpd_l = [r["FPD KESİŞEN KİTLE (adet)"] for r in _ozet_bu if r["FPD KESİŞEN KİTLE (adet)"] is not None]
-            _fpd_t = int(sum(_fpd_l)) if _fpd_l else None
-            _rt = {"DONEM": _don, "SEGMENT": "TOPLAM",
-                   "TÜM KİTLE (adet)": int(len(_ta)), "ORTAK KİTLE (adet)": int(len(_to)),
-                   "ORTAK KİTLE PAYI (%)": _r4(len(_to) / len(_ta)) if len(_ta) else None,
-                   "FPD KESİŞEN KİTLE (adet)": _fpd_t,
-                   "FPD KESİŞEN KİTLE PAYI (%)": _r4(_fpd_t / len(_ta)) if _fpd_t is not None and len(_ta) else None}
-            for _a, _skor_m in _skorm_map.items():
-                _var = any(k in _ta.columns and _ta[k].notna().any() for k in _ACT_KAYNAK_MAP[_a])
-                _mk = _to[_a].notna() & _to[_skor_m].notna()
-                _rt[f"{_kisa_ad(_a)}: VAKA (adet)"] = int(_to.loc[_mk, _a].sum()) if _var else None
-                _rt[f"{_kisa_ad(_a)}: ORAN (%)"] = (_r4(_to.loc[_mk, _a].mean())
-                                                    if _var and _mk.any() else None)
-            ozet_satirlar.extend(_ozet_bu + [_rt])
-
-        # ---- BUCKET20: her kıyas skoru için 6 renk bloğu (ORTAK KİTLE) ----
-        for _ad, _col, _isaret, _ad_tr in KIYAS_SKORLARI:
-            _bloklar = []
-            for _rk in _SKOR_RENKLER:
-                _do = dfO[dfO["RENK_KOD"] == _rk]
-                if len(_do) >= ANALIZ_N_BUCKET:
-                    _bloklar.append(_bucket_blogu(_do, _renk_etiket(_rk), _col, _isaret,
-                                                  _renk_listeleri[_rk]))
-            if _bloklar:
-                bucket_sheetler[f"BUCKET20_{_ad}_OOT_{_don}"] = (_bloklar, _col, _isaret, _ad_tr, _don)
-
-        # ---- HÜKÜM + KAÇAN DİLİM (ORTAK KİTLE, renk bazında) ----
-        kacan_satirlar, hukum_satirlar, yakalama_satirlar = [], [], []
-        for _rk in _SKOR_RENKLER:
-            _do = dfO[dfO["RENK_KOD"] == _rk]
-            if len(_do) >= ANALIZ_N_BUCKET:
-                _segment_isle(_do, _renk_etiket(_rk), _skorm_map, kacan_satirlar, hukum_satirlar, yakalama_satirlar)
-        analiz_ciktilar[_don] = {"hukum": pd.DataFrame(hukum_satirlar),
-                                 "kacan": pd.DataFrame(kacan_satirlar),
-                                 "yakalama": pd.DataFrame(yakalama_satirlar)}
-
-        # ---- Kontrol: hedef tanımları + klasördeki target_actual ile uyum ----
-        _hdf = {a: f"HDF_{k}" for k, _, a in _kls}
-        for _a in _skorm_map:
-            _kaynak_var = any(k in dfA0.columns and dfA0[k].notna().any() for k in _ACT_KAYNAK_MAP[_a])
-            _h = _hdf.get(_a)
-            _b = dfA0[_a].notna() & dfA0[_h].notna() if _h in dfA0.columns else pd.Series(False, index=dfA0.index)
-            _uyum = _r4((dfA0.loc[_b, _a] == dfA0.loc[_b, _h]).mean()) if _b.any() else None
-            _not = ""
-            if not _kaynak_var:
-                _durum, _not = "YOK", "Kaynak kolon bu dönemde boş: gerçekleşme penceresi henüz kapanmadı"
-            elif _uyum is not None and _uyum < ESIK_HEDEF_UYUM:
-                _durum = "UYARI"
-                _not = (f"Klasördeki target_actual bu tanımla %{_uyum * 100:.2f}".replace(".", ",") +
-                        " uyumlu: rapordaki hedef modelin eğitildiği hedefle aynı değil")
-            else:
-                _durum = "OK"
-            _ktrl_hedef.append({
-                "DONEM": _don, "HEDEF": _kisa_ad(_a), "TANIM": _ACT_TANIM[_a],
-                "KİTLE": _ACT_KITLE[_a],
-                "TANIM KİTLESİ (adet)": int(dfA0[_a].notna().sum()),
-                "TÜM KİTLE HEDEF ORANI (%)": _r4(dfA0[_a].mean()) if _kaynak_var else None,
-                "ORTAK KİTLE HEDEF ORANI (%)": (_r4(dfO.loc[dfO[_skorm_map[_a]].notna(), _a].mean())
-                                                if _kaynak_var and len(dfO) else None),
-                "KLASÖRDEKİ HEDEFLE UYUM (%)": _uyum,
-                "DURUM": _durum,
-                "NOT": _not,
-            })
-
-        # ---- Kontrol: mevcut skor kapsaması (TÜM KİTLE) ----
-        _m_dav = dfA0["DAVRANIS_SKOR"].notna()
-        _m_mus = dfA0["MUSTERI_SKOR"].notna()
-        for _sen, _kap in [("SADECE DAVRANIŞ SKORU", _m_dav), ("SADECE MÜŞTERİ SKORU", _m_mus),
-                           ("EN AZ BİRİ VAR", _m_dav | _m_mus), ("İKİSİ DE VAR", _m_dav & _m_mus)]:
-            _r = {"DONEM": _don, "SENARYO": _sen, "SKOR OLAN MÜŞTERİ (%)": _r4(_kap.mean())}
-            for _a in _skorm_map:
-                _yy = pd.to_numeric(dfA0[_a], errors="coerce").fillna(0)
-                _r[f"{_kisa_ad(_a)}: SKORSUZ KİŞİLERDEKİ VAKA PAYI (%)"] = (
-                    _r4(_yy[~_kap].sum() / _yy.sum()) if _yy.sum() else None)
-            _ktrl_kapsama.append(_r)
-
-    if not analiz_ciktilar:
-        raise RuntimeError("Hiçbir OOT için analiz üretilemedi. Model skor kolonlarını kontrol edin.")
-
-    # ---- Kontrol tablolarına DURUM ve NOT ekle ----
-    for _r in _ktrl_skor_dosya:
-        _es = _r.get("TANIM KİTLESİNDE SKORU OLAN (%)")
-        _n = []
-        if not _r["OKUNAN RENK DOSYASI"].startswith(f"{len(_SKOR_RENKLER)} /"):
-            _n.append("Bazı renk dosyaları okunamadı")
-        if _r["MÜKERRER SATIR (adet)"]:
-            _n.append("Aynı müşteri+dönem birden fazla satırda; ilki tutuldu")
-        if _es is None or _es < ESIK_SKOR_ESLESME:
-            _n.append(f"Hedef tanımına giren müşterilerin %{ESIK_SKOR_ESLESME * 100:.0f}'inden azında "
-                      "model skoru var; bu hedef eksik kitlede ölçülür")
-        if _r.get("SKORU OLUP TANIM KİTLESİ DIŞINDA (adet)"):
-            _n.append("Model, bu raporun hedef tanımının dışında kalan müşterileri de skorlamış: "
-                      "tanım ya da kitle modelinkiyle farklı")
-        _r["DURUM"] = "UYARI" if _n else "OK"
-        _r["NOT"] = "; ".join(_n)
-
-    for _r in _ktrl_model_tablo:
-        _n = [_r.pop("_not")] if _r.get("_not") else []
-        _r.pop("_not", None)
-        if _r["OKUNAN DOSYA"] is None:
-            _r["DURUM"] = "YOK"
-        else:
-            _uyari = []
-            if _r["BUCKET SAYISI"] != ANALIZ_N_BUCKET:
-                _uyari.append(f"Tabloda {_r['BUCKET SAYISI']} bucket var, {ANALIZ_N_BUCKET} bekleniyordu")
-            if _r["BAD_RATE = BAD / N"] == "HAYIR":
-                _uyari.append("Tablodaki bad_rate, bad / n ile tutmuyor")
-            if _r["KİTLE FARKI (%)"] is None or abs(_r["KİTLE FARKI (%)"]) > ESIK_MUSTERI_FARK:
-                _uyari.append("Model kitlesi ile raporda model skoru olan kitle farklı büyüklükte")
-            if _r["HEDEF ORANI FARKI (%)"] is None or abs(_r["HEDEF ORANI FARKI (%)"]) > ESIK_HEDEF_ORANI_FARK:
-                _uyari.append("Hedef oranları tutmuyor: rapordaki hedef tanımı modelinkiyle aynı olmayabilir")
-            _r["DURUM"] = "UYARI" if _uyari else "OK"
-            _n += _uyari
-        _r["NOT"] = "; ".join(_n)
-
-    _ktrl_hedef_df       = pd.DataFrame(_ktrl_hedef)
-    _ktrl_skor_dosya_df  = pd.DataFrame(_ktrl_skor_dosya)
-    _ktrl_model_tablo_df = pd.DataFrame(_ktrl_model_tablo)
-    _ktrl_kapsama_df     = pd.DataFrame(_ktrl_kapsama)
-    _ktrl_fpd_df         = pd.DataFrame(_ktrl_fpd)
-    ozet_df              = pd.DataFrame(ozet_satirlar)
-    _n_uyari = sum(int((d["DURUM"] != "OK").sum()) for d in
-                   [_ktrl_hedef_df, _ktrl_skor_dosya_df, _ktrl_model_tablo_df] if "DURUM" in d)
-    print(f"\nKONTROLLER: {_n_uyari} satır OK değil (KONTROLLER sheet'ine bakın)")
-
-    # ==============================================================
-    # H) EXCEL
-    # --------------------------------------------------------------
-    # Her sheet aynı düzende:
-    #   SOL (A-B): başlık, madde madde okuma notları ve KOLON SÖZLÜĞÜ
-    #              (her kolon ne anlatıyor, hangi kitleden)
-    #   SAĞ (D'den itibaren): tablo(lar)
-    # ==============================================================
-    _fill = PatternFill("solid", fgColor="F4CCCC")
-    _byz  = Font(bold=True, color="7A1F1F")
-    _RENK_DURUM = {
-        "OK": "C6EFCE", "MEVCUT SKOR YETER": "C6EFCE", "MODEL": "C6EFCE",
-        "DAVRANIŞ SKORU YETER": "C6EFCE", "MÜŞTERİ SKORU YETER": "C6EFCE",
-        "UYARI": "FFC7CE", "MODEL GEREKLİ": "FFC7CE", "MEVCUT SKOR": "FFC7CE",
-        "SINIRDA": "FFEB9C", "BERABER": "FFEB9C",
-        "YOK": "D9D9D9", "HESAPLANAMADI": "D9D9D9", "YETERSİZ VAKA": "D9D9D9",
-    }
-    _TABLO_SUTUN = 4         # tablo D sütunundan başlar (0 tabanlı 3)
-    _ILK_SATIR   = 3         # tablo başlığı 3. satırda
-
-    def _panel_yaz(ws, baslik, notlar, sozluk):
-        """Sol panel: A1 başlık, altında madde madde notlar, sonra kolon sözlüğü."""
-        ws.cell(row=1, column=1, value=baslik).font = Font(bold=True, size=12)
-        r = 3
-        ws.cell(row=r, column=1, value="OKUMA NOTLARI").font = _byz
-        for _t in notlar:                           # uzun notlar tabloya taşmasın diye bölünür
-            for _j, _par in enumerate(textwrap.wrap(_t, 135)):
-                r += 1
-                ws.cell(row=r, column=1, value=("• " if _j == 0 else "  ") + _par)
-        r += 2
-        ws.cell(row=r, column=1, value="KOLON").font = _byz
-        ws.cell(row=r, column=2, value="NE ANLATIYOR").font = _byz
-        for _k, _a in sozluk:
-            for _j, _par in enumerate(textwrap.wrap(_a, 95)):
-                r += 1
-                if _j == 0:
-                    ws.cell(row=r, column=1, value=_k).font = Font(bold=True)
-                ws.cell(row=r, column=2, value=_par)
-        ws.column_dimensions["A"].width = 46
-        ws.column_dimensions["B"].width = 95
-        ws.column_dimensions["C"].width = 3
-        for _r in range(3, r + 1):
-            ws.cell(row=_r, column=1).alignment = Alignment(vertical="top")
-
-    def _tablo_bicim(ws, kolonlar, bas, bit, genislik=15):
-        """bas: başlık satırı (1 tabanlı), bit: son veri satırı. Tablo D'den başlar."""
-        for _i, ad in enumerate(kolonlar):
-            c = _TABLO_SUTUN + _i
-            h = ws.cell(row=bas, column=c); h.fill = _fill; h.font = _byz
-            h.alignment = Alignment(wrap_text=True, vertical="top")
-            ws.column_dimensions[get_column_letter(c)].width = genislik
-            ad = str(ad)
-            _fmt = ("0.00%" if ad.endswith("(%)") else "#,##0" if ad.endswith("(adet)") else
-                    "0.00" if ad.endswith("LIFT") else None)
-            for _r in range(bas + 1, bit + 1):
-                _h = ws.cell(row=_r, column=c)
-                if _fmt:
-                    _h.number_format = _fmt
-                if ad in ("HÜKÜM", "DURUM", _C_KAZANAN) and _h.value in _RENK_DURUM:
-                    _h.fill = PatternFill("solid", fgColor=_RENK_DURUM[_h.value])
-        ws.row_dimensions[bas].height = 45
-
-    def _sheet_yaz(xl, sheet, df, baslik, notlar, sozluk, genislik=15):
-        df.to_excel(xl, sheet_name=sheet, index=False, startrow=_ILK_SATIR - 1, startcol=_TABLO_SUTUN - 1)
-        ws = xl.book[sheet]
-        _panel_yaz(ws, baslik, notlar, sozluk)
-        _tablo_bicim(ws, df.columns, _ILK_SATIR, _ILK_SATIR + len(df), genislik)
-        ws.freeze_panes = ws.cell(row=_ILK_SATIR + 1, column=1)
-        return ws
-
-    _yzd = lambda x: f"%{x * 100:g}".replace(".", ",")
-    _KUCUK = {"DAVRANIŞ SKORU": "davranış skoru", "MÜŞTERİ SKORU": "müşteri skoru"}
-    _KITLE_ORTAK = ("ORTAK KİTLE = OOT dönemindeki KK ürünlü müşterilerden Davranış skoru ve Müşteri skoru "
-                    "dolu olanlar. Her hedef bunun içinde o modelin kitlesiyle ölçülür: hedef tanımına giren "
-                    "ve model skoru dolu müşteriler. Üç skor her satırda aynı kişiler üzerinde ölçülür.")
-
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-
-        # ---- 1) HÜKÜM ----
-        for _don, _c in analiz_ciktilar.items():
-            if _c["hukum"].empty:
-                continue
-            ws = _sheet_yaz(xl, f"HUKUM_OOT_{_don}", _c["hukum"],
-                f"HÜKÜM (OOT {_don}): Davranış ve Müşteri skoru varken bu modellere ihtiyaç var mı?",
-                [
-                    "KİTLE: " + _KITLE_ORTAK,
-                    "Her satır bir renk segmenti x bir hedef. GENEL satırı yok: 6 renk modelinin skorları tek sıraya konamaz.",
-                    (f"KARAR: GINI FARKI {_yzd(ESIK_GINI_GEREKLI)} ve üstü → MODEL GEREKLİ; 0 ile "
-                     f"{_yzd(ESIK_GINI_GEREKLI)} arası → SINIRDA; 0 veya eksi → mevcut skor yeter: hangisinin yettiği "
-                     "yazılır (DAVRANIŞ SKORU YETER ya da MÜŞTERİ SKORU YETER)."),
-                    "EN İYİ MEVCUT SKOR: iki mevcut skordan Gini'si yüksek olan; model bu skorla kıyaslanır.",
-                    f"Vaka ya da vaka olmayan müşteri {ESIK_MIN_VAKA}'dan azsa Gini güvenilmez → YETERSİZ VAKA.",
-                    "Yakalama kolonları karara girmez, destek bilgisidir.",
-                    ("X içinde takibe düşenleri kitleden çıkaran hedeflerde (NO:1 SONRA KIRMIZIYA GÖÇ, NO:2 İÇİNDE "
-                     "KIRMIZIYA GÖÇ) bu müşteriler o satırın kitlesinde yoktur; diğer hedeflerde vardır."),
-                    "Önce KONTROLLER sheet'inde UYARI olmadığına bakın.",
-                ],
-                [
-                    ("SEGMENT", "Renk segmenti."),
-                    ("HEDEF", "Ölçülen gerçekleşme (örn. 3M İÇİNDE KIRMIZIYA GÖÇ = 3 ay içinde kırmızıya geçti). "
-                              "Tanımı KONTROLLER 1. tabloda."),
-                    ("KİTLE (adet)", "Bu segmentte ortak kitleden bu modelin kitlesine giren müşteri sayısı. "
-                                     "Satırdaki tüm metrikler bu kişiler üzerinden."),
-                    ("KİTLE VAKA (adet)", "Bu kişilerden hedefi gerçekleşen sayısı."),
-                    ("HEDEF ORANI (%)", "KİTLE VAKA / KİTLE."),
-                    ("GINI: DAVRANIŞ / MÜŞTERİ / MODEL (%)", "Skorun vakaları ne kadar üste sıraladığı. 0 = rastgele, %100 = kusursuz, eksi = ters sıralıyor."),
-                    ("GINI FARKI: MODEL - EN İYİ MEVCUT (%)", "Model Gini'si eksi iki mevcut skordan yüksek olanın Gini'si. Karar bu kolondan verilir."),
-                    ("EN İYİ MEVCUT SKOR", "Davranış ve Müşteri skorundan bu segment ve hedefte Gini'si yüksek olan. "
-                                           "GINI FARKI bu skora göre hesaplanır."),
-                    ("HÜKÜM", "GINI FARKI'na göre karar (OKUMA NOTLARI'ndaki kural). Mevcut skor yetiyorsa hangisinin "
-                              "yettiği yazılır: DAVRANIŞ SKORU YETER / MÜŞTERİ SKORU YETER."),
-                    ("YAKALAMA: ... (%)", f"Skorun en riskli %{_RISKLI_YZD}'si işaretlenseydi vakaların yüzde kaçı bu dilimde olurdu."),
-                    ("YAKALAMA ÜST SINIRI (%)", f"Kusursuz bir skorun ulaşabileceği en yüksek yakalama (%{_RISKLI_YZD} / hedef oranı). "
-                                                "Kırmızı gibi hedef oranı yüksek segmentlerde düşüktür; yakalamayı buna göre okuyun."),
-                    ("AÇIKLAMA", "Hükmün tek cümlelik gerekçesi."),
-                ])
-            _son = get_column_letter(_TABLO_SUTUN + _c["hukum"].shape[1] - 1)
-            ws.column_dimensions[_son].width = 80
-
-        # ---- 2) KONTROLLER ----
-        _sh = "KONTROLLER"
-        _bloklar_k = [
-            ("1) HEDEF TANIMLARI", _ktrl_hedef_df),
-            ("2) MODEL SKOR DOSYALARI", _ktrl_skor_dosya_df),
-            ("3) MODEL KLASÖRÜNDEKİ BUCKET TABLOLARI", _ktrl_model_tablo_df),
-            ("4) MEVCUT SKOR KAPSAMASI", _ktrl_kapsama_df),
-            ("5) FPD KESİŞEN KİTLE", _ktrl_fpd_df),
-        ]
-        r = _ILK_SATIR - 1
-        for _bas, _df in _bloklar_k:
-            if _df.empty:
-                continue
-            _df.to_excel(xl, sheet_name=_sh, index=False, startrow=r + 1, startcol=_TABLO_SUTUN - 1)
-            ws = xl.book[_sh]
-            ws.cell(row=r + 1, column=_TABLO_SUTUN, value=_bas).font = Font(bold=True, size=12)
-            _tablo_bicim(ws, _df.columns, r + 2, r + 2 + len(_df))
-            r += len(_df) + 4
-        ws = xl.book[_sh]
-        _panel_yaz(ws,
-            "KONTROLLER: Rapordaki sonuçlara güvenmeden önce bakılacak veri ve eşleşme kontrolleri",
-            [
-                (f"ÖZET: {_n_uyari} kontrol satırı OK değil." if _n_uyari else "ÖZET: tüm kontroller OK."),
-                "DURUM: OK = eşik içinde. UYARI = eşik dışı, nedeni NOT kolonunda. YOK = veri bulunamadı.",
-                "KİTLE adları: TÜM KİTLE = OOT KK müşterileri (skor şartı yok).",
-                "ORTAK KİTLE = TÜM KİTLE'den Davranış ve Müşteri skoru dolu olanlar; her hedef bunun içinde o modelin kitlesiyle ölçülür (HÜKÜM, KAÇAN DİLİM, BUCKET20 SKOR tarafı).",
-                "MODEL KİTLESİ = model klasöründeki bucket tablosunun kendi kitlesi; rapordan bağımsız (BUCKET20 MODEL tarafı).",
-                "Eşikler hücrenin başındaki ANALIZ_AYAR bloğundan değiştirilebilir.",
-            ],
-            [
-                ("1) HEDEF TANIMLARI", "Rapordaki her hedefin formülü, kitlesi ve OOT'ta tüm kitle ile ortak kitledeki oranı. "
-                                       "KLASÖRDEKİ HEDEFLE UYUM: aynı müşteride raporun hedefi ile model klasöründeki "
-                                       f"target_actual aynı mı; {_yzd(ESIK_HEDEF_UYUM)} altı UYARI."),
-                ("2) MODEL SKOR DOSYALARI", "Modelin renk dosyaları okundu mu (6/6), mükerrer satır var mı ve hedef "
-                                            f"tanımına giren müşterilerin ne kadarında skor var. {_yzd(ESIK_SKOR_ESLESME)} altı UYARI."),
-                ("3) BUCKET TABLOLARI", "BUCKET20'deki MODEL kolonlarının kaynağı: her model klasöründen renk_<kod>_<ad>_bucket20_train_val_oot.xlsx, "
-                                        "sadece kume = OOT satırları. Dosya okundu mu, 20 bucket mı, bad_rate = bad / n mi."),
-                ("   KİTLE FARKI (%)", "(Model kitlesi - raporda model skoru olan müşteri) / raporda model skoru olan müşteri. "
-                                       f"İki taraf da aynı tanım (OOT, segment, model skoru dolu). {_yzd(ESIK_MUSTERI_FARK)} üstü UYARI."),
-                ("   HEDEF ORANI FARKI (%)", f"Model kitlesi hedef oranı - raporda model skoru olanların hedef oranı. {_yzd(ESIK_HEDEF_ORANI_FARK)} üstü UYARI. "
-                                            "EN KRİTİK KONTROL: tutmuyorsa BUCKET20'de iki oran karşılaştırılamaz."),
-                ("4) MEVCUT SKOR KAPSAMASI", "Tüm kitlede. Model yerine sadece mevcut skor kullanılırsa skoru OLMAYAN "
-                                             "kişilerdeki vakalar hiç görülmez; SKORSUZ KİŞİLERDEKİ VAKA PAYI bu kaybı gösterir."),
-                ("5) FPD KESİŞEN KİTLE", f"OZET_ADETLER'deki FPD KESİŞEN KİTLE'nin kaynağı: bucket20 tablosundaki {FPD_KOLON} kolonunun "
-                                         "OOT satırlarındaki toplamı. Modellerin kitlesi farklıysa (NO:1 / NO:2) en geniş kitleli "
-                                         "modelin değeri kullanılır; EN AZ / EN ÇOK modeller arasındaki aralıktır."),
-            ])
-
-        # ---- 3) BUCKET20 ----
-        for _sheet, (_bloklar, _col, _isaret, _ad_tr, _don) in bucket_sheetler.items():
-            r = _ILK_SATIR - 1
-            for _i, b in enumerate(_bloklar):
-                b.to_excel(xl, sheet_name=_sheet, index=False, startrow=r,
-                           startcol=_TABLO_SUTUN - 1, header=(_i == 0))
-                r += len(b) + (1 if _i == 0 else 0) + 1
-            ws = xl.book[_sheet]
-            _yon = "düşük skor = riskli" if _isaret < 0 else "yüksek skor = riskli"
-            _panel_yaz(ws,
-                f"{_ad_tr} ile MODEL, 20'li bucket (OOT {_don}): hangisi riskli müşteriyi daha iyi sıralıyor?",
-                [
-                    "Tablo iki taraftan oluşur ve iki tarafın KİTLESİ FARKLIDIR:",
-                    f"SKOR tarafı: ORTAK KİTLE, {_KUCUK[_ad_tr]}na göre 20 eşit dilime bölündü ({_yon}). Bucket 1 = en riskli %5. "
-                    "Her hedefin oranı o dilimde yalnızca o modelin kitlesindeki müşterilerle hesaplanır.",
-                    "MODEL tarafı: model klasöründeki renk_<kod>_<ad>_bucket20_train_val_oot.xlsx dosyasının kume = OOT satırları, hesaplanmadan aynen alındı. "
-                    "Kitlesi MODEL KİTLESİ'dir (rapordan bağımsız). Bucket 1 = modelin en riskli %5'i.",
-                    "Bu yüzden aynı satırdaki iki bucket'ta farklı müşteriler var; karşılaştırılan şey dilimlerin oranlarıdır.",
-                    "Karşılaştırma ancak KONTROLLER 3. tablodaki HEDEF ORANI FARKI küçükse geçerlidir (aynı hedef, benzer kitle).",
-                    "İyi bir skorda oran bucket 1'de en yüksektir ve aşağı indikçe düzenli düşer. MODEL oranı üstte daha yüksek, altta daha düşükse model daha iyi ayırıyor.",
-                ],
-                [
-                    ("SEGMENT", "Renk segmenti. Her segment ayrı blok; GENEL blok yok (modeller renk bazlı)."),
-                    ("BUCKET", "1-20 arası dilim numarası, 1 = en riskli %5. TOPLAM = segmentin tamamı."),
-                    ("MÜŞTERİ (adet)", "SKOR tarafında bu dilimdeki ortak kitle müşteri sayısı."),
-                    ("SKOR_MIN / ORT / MAX", f"Dilimdeki {_KUCUK[_ad_tr]} aralığı."),
-                    ("<HEDEF> | SKOR DİLİMİNDE GERÇEKLEŞEN (%)", f"{_ad_tr} diliminde hedefin gerçekleşme oranı (ortak kitle, modelin kitlesi)."),
-                    ("<HEDEF> | MODEL DİLİMİNDE GERÇEKLEŞEN (%)", "Modelin aynı numaralı diliminde gerçekleşme oranı (klasör tablosu bad_rate, model kitlesi)."),
-                    ("<HEDEF> | SKOR DİLİMİ LIFT", "Dilim oranı / segmentin toplam oranı. 2 = dilimde vaka oranı segment ortalamasının 2 katı."),
-                    ("<HEDEF> | MODEL DİLİMİ LIFT", "Klasör tablosundaki lift (yoksa dilim oranı / model kitlesinin toplam oranı). İki lift aynı ölçekte, doğrudan karşılaştırılabilir."),
-                    ("   Lift üst sınırı", "1 / segment oranı. Kırmızı'da oran %92 ise lift en fazla 1,08 olabilir; orada 1,07 çok iyi bir değerdir."),
-                    ("<HEDEF> | SKOR DİLİMİNDE GERÇEKLEŞEN (adet)", "SKOR tarafında dilimdeki vaka sayısı."),
-                    ("<HEDEF> | MODEL DİLİMİ MÜŞTERİ (adet)", "MODEL tarafında dilimdeki müşteri sayısı (klasör tablosu n)."),
-                    ("<HEDEF> | MODEL DİLİMİNDE GERÇEKLEŞEN (adet)", "MODEL tarafında dilimdeki vaka sayısı (klasör tablosu bad)."),
-                    ("TOPLAM satırı", "İki taraftaki toplam oranlar (base rate). Birbirine yakın olmalı; uzaksa iki kitle/hedef tanımı farklıdır."),
-                ])
-            _tablo_bicim(ws, _bloklar[0].columns, _ILK_SATIR, r)
-            ws.freeze_panes = ws.cell(row=_ILK_SATIR + 1, column=1)
-
-        # ---- 4) KAÇAN DİLİM ----
-        for _don, _c in analiz_ciktilar.items():
-            if _c["kacan"].empty:
-                continue
-            _sheet_yaz(xl, f"KACAN_DILIM_OOT_{_don}", _c["kacan"],
-                f"KAÇAN DİLİM (OOT {_don}): Model ile mevcut skor farklı kişileri riskli dediğinde hangisi haklı?",
-                [
-                    "KİTLE: " + _KITLE_ORTAK + " DAVRANIŞ ve MÜŞTERİ satırlarının kitlesi aynıdır.",
-                    f"İki skor da kitlenin en riskli %{_RISKLI_YZD}'sini 'riskli' sayar. Listeler aynı büyüklükte olduğundan farklı kalan kişiler iki eşit gruba ayrılır.",
-                    "Bu iki grubun HEDEF ORANI'nı karşılaştırın: oranı yüksek olan grup haklı skoru gösterir (ORAN FARKI kolonu).",
-                    (f"KAZANAN: ORAN FARKI {_yzd(ESIK_BERABER_PUAN)} puandan küçükse BERABER; değilse pozitif → MODEL, negatif → MEVCUT SKOR. "
-                     "Kural segmentin hedef oranından bağımsızdır, Kırmızı gibi yüksek oranlı segmentlerde de çalışır."),
-                    "Eşik yok: PRED (0/1) değil, model skorunun sıralaması kullanılır.",
-                ],
-                [
-                    ("SEGMENT / HEDEF", "Renk segmenti ve ölçülen gerçekleşme."),
-                    ("MEVCUT SKOR", "Modelle karşılaştırılan skor (Davranış ya da Müşteri)."),
-                    ("KİTLE (adet) / KİTLE VAKA (adet)", "Segmentteki ortak kitlede bu modelin kitlesi ve içindeki vaka sayısı."),
-                    ("KİTLE HEDEF ORANI (%)", "Kıyas noktası: gruplardaki oranlar buna göre yüksek/düşük okunur."),
-                    (f"{_G_SADECE_MODEL}", "Mevcut skor temiz, model riskli diyor: mevcut skorun kaçırdığı kişiler."),
-                    (f"{_G_SADECE_MEVCUT}", "Mevcut skor riskli, model temiz diyor: modelin kaçırdığı kişiler."),
-                    ("... (adet) / VAKA (adet) / HEDEF ORANI (%)", "Gruptaki kişi sayısı, vaka sayısı ve vaka oranı."),
-                    (_C_NET, "Sadece-model grubundaki vaka - sadece-mevcut grubundaki vaka. Pozitif = model fazladan vaka yakalıyor."),
-                    (_C_ORAN_FARK, "Sadece-model grubunun hedef oranı - sadece-mevcut grubunun hedef oranı (puan). KAZANAN bu kolondan verilir."),
-                    ("KAZANAN", "MODEL / MEVCUT SKOR / BERABER."),
-                    (f"{_G_IKISI_RISKLI} / {_G_IKISI_TEMIZ}", "İki skorun anlaştığı kişiler; bağlam içindir."),
-                    ("RİSKLİ LİSTE ÖRTÜŞMESİ (%)", "İkisi de riskli / mevcut skorun riskli listesi. Yüksekse iki skor büyük ölçüde aynı kişileri gösteriyor."),
-                ], genislik=17)
-
-        # ---- 4b) YAKALAMA EĞRİSİ ----
-        for _don, _c in analiz_ciktilar.items():
-            if _c.get("yakalama") is None or _c["yakalama"].empty:
-                continue
-            _sheet_yaz(xl, f"YAKALAMA_OOT_{_don}", _c["yakalama"],
-                f"YAKALAMA EĞRİSİ (OOT {_don}): en riskli %X müşteriye bakınca vakaların yüzde kaçı bulunuyor?",
-                [
-                    "KİTLE: " + _KITLE_ORTAK,
-                    "Her satır bir renk segmenti x bir hedef x bir skor (MODEL, DAVRANIŞ SKORU, MÜŞTERİ SKORU). Üç skor aynı kişiler üzerinde ölçülür.",
-                    "%X kolonu: skorun en riskli %X'i işaretlenseydi o kitledeki vakaların yüzde kaçı bu dilimde olurdu (kümülatif yakalama).",
-                    f"%{_RISKLI_YZD} kolonu HÜKÜM sheet'indeki YAKALAMA kolonlarıyla aynı sayıdır (aynı fonksiyon, aynı kitle).",
-                    "Rastgele bir sıralamada %X kolonu yaklaşık %X olur; eğri bunun ne kadar üstündeyse skor o kadar iyi ayırıyor.",
-                ],
-                [
-                    ("SEGMENT / HEDEF", "Renk segmenti ve ölçülen gerçekleşme."),
-                    ("SKOR", "Eğrisi çizilen skor: MODEL ya da mevcut skorlardan biri."),
-                    ("KİTLE (adet) / KİTLE VAKA (adet)", "HÜKÜM ile aynı kitle ve içindeki vaka sayısı."),
-                    ("%5 (%) ... %100 (%)", "En riskli %X müşterideki vakanın tüm vakaya oranı. %100 her zaman %100'dür."),
-                ], genislik=9)
-
-        # ---- 5) ÖZET ----
-        if not ozet_df.empty:
-            _sheet_yaz(xl, "OZET_ADETLER", ozet_df,
-                f"ÖZET ADETLER (OOT {', '.join(map(str, _oot_donemleri))}): kitle hunisi ve hedef oranları",
-                [
-                    "TÜM KİTLE: OOT dönemindeki KK ürünlü müşteriler (skor şartı yok).",
-                    "ORTAK KİTLE: bunlardan Davranış ve Müşteri skoru dolu olanlar. Raporun geri kalanı bu kitleyle hesaplanır.",
-                    "ORTAK KİTLE PAYI düşükse skorsuz müşteriler analiz dışında kalıyor demektir; kimin düştüğü KONTROLLER 2. ve 4. tablodadır.",
-                    (f"FPD KESİŞEN KİTLE: model klasöründeki bucket20 tablosunun {FPD_KOLON} kolonunun OOT satırlarındaki (20 bucket) "
-                     "toplamı; FPD verisiyle eşleşen müşteri sayısı. PAYI = FPD KESİŞEN KİTLE / TÜM KİTLE. Kaynağı KONTROLLER 5. tablodadır."),
-                    ("Hedef adet ve oranları ortak kitlede, o modelin kitlesiyle hesaplanır (hedef tanımına giren ve model skoru dolu "
-                     "müşteriler). Boş hücre = gerçekleşme penceresi bu dönem için henüz kapanmadı."),
-                    "TOPLAM satırı: adetler segmentlerin toplamı; oranlar toplam adetlerden yeniden hesaplanır.",
-                ],
-                [
-                    ("SEGMENT", "Renk segmenti. TOPLAM = tüm segmentler."),
-                    ("TÜM KİTLE (adet)", "Segmentteki OOT KK müşteri sayısı."),
-                    ("ORTAK KİTLE (adet)", "Bunlardan Davranış ve Müşteri skoru dolu olanlar."),
-                    ("ORTAK KİTLE PAYI (%)", "ORTAK KİTLE / TÜM KİTLE."),
-                    ("FPD KESİŞEN KİTLE (adet)", f"Bucket20 tablosundaki {FPD_KOLON} toplamı (OOT, 20 bucket)."),
-                    ("FPD KESİŞEN KİTLE PAYI (%)", "FPD KESİŞEN KİTLE / TÜM KİTLE."),
-                    ("<HEDEF>: VAKA (adet)", "Ortak kitlede, bu modelin kitlesinde hedefi gerçekleşen müşteri sayısı."),
-                    ("<HEDEF>: ORAN (%)", "VAKA / bu modelin ortak kitledeki müşteri sayısı. HÜKÜM'deki HEDEF ORANI ile aynıdır."),
-                ])
-
-        # Sheet sırası: ÖZET → HÜKÜM → KONTROLLER → BUCKET20 → KAÇAN DİLİM → YAKALAMA
-        _ad = xl.book.sheetnames
-        _sira = (["OZET_ADETLER"] + [s for s in _ad if s.startswith("HUKUM_")] + ["KONTROLLER"] +
-                 [s for s in _ad if s.startswith("BUCKET20_")] +
-                 [s for s in _ad if s.startswith("KACAN_DILIM_")] +
-                 [s for s in _ad if s.startswith("YAKALAMA_")])
-        xl.book._sheets = [xl.book[s] for s in _sira if s in _ad] + \
-                          [ws for ws in xl.book._sheets if ws.title not in _sira]
-        _sheet_adlari = [ws.title for ws in xl.book._sheets]
-
-    buf.seek(0)
-    _rapor_yolu = "/kiyas_skorlari_vs_modeller_bucket20.xlsx"
-    mf.upload_stream(_rapor_yolu, buf)
-    print(f"✓ {_rapor_yolu} yazıldı | sheet'ler: {', '.join(_sheet_adlari)}")
-    del _kitle_cache
+if _VERI_WS:                                                  # gizli grafik verisi en sona
+    wb._sheets.remove(_VERI_WS[0])
+    wb._sheets.append(_VERI_WS[0])
+wb.active = 0
+_buf = BytesIO()
+wb.save(_buf)
+_veri = _buf.getvalue()
+_n_dilim = 0
+if DILIMLEYICI_PLANI:
+    try:
+        _veri, _n_dilim = _dilimleyici_ekle(_veri, DILIMLEYICI_PLANI)
+    except Exception as e:
+        _log(f"⚠ Dilimleyiciler eklenemedi ({type(e).__name__}: {e}); dosya dilimleyicisiz yazılıyor, tablo filtreleri çalışır")
+mf.upload_stream(CIKTI_DOSYA, BytesIO(_veri))
+_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yazıldı | sheet'ler: {', '.join(wb.sheetnames)} | dilimleyici: {_n_dilim} | "
+     f"kapsam sonuç özeti: {_dolu} / {N_HV * N_RENK * 2} hücre dolu")
