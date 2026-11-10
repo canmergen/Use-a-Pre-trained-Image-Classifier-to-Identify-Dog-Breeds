@@ -1,235 +1,28 @@
 import numpy as np
 import pandas as pd
 
-# ==================================================================
-# 23) ODM PSI KONTROLÜ: 202511'deki yüksek ODM_AVG PSI'ı hesaptan mı, veriden mi geliyor?
-# SIRA: ham veri (df) bellekteyken; 22 çalıştıysa onun dönemlerini ve sonucunu da kullanır. Feature engineering
-# çalışmaz, birkaç dakikada biter. Yalnızca log yazar, dosya üretmez.
-# ODM_AVG_L3M / L6M / L12M ham KK_ODEME_ORANI_LM..L12M'den feature engineering ile aynı yolla hesaplanır
-# (penceredeki dolu ayların ortalaması; _summ ile birebir aynı toplama sırası).
-#   1) PSI üç yolla, 22'den bağımsız kodla: 22'nin önceki yöntemi, 22'nin yeni yöntemi, pandas qcut. 22 bellekteyse
-#      onun sonucu da yanında: önceki yöntemle aynıysa 22'nin hesabı doğru yeniden üretilmiş demektir.
-#   2) En yüksek PSI'ın dilim dilim dökümü: PSI hangi dilimden geliyor.
-#   3) Ham KK_ODEME_ORANI takvim ayı bazında (bütün KK müşterileri): kayma hangi aydan başlıyor.
-#   4) Aynı müşteri, aynı takvim ayı, farklı dönem satırı: değer aynı mı (kaynak tablo tutarlılığı).
-# ==================================================================
-_OK_SERI, _OK_ONEK, _OK_DILIM, _OK_EPS, _OK_TAM = "KK_ODEME_ORANI", "ODM", 10, 1e-4, 100.0
-_OK_AYLAR = ["LM"] + [f"L{i}M" for i in range(2, 13)]
-_ok_yaz = globals().get("_log", print)
-
-_OK_V = globals().get("_ST_VERI")
-if not isinstance(_OK_V, pd.DataFrame):
-    _OK_V = globals().get("df") if isinstance(globals().get("df"), pd.DataFrame) else globals().get("df_raw")
-if not isinstance(_OK_V, pd.DataFrame) or not {"DONEM", "RENK"} <= set(_OK_V.columns):
-    raise RuntimeError("Ham veri bellekte yok: DONEM ve RENK kolonlu df bekleniyor.")
-_OK_KOL = [f"{_OK_SERI}_{a}" for a in _OK_AYLAR]
-_ok_eksik = [c for c in _OK_KOL if c not in _OK_V.columns]
-if _ok_eksik:
-    raise RuntimeError(f"Ham veride eksik kolon: {_ok_eksik}")
-_OK_DON = [int(d) for d in dict.fromkeys(globals().get("_ST_DON") or [202504, 202506, 202511])]
-_OK_REF, _OK_KARS = _OK_DON[0], _OK_DON[1:]
-
-_OK_DONEM_A = pd.to_numeric(_OK_V["DONEM"], errors="coerce").to_numpy()
-_OK_RENK_A = pd.to_numeric(_OK_V["RENK"], errors="coerce").to_numpy()
-_OK_KK_A = ((_OK_V["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in _OK_V.columns
-            else np.ones(len(_OK_V), dtype=bool))
-if "RENKLER" in globals():
-    _OK_RENKLER = [(k, a) for k, a, *_ in RENKLER]
-else:
-    _OK_RENKLER = [(int(k), str(int(k))) for k in sorted(set(_OK_RENK_A[np.isfinite(_OK_RENK_A)]))]
-_ok_etiket = globals().get("_seg_etiket", lambda k: str(k))
+# 23 EK) KK_ODEME_ORANI'nın boş / 100 kodlaması kart bakiyesine (KK_RISK) göre, takvim ayı bazında (202511 satırları).
+# Bakiyesi 0 (ya da eksi) olan müşterilerde bazı aylarda ODM = 100, bazı aylarda boş çıkıyorsa kodlama aydan aya değişiyor.
+_V = _OK_V if "_OK_V" in globals() else df
+_DON = 202511
+_d = pd.to_numeric(_V["DONEM"], errors="coerce").to_numpy()
+_kk = (_V["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in _V.columns else np.ones(len(_V), dtype=bool)
+_pos = np.flatnonzero((_d == _DON) & _kk)
+_ay0 = (_DON // 100) * 12 + _DON % 100 - 1
 
 
-def _ok_mat(pos):
-    return np.column_stack([pd.to_numeric(_OK_V[c].iloc[pos], errors="coerce").to_numpy("float64", na_value=np.nan)
-                            for c in _OK_KOL])
+def _y(x):
+    return f"%{100 * x:.1f}".replace(".", ",")
 
 
-def _ok_ort(M, k):
-    """Feature engineering'deki _summ ile aynı: dolu ayların toplamı (soldan kümülatif) / dolu ay sayısı."""
-    gecerli = ~np.isnan(M)
-    dolu = np.where(gecerli, M, 0.0)
-    s = np.cumsum(dolu, axis=1)[:, k - 1]
-    n = np.cumsum(gecerli, axis=1, dtype=np.int8)[:, k - 1]
-    o = s / np.maximum(n, 1)
-    o[n == 0] = np.nan
-    return o
-
-
-def _ok_sinir(r, yeni):
-    d = r[np.isfinite(r)]
-    s = np.unique(np.quantile(d, np.linspace(0, 1, _OK_DILIM + 1)[1:-1]))
-    return s[s < d.max()] if yeni else s
-
-
-def _ok_pay(v, sinir):
-    ok = np.isfinite(v)
-    say = np.bincount(np.searchsorted(sinir, v[ok], side="left"), minlength=len(sinir) + 1).astype("float64")
-    return np.append(say, float((~ok).sum())) / max(len(v), 1)
-
-
-def _ok_psi(p, q):
-    p, q = np.maximum(p, _OK_EPS), np.maximum(q, _OK_EPS)
-    return float(np.sum((q - p) * np.log(q / p)))
-
-
-def _ok_psi_pandas(r, c):
-    """22'den bağımsız: pandas qcut ile referans ondalık sınırları, uçlar ±sonsuz, boşlar ayrı dilim."""
-    rs, cs = pd.Series(r), pd.Series(c)
-    try:
-        _, b = pd.qcut(rs.dropna(), _OK_DILIM, retbins=True, duplicates="drop")
-        b[0], b[-1] = -np.inf, np.inf
-        pr = np.append(pd.Series(pd.cut(rs.dropna(), b)).value_counts(sort=False).to_numpy(), rs.isna().sum()) / len(rs)
-        pc = np.append(pd.Series(pd.cut(cs.dropna(), b)).value_counts(sort=False).to_numpy(), cs.isna().sum()) / len(cs)
-    except Exception:
-        return np.nan
-    return _ok_psi(pr, pc)
-
-
-def _ok_y(x, n=1):
-    return "" if x is None or not np.isfinite(x) else f"%{100 * x:.{n}f}".replace(".", ",")
-
-
-def _ok_s(x, n=3):
-    return "" if x is None or not np.isfinite(x) else f"{x:,.{n}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-# ==================================================================
-# 1) PSI ÜÇ YOLLA
-# ==================================================================
-_ok_degerler = {}                                             # (renk, değişken, dönem) → değerler
-for _kod, _ad in _OK_RENKLER:
-    for d in _OK_DON:
-        pos = np.flatnonzero((_OK_RENK_A == _kod) & (_OK_DONEM_A == d) & _OK_KK_A)
-        if not len(pos):
-            continue
-        M = _ok_mat(pos)
-        for k in (3, 6, 12):
-            _ok_degerler[(_kod, f"{_OK_ONEK}_AVG_L{k}M", d)] = _ok_ort(M, k)
-
-_ok_satir, _ok_dokum = [], {}
-_ST_DEG_ = globals().get("_ST_DEG") or {}
-for _kod, _ad in _OK_RENKLER:
-    for k in (3, 6, 12):
-        f = f"{_OK_ONEK}_AVG_L{k}M"
-        r = _ok_degerler.get((_kod, f, _OK_REF))
-        if r is None or not np.isfinite(r).any():
-            continue
-        s_eski, s_yeni = _ok_sinir(r, False), _ok_sinir(r, True)
-        p_eski, p_yeni = _ok_pay(r, s_eski), _ok_pay(r, s_yeni)
-        rmax = float(np.nanmax(r))
-        for d in _OK_KARS:
-            c = _ok_degerler.get((_kod, f, d))
-            if c is None:
-                continue
-            q_eski = _ok_pay(c, s_eski)
-            psi_eski = _ok_psi(p_eski, q_eski)
-            ist22 = (_ST_DEG_.get((_kod, f)) or {}).get("ist", {}).get(d)
-            _ok_satir.append({
-                "Renk": _ok_etiket(_kod), "Değişken": f, "Dönem": d,
-                "22 sonucu": _ok_s(ist22["csi"]) if ist22 else "",
-                "PSI önceki yöntem": _ok_s(psi_eski), "PSI yeni yöntem": _ok_s(_ok_psi(p_yeni, _ok_pay(c, s_yeni))),
-                "PSI pandas qcut": _ok_s(_ok_psi_pandas(r, c)),
-                "Ref max": _ok_s(rmax, 2), "Ref max üstü pay": _ok_y(float(np.mean(c > rmax)), 2),
-                "Ref = max payı": _ok_y(float(np.mean(r == rmax))), "Dönem = ref max payı": _ok_y(float(np.mean(c == rmax))),
-                "Boş ref": _ok_y(float(np.mean(~np.isfinite(r)))), "Boş dönem": _ok_y(float(np.mean(~np.isfinite(c)))),
-                "_psi": psi_eski})
-            _ok_dokum[(_kod, f, d)] = (s_eski, p_eski, q_eski)
-
-_ok_t1 = pd.DataFrame(_ok_satir).sort_values("_psi", ascending=False)
-print(f"\n1) {_OK_ONEK}_AVG PSI'ı, referans {_OK_REF} (yalnızca 22'den bağımsız kodla)")
-print("   22 sonucu: 22 bu oturumda çalıştıysa bellekteki PSI. 'PSI önceki yöntem' ile aynıysa 22 doğru hesaplamış.")
-print("   PSI yeni yöntem: referansın en büyük değerine denk gelen dilim sınırı atılmış hali (22'nin güncel sürümü).")
-with pd.option_context("display.width", 250, "display.max_columns", 50, "display.max_rows", 500):
-    print(_ok_t1.drop(columns="_psi").to_string(index=False))
-
-# ==================================================================
-# 2) EN YÜKSEK PSI'IN DİLİM DİLİM DÖKÜMÜ (önceki yöntemin dilimleri)
-# ==================================================================
-if len(_ok_t1):
-    _r0 = _ok_t1.iloc[0]
-    _kod0 = next(k for k, _ in _OK_RENKLER if _ok_etiket(k) == _r0["Renk"])
-    s_e, p_e, q_e = _ok_dokum[(_kod0, _r0["Değişken"], int(_r0["Dönem"]))]
-    sinirlar = [-np.inf] + list(s_e) + [np.inf]
-    _sn = lambda x: "-∞" if x == -np.inf else ("∞" if x == np.inf else _ok_s(x, 2))
-    adlar = [f"({_sn(sinirlar[i])} ; {_sn(sinirlar[i + 1])}]" for i in range(len(s_e) + 1)] + ["boş"]
-    pp, qq = np.maximum(p_e, _OK_EPS), np.maximum(q_e, _OK_EPS)
-    t2 = pd.DataFrame({"Dilim": adlar, f"Pay {_OK_REF}": [_ok_y(x) for x in p_e],
-                       f"Pay {_r0['Dönem']}": [_ok_y(x) for x in q_e],
-                       "PSI katkısı": [_ok_s(x) for x in (qq - pp) * np.log(qq / pp)]})
-    print(f"\n2) {_r0['Renk']} {_r0['Değişken']} {_r0['Dönem']}: PSI {_r0['PSI önceki yöntem']} hangi dilimden geliyor")
-    print("   Referans payı %0,0 olan bir dilim varsa PSI'a 1e-4 ile girer; birkaç müşteri bile büyük katkı yapar.")
-    print(t2.to_string(index=False))
-
-# ==================================================================
-# 3) HAM KK_ODEME_ORANI TAKVİM AYI BAZINDA (bütün KK müşterileri)
-# ==================================================================
-def _ok_ay(yyyymm):
-    return (int(yyyymm) // 100) * 12 + int(yyyymm) % 100 - 1
-
-
-def _ok_ay_ad(i):
-    return f"{i // 12}{i % 12 + 1:02d}"
-
-
-_ok_t3 = []
-for d in _OK_DON:
-    pos = np.flatnonzero((_OK_DONEM_A == d) & _OK_KK_A)
-    if not len(pos):
-        continue
-    M = _ok_mat(pos)
-    for j, a in enumerate(_OK_AYLAR):
-        v = M[:, j]
-        ok = np.isfinite(v)
-        q = np.quantile(v[ok], [0.05, 0.5, 0.95]) if ok.any() else [np.nan] * 3
-        _ok_t3.append({"Takvim ayı": _ok_ay_ad(_ok_ay(d) - (j + 1)), "Dönem satırı": d, "Kolon": f"{_OK_SERI}_{a}",
-                       "Müşteri": f"{len(v):,}".replace(",", "."), "Boş": _ok_y(float(np.mean(~ok))),
-                       "= 0": _ok_y(float(np.mean(v == 0))), f"= {_OK_TAM:.0f}": _ok_y(float(np.mean(v == _OK_TAM))),
-                       f"> {_OK_TAM:.0f}": _ok_y(float(np.mean(v > _OK_TAM)), 2),
-                       "P5": _ok_s(q[0], 2), "Medyan": _ok_s(q[1], 2), "P95": _ok_s(q[2], 2),
-                       "Max": _ok_s(float(v[ok].max()) if ok.any() else np.nan, 2)})
-print(f"\n3) Ham {_OK_SERI} takvim ayı bazında (bütün KK müşterileri; LM = dönemden bir önceki ay)")
-print("   Aynı takvim ayı birden çok dönem satırında varsa alt alta: değerler benzer olmalı. Kayma hangi aydan "
-      "başlıyorsa orada görünür.")
-with pd.option_context("display.width", 250, "display.max_columns", 50, "display.max_rows", 500):
-    print(pd.DataFrame(_ok_t3).sort_values(["Takvim ayı", "Dönem satırı"]).to_string(index=False))
-
-# ==================================================================
-# 4) AYNI MÜŞTERİ, AYNI TAKVİM AYI, FARKLI DÖNEM SATIRI
-# ==================================================================
-if "MBB_NO" in _OK_V.columns:
-    print(f"\n4) Aynı müşterinin aynı takvim ayındaki {_OK_SERI} değeri farklı dönem satırlarında aynı mı "
-          "(o dönemde tek satırı olan KK müşterileri; ikisi de boşsa aynı sayılır)")
-    _ok_tek = {}
-    for d in _OK_DON:
-        pos = np.flatnonzero((_OK_DONEM_A == d) & _OK_KK_A)
-        m = _OK_V["MBB_NO"].iloc[pos].astype(str).to_numpy()
-        say = pd.Series(m).value_counts()
-        tek = np.isin(m, say.index[say.to_numpy() == 1])
-        _ok_tek[d] = pd.DataFrame(_ok_mat(pos[tek]), index=m[tek], columns=_OK_AYLAR)
-    for i, a in enumerate(_OK_DON):
-        for b in _OK_DON[i + 1:]:
-            ortak = _ok_tek[a].index.intersection(_ok_tek[b].index)
-            A, B = _ok_tek[a].loc[ortak], _ok_tek[b].loc[ortak]
-            fark = _ok_ay(b) - _ok_ay(a)                    # b satırında aynı ay fark kadar daha eski kolonda
-            satir, top_n, top_esit = [], 0, 0
-            for j in range(12 - fark):
-                va, vb = A.iloc[:, j].to_numpy(), B.iloc[:, j + fark].to_numpy()
-                esit = (va == vb) | (np.isnan(va) & np.isnan(vb))
-                top_n, top_esit = top_n + len(esit), top_esit + int(esit.sum())
-                if len(esit) and esit.mean() < 0.999:
-                    farkli = ~esit & np.isfinite(va) & np.isfinite(vb)
-                    satir.append(f"      {_ok_ay_ad(_ok_ay(a) - (j + 1))} ({a} {_OK_AYLAR[j]} = {b} "
-                                 f"{_OK_AYLAR[j + fark]}): aynı {_ok_y(float(esit.mean()), 2)} | yalnız birinde boş "
-                                 f"{_ok_y(float(np.mean(np.isnan(va) != np.isnan(vb))), 2)} | ikisi dolu ve farklı "
-                                 f"{_ok_y(float(farkli.mean()), 2)}"
-                                 + (f", medyan fark {_ok_s(float(np.median(np.abs(va - vb)[farkli])), 2)}" if farkli.any() else ""))
-            if not top_n:
-                print(f"   {a} ile {b}: ortak takvim ayı ya da ortak müşteri yok")
-                continue
-            print(f"   {a} ile {b}: {len(ortak):,}".replace(",", ".") + f" ortak müşteri, {12 - fark} ortak ay | aynı "
-                  f"{_ok_y(top_esit / top_n, 2)}" + ("" if satir else " | bütün aylar %99,9 üstü aynı"))
-            for s in satir:
-                print(s)
-else:
-    print("\n4) MBB_NO kolonu yok; aynı müşteri kontrolü atlandı.")
+_sat = []
+for j, a in enumerate(["LM"] + [f"L{i}M" for i in range(2, 13)]):
+    o = pd.to_numeric(_V[f"KK_ODEME_ORANI_{a}"].iloc[_pos], errors="coerce").to_numpy("float64", na_value=np.nan)
+    r = pd.to_numeric(_V[f"KK_RISK_{a}"].iloc[_pos], errors="coerce").to_numpy("float64", na_value=np.nan)
+    ay = _ay0 - (j + 1)
+    for grup, m in (("bakiye 0", r == 0), ("bakiye eksi", r < 0), ("bakiye artı", r > 0), ("bakiye boş", np.isnan(r))):
+        if m.any():
+            _sat.append({"Takvim ayı": f"{ay // 12}{ay % 12 + 1:02d}", "Bakiye": grup, "Müşteri payı": _y(m.mean()),
+                         "ODM boş": _y(np.isnan(o[m]).mean()), "ODM = 100": _y(np.mean(o[m] == 100)),
+                         "ODM diğer": _y(np.mean(np.isfinite(o[m]) & (o[m] != 100)))})
+print(pd.DataFrame(_sat).sort_values(["Takvim ayı", "Bakiye"]).to_string(index=False))
