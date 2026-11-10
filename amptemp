@@ -2,64 +2,118 @@ import numpy as np
 import pandas as pd
 
 # ==================================================================
-# ÖDEME ORANI TEMİZLİĞİ: o ay bakiyesi (KK_RISK) 0'dan büyük değilse ödeme oranı 100 → boş.
-# Neden: log tablosu borcu olmayan kartları 202404, 202406, 202410, 202501 ve 202503'te 100 yazmış, diğer aylarda hiç
-# yazmamış. Kural bütün aylara aynı uygulandığı için aylar tutarlı olur.
-# Bakiye 0, eksi ya da boşsa ve ödeme oranı 100 ise boş yapılır; bakiye 0'dan büyükse 100 aynen kalır. 100 dışındaki
-# değerlere dokunulmaz.
-# SIRA: ham veri (df) yüklendikten hemen sonra; 21, 22, 23 ve pipeline'dan ÖNCE. Eğitim verisi de değiştiği için
-# pipeline yeniden çalıştırılmalı. Hücreyi iki kez çalıştırmak zararsız (ikincide değişen 0 olur).
+# ÖDEME ORANI: MÜŞTERİ ÖRNEĞİ (sorunlu ve sorunsuz müşteriler yan yana)
+# 202504 satırındaki 12 ay (202404-202503) her müşteri için: ödeme oranı ve bakiye (KK_RISK).
+# Log tablosunda fazla satır olan aylar (202404, 202406, 202410, 202501, 202503) * ile işaretli.
+#   1) Sorunlu: bakiyesi 0 olan, ödeme oranı yalnızca * aylarda 100, diğer aylarda boş olan müşteriler.
+#   2) Sorunsuz: 12 ayın hepsinde bakiyesi 0'dan büyük ve ödeme oranı dolu olan müşteriler. Bunlarda * aylar diğer
+#      aylardan farklı görünmemeli. Örneklerin yarısı her ay 100 ödeyen (gerçek 100'ler), yarısı oranı aydan aya
+#      değişen müşteriler.
+# Tek başına çalışır; bellekte df olması yeter. Ödeme oranı temizliği bu oturumda çalıştıysa sorunlu desen artık
+# görünmez (beklenen). En sonda iki grubun log tablosundaki ham satırlarını getiren SQL'i hazır basar.
 # ==================================================================
-_TM_AYLAR = ["LM"] + [f"L{i}M" for i in range(2, 13)]
-_tm_eksik = [k for a in _TM_AYLAR for k in (f"KK_ODEME_ORANI_{a}", f"KK_RISK_{a}") if k not in df.columns]
-if _tm_eksik:
-    raise RuntimeError(f"df'te eksik kolon: {_tm_eksik[:6]}")
+_DON = 202504
+_FAZLA = {202404, 202406, 202410, 202501, 202503}
+_N_ORNEK = 8
 
-_tm_don = pd.to_numeric(df["DONEM"], errors="coerce").to_numpy()
-_tm_kk = (df["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in df.columns else np.ones(len(df), dtype=bool)
-_tm_ay0 = (_tm_don // 100) * 12 + _tm_don % 100 - 1                    # dönemin ay sırası (NaN dönem → NaN)
-_tm_say = {}                                                         # takvim ayı → [n, boş önce, 100 önce, değişen]
-_tm_toplam = 0
-
-for j, a in enumerate(_TM_AYLAR):
-    o_kol, r_kol = f"KK_ODEME_ORANI_{a}", f"KK_RISK_{a}"
-    o = pd.to_numeric(df[o_kol], errors="coerce").to_numpy("float64", na_value=np.nan)
-    r = pd.to_numeric(df[r_kol], errors="coerce").to_numpy("float64", na_value=np.nan)
-    degis = (o == 100) & ~(r > 0)                                    # bakiye 0, eksi ya da boş
-    # rapor (yalnızca KK müşterileri): takvim ayı bazında önce / sonra
-    ay = _tm_ay0 - (j + 1)
-    ok = _tm_kk & np.isfinite(ay)
-    if ok.any():
-        k = ay[ok].astype(np.int64)
-        k0 = int(k.min())
-        n_ = np.bincount(k - k0)
-        b_ = np.bincount(k - k0, weights=np.isnan(o[ok]))
-        y_ = np.bincount(k - k0, weights=(o[ok] == 100))
-        d_ = np.bincount(k - k0, weights=degis[ok])
-        for i in np.flatnonzero(n_):
-            s = _tm_say.setdefault(k0 + int(i), [0, 0, 0, 0])
-            s[0] += int(n_[i]); s[1] += int(b_[i]); s[2] += int(y_[i]); s[3] += int(d_[i])
-    if degis.any():
-        df.loc[degis, o_kol] = np.nan
-        _tm_toplam += int(degis.sum())
+_AYLAR = ["LM"] + [f"L{i}M" for i in range(2, 13)]
+_d = pd.to_numeric(df["DONEM"], errors="coerce").to_numpy()
+_kk = (df["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in df.columns else np.ones(len(df), dtype=bool)
+_X = df.loc[(_d == _DON) & _kk]
+_ay0 = (_DON // 100) * 12 + _DON % 100 - 1
+_takvim = [((_ay0 - j - 1) // 12) * 100 + (_ay0 - j - 1) % 12 + 1 for j in range(12)]     # LM, L2M, ... → YYYYMM
 
 
-def _tm_y(x):
-    return "%" + f"{100 * x:.1f}".replace(".", ",")
+def _seri(on_ek):
+    t = pd.DataFrame({ay: pd.to_numeric(_X[f"{on_ek}_{a}"], errors="coerce").to_numpy("float64", na_value=np.nan)
+                      for a, ay in zip(_AYLAR, _takvim)})
+    return t[sorted(t.columns)]                                # eski aydan yeniye
 
 
-_tm_rapor = pd.DataFrame([{"Takvim ayı": f"{k // 12}{k % 12 + 1:02d}", "Değer": f"{s[0]:,}".replace(",", "."),
-                           "Boş önce": _tm_y(s[1] / s[0]), "100 önce": _tm_y(s[2] / s[0]),
-                           "Boş sonra": _tm_y((s[1] + s[3]) / s[0]), "100 sonra": _tm_y((s[2] - s[3]) / s[0]),
-                           "Değişen": _tm_y(s[3] / s[0])} for k, s in sorted(_tm_say.items())])
-print(f"Ödeme oranı temizlendi: {_tm_toplam:,}".replace(",", ".") + " değer 100 → boş "
-      "(bakiyesi 0'dan büyük olmayan aylar).")
-print("Takvim ayı bazında, bütün dönem satırları birlikte (KK müşterileri). Temizlikten sonra * aylar diğerlerinden "
-      "ayrışmamalı:")
-with pd.option_context("display.width", 200, "display.max_rows", 100):
-    print(_tm_rapor.to_string(index=False))
+def _mbb_metin(x):
+    """148535.0 → '148535' (müşteri numarası ondalıklı okunduysa)."""
+    try:
+        f = float(x)
+        if np.isfinite(f) and f == int(f):
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return str(x)
 
-# 22'nin bellekteki hesapları eski veriye ait: silinir ki 22 yeniden hesaplasın (aynı df nesnesi değiştiği için 22 bunu
-# kendisi fark edemez).
-for _k in ("_ST_ONB", "_ST_DEG", "_ST_MOD"):
-    globals().pop(_k, None)
+
+def _say(n, pay):
+    yuzde = f"{100 * pay:.1f}".replace(".", ",")
+    return f"{int(n):,}".replace(",", ".") + f" (%{yuzde})"
+
+
+_odm, _bky = _seri("KK_ODEME_ORANI"), _seri("KK_RISK")
+_mbb = (np.array([_mbb_metin(x) for x in _X["MBB_NO"]]) if "MBB_NO" in _X.columns
+        else np.arange(len(_X)).astype(str))
+_fazla = [c for c in _odm.columns if c in _FAZLA]
+_diger = [c for c in _odm.columns if c not in _FAZLA]
+_etiket = [f"{c}{'*' if c in _FAZLA else ''}" for c in _odm.columns]
+_rs = np.random.RandomState(0)
+
+# 1) sorunlu
+_tam = ((_odm[_fazla] == 100).all(axis=1) & _odm[_diger].isna().all(axis=1)).to_numpy()
+_gevsek = ((_odm[202501] == 100) & _odm[202502].isna() & (_odm[202503] == 100)).to_numpy()
+# 2) sorunsuz: her ay bakiye > 0 ve oran dolu
+_sorunsuz = ((_bky > 0).all(axis=1) & _odm.notna().all(axis=1)).to_numpy()
+_her_ay_100 = _sorunsuz & (_odm == 100).all(axis=1).to_numpy()
+_degisen = _sorunsuz & ~_her_ay_100
+
+print(f"{_DON} satırında {len(_odm):,} KK müşterisi".replace(",", "."))
+print(f"   Sorunlu: 202501'de 100, 202502'de boş, 202503'te yine 100: {_say(_gevsek.sum(), _gevsek.mean())}")
+print(f"   Sorunlu: bütün * aylarda 100, diğer 7 ayın hepsinde boş: {_say(_tam.sum(), _tam.mean())}")
+print(f"   Sorunsuz: 12 ayın hepsinde bakiye 0'dan büyük ve ödeme oranı dolu: {_say(_sorunsuz.sum(), _sorunsuz.mean())}")
+print(f"      bunlardan her ay 100 ödeyen: {_say(_her_ay_100.sum(), _her_ay_100.mean())} | oranı aydan aya değişen: "
+      f"{_say(_degisen.sum(), _degisen.mean())}")
+
+
+def _sec(maske, n):
+    i = np.flatnonzero(maske)
+    return np.sort(_rs.choice(i, min(n, len(i)), replace=False)) if len(i) else i
+
+
+def _tablo(t, sec, bicim):
+    g = t.iloc[sec].copy()
+    g = g.apply(lambda s: s.map(lambda x: "boş" if pd.isna(x) else bicim(x)))
+    g.columns = _etiket
+    g.insert(0, "MBB_NO", _mbb[sec])
+    return g.to_string(index=False)
+
+
+_b_odm = lambda x: f"{x:.0f}" if x == round(x) else f"{x:.1f}".replace(".", ",")
+_b_bky = lambda x: f"{x:,.0f}".replace(",", ".")
+
+_sec_sorunlu = _sec(_tam if _tam.any() else _gevsek, _N_ORNEK)
+_sec_sorunsuz = np.concatenate([_sec(_her_ay_100, _N_ORNEK // 2), _sec(_degisen, _N_ORNEK - _N_ORNEK // 2)])
+
+with pd.option_context("display.width", 250, "display.max_columns", 50):
+    if len(_sec_sorunlu):
+        print("\n1) SORUNLU MÜŞTERİLER (* = log tablosunda fazla satır olan ay)")
+        print("Ödeme oranı:")
+        print(_tablo(_odm, _sec_sorunlu, _b_odm))
+        print("Bakiye (KK_RISK):")
+        print(_tablo(_bky, _sec_sorunlu, _b_bky))
+    else:
+        print("\n1) Sorunlu desende müşteri yok: ödeme oranı temizliği bu oturumda çalışmış görünüyor (beklenen).")
+    if len(_sec_sorunsuz):
+        print("\n2) SORUNSUZ MÜŞTERİLER: ilk satırlar her ay 100 ödeyen, sonrakiler oranı değişen (* aylar farklı olmamalı)")
+        print("Ödeme oranı:")
+        print(_tablo(_odm, _sec_sorunsuz, _b_odm))
+        print("Bakiye (KK_RISK):")
+        print(_tablo(_bky, _sec_sorunsuz, _b_bky))
+
+_liste = [m for m in np.concatenate([_mbb[_sec_sorunlu], _mbb[_sec_sorunsuz]])]
+if "MBB_NO" in _X.columns and _liste:
+    _sql = ", ".join(m if m.isdigit() else f"'{m}'" for m in _liste)
+    print("\nİki grubun log tablosundaki ham satırları (SQL notebook'ta çalıştırın; sorunlu müşterilerde yalnızca * ayların "
+          "satırları gelmeli, sorunsuzlarda her ay bir satır):\n")
+    print(f"""SELECT T2.TARAF_ID, T3.*
+FROM DWH_THSP_TARAF_ILIS T2
+JOIN DWH_THSP_KK_ODEME_ORAN_LOG T3 ON T2.HESAP_ID = T3.HESAP_ID
+WHERE T2.TARAF_ID IN ({_sql})
+  AND T3.EKSTRE_KESIM_TARIHI >= DATE '2024-04-01'
+  AND T3.EKSTRE_KESIM_TARIHI <  DATE '2025-04-01'
+ORDER BY T2.TARAF_ID, T3.HESAP_ID, T3.EKSTRE_KESIM_TARIHI""")
