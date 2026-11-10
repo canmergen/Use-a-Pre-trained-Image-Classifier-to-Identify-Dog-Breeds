@@ -1,5 +1,8 @@
+import os
 import re
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 import pickle
 import warnings
 import numpy as np
@@ -22,18 +25,23 @@ from openpyxl.utils import get_column_letter
 #              0,10 altı Stabil, 0,10 ile 0,25 arası Dikkat, 0,25 üstü Belirgin kayma.
 #   HHI: aynı dilimlerde Σ p², değerler birkaç dilime yığılıyor mu (sayısal değişkende referansta ~0,10).
 #        Yaygın bir eşiği olmadığı için değer olarak verilir.
+#   Referans dönem kendisiyle karşılaştırılmaz (PSI'ı her zaman 0): PSI ve durum karşılaştırılan dönemler için verilir;
+#   referansın kendi değerleri HHI'da ve dağılım özetinde.
 # ÇIKTI
 #   Log: her dönemde sorunlu (PSI 0,10 üstü) ve modele giren değişkenler, girdikleri modellerle; sonunda pipeline'da
 #        çıkarmak için hazır liste.
 #   RENK_Model_Sonuclar.xlsx "Stabilite" sheet'i: 1) her değişken (renk x değişken) için her dönemin PSI (CSI), durumu
-#        ve HHI'ı, girdiği modeller; 2) her modelin skor PSI ve HHI'ı.
-#   GOC_MODEL_RESULTS: stabilite_degiskenler.csv, stabilite_model_skor.csv, stabil_olmayan_degiskenler.csv.
+#        ve HHI'ı, girdiği modeller; 2) modele giren her değişkenin her dönemde boş oranı, min, P5, medyan, ortalama,
+#        P95, max; 3) her modelin skor PSI ve HHI'ı.
+#   GOC_MODEL_RESULTS: stabilite_degiskenler.csv, stabilite_dagilim_ozeti.csv, stabilite_model_skor.csv,
+#        stabil_olmayan_degiskenler.csv.
 # ==================================================================
 DONEMLER = [202504, 202506, 202511]       # ilki referans; ör. 202601 eklemek için listeye yaz
 
 _ST_SAYFA, _ST_DILIM, _ST_GRUP, _ST_ALT, _ST_UST, _ST_EPS = "Stabilite", 10, 20, 0.10, 0.25, 1e-4
 _ST_DURUM_RENK = {"Stabil": "C6EFCE", "Dikkat": "FFEB84", "Belirgin kayma": "F4B6B7"}
 _ST_DURUM_SIRA = {"Belirgin kayma": 2, "Dikkat": 1, "Stabil": 0}
+_ST_IS = max(1, min(8, os.cpu_count() or 1))                   # değişken istatistikleri paralel (iş parçacığı)
 _ST_GEREKLI = ["wb", "MODELLER", "RENKLER", "_MODEL_ADI", "TUM_MODELLER", "N_RENK", "mf", "Sayfa", "_yeni_sayfa",
                "_tablo_ekle", "_dilimleyici_alani", "DILIMLEYICI_PLANI", "DILIMLEYICI_EKLE", "_dilimleyici_ekle", "_yazdir",
                "_log", "_seg_etiket", "_adet", "CIKTI_DOSYA", "KARSILASTIRMA_SAYFA", "_VERI_WS", "_BOLUM", "_KENAR_B",
@@ -260,8 +268,18 @@ def _st_havuz(paket):
     return raw + fe + [c for c in ds if c not in set(raw + fe)]
 
 
+def _st_ozet(v):
+    """Boşlar hariç dağılım özeti (v yalnızca dolu değerler): min, P5, medyan, ortalama, P95, max."""
+    if not len(v):
+        return {}
+    p5, med, p95 = np.quantile(v, [0.05, 0.5, 0.95])
+    return {"min": float(v.min()), "p5": float(p5), "med": float(med), "ort": float(v.mean()), "p95": float(p95),
+            "max": float(v.max())}
+
+
 def _st_kolon_ist(s, kategorik, ref=None):
-    """Bir değişkenin bir dönemdeki dağılımı: dilim payları, PSI (CSI), HHI. ref None ise dilimler buradan kurulur."""
+    """Bir değişkenin bir dönemdeki dağılımı: dilim payları, PSI (CSI), HHI, boş oranı ve (sayısalda) dağılım özeti.
+    ref None ise dilimler buradan kurulur."""
     if kategorik:
         v = s.astype("object")
         bos = v.isna().to_numpy()
@@ -277,9 +295,10 @@ def _st_kolon_ist(s, kategorik, ref=None):
         else:
             sinir = (np.unique(np.quantile(v[ok], np.linspace(0, 1, _ST_DILIM + 1)[1:-1])) if ok.any()
                      else np.array([]))
-        idx = np.searchsorted(sinir, v[ok], side="left")
+        dolu = v[ok]
+        idx = np.searchsorted(sinir, dolu, side="left")
         pay = list(np.bincount(idx, minlength=len(sinir) + 1).astype("float64")) + [float((~ok).sum())]
-        d = {"sinir": sinir}
+        d = {"sinir": sinir, "ozet": _st_ozet(dolu)}
     pay = np.asarray(pay, dtype="float64") / max(len(s), 1)
     d.update({"pay": pay, "bos": float(pay[-1]), "hhi": float(np.sum(pay ** 2)),
               "csi": _st_csi(ref["pay"], pay) if ref else np.nan})
@@ -314,7 +333,8 @@ def _st_satirlar(kod, donem, kolonlar):
 # ==================================================================
 if "_ST_ONB" not in globals():
     _ST_ONB = {}
-_st_v0 = (id(_ST_VERI), len(_ST_VERI))
+_ST_SURUM = 2                                                # hesaplanan istatistikler değişirse artar; eski bellek silinir
+_st_v0 = (id(_ST_VERI), len(_ST_VERI), _ST_SURUM)
 for _k in [k for k in _ST_ONB if k[0] != _st_v0]:
     del _ST_ONB[_k]                                          # ham veri yeniden çekildiyse eski hesaplar silinir
 _st_donem_var = set(pd.to_numeric(_ST_VERI["DONEM"], errors="coerce").dropna().astype(int).unique())
@@ -323,6 +343,9 @@ if _ST_REF not in _st_donem_var:
 _st_yok = [d for d in _ST_KARS if d not in _st_donem_var]
 _log(f"Stabilite: referans {_ST_REF} | karşılaştırılan {', '.join(map(str, _ST_KARS))} | {len(TUM_MODELLER)} model"
      + (f" | ⚠ veride olmayan dönem: {_st_yok}" if _st_yok else ""))
+if not _ST_ONB:
+    _log("   İlk çalıştırma: her renk ve dönem için değişkenler ham veriden yeniden üretiliyor (21 kadar sürer). "
+         "Aynı oturumda tekrar çalıştırınca ya da dönem ekleyince hesaplanan dönemler bellekten gelir.")
 
 _ST_DEG = {}          # (renk, değişken) → {kaynak, tür, modeller, ist: {dönem: kolon istatistiği}}
 _ST_MOD = []          # model → skor istatistikleri
@@ -344,7 +367,7 @@ for _kod, _ad, _ in RENKLER:
     for x, m in pk.items():
         gruplar.setdefault(m["ham"], []).append(x)
     for d in [x for x in _ST_DON if x in _st_donem_var]:
-        rows = None
+        rows, _t0, _hesap = None, time.time(), False
         for ham, xs in gruplar.items():
             p0 = pk[xs[0]]["p"]                                   # havuz bu ham kolon setindeki ilk modelin paketinden
             ds0 = set((p0.get("desen_kodlama") or {}).get("kolonlar", {}))
@@ -354,6 +377,7 @@ for _kod, _ad, _ in RENKLER:
             lazim_m = [x for x in xs if (_st_v0, pk[x]["klasor"], _kod, d) not in _ST_ONB
                        and (d == _ST_REF or (_st_v0, pk[x]["klasor"], _kod, _ST_REF) in _ST_ONB)]
             if lazim_h or lazim_m:
+                _hesap = True
                 if rows is None:
                     rows = _st_satirlar(_kod, d, [c for h in gruplar for c in h])
                 eksik = [c for c in ham if c not in rows.columns]
@@ -368,13 +392,15 @@ for _kod, _ad, _ in RENKLER:
                 if lazim_h:                                   # havuzdaki her değişken (DSN hariç; o modele göre)
                     kat = set(p0["preprocess_schema"].get("categorical", {}))
                     ref_h = None if d == _ST_REF else _ST_ONB[(_st_v0, _kod, ham, _ST_REF)]
-                    sonuc = {}
-                    for c in havuz:
+
+                    def _bir(c, U=U, p0=p0, kat=kat, ref_h=ref_h):
                         try:
-                            sonuc[c] = _st_kolon_ist(U.kolon(c, p0), c in kat, ref_h[c] if ref_h else None)
+                            return c, _st_kolon_ist(U.kolon(c, p0), c in kat, ref_h[c] if ref_h else None)
                         except Exception:
-                            continue
-                    _ST_ONB[a_h] = sonuc
+                            return c, None
+
+                    with ThreadPoolExecutor(max_workers=_ST_IS) as ex:
+                        _ST_ONB[a_h] = {c: r for c, r in ex.map(_bir, havuz) if r is not None}
                 for x in lazim_m:                             # modelin skoru ve DSN değişkenleri
                     m = pk[x]
                     ref_m = None if d == _ST_REF else _ST_ONB[(_st_v0, m["klasor"], _kod, _ST_REF)]
@@ -400,13 +426,16 @@ for _kod, _ad, _ in RENKLER:
                 if not mm:
                     continue
                 pk[x]["skor"][d] = mm["skor"]
-                for c, ist in mm["dsn"].items():                # DSN: modeller arasında en yüksek PSI
+                for c, ist in mm["dsn"].items():                # DSN hedefe göre kodlanır: her modelin kendi değeri
                     g = _ST_DEG.setdefault((_kod, c), {"kod": _kod, "feat": c, "ist": {}, "kaynak": "DSN", "tur": "sayısal"})
-                    eski = g["ist"].get(d)
-                    if eski is None or (np.isfinite(ist["csi"]) and ist["csi"] > (eski["csi"] if np.isfinite(eski["csi"]) else -1)):
-                        g["ist"][d] = ist
+                    g.setdefault("dsn_m", {}).setdefault(pk[x]["ad"], {})[d] = ist
         del rows
-        _log(f"   renk {_kod} {d}: hazır ({_adet(int(((_ST_RENK_A == _kod) & (_ST_DONEM_A == d) & _ST_KK_A).sum()))} müşteri)")
+        _log(f"   renk {_kod} {d}: {_adet(int(((_ST_RENK_A == _kod) & (_ST_DONEM_A == d) & _ST_KK_A).sum()))} müşteri | "
+             + (f"hesaplandı ({time.time() - _t0:.0f} sn)" if _hesap else "bellekten"))
+    for (k, c), g in _ST_DEG.items():                         # DSN: en çok kayan modelin değerleri, bütün dönemlerde aynı model
+        if k == _kod and g.get("dsn_m"):
+            g["ist"] = dict(max(g["dsn_m"].values(), key=lambda s: max(
+                [i["csi"] for i in s.values() if np.isfinite(i["csi"])], default=-1.0)))
     for x, m in pk.items():                                   # hangi değişken hangi modele girmiş
         for c in m["p"]["features"]:
             g = _ST_DEG.get((_kod, c))
@@ -442,6 +471,22 @@ for g in _ST_DEG.values():
 # önce modele giren sorunlular, sonra diğerleri; her grupta en yüksek PSI başta
 _ST_T_DEG.sort(key=lambda t: (t["modelde"] != "Evet", -_ST_DURUM_SIRA.get(t["durum"], -1),
                               -(t["psi_max"] if np.isfinite(t["psi_max"]) else -1)))
+
+# modele giren değişkenlerin her dönemdeki dağılım özeti (1. tablonun sırasıyla; her değişkenin dönemleri alt alta)
+_st_sira = {(t["seg"], t["feat"]): i for i, t in enumerate(_ST_T_DEG)}
+_ST_T_OZET = []
+for g in sorted((g for g in _ST_DEG.values() if g.get("modeller")),
+                key=lambda g: _st_sira[(_seg_etiket(g["kod"]), g["feat"])]):
+    for d in _ST_DON:
+        ist = g["ist"].get(d)
+        if ist is None:
+            continue
+        oz, ref = ist.get("ozet") or {}, d == _ST_REF
+        _ST_T_OZET.append({"seg": _seg_etiket(g["kod"]), "feat": g["feat"], "kaynak": g["kaynak"], "tur": g["tur"],
+                           "donem": f"{d} (referans)" if ref else str(d), "bos": ist["bos"],
+                           **{k: oz.get(k, np.nan) for k in ("min", "p5", "med", "ort", "p95", "max")},
+                           "psi": np.nan if ref else ist["csi"], "durum": None if ref else _st_durum(ist["csi"]),
+                           "modeller": ", ".join(g["modeller"])})
 
 _ST_T_MOD = []
 for m in sorted(_ST_MOD, key=lambda m: (m["kod"], m["v"], m["a"])):
@@ -503,6 +548,12 @@ _ST_K_DEG = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Değişken", None,
                 ("R", "Girdiği modeller", None, 70, "modeller")])
 _ST_G_DEG = {"M": "Değişken", "P": f"PSI (CSI), referans {_ST_REF}", "D": "Durum", "H": "HHI (dilimlerde yığılma)",
              "R": "Sonuç ve modeller"}
+_ST_K_OZET = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Değişken", None, 34, "feat"),
+               ("M", "Dönem", None, 16, "donem"), ("M", "Tür", None, 10, "tur"), ("O", "Boş oranı", "0.0%", 9, "bos")]
+              + [("O", a, "SAYI", 12, k) for a, k in (("Min", "min"), ("P5", "p5"), ("Medyan", "med"),
+                                                       ("Ortalama", "ort"), ("P95", "p95"), ("Max", "max"))]
+              + [("P", "PSI (CSI)", "0.000", 10, "psi"), ("P", "Durum", None, 14, "durum")])
+_ST_G_OZET = {"M": "Değişken ve dönem", "O": "Dağılım: boş oranı ve dolu değerlerin özeti", "P": f"Referansa ({_ST_REF}) göre"}
 _ST_K_MOD = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Model", None, 34, "model"), ("M", "Hedef Süre", "0", 8, "vade")]
              + [("P", f"Skor PSI: {d}", "0.000", 10, f"psi_{d}") for d in _ST_KARS]
              + [("H", f"Skor HHI: {_ST_REF}", "0.000", 10, "hhi_R")]
@@ -517,8 +568,17 @@ def _st_deger(x):
     return x.item() if hasattr(x, "item") else x
 
 
+def _st_sayi_bicim(x):
+    """Değişkenlerin ölçeği farklı (oran, adet, tutar): hücrenin büyüklüğüne göre okunur bir biçim."""
+    if x is None:
+        return "General"
+    a = abs(x)
+    return "0.0000" if a < 10 else ("#,##0.00" if a < 100000 else "#,##0")
+
+
 def _st_tablo(ws, S, r, kolonlar, gruplar, satirlar, tablo_adi, dilimler):
-    """Dilimleyici alanı + grup bandı + başlık + satırlar + Excel tablosu. dilimler: [(anahtar, buton kolonu, genişlik)]."""
+    """Dilimleyici alanı + grup bandı + başlık + satırlar + Excel tablosu. dilimler: [(anahtar, buton kolonu, genişlik)].
+    Biçim "SAYI" olan kolonlarda biçim her hücrenin büyüklüğüne göre seçilir."""
     C = {k[4]: 2 + i for i, k in enumerate(kolonlar)}
     ad = {k[4]: k[1] for k in kolonlar}
     r_bant = r + 7 if DILIMLEYICI_EKLE else r
@@ -536,8 +596,8 @@ def _st_tablo(ws, S, r, kolonlar, gruplar, satirlar, tablo_adi, dilimler):
         for k in kolonlar:
             v = _st_deger(d.get(k[4]))
             durum = k[4] == "durum" or k[4].startswith("dr_")
-            x = S.hucre(rr, C[k[4]], v, fmt=k[2], wrap=False, dikey="center", size=10,
-                        h="left" if k[2] is None and not durum else "center")
+            x = S.hucre(rr, C[k[4]], v, fmt=_st_sayi_bicim(v) if k[2] == "SAYI" else k[2], wrap=False, dikey="center",
+                        size=10, h="left" if k[2] is None and not durum else ("right" if k[2] == "SAYI" else "center"))
             if durum and v in _ST_DURUM_RENK:
                 x.fill = PatternFill("solid", fgColor=_ST_DURUM_RENK[v])
                 x.font = Font(name=YAZI_TIPI, bold=True, size=10)
@@ -566,11 +626,11 @@ def _st_sayfa():
         wb.remove(wb[_ST_SAYFA])
     DILIMLEYICI_PLANI[:] = [p for p in DILIMLEYICI_PLANI if p.get("sayfa") != _ST_SAYFA]
     gen = {}
-    for kolonlar in (_ST_K_DEG, _ST_K_MOD):
+    for kolonlar in (_ST_K_DEG, _ST_K_OZET, _ST_K_MOD):
         for i, k in enumerate(kolonlar):
             gen[2 + i] = max(gen.get(2 + i, 0), k[3])
     ws = _yeni_sayfa(_ST_SAYFA, gen)
-    son_deg, son_mod = 1 + len(_ST_K_DEG), 1 + len(_ST_K_MOD)
+    son_deg, son_oz, son_mod = 1 + len(_ST_K_DEG), 1 + len(_ST_K_OZET), 1 + len(_ST_K_MOD)
     S = Sayfa(ws, son_deg)
     r = 2
     S.baslik(r, f"Stabilite: her değişkenin PSI (CSI) ve HHI'ı, referans {_ST_REF}; karşılaştırılan "
@@ -582,10 +642,16 @@ def _st_sayfa():
                  "çıkarılan değişkenin yerine gelecek olanın da stabil olduğu görülür.", 32),
         ("PSI (CSI)", f"Σ (p_dönem - p_referans) x ln(p_dönem / p_referans). Değişkende buna CSI denir; hesap aynı. "
                       f"Sayısal değişken referansın {_ST_DILIM} yüzdelik dilimine, kategorik değişken kategorilere "
-                      "ayrılır; boşlar ayrı dilim. 0,10 altı Stabil, 0,10 ile 0,25 arası Dikkat, 0,25 üstü Belirgin kayma.", 32),
+                      "ayrılır; boşlar ayrı dilim. 0,10 altı Stabil, 0,10 ile 0,25 arası Dikkat, 0,25 üstü Belirgin kayma. "
+                      f"Referans {_ST_REF} kendisiyle karşılaştırılmaz (PSI'ı her zaman 0); onun değerleri HHI'da ve "
+                      "2. tabloda.", 44),
         ("HHI", "Aynı dilimlerde Σ p²: değerler birkaç dilime yığılıyor mu (sayısal değişkende referansta yaklaşık 0,10). "
                 "Yaygın bir eşiği olmadığı için değer olarak verilir; PSI yüksek bir değişkende kaymanın yığılma mı "
                 "yoksa kayma mı olduğunu ayırır.", 32),
+        ("Dağılım özeti", "2. tablo: modele giren her değişkenin her dönemde boş oranı (bütün müşteriler içinde) ve boşlar "
+                          "hariç min, P5, medyan, ortalama, P95, max; aynı değişkenin dönemleri alt alta. Kategorik "
+                          "değişkende yalnızca boş oranı. DSN değişkeni hedefe göre kodlandığı için modelden modele "
+                          "değişir; en çok kayan modelinki gösterilir.", 44),
         ("Nasıl kullanılır", "Tablo önce modele giren sorunlu değişkenlerle başlar. Çıkarmak için hazır liste hücrenin "
                              "çıktısında (STABIL_OLMAYAN_FE / _HAM) ve stabil_olmayan_degiskenler.csv'de.", 32),
     ]:
@@ -598,7 +664,13 @@ def _st_sayfa():
                           [("seg", N_RENK, 3), ("modelde", 2, 2), ("durum", 3, 3)])
     _st_esik_renk(ws, C, [f"psi_{d}" for d in _ST_KARS], R0, RS)
     r = RS + 3
-    S.baslik(r, "2) Modeller: skor PSI ve HHI", c2=son_mod)
+    S.baslik(r, "2) Modele giren değişkenler: her dönemde boş oranı, min, P5, medyan, ortalama, P95, max", c2=son_oz)
+    r += 2
+    R0, RS, C = _st_tablo(ws, S, r, _ST_K_OZET, _ST_G_OZET, _ST_T_OZET, "Stabilite_Dagilim",
+                          [("seg", N_RENK, 3), ("donem", len(_ST_DON), 3)])
+    _st_esik_renk(ws, C, ["psi"], R0, RS)
+    r = RS + 3
+    S.baslik(r, "3) Modeller: skor PSI ve HHI", c2=son_mod)
     r += 2
     R0, RS, C = _st_tablo(ws, S, r, _ST_K_MOD, _ST_G_MOD, _ST_T_MOD, "Stabilite_Model",
                           [("seg", N_RENK, 2), ("model", 2, 1), ("vade", 3, 2), ("durum", 3, 2)])
@@ -748,8 +820,8 @@ def _st_gorselleri_tazele():
                 raise RuntimeError("Görsel verisi bulunamadı: önce 18. hücreyi yeniden çalıştırın, sonra bu hücreyi.")
 
 
-for _ad, _t in (("stabilite_degiskenler", _ST_T_DEG), ("stabilite_model_skor", _ST_T_MOD),
-                ("stabil_olmayan_degiskenler", _ST_CIKAR)):
+for _ad, _t in (("stabilite_degiskenler", _ST_T_DEG), ("stabilite_dagilim_ozeti", _ST_T_OZET),
+                ("stabilite_model_skor", _ST_T_MOD), ("stabil_olmayan_degiskenler", _ST_CIKAR)):
     _b = BytesIO()
     pd.DataFrame(_t).to_csv(_b, index=False, encoding="utf-8")
     _b.seek(0)
@@ -780,4 +852,5 @@ if DILIMLEYICI_PLANI:
         _log(f"⚠ Dilimleyiciler eklenemedi ({type(e).__name__}: {e}); dosya dilimleyicisiz yazılıyor")
 mf.upload_stream(CIKTI_DOSYA, BytesIO(_veri))
 _log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yeniden yazıldı (sheet: {_ST_SAYFA}) | stabilite_degiskenler.csv "
-     f"({len(_ST_T_DEG)} satır), stabilite_model_skor.csv, stabil_olmayan_degiskenler.csv ({len(_ST_CIKAR)} satır)")
+     f"({len(_ST_T_DEG)} satır), stabilite_dagilim_ozeti.csv ({len(_ST_T_OZET)} satır), stabilite_model_skor.csv, "
+     f"stabil_olmayan_degiskenler.csv ({len(_ST_CIKAR)} satır)")
