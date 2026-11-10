@@ -1,867 +1,235 @@
-import os
-import re
-import time
-import zipfile
-from concurrent.futures import ThreadPoolExecutor
-import pickle
-import warnings
 import numpy as np
 import pandas as pd
-from io import BytesIO
-from openpyxl.formatting.rule import ColorScaleRule
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 # ==================================================================
-# 22) STABİLİTE: her değişkenin dönem bazında PSI (CSI) ve HHI'ı; sorunlu değişken hangi modellere girmiş
-# SIRA: ham veri → 5. hücre yardımcıları + FE + COLOR_MAP → 21 (feature üretimi ve doğrulama) → 18 → 22.
-# ------------------------------------------------------------------
-# AMAÇ: dönem dönem kayan değişkenleri bulmak ve modellere girenleri çıkarıp pipeline'ı yeniden çalıştırarak daha
-# stabil modeller kurmak. Bu yüzden yalnızca modele girenler değil, eğitimdeki havuzun bütün değişkenleri (ham + FE +
-# DSN) ölçülür: çıkarılan değişkenin yerine seçilecek olanın da stabil olduğu görülsün.
-# Tek ayar DONEMLER: ilki referans (modellerin eğitildiği dönem). Yeni dönem için listeye ekleyip yeniden çalıştırın.
-#   PSI (CSI): Σ (p_dönem - p_ref) x ln(p_dönem / p_ref). Değişkende buna CSI denir; aynı hesap. Sayısal değişken
-#              referansın 10 yüzdelik dilimine, kategorik değişken kategorilere ayrılır, boşlar ayrı dilim.
-#              Referansın en büyük değerine denk gelen sınır kullanılmaz (üstte boş dilim kalmasın; _st_sinirlar).
-#              0,10 altı Stabil, 0,10 ile 0,25 arası Dikkat, 0,25 üstü Belirgin kayma.
-#   HHI: aynı dilimlerde Σ p², değerler birkaç dilime yığılıyor mu (sayısal değişkende referansta ~0,10).
-#        Yaygın bir eşiği olmadığı için değer olarak verilir.
-#   Referans dönem kendisiyle karşılaştırılmaz (PSI'ı her zaman 0): PSI ve durum karşılaştırılan dönemler için verilir;
-#   referansın kendi değerleri HHI'da ve dağılım özetinde.
-# ÇIKTI
-#   Log: her dönemde sorunlu (PSI 0,10 üstü) ve modele giren değişkenler, girdikleri modellerle; sonunda pipeline'da
-#        çıkarmak için hazır liste.
-#   RENK_Model_Sonuclar.xlsx "Stabilite" sheet'i: 1) her değişken (renk x değişken) için her dönemin PSI (CSI), durumu
-#        ve HHI'ı, girdiği modeller; 2) modele giren her değişkenin her dönemde boş oranı, min, P5, medyan, ortalama,
-#        P95, max; 3) her modelin skor PSI ve HHI'ı.
-#   GOC_MODEL_RESULTS: stabilite_degiskenler.csv, stabilite_dagilim_ozeti.csv, stabilite_model_skor.csv,
-#        stabil_olmayan_degiskenler.csv.
+# 23) ODM PSI KONTROLÜ: 202511'deki yüksek ODM_AVG PSI'ı hesaptan mı, veriden mi geliyor?
+# SIRA: ham veri (df) bellekteyken; 22 çalıştıysa onun dönemlerini ve sonucunu da kullanır. Feature engineering
+# çalışmaz, birkaç dakikada biter. Yalnızca log yazar, dosya üretmez.
+# ODM_AVG_L3M / L6M / L12M ham KK_ODEME_ORANI_LM..L12M'den feature engineering ile aynı yolla hesaplanır
+# (penceredeki dolu ayların ortalaması; _summ ile birebir aynı toplama sırası).
+#   1) PSI üç yolla, 22'den bağımsız kodla: 22'nin önceki yöntemi, 22'nin yeni yöntemi, pandas qcut. 22 bellekteyse
+#      onun sonucu da yanında: önceki yöntemle aynıysa 22'nin hesabı doğru yeniden üretilmiş demektir.
+#   2) En yüksek PSI'ın dilim dilim dökümü: PSI hangi dilimden geliyor.
+#   3) Ham KK_ODEME_ORANI takvim ayı bazında (bütün KK müşterileri): kayma hangi aydan başlıyor.
+#   4) Aynı müşteri, aynı takvim ayı, farklı dönem satırı: değer aynı mı (kaynak tablo tutarlılığı).
 # ==================================================================
-DONEMLER = [202504, 202506, 202511]       # ilki referans; ör. 202601 eklemek için listeye yaz
+_OK_SERI, _OK_ONEK, _OK_DILIM, _OK_EPS, _OK_TAM = "KK_ODEME_ORANI", "ODM", 10, 1e-4, 100.0
+_OK_AYLAR = ["LM"] + [f"L{i}M" for i in range(2, 13)]
+_ok_yaz = globals().get("_log", print)
 
-_ST_SAYFA, _ST_DILIM, _ST_GRUP, _ST_ALT, _ST_UST, _ST_EPS = "Stabilite", 10, 20, 0.10, 0.25, 1e-4
-_ST_DURUM_RENK = {"Stabil": "C6EFCE", "Dikkat": "FFEB84", "Belirgin kayma": "F4B6B7"}
-_ST_DURUM_SIRA = {"Belirgin kayma": 2, "Dikkat": 1, "Stabil": 0}
-_ST_IS = max(1, min(8, os.cpu_count() or 1))                   # değişken istatistikleri paralel (iş parçacığı)
-_ST_GEREKLI = ["wb", "MODELLER", "RENKLER", "_MODEL_ADI", "TUM_MODELLER", "N_RENK", "mf", "Sayfa", "_yeni_sayfa",
-               "_tablo_ekle", "_dilimleyici_alani", "DILIMLEYICI_PLANI", "DILIMLEYICI_EKLE", "_dilimleyici_ekle", "_yazdir",
-               "_log", "_seg_etiket", "_adet", "CIKTI_DOSYA", "KARSILASTIRMA_SAYFA", "_VERI_WS", "_BOLUM", "_KENAR_B",
-               "BASLIK_YAZI", "YAZI_TIPI", "MAIN_FOLDER"]
-_st_eksik = [g for g in _ST_GEREKLI if g not in globals()]
-if _st_eksik:
-    raise RuntimeError("Bu hücre 18. hücre (RENK model sonuçları) aynı oturumda çalıştıktan sonra çalışır; bellekte yok: "
-                       f"{', '.join(_st_eksik)}. Önce 18. hücreyi çalıştırın.")
-if "feature_engineering" not in globals():
-    raise RuntimeError("feature_engineering bellekte yok: önce 5. hücre yardımcılarını ve FE hücresini çalıştırın.")
-_ST_VERI = globals().get("df") if isinstance(globals().get("df"), pd.DataFrame) else globals().get("df_raw")
-if not isinstance(_ST_VERI, pd.DataFrame) or not {"DONEM", "RENK"} <= set(_ST_VERI.columns):
-    raise RuntimeError("Ham veri bellekte yok: DONEM ve RENK kolonlu df (ya da df_raw) bekleniyor.")
-_ST_DON = [int(d) for d in dict.fromkeys(DONEMLER)]
-if len(_ST_DON) < 2:
-    raise ValueError("DONEMLER'de en az iki dönem olmalı: ilki referans, diğerleri karşılaştırılan.")
-_ST_REF, _ST_KARS = _ST_DON[0], _ST_DON[1:]
+_OK_V = globals().get("_ST_VERI")
+if not isinstance(_OK_V, pd.DataFrame):
+    _OK_V = globals().get("df") if isinstance(globals().get("df"), pd.DataFrame) else globals().get("df_raw")
+if not isinstance(_OK_V, pd.DataFrame) or not {"DONEM", "RENK"} <= set(_OK_V.columns):
+    raise RuntimeError("Ham veri bellekte yok: DONEM ve RENK kolonlu df bekleniyor.")
+_OK_KOL = [f"{_OK_SERI}_{a}" for a in _OK_AYLAR]
+_ok_eksik = [c for c in _OK_KOL if c not in _OK_V.columns]
+if _ok_eksik:
+    raise RuntimeError(f"Ham veride eksik kolon: {_ok_eksik}")
+_OK_DON = [int(d) for d in dict.fromkeys(globals().get("_ST_DON") or [202504, 202506, 202511])]
+_OK_REF, _OK_KARS = _OK_DON[0], _OK_DON[1:]
 
-
-# ==================================================================
-# 1) DEĞİŞKEN ÜRETİMİ VE SKOR (pipeline'daki renk_goc_skorla ile aynı yol; 21 ile aynı)
-# ==================================================================
-def _st_kat_metin(s):
-    """Kategori değerlerini metne çevirir; 1 ve 1.0 aynı metin ('1') olur (pipeline'daki _kat_metin)."""
-    if pd.api.types.is_numeric_dtype(s.dtype) and not pd.api.types.is_bool_dtype(s.dtype):
-        v = pd.to_numeric(s, errors="coerce").astype("float64")
-        out = v.astype("string")
-        tam = v.notna() & np.isfinite(v) & (v == np.round(v)) & (v.abs() < 2 ** 53)
-        out[tam] = v[tam].astype("int64").astype("string")
-        return out
-    return s.astype("string")
+_OK_DONEM_A = pd.to_numeric(_OK_V["DONEM"], errors="coerce").to_numpy()
+_OK_RENK_A = pd.to_numeric(_OK_V["RENK"], errors="coerce").to_numpy()
+_OK_KK_A = ((_OK_V["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in _OK_V.columns
+            else np.ones(len(_OK_V), dtype=bool))
+if "RENKLER" in globals():
+    _OK_RENKLER = [(k, a) for k, a, *_ in RENKLER]
+else:
+    _OK_RENKLER = [(int(k), str(int(k))) for k in sorted(set(_OK_RENK_A[np.isfinite(_OK_RENK_A)]))]
+_ok_etiket = globals().get("_seg_etiket", lambda k: str(k))
 
 
-_ST_DESEN_AYLAR = ["LM"] + [f"L{i}M" for i in range(2, 13)]
+def _ok_mat(pos):
+    return np.column_stack([pd.to_numeric(_OK_V[c].iloc[pos], errors="coerce").to_numpy("float64", na_value=np.nan)
+                            for c in _OK_KOL])
 
 
-def _st_desen_num(frame, c):
-    if c not in frame.columns:
-        return np.full(len(frame), np.nan)
-    return pd.to_numeric(frame[c], errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
+def _ok_ort(M, k):
+    """Feature engineering'deki _summ ile aynı: dolu ayların toplamı (soldan kümülatif) / dolu ay sayısı."""
+    gecerli = ~np.isnan(M)
+    dolu = np.where(gecerli, M, 0.0)
+    s = np.cumsum(dolu, axis=1)[:, k - 1]
+    n = np.cumsum(gecerli, axis=1, dtype=np.int8)[:, k - 1]
+    o = s / np.maximum(n, 1)
+    o[n == 0] = np.nan
+    return o
 
 
-def _st_desen_bin(v, sinirlar, etiketler):
-    out = np.full(len(v), "X", dtype=object)
+def _ok_sinir(r, yeni):
+    d = r[np.isfinite(r)]
+    s = np.unique(np.quantile(d, np.linspace(0, 1, _OK_DILIM + 1)[1:-1]))
+    return s[s < d.max()] if yeni else s
+
+
+def _ok_pay(v, sinir):
     ok = np.isfinite(v)
-    out[ok] = np.asarray(etiketler, dtype=object)[np.digitize(v[ok], sinirlar)]
-    return out
+    say = np.bincount(np.searchsorted(sinir, v[ok], side="left"), minlength=len(sinir) + 1).astype("float64")
+    return np.append(say, float((~ok).sum())) / max(len(v), 1)
 
 
-def _st_desen_birlestir(parcalar):
-    res = parcalar[0].astype(str)
-    for p in parcalar[1:]:
-        res = np.char.add(np.char.add(res, "|"), p.astype(str))
-    return res
-
-
-def _st_desen_anahtarlari(frame):
-    """Satır bazlı desen anahtarları (pipeline'daki _desen_anahtarlari, kaydir=0)."""
-    aylar = _ST_DESEN_AYLAR[:6]
-    aktif = [k for k, v in COLOR_MAP.items() if str(v).upper() != "INAKTIF"]
-    R = np.column_stack([_st_desen_num(frame, f"RENK_{m}") for m in aylar])
-    Rk = np.where(np.isin(R, aktif) | (R == 0), R, np.nan)
-    renk_str = np.where(np.isfinite(Rk), np.nan_to_num(Rk).astype(int).astype(str), "X")
-    anahtar = {"RENK3": _st_desen_birlestir([renk_str[:, j] for j in range(3)])}
-    Ra = np.where(np.isin(R, aktif), R, np.nan)
-    hareket = []
-    for j in range(5):
-        a, b = Ra[:, j], Ra[:, j + 1]
-        ok = np.isfinite(a) & np.isfinite(b)
-        h = np.where(a < b, "-", np.where(a > b, "+", "0"))
-        hareket.append(np.where(ok, h, "X"))
-    anahtar["RENK_HAREKET5"] = _st_desen_birlestir(hareket)
-    U = []
-    for m in aylar[:3]:
-        lim, rsk = _st_desen_num(frame, f"KK_LIMIT_{m}"), _st_desen_num(frame, f"KK_RISK_{m}")
-        ok = np.isfinite(lim) & np.isfinite(rsk) & (lim > 0)
-        U.append(np.where(ok, rsk / np.where(ok, lim, 1.0), np.nan))
-    kku = [_st_desen_bin(u, [0.3, 0.8, 0.9], ["a", "b", "c", "d"]) for u in U]
-    odm = [_st_desen_bin(_st_desen_num(frame, f"KK_ODEME_ORANI_{m}"), [20, 100], ["a", "b", "c"]) for m in aylar[:3]]
-    anahtar["KKU3"] = _st_desen_birlestir(kku)
-    anahtar["ODM3"] = _st_desen_birlestir(odm)
-    anahtar["RENK_KKU_ODM_LM"] = _st_desen_birlestir([renk_str[:, 0], kku[0], odm[0]])
-    return {k: pd.Series(v, index=frame.index) for k, v in anahtar.items()}
-
-
-_ST_DESEN_KOL = ([f"RENK_{m}" for m in _ST_DESEN_AYLAR[:6]] +
-                 [f"{b}_{m}" for b in ("KK_LIMIT", "KK_RISK", "KK_ODEME_ORANI") for m in _ST_DESEN_AYLAR[:3]])
-
-
-def _st_girdi(X, eng, paket):
-    """Ham satırlar (X) ve FE çıktısından (eng) modele giren tablo ve skor. renk_goc_skorla ile aynı: ham kolonu FE
-    dönüştürdüyse dönüşmüş hali, FE'nin ürettiği kolon yalnızca paketin engineered_features listesindeyse kullanılır."""
-    raw = set(paket["required_raw_features"])
-    eng_liste = set(paket["engineered_features"])
-
-    def kolon(c):
-        if c in raw:
-            if c in eng.columns and not eng[c].equals(X[c]):
-                return eng[c]
-            return X[c]
-        if c in eng_liste and c in eng.columns:
-            return eng[c]
-        return None
-
-    schema = paket["preprocess_schema"]
-    if schema.get("mode") != "train_fitted_native":
-        raise NotImplementedError("Yalnızca train_fitted_native ön işlemeli paketler skorlanabilir.")
-    feats = list(paket["features"])
-    desen = paket.get("desen_kodlama") or {}
-    ds_kolon = desen.get("kolonlar", {})
-    kolonlar = {}
-    for c in feats:
-        if c in ds_kolon:
-            continue
-        s = kolon(c)
-        if s is None:
-            raise KeyError(f"Modelin değişkeni üretilemedi: {c}")
-        if c in schema["categorical"]:
-            kolonlar[c] = _st_kat_metin(s).astype(pd.CategoricalDtype(categories=schema["categorical"][c]))
-        else:
-            kolonlar[c] = pd.to_numeric(s, errors="coerce")
-    ds_cols = [c for c in feats if c in ds_kolon]
-    if ds_cols:
-        if "COLOR_MAP" not in globals():
-            raise RuntimeError("Desen değişkenleri (DSN_*) için COLOR_MAP bellekte olmalı.")
-        cerceve = pd.DataFrame({c: s for c in _ST_DESEN_KOL if (s := kolon(c)) is not None}, index=X.index)
-        anahtar = _st_desen_anahtarlari(cerceve)
-        for c in ds_cols:
-            ad, tur = ds_kolon[c]
-            dolgu = desen["haritalar"][ad]["nadir_oran"] if tur == "oran" else 0.0
-            kolonlar[c] = pd.Series(anahtar[ad].map(desen["haritalar"][ad][tur]).fillna(dolgu).to_numpy(dtype="float64"),
-                                    index=X.index)
-    F = pd.DataFrame(kolonlar, index=X.index)[feats]
-    skor = paket["model"].predict_proba(F)[:, 1]
-    turler = {c: ("kategorik" if c in schema["categorical"] else "sayısal") for c in feats}
-    return F, np.asarray(skor, dtype="float64"), turler
-
-
-def _st_csi(p, q):
-    p = np.maximum(np.asarray(p, dtype="float64"), _ST_EPS)
-    q = np.maximum(np.asarray(q, dtype="float64"), _ST_EPS)
+def _ok_psi(p, q):
+    p, q = np.maximum(p, _OK_EPS), np.maximum(q, _OK_EPS)
     return float(np.sum((q - p) * np.log(q / p)))
 
 
-def _st_durum(x):
-    if not np.isfinite(x):
-        return None
-    return "Belirgin kayma" if x > _ST_UST else ("Dikkat" if x > _ST_ALT else "Stabil")
-
-
-def _st_paket(klasor, kod, ad):
-    yol = f"/{klasor}/renk_{kod}_{ad}_model.pkl"
+def _ok_psi_pandas(r, c):
+    """22'den bağımsız: pandas qcut ile referans ondalık sınırları, uçlar ±sonsuz, boşlar ayrı dilim."""
+    rs, cs = pd.Series(r), pd.Series(c)
     try:
-        with mf.get_download_stream(yol) as s:
-            ham = s.read()
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r"Trying to unpickle estimator")
-            paket = pickle.loads(ham)
-    except Exception as e:
-        return None, f"{yol} okunamadı ({type(e).__name__})"
-    gerekli = {"model", "features", "required_raw_features", "engineered_features", "preprocess_schema"}
-    if not isinstance(paket, dict) or not gerekli <= set(paket):
-        return None, f"{yol} skorlama paketi değil (eksik: {sorted(gerekli - set(paket)) if isinstance(paket, dict) else 'hepsi'})"
-    return paket, None
+        _, b = pd.qcut(rs.dropna(), _OK_DILIM, retbins=True, duplicates="drop")
+        b[0], b[-1] = -np.inf, np.inf
+        pr = np.append(pd.Series(pd.cut(rs.dropna(), b)).value_counts(sort=False).to_numpy(), rs.isna().sum()) / len(rs)
+        pc = np.append(pd.Series(pd.cut(cs.dropna(), b)).value_counts(sort=False).to_numpy(), cs.isna().sum()) / len(cs)
+    except Exception:
+        return np.nan
+    return _ok_psi(pr, pc)
 
 
-class _StUretim:
-    """Bir renk x dönem x ham kolon seti için FE çıktısı; değişkenler paketin tanımıyla tek tek istenir."""
-
-    def __init__(self, X, eng, eng_liste):
-        self.X, self.eng, self.eng_liste = X, eng, eng_liste
-        self._anahtar = None
-        self._degisti = {}
-
-    def _ham_veya_fe(self, c, raw, eng_set):
-        if c in raw:
-            if c in self.eng.columns:
-                if c not in self._degisti:
-                    self._degisti[c] = not self.eng[c].equals(self.X[c])
-                if self._degisti[c]:
-                    return self.eng[c]                        # FE ham kolonu dönüştürdüyse dönüşmüş hali
-            return self.X[c]
-        if c in eng_set and c in self.eng.columns:
-            return self.eng[c]
-        return None
-
-    def kolon(self, c, paket):
-        """Değişkenin modelin gördüğü hali (sayısal ya da paketteki kategorilerle kategorik)."""
-        raw, eng_set = set(paket["required_raw_features"]), set(paket["engineered_features"])
-        desen = paket.get("desen_kodlama") or {}
-        ds = desen.get("kolonlar", {})
-        if c in ds:
-            if self._anahtar is None:
-                if "COLOR_MAP" not in globals():
-                    raise RuntimeError("Desen değişkenleri (DSN_*) için COLOR_MAP bellekte olmalı.")
-                cer = pd.DataFrame({k: s for k in _ST_DESEN_KOL if (s := self._ham_veya_fe(k, raw, eng_set)) is not None},
-                                   index=self.X.index)
-                self._anahtar = _st_desen_anahtarlari(cer)
-            ad, tur = ds[c]
-            dolgu = desen["haritalar"][ad]["nadir_oran"] if tur == "oran" else 0.0
-            return pd.Series(self._anahtar[ad].map(desen["haritalar"][ad][tur]).fillna(dolgu).to_numpy(dtype="float64"),
-                             index=self.X.index)
-        s = self._ham_veya_fe(c, raw, eng_set)
-        if s is None:
-            raise KeyError(f"Değişken üretilemedi: {c}")
-        schema = paket["preprocess_schema"]
-        if c in schema.get("categorical", {}):
-            return _st_kat_metin(s).astype(pd.CategoricalDtype(categories=schema["categorical"][c]))
-        return pd.to_numeric(s, errors="coerce")
-
-    def girdi_ve_skor(self, paket):
-        if paket["preprocess_schema"].get("mode") != "train_fitted_native":
-            raise NotImplementedError("Yalnızca train_fitted_native ön işlemeli paketler skorlanabilir.")
-        feats = list(paket["features"])
-        F = pd.DataFrame({c: self.kolon(c, paket) for c in feats}, index=self.X.index)[feats]
-        return F, np.asarray(paket["model"].predict_proba(F)[:, 1], dtype="float64")
+def _ok_y(x, n=1):
+    return "" if x is None or not np.isfinite(x) else f"%{100 * x:.{n}f}".replace(".", ",")
 
 
-def _st_havuz(paket):
-    """Eğitimdeki eleme öncesi havuz: ham + FE + DSN (pipeline'daki FEATURES sırası)."""
-    raw = list(paket["required_raw_features"])
-    fe = [c for c in paket["engineered_features"] if c not in set(raw)]
-    ds = list((paket.get("desen_kodlama") or {}).get("kolonlar", {}))
-    return raw + fe + [c for c in ds if c not in set(raw + fe)]
-
-
-def _st_sinirlar(dolu, n):
-    """Referansın n'lik yüzdelik sınırları. Referansın en büyük değerine eşit (ya da üstünde) sınır atılır: ör. ödeme
-    oranında %100'de yığılma varsa üst yüzdelikler 100'e denk gelir ve (100, ∞) dilimi referansta boş kalır. Boş dilim
-    PSI'da 1e-4 sayıldığı için referansın biraz üstüne çıkan birkaç müşteri (ör. %100,5) PSI'ı tek başına
-    'Belirgin kayma'ya taşırdı. Sınır atılınca bu müşteriler en üst dilime girer; aralık dışına çıkış Max kolonunda görünür."""
-    if not len(dolu):
-        return np.array([])
-    s = np.unique(np.quantile(dolu, np.linspace(0, 1, n + 1)[1:-1]))
-    return s[s < dolu.max()]
-
-
-def _st_ozet(v):
-    """Boşlar hariç dağılım özeti (v yalnızca dolu değerler): min, P5, medyan, ortalama, P95, max."""
-    if not len(v):
-        return {}
-    p5, med, p95 = np.quantile(v, [0.05, 0.5, 0.95])
-    return {"min": float(v.min()), "p5": float(p5), "med": float(med), "ort": float(v.mean()), "p95": float(p95),
-            "max": float(v.max())}
-
-
-def _st_kolon_ist(s, kategorik, ref=None):
-    """Bir değişkenin bir dönemdeki dağılımı: dilim payları, PSI (CSI), HHI, boş oranı ve (sayısalda) dağılım özeti.
-    ref None ise dilimler buradan kurulur."""
-    if kategorik:
-        v = s.astype("object")
-        bos = v.isna().to_numpy()
-        say = pd.Series(v[~bos]).value_counts()
-        kat = ref["kat"] if ref else list(say.index)
-        pay = [float(say.get(k, 0)) for k in kat] + [float(say[~say.index.isin(kat)].sum()), float(bos.sum())]
-        d = {"kat": kat}
-    else:
-        v = pd.to_numeric(s, errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
-        ok = np.isfinite(v)
-        dolu = v[ok]
-        sinir = ref["sinir"] if ref else _st_sinirlar(dolu, _ST_DILIM)
-        idx = np.searchsorted(sinir, dolu, side="left")
-        pay = list(np.bincount(idx, minlength=len(sinir) + 1).astype("float64")) + [float((~ok).sum())]
-        d = {"sinir": sinir, "ozet": _st_ozet(dolu)}
-    pay = np.asarray(pay, dtype="float64") / max(len(s), 1)
-    d.update({"pay": pay, "bos": float(pay[-1]), "hhi": float(np.sum(pay ** 2)),
-              "csi": _st_csi(ref["pay"], pay) if ref else np.nan})
-    return d
-
-
-def _st_skor_ist(skor, ref=None):
-    """Skorun 20'li gruplardaki payı (referansın sınırlarıyla; B1 = en riskli), PSI ve HHI."""
-    s = np.asarray(skor, dtype="float64")
-    ok = np.isfinite(s)
-    sinir = ref["sinir"] if ref else _st_sinirlar(s[ok], _ST_GRUP)
-    say = np.bincount(np.searchsorted(sinir, s[ok], side="left"), minlength=len(sinir) + 1).astype("float64")[::-1]
-    pay = say / max(say.sum(), 1.0)
-    return {"sinir": sinir, "pay": pay, "hhi": float(np.sum(pay ** 2)), "psi": _st_csi(ref["pay"], pay) if ref else np.nan}
-
-
-_ST_RENK_A = pd.to_numeric(_ST_VERI["RENK"], errors="coerce").to_numpy()
-_ST_DONEM_A = pd.to_numeric(_ST_VERI["DONEM"], errors="coerce").to_numpy()
-_ST_KK_A = ((_ST_VERI["KK_URUN_FLG"] == "KK").to_numpy() if "KK_URUN_FLG" in _ST_VERI.columns
-            else np.ones(len(_ST_VERI), dtype=bool))
-
-
-def _st_satirlar(kod, donem, kolonlar):
-    """Pipeline kitlesi: KK ürünü, renk, dönem; bütün müşteriler."""
-    pos = np.flatnonzero((_ST_RENK_A == kod) & (_ST_DONEM_A == donem) & _ST_KK_A)
-    kol = [c for c in dict.fromkeys(kolonlar) if c in _ST_VERI.columns]
-    return _ST_VERI.iloc[pos, [_ST_VERI.columns.get_loc(c) for c in kol]]
+def _ok_s(x, n=3):
+    return "" if x is None or not np.isfinite(x) else f"{x:,.{n}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 # ==================================================================
-# 2) HESAP: her renkte önce referans; FE her renk x dönem x ham kolon setinde bir kez
+# 1) PSI ÜÇ YOLLA
 # ==================================================================
-if "_ST_ONB" not in globals():
-    _ST_ONB = {}
-_ST_SURUM = 3                                                # hesap değişirse artar; eski bellek silinir
-_st_v0 = (id(_ST_VERI), len(_ST_VERI), _ST_SURUM)
-for _k in [k for k in _ST_ONB if k[0] != _st_v0]:
-    del _ST_ONB[_k]                                          # ham veri yeniden çekildiyse eski hesaplar silinir
-_st_donem_var = set(pd.to_numeric(_ST_VERI["DONEM"], errors="coerce").dropna().astype(int).unique())
-if _ST_REF not in _st_donem_var:
-    raise RuntimeError(f"Referans dönem {_ST_REF} ham veride yok.")
-_st_yok = [d for d in _ST_KARS if d not in _st_donem_var]
-_log(f"Stabilite: referans {_ST_REF} | karşılaştırılan {', '.join(map(str, _ST_KARS))} | {len(TUM_MODELLER)} model"
-     + (f" | ⚠ veride olmayan dönem: {_st_yok}" if _st_yok else ""))
-if not _ST_ONB:
-    _log("   İlk çalıştırma: her renk ve dönem için değişkenler ham veriden yeniden üretiliyor (21 kadar sürer). "
-         "Aynı oturumda tekrar çalıştırınca ya da dönem ekleyince hesaplanan dönemler bellekten gelir.")
+_ok_degerler = {}                                             # (renk, değişken, dönem) → değerler
+for _kod, _ad in _OK_RENKLER:
+    for d in _OK_DON:
+        pos = np.flatnonzero((_OK_RENK_A == _kod) & (_OK_DONEM_A == d) & _OK_KK_A)
+        if not len(pos):
+            continue
+        M = _ok_mat(pos)
+        for k in (3, 6, 12):
+            _ok_degerler[(_kod, f"{_OK_ONEK}_AVG_L{k}M", d)] = _ok_ort(M, k)
 
-_ST_DEG = {}          # (renk, değişken) → {kaynak, tür, modeller, ist: {dönem: kolon istatistiği}}
-_ST_MOD = []          # model → skor istatistikleri
-_st_atlanan = []
-for _kod, _ad, _ in RENKLER:
-    pk = {}
-    for kod, v, a in TUM_MODELLER:
-        if kod != _kod or kod not in MODELLER[(v, a)]["renkler"]:
+_ok_satir, _ok_dokum = [], {}
+_ST_DEG_ = globals().get("_ST_DEG") or {}
+for _kod, _ad in _OK_RENKLER:
+    for k in (3, 6, 12):
+        f = f"{_OK_ONEK}_AVG_L{k}M"
+        r = _ok_degerler.get((_kod, f, _OK_REF))
+        if r is None or not np.isfinite(r).any():
             continue
-        paket, hata = _st_paket(MODELLER[(v, a)]["klasor"], _kod, _ad)
-        if paket is None:
-            _st_atlanan.append(f"{MODELLER[(v, a)]['klasor']} renk {_kod}: {hata}")
-            continue
-        pk[(v, a)] = {"p": paket, "klasor": MODELLER[(v, a)]["klasor"], "ham": tuple(paket["required_raw_features"]),
-                      "ad": f"{v}M {_MODEL_ADI[a]}", "v": v, "a": a, "skor": {}}
-    if not pk:
+        s_eski, s_yeni = _ok_sinir(r, False), _ok_sinir(r, True)
+        p_eski, p_yeni = _ok_pay(r, s_eski), _ok_pay(r, s_yeni)
+        rmax = float(np.nanmax(r))
+        for d in _OK_KARS:
+            c = _ok_degerler.get((_kod, f, d))
+            if c is None:
+                continue
+            q_eski = _ok_pay(c, s_eski)
+            psi_eski = _ok_psi(p_eski, q_eski)
+            ist22 = (_ST_DEG_.get((_kod, f)) or {}).get("ist", {}).get(d)
+            _ok_satir.append({
+                "Renk": _ok_etiket(_kod), "Değişken": f, "Dönem": d,
+                "22 sonucu": _ok_s(ist22["csi"]) if ist22 else "",
+                "PSI önceki yöntem": _ok_s(psi_eski), "PSI yeni yöntem": _ok_s(_ok_psi(p_yeni, _ok_pay(c, s_yeni))),
+                "PSI pandas qcut": _ok_s(_ok_psi_pandas(r, c)),
+                "Ref max": _ok_s(rmax, 2), "Ref max üstü pay": _ok_y(float(np.mean(c > rmax)), 2),
+                "Ref = max payı": _ok_y(float(np.mean(r == rmax))), "Dönem = ref max payı": _ok_y(float(np.mean(c == rmax))),
+                "Boş ref": _ok_y(float(np.mean(~np.isfinite(r)))), "Boş dönem": _ok_y(float(np.mean(~np.isfinite(c)))),
+                "_psi": psi_eski})
+            _ok_dokum[(_kod, f, d)] = (s_eski, p_eski, q_eski)
+
+_ok_t1 = pd.DataFrame(_ok_satir).sort_values("_psi", ascending=False)
+print(f"\n1) {_OK_ONEK}_AVG PSI'ı, referans {_OK_REF} (yalnızca 22'den bağımsız kodla)")
+print("   22 sonucu: 22 bu oturumda çalıştıysa bellekteki PSI. 'PSI önceki yöntem' ile aynıysa 22 doğru hesaplamış.")
+print("   PSI yeni yöntem: referansın en büyük değerine denk gelen dilim sınırı atılmış hali (22'nin güncel sürümü).")
+with pd.option_context("display.width", 250, "display.max_columns", 50, "display.max_rows", 500):
+    print(_ok_t1.drop(columns="_psi").to_string(index=False))
+
+# ==================================================================
+# 2) EN YÜKSEK PSI'IN DİLİM DİLİM DÖKÜMÜ (önceki yöntemin dilimleri)
+# ==================================================================
+if len(_ok_t1):
+    _r0 = _ok_t1.iloc[0]
+    _kod0 = next(k for k, _ in _OK_RENKLER if _ok_etiket(k) == _r0["Renk"])
+    s_e, p_e, q_e = _ok_dokum[(_kod0, _r0["Değişken"], int(_r0["Dönem"]))]
+    sinirlar = [-np.inf] + list(s_e) + [np.inf]
+    _sn = lambda x: "-∞" if x == -np.inf else ("∞" if x == np.inf else _ok_s(x, 2))
+    adlar = [f"({_sn(sinirlar[i])} ; {_sn(sinirlar[i + 1])}]" for i in range(len(s_e) + 1)] + ["boş"]
+    pp, qq = np.maximum(p_e, _OK_EPS), np.maximum(q_e, _OK_EPS)
+    t2 = pd.DataFrame({"Dilim": adlar, f"Pay {_OK_REF}": [_ok_y(x) for x in p_e],
+                       f"Pay {_r0['Dönem']}": [_ok_y(x) for x in q_e],
+                       "PSI katkısı": [_ok_s(x) for x in (qq - pp) * np.log(qq / pp)]})
+    print(f"\n2) {_r0['Renk']} {_r0['Değişken']} {_r0['Dönem']}: PSI {_r0['PSI önceki yöntem']} hangi dilimden geliyor")
+    print("   Referans payı %0,0 olan bir dilim varsa PSI'a 1e-4 ile girer; birkaç müşteri bile büyük katkı yapar.")
+    print(t2.to_string(index=False))
+
+# ==================================================================
+# 3) HAM KK_ODEME_ORANI TAKVİM AYI BAZINDA (bütün KK müşterileri)
+# ==================================================================
+def _ok_ay(yyyymm):
+    return (int(yyyymm) // 100) * 12 + int(yyyymm) % 100 - 1
+
+
+def _ok_ay_ad(i):
+    return f"{i // 12}{i % 12 + 1:02d}"
+
+
+_ok_t3 = []
+for d in _OK_DON:
+    pos = np.flatnonzero((_OK_DONEM_A == d) & _OK_KK_A)
+    if not len(pos):
         continue
-    gruplar = {}
-    for x, m in pk.items():
-        gruplar.setdefault(m["ham"], []).append(x)
-    for d in [x for x in _ST_DON if x in _st_donem_var]:
-        rows, _t0, _hesap = None, time.time(), False
-        for ham, xs in gruplar.items():
-            p0 = pk[xs[0]]["p"]                                   # havuz bu ham kolon setindeki ilk modelin paketinden
-            ds0 = set((p0.get("desen_kodlama") or {}).get("kolonlar", {}))
-            havuz = [c for c in _st_havuz(p0) if c not in ds0]
-            a_h = (_st_v0, _kod, ham, d)
-            lazim_h = a_h not in _ST_ONB and (d == _ST_REF or (_st_v0, _kod, ham, _ST_REF) in _ST_ONB)
-            lazim_m = [x for x in xs if (_st_v0, pk[x]["klasor"], _kod, d) not in _ST_ONB
-                       and (d == _ST_REF or (_st_v0, pk[x]["klasor"], _kod, _ST_REF) in _ST_ONB)]
-            if lazim_h or lazim_m:
-                _hesap = True
-                if rows is None:
-                    rows = _st_satirlar(_kod, d, [c for h in gruplar for c in h])
-                eksik = [c for c in ham if c not in rows.columns]
-                if eksik:
-                    _st_atlanan.append(f"renk {_kod} {d}: ham veride eksik kolon {eksik[:5]}")
-                    continue
-                X = rows.loc[:, list(ham)]
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    eng, _ = feature_engineering(X)
-                U = _StUretim(X, eng, None)
-                if lazim_h:                                   # havuzdaki her değişken (DSN hariç; o modele göre)
-                    kat = set(p0["preprocess_schema"].get("categorical", {}))
-                    ref_h = None if d == _ST_REF else _ST_ONB[(_st_v0, _kod, ham, _ST_REF)]
-
-                    def _bir(c, U=U, p0=p0, kat=kat, ref_h=ref_h):
-                        try:
-                            return c, _st_kolon_ist(U.kolon(c, p0), c in kat, ref_h[c] if ref_h else None)
-                        except Exception:
-                            return c, None
-
-                    with ThreadPoolExecutor(max_workers=_ST_IS) as ex:
-                        _ST_ONB[a_h] = {c: r for c, r in ex.map(_bir, havuz) if r is not None}
-                for x in lazim_m:                             # modelin skoru ve DSN değişkenleri
-                    m = pk[x]
-                    ref_m = None if d == _ST_REF else _ST_ONB[(_st_v0, m["klasor"], _kod, _ST_REF)]
-                    try:
-                        _, skor, _ = _st_girdi(X, eng, m["p"])
-                    except Exception as e:
-                        _st_atlanan.append(f"{m['klasor']} renk {_kod} {d}: skorlanamadı ({type(e).__name__}: {e})")
-                        continue
-                    dsn = {}
-                    for c in (m["p"].get("desen_kodlama") or {}).get("kolonlar", {}):
-                        dsn[c] = _st_kolon_ist(U.kolon(c, m["p"]), False, ref_m["dsn"][c] if ref_m else None)
-                    _ST_ONB[(_st_v0, m["klasor"], _kod, d)] = {"skor": _st_skor_ist(skor, ref_m["skor"] if ref_m else None),
-                                                               "dsn": dsn}
-                del U, eng, X
-            # sonuçları topla
-            for c, ist in (_ST_ONB.get(a_h) or {}).items():
-                g = _ST_DEG.setdefault((_kod, c), {"kod": _kod, "feat": c, "ist": {},
-                                                   "kaynak": "HAM" if c in ham else "FE",
-                                                   "tur": "kategorik" if "kat" in ist else "sayısal"})
-                g["ist"][d] = ist
-            for x in xs:
-                mm = _ST_ONB.get((_st_v0, pk[x]["klasor"], _kod, d))
-                if not mm:
-                    continue
-                pk[x]["skor"][d] = mm["skor"]
-                for c, ist in mm["dsn"].items():                # DSN hedefe göre kodlanır: her modelin kendi değeri
-                    g = _ST_DEG.setdefault((_kod, c), {"kod": _kod, "feat": c, "ist": {}, "kaynak": "DSN", "tur": "sayısal"})
-                    g.setdefault("dsn_m", {}).setdefault(pk[x]["ad"], {})[d] = ist
-        del rows
-        _log(f"   renk {_kod} {d}: {_adet(int(((_ST_RENK_A == _kod) & (_ST_DONEM_A == d) & _ST_KK_A).sum()))} müşteri | "
-             + (f"hesaplandı ({time.time() - _t0:.0f} sn)" if _hesap else "bellekten"))
-    for (k, c), g in _ST_DEG.items():                         # DSN: en çok kayan modelin değerleri, bütün dönemlerde aynı model
-        if k == _kod and g.get("dsn_m"):
-            g["ist"] = dict(max(g["dsn_m"].values(), key=lambda s: max(
-                [i["csi"] for i in s.values() if np.isfinite(i["csi"])], default=-1.0)))
-    for x, m in pk.items():                                   # hangi değişken hangi modele girmiş
-        for c in m["p"]["features"]:
-            g = _ST_DEG.get((_kod, c))
-            if g is not None:
-                g.setdefault("modeller", []).append(m["ad"])
-        if m["skor"]:
-            _ST_MOD.append({"kod": _kod, "ad": m["ad"], "v": m["v"], "a": m["a"], "skor": m["skor"]})
-    del pk
-for _m in _st_atlanan:
-    _log(f"   ⚠ {_m}")
-if not _ST_DEG:
-    raise RuntimeError("Hiçbir değişken için stabilite hesaplanamadı (yukarıdaki uyarılara bakın).")
-
+    M = _ok_mat(pos)
+    for j, a in enumerate(_OK_AYLAR):
+        v = M[:, j]
+        ok = np.isfinite(v)
+        q = np.quantile(v[ok], [0.05, 0.5, 0.95]) if ok.any() else [np.nan] * 3
+        _ok_t3.append({"Takvim ayı": _ok_ay_ad(_ok_ay(d) - (j + 1)), "Dönem satırı": d, "Kolon": f"{_OK_SERI}_{a}",
+                       "Müşteri": f"{len(v):,}".replace(",", "."), "Boş": _ok_y(float(np.mean(~ok))),
+                       "= 0": _ok_y(float(np.mean(v == 0))), f"= {_OK_TAM:.0f}": _ok_y(float(np.mean(v == _OK_TAM))),
+                       f"> {_OK_TAM:.0f}": _ok_y(float(np.mean(v > _OK_TAM)), 2),
+                       "P5": _ok_s(q[0], 2), "Medyan": _ok_s(q[1], 2), "P95": _ok_s(q[2], 2),
+                       "Max": _ok_s(float(v[ok].max()) if ok.any() else np.nan, 2)})
+print(f"\n3) Ham {_OK_SERI} takvim ayı bazında (bütün KK müşterileri; LM = dönemden bir önceki ay)")
+print("   Aynı takvim ayı birden çok dönem satırında varsa alt alta: değerler benzer olmalı. Kayma hangi aydan "
+      "başlıyorsa orada görünür.")
+with pd.option_context("display.width", 250, "display.max_columns", 50, "display.max_rows", 500):
+    print(pd.DataFrame(_ok_t3).sort_values(["Takvim ayı", "Dönem satırı"]).to_string(index=False))
 
 # ==================================================================
-# 3) SONUÇ: her değişken x dönem; sorunlu ve modele girenler
+# 4) AYNI MÜŞTERİ, AYNI TAKVİM AYI, FARKLI DÖNEM SATIRI
 # ==================================================================
-_ST_T_DEG = []
-for g in _ST_DEG.values():
-    t = {"seg": _seg_etiket(g["kod"]), "feat": g["feat"], "kaynak": g["kaynak"], "tur": g["tur"],
-         "modelde": "Evet" if g.get("modeller") else "Hayır", "n_model": len(g.get("modeller", [])),
-         "modeller": ", ".join(g.get("modeller", [])), "hhi_R": g["ist"].get(_ST_REF, {}).get("hhi", np.nan)}
-    kotu = []
-    for d in _ST_KARS:
-        ist = g["ist"].get(d)
-        if ist is None or not np.isfinite(ist["csi"]):
-            continue
-        t[f"psi_{d}"], t[f"hhi_{d}"], t[f"dr_{d}"] = ist["csi"], ist["hhi"], _st_durum(ist["csi"])
-        kotu.append(ist["csi"])
-    t["psi_max"] = max(kotu) if kotu else np.nan
-    t["durum"] = _st_durum(t["psi_max"]) if kotu else None
-    _ST_T_DEG.append(t)
-# önce modele giren sorunlular, sonra diğerleri; her grupta en yüksek PSI başta
-_ST_T_DEG.sort(key=lambda t: (t["modelde"] != "Evet", -_ST_DURUM_SIRA.get(t["durum"], -1),
-                              -(t["psi_max"] if np.isfinite(t["psi_max"]) else -1)))
-
-# modele giren değişkenlerin her dönemdeki dağılım özeti (1. tablonun sırasıyla; her değişkenin dönemleri alt alta)
-_st_sira = {(t["seg"], t["feat"]): i for i, t in enumerate(_ST_T_DEG)}
-_ST_T_OZET = []
-for g in sorted((g for g in _ST_DEG.values() if g.get("modeller")),
-                key=lambda g: _st_sira[(_seg_etiket(g["kod"]), g["feat"])]):
-    for d in _ST_DON:
-        ist = g["ist"].get(d)
-        if ist is None:
-            continue
-        oz, ref = ist.get("ozet") or {}, d == _ST_REF
-        _ST_T_OZET.append({"seg": _seg_etiket(g["kod"]), "feat": g["feat"], "kaynak": g["kaynak"], "tur": g["tur"],
-                           "donem": f"{d} (referans)" if ref else str(d), "bos": ist["bos"],
-                           **{k: oz.get(k, np.nan) for k in ("min", "p5", "med", "ort", "p95", "max")},
-                           "psi": np.nan if ref else ist["csi"], "durum": None if ref else _st_durum(ist["csi"]),
-                           "modeller": ", ".join(g["modeller"])})
-
-_ST_T_MOD = []
-for m in sorted(_ST_MOD, key=lambda m: (m["kod"], m["v"], m["a"])):
-    t = {"seg": _seg_etiket(m["kod"]), "model": _MODEL_ADI[m["a"]], "vade": m["v"], "hhi_R": m["skor"][_ST_REF]["hhi"]}
-    kotu = []
-    for d in _ST_KARS:
-        sk = m["skor"].get(d)
-        if sk:
-            t[f"psi_{d}"], t[f"hhi_{d}"] = sk["psi"], sk["hhi"]
-            kotu.append(sk["psi"])
-    t["durum"] = _st_durum(max(kotu)) if kotu else None
-    t["n_sorunlu"] = sum(1 for g in _ST_T_DEG if g["modelde"] == "Evet" and g["seg"] == t["seg"]
-                         and _ST_DURUM_SIRA.get(g["durum"], 0) >= 1 and f"{m['v']}M {_MODEL_ADI[m['a']]}" in g["modeller"].split(", "))
-    _ST_T_MOD.append(t)
-
-for d in _ST_KARS:
-    sor = [t for t in _ST_T_DEG if _ST_DURUM_SIRA.get(t.get(f"dr_{d}"), 0) >= 1]
-    sor_m = sorted([t for t in sor if t["modelde"] == "Evet"], key=lambda t: -t[f"psi_{d}"])
-    mp = sorted([t for t in _ST_T_MOD if np.isfinite(t.get(f"psi_{d}", np.nan)) and t[f"psi_{d}"] > _ST_ALT],
-                key=lambda t: -t[f"psi_{d}"])
-    _log(f"   {d}: sorunlu değişken (PSI 0,10 üstü) {len(sor)}, bunlardan modele giren {len(sor_m)} | skor PSI'ı 0,10 "
-         f"üstü model {len(mp)}")
-    for t in sor_m:
-        _log(f"      {'⚠' if t[f'dr_{d}'] == 'Belirgin kayma' else '•'} {t['seg']} {t['feat']}: PSI (CSI) "
-             f"{t[f'psi_{d}']:.3f} | HHI {t['hhi_R']:.3f} → {t[f'hhi_{d}']:.3f}".replace(".", ",")
-             + f" | modeller: {t['modeller']}")
-    for t in mp:
-        _log(f"      {'⚠' if t[f'psi_{d}'] > _ST_UST else '•'} skor: {t['seg']} {t['vade']}M {t['model']} PSI "
-             f"{t[f'psi_{d}']:.3f}".replace(".", ","))
-
-# çıkarma listesi: herhangi bir karşılaştırılan dönemde belirgin kayma (PSI 0,25 üstü)
-_ST_CIKAR = [t for t in _ST_T_DEG if t["durum"] == "Belirgin kayma"]
-_st_fe = sorted({t["feat"] for t in _ST_CIKAR if t["kaynak"] == "FE"})
-_st_ham = sorted({t["feat"] for t in _ST_CIKAR if t["kaynak"] == "HAM"})
-_st_dsn = sorted({t["feat"] for t in _ST_CIKAR if t["kaynak"] == "DSN"})
-_log(f"   Belirgin kayma (herhangi bir dönemde PSI 0,25 üstü): {len(_ST_CIKAR)} renk x değişken; modele giren "
-     f"{sum(1 for t in _ST_CIKAR if t['modelde'] == 'Evet')}")
-print("\n# Pipeline'ı stabil değişkenlerle yeniden çalıştırmak için (bütün renklerde ortak liste):")
-print("# FE değişkenleri: LEAK_COLS'a eklenirse yalnızca bu değişkenler havuzdan çıkar")
-print(f"STABIL_OLMAYAN_FE = {_st_fe}")
-print("# Ham değişkenler: LEAK_COLS'a eklenirse feature engineering'e de girmez, bunlardan üretilen FE değişkenleri de çıkar")
-print(f"STABIL_OLMAYAN_HAM = {_st_ham}")
-if _st_dsn:
-    print("# DSN değişkenleri tek tek çıkarılamaz; DESEN_AKTIF = False hepsini kapatır")
-    print(f"STABIL_OLMAYAN_DSN = {_st_dsn}")
-print("# Kullanım (pipeline hücresinden önce): LEAK_COLS = set(LEAK_COLS) | set(STABIL_OLMAYAN_FE)\n")
-
-
-# ==================================================================
-# 4) SHEET
-# ==================================================================
-_ST_K_DEG = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Değişken", None, 34, "feat"), ("M", "Kaynak", None, 8, "kaynak"),
-              ("M", "Modelde", None, 9, "modelde")]
-             + [("P", f"PSI (CSI): {d}", "0.000", 10, f"psi_{d}") for d in _ST_KARS]
-             + [("D", f"Durum: {d}", None, 14, f"dr_{d}") for d in _ST_KARS]
-             + [("H", f"HHI: {_ST_REF}", "0.000", 9, "hhi_R")]
-             + [("H", f"HHI: {d}", "0.000", 9, f"hhi_{d}") for d in _ST_KARS]
-             + [("R", "En kötü durum", None, 14, "durum"), ("R", "Girdiği model sayısı", "0", 9, "n_model"),
-                ("R", "Girdiği modeller", None, 70, "modeller")])
-_ST_G_DEG = {"M": "Değişken", "P": f"PSI (CSI), referans {_ST_REF}", "D": "Durum", "H": "HHI (dilimlerde yığılma)",
-             "R": "Sonuç ve modeller"}
-_ST_K_OZET = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Değişken", None, 34, "feat"),
-               ("M", "Dönem", None, 16, "donem"), ("M", "Tür", None, 10, "tur"), ("O", "Boş oranı", "0.0%", 9, "bos")]
-              + [("O", a, "SAYI", 12, k) for a, k in (("Min", "min"), ("P5", "p5"), ("Medyan", "med"),
-                                                       ("Ortalama", "ort"), ("P95", "p95"), ("Max", "max"))]
-              + [("P", "PSI (CSI)", "0.000", 10, "psi"), ("P", "Durum", None, 14, "durum")])
-_ST_G_OZET = {"M": "Değişken ve dönem", "O": "Dağılım: boş oranı ve dolu değerlerin özeti", "P": f"Referansa ({_ST_REF}) göre"}
-_ST_K_MOD = ([("M", "Renk Segmenti", None, 13, "seg"), ("M", "Model", None, 34, "model"), ("M", "Hedef Süre", "0", 8, "vade")]
-             + [("P", f"Skor PSI: {d}", "0.000", 10, f"psi_{d}") for d in _ST_KARS]
-             + [("H", f"Skor HHI: {_ST_REF}", "0.000", 10, "hhi_R")]
-             + [("H", f"Skor HHI: {d}", "0.000", 10, f"hhi_{d}") for d in _ST_KARS]
-             + [("R", "Durum", None, 14, "durum"), ("R", "Sorunlu değişken sayısı (modelde)", "0", 12, "n_sorunlu")])
-_ST_G_MOD = {"M": "Model", "P": "Skor PSI", "H": "Skor HHI", "R": "Sonuç"}
-
-
-def _st_deger(x):
-    if x is None or (isinstance(x, (float, np.floating)) and not np.isfinite(x)):
-        return None
-    return x.item() if hasattr(x, "item") else x
-
-
-def _st_sayi_bicim(x):
-    """Değişkenlerin ölçeği farklı (oran, adet, tutar): hücrenin büyüklüğüne göre okunur bir biçim."""
-    if x is None:
-        return "General"
-    a = abs(x)
-    return "0.0000" if a < 10 else ("#,##0.00" if a < 100000 else "#,##0")
-
-
-def _st_tablo(ws, S, r, kolonlar, gruplar, satirlar, tablo_adi, dilimler):
-    """Dilimleyici alanı + grup bandı + başlık + satırlar + Excel tablosu. dilimler: [(anahtar, buton kolonu, genişlik)].
-    Biçim "SAYI" olan kolonlarda biçim her hücrenin büyüklüğüne göre seçilir."""
-    C = {k[4]: 2 + i for i, k in enumerate(kolonlar)}
-    ad = {k[4]: k[1] for k in kolonlar}
-    r_bant = r + 7 if DILIMLEYICI_EKLE else r
-    for g in dict.fromkeys(k[0] for k in kolonlar):
-        cs = [C[k[4]] for k in kolonlar if k[0] == g]
-        S.birlestir(r_bant, cs[0], cs[-1], gruplar[g], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, size=11, h="center",
-                    kenar=_KENAR_B)
-    ws.row_dimensions[r_bant].height = 20
-    R0 = r_bant + 1
-    for k in kolonlar:
-        S.hucre(R0, C[k[4]], k[1], bold=True, fill=_BOLUM, renk=BASLIK_YAZI, h="center", kenar=_KENAR_B, size=10)
-    ws.row_dimensions[R0].height = 46
-    for i, d in enumerate(satirlar):
-        rr = R0 + 1 + i
-        for k in kolonlar:
-            v = _st_deger(d.get(k[4]))
-            durum = k[4] == "durum" or k[4].startswith("dr_")
-            x = S.hucre(rr, C[k[4]], v, fmt=_st_sayi_bicim(v) if k[2] == "SAYI" else k[2], wrap=False, dikey="center",
-                        size=10, h="left" if k[2] is None and not durum else ("right" if k[2] == "SAYI" else "center"))
-            if durum and v in _ST_DURUM_RENK:
-                x.fill = PatternFill("solid", fgColor=_ST_DURUM_RENK[v])
-                x.font = Font(name=YAZI_TIPI, bold=True, size=10)
-        ws.row_dimensions[rr].height = 16
-    RS = R0 + max(len(satirlar), 1)
-    _tablo_ekle(ws, tablo_adi, R0, RS, 2, [k[1] for k in kolonlar])
-    plan, c = [], 2
-    for anahtar, n_buton, gen in dilimler:
-        plan.append((ad[anahtar], ad[anahtar], c, c + gen - 1, 4, n_buton))
-        c += gen
-    _dilimleyici_alani(ws, tablo_adi, r, plan)
-    return R0, RS, C
-
-
-def _st_esik_renk(ws, C, anahtarlar, R0, RS):
-    """PSI hücreleri: 0'da beyaz, 0,10'da sarı, 0,25 ve üstünde kırmızı."""
-    for k in anahtarlar:
-        c = get_column_letter(C[k])
-        ws.conditional_formatting.add(f"{c}{R0 + 1}:{c}{RS}", ColorScaleRule(
-            start_type="num", start_value=0, start_color="FFFFFF", mid_type="num", mid_value=_ST_ALT, mid_color="FFEB84",
-            end_type="num", end_value=_ST_UST, end_color="F8696B"))
-
-
-def _st_sayfa():
-    if _ST_SAYFA in wb.sheetnames:                            # yeniden çalışırsa eski sheet ve dilimleyici planı silinir
-        wb.remove(wb[_ST_SAYFA])
-    DILIMLEYICI_PLANI[:] = [p for p in DILIMLEYICI_PLANI if p.get("sayfa") != _ST_SAYFA]
-    gen = {}
-    for kolonlar in (_ST_K_DEG, _ST_K_OZET, _ST_K_MOD):
-        for i, k in enumerate(kolonlar):
-            gen[2 + i] = max(gen.get(2 + i, 0), k[3])
-    ws = _yeni_sayfa(_ST_SAYFA, gen)
-    son_deg, son_oz, son_mod = 1 + len(_ST_K_DEG), 1 + len(_ST_K_OZET), 1 + len(_ST_K_MOD)
-    S = Sayfa(ws, son_deg)
-    r = 2
-    S.baslik(r, f"Stabilite: her değişkenin PSI (CSI) ve HHI'ı, referans {_ST_REF}; karşılaştırılan "
-                f"{', '.join(map(str, _ST_KARS))}", c2=son_deg)
-    r += 1
-    for e, m, yuk in [
-        ("Amaç", "Dönemler arasında kayan değişkenleri bulmak; modele girenleri çıkarıp pipeline'ı yeniden çalıştırarak "
-                 "daha stabil model kurmak. Eğitimdeki havuzun bütün değişkenleri (ham + FE + DSN) ölçülür; böylece "
-                 "çıkarılan değişkenin yerine gelecek olanın da stabil olduğu görülür.", 32),
-        ("PSI (CSI)", f"Σ (p_dönem - p_referans) x ln(p_dönem / p_referans). Değişkende buna CSI denir; hesap aynı. "
-                      f"Sayısal değişken referansın {_ST_DILIM} yüzdelik dilimine, kategorik değişken kategorilere "
-                      "ayrılır; boşlar ayrı dilim. Referansın en büyük değerine denk gelen sınır kullanılmaz (ör. ödeme "
-                      "oranı %100'de yığılıyorsa (100, ∞) dilimi referansta boş kalır ve %100'ün biraz üstüne çıkan birkaç "
-                      "müşteri PSI'ı şişirirdi); aralık dışına çıkış 2. tablonun Max kolonunda görünür. 0,10 altı Stabil, "
-                      "0,10 ile 0,25 arası Dikkat, 0,25 üstü Belirgin kayma. "
-                      f"Referans {_ST_REF} kendisiyle karşılaştırılmaz (PSI'ı her zaman 0); onun değerleri HHI'da ve "
-                      "2. tabloda.", 58),
-        ("HHI", "Aynı dilimlerde Σ p²: değerler birkaç dilime yığılıyor mu (sayısal değişkende referansta yaklaşık 0,10). "
-                "Yaygın bir eşiği olmadığı için değer olarak verilir; PSI yüksek bir değişkende kaymanın yığılma mı "
-                "yoksa kayma mı olduğunu ayırır.", 32),
-        ("Dağılım özeti", "2. tablo: modele giren her değişkenin her dönemde boş oranı (bütün müşteriler içinde) ve boşlar "
-                          "hariç min, P5, medyan, ortalama, P95, max; aynı değişkenin dönemleri alt alta. Kategorik "
-                          "değişkende yalnızca boş oranı. DSN değişkeni hedefe göre kodlandığı için modelden modele "
-                          "değişir; en çok kayan modelinki gösterilir.", 44),
-        ("Nasıl kullanılır", "Tablo önce modele giren sorunlu değişkenlerle başlar. Çıkarmak için hazır liste hücrenin "
-                             "çıktısında (STABIL_OLMAYAN_FE / _HAM) ve stabil_olmayan_degiskenler.csv'de.", 32),
-    ]:
-        S.satir(r, e, m, yuk)
-        r += 1
-    r += 1
-    S.baslik(r, "1) Değişkenler: her dönemin PSI (CSI), durumu ve HHI'ı; girdiği modeller", c2=son_deg)
-    r += 2
-    R0, RS, C = _st_tablo(ws, S, r, _ST_K_DEG, _ST_G_DEG, _ST_T_DEG, "Stabilite_Degisken",
-                          [("seg", N_RENK, 3), ("modelde", 2, 2), ("durum", 3, 3)])
-    _st_esik_renk(ws, C, [f"psi_{d}" for d in _ST_KARS], R0, RS)
-    r = RS + 3
-    S.baslik(r, "2) Modele giren değişkenler: her dönemde boş oranı, min, P5, medyan, ortalama, P95, max", c2=son_oz)
-    r += 2
-    R0, RS, C = _st_tablo(ws, S, r, _ST_K_OZET, _ST_G_OZET, _ST_T_OZET, "Stabilite_Dagilim",
-                          [("seg", N_RENK, 3), ("donem", len(_ST_DON), 3)])
-    _st_esik_renk(ws, C, ["psi"], R0, RS)
-    r = RS + 3
-    S.baslik(r, "3) Modeller: skor PSI ve HHI", c2=son_mod)
-    r += 2
-    R0, RS, C = _st_tablo(ws, S, r, _ST_K_MOD, _ST_G_MOD, _ST_T_MOD, "Stabilite_Model",
-                          [("seg", N_RENK, 2), ("model", 2, 1), ("vade", 3, 2), ("durum", 3, 2)])
-    _st_esik_renk(ws, C, [f"psi_{d}" for d in _ST_KARS], R0, RS)
-    _yazdir(ws)
-    return ws
-
-
-# ==================================================================
-# 5) KAYDET
-# ==================================================================
-def _st_grafik_yerlesimi(kitap):
-    """Grafiklerde yazılar üst üste binmesin: başlık üstte, açıklama (legend) altta ve ikisi de çizim alanının dışında;
-    çizim alanı aradaki boşluğa sabitlenir. Bütün sheet'lerdeki grafiklere uygulanır; tekrar çağırmak zararsızdır."""
-    from openpyxl.chart import BarChart
-    from openpyxl.chart.layout import Layout, ManualLayout
-    from openpyxl.drawing.text import CharacterProperties, ParagraphProperties
-
-    def _satir(uzunluk_cm, en_cm):
-        return max(1, int(np.ceil(uzunluk_cm / max(en_cm - 1.2, 3.0))))
-
-    def _metin(t):
-        try:
-            return "".join(r.t or "" for p in t.tx.rich.p for r in (p.r or []))
-        except Exception:
-            return ""
-
-    for w in kitap.worksheets:
-        for ch in getattr(w, "_charts", []):
-            en, boy = float(ch.width or 15.0), float(ch.height or 7.5)
-            ust, alt, sol, sag = 0.3, 0.3, 0.25, 0.45
-            if ch.title is not None:
-                ch.title.overlay = False
-                for p in ch.title.tx.rich.p:
-                    p.pPr = ParagraphProperties(defRPr=CharacterProperties(sz=1200, b=True))
-                    for r in (p.r or []):
-                        r.rPr = CharacterProperties(sz=1200, b=True)
-                ust = 0.5 + 0.65 * _satir(len(_metin(ch.title)) * 0.25, en)
-            if ch.legend is not None:
-                ch.legend.overlay = False
-                ch.legend.position = "b"
-                adlar = []
-                for s in ch.series:
-                    ad = getattr(getattr(s, "tx", None), "v", None)
-                    adlar.append(len(ad) if ad else 25)
-                alt = 0.45 + 0.5 * _satir(sum(n * 0.2 + 1.2 for n in adlar), en)
-            yatay = isinstance(ch, BarChart) and ch.type == "bar"
-            alt_eksen, sol_eksen = (ch.y_axis, ch.x_axis) if yatay else (ch.x_axis, ch.y_axis)
-            if getattr(alt_eksen, "title", None) is not None:
-                alt += 0.9
-            if getattr(sol_eksen, "title", None) is not None:
-                sol += 1.0
-            ch.layout = Layout(manualLayout=ManualLayout(
-                layoutTarget="outer", xMode="edge", yMode="edge", x=sol / en, y=ust / boy,
-                w=max(0.3, 1.0 - (sol + sag) / en), h=max(0.3, 1.0 - (ust + alt) / boy)))
-
-
-def _st_dilimleyicileri_birlestir(veri):
-    """Excel bir sheet'te tek dilimleyici listesi (extLst > ext) ve tek dilimleyici parçası (xl/slicers/slicerN.xml) bekler.
-    Bu sheet'te üç tablonun dilimleyicisi var; her tablo ayrı liste ve parça eklediği için Excel dosyayı "onarmak" isterdi.
-    Aynı sheet'in dilimleyicileri, Excel'in kendi kaydettiği gibi, tek parçada ve tek listede birleştirilir."""
-    import posixpath
-    from xml.etree import ElementTree as _ET
-    uri = globals().get("_URI_SAYFA", "{3A4CF648-6AED-40f4-86FF-DC5316D8AED3}")
-    desen_ext = re.compile(r'<(?P<on>(?:\w+:)?)ext uri="' + re.escape(uri) + r'"[^>]*>(?P<ic>.*?)</(?P=on)ext>', re.S)
-    desen_rel = re.compile(r"<Relationship\b[^>]*/>")
-    zin = zipfile.ZipFile(BytesIO(veri))
-    sira = [i.filename for i in zin.infolist()]
-    z = {ad: zin.read(ad) for ad in sira}
-    silinen, birlesen = set(), 0
-
-    def _ozellik(etiket, ad):
-        m = re.search(rf'\b{ad}="([^"]*)"', etiket)
-        return m.group(1) if m else None
-
-    for ad in sira:
-        if not (ad.startswith("xl/worksheets/") and ad.endswith(".xml")):
-            continue
-        s = z[ad].decode("utf-8")
-        bul = list(desen_ext.finditer(s))
-        refler = [r for m in bul for r in re.findall(r"<x14:slicer\b[^>]*/>", m.group("ic"))]
-        if len(bul) < 2 and len(refler) < 2:
-            continue
-        rels_ad = posixpath.join(posixpath.dirname(ad), "_rels", posixpath.basename(ad) + ".rels")
-        rels = z[rels_ad].decode("utf-8")
-        hedef = {}
-        for r in desen_rel.findall(rels):
-            t = _ozellik(r, "Target") or ""
-            hedef[_ozellik(r, "Id")] = (r, t[1:] if t.startswith("/") else posixpath.normpath(
-                posixpath.join(posixpath.dirname(ad), t)))
-        idler = [re.search(r'r:id="([^"]+)"', r).group(1) for r in refler]
-        parcalar = [hedef[i][1] for i in idler]
-        govde = []
-        for p in parcalar:
-            m = re.search(r"<(?P<on>(?:\w+:)?)slicers\b[^>]*>(?P<ic>.*)</(?P=on)slicers>", z[p].decode("utf-8"), re.S)
-            govde.append(m.group("ic"))
-        ilk = z[parcalar[0]].decode("utf-8")
-        m = re.search(r"(<(?P<on>(?:\w+:)?)slicers\b[^>]*>).*(</(?P=on)slicers>)", ilk, re.S)
-        ilk = ilk[:m.start()] + m.group(1) + "".join(govde) + m.group(3) + ilk[m.end():]
-        _ET.fromstring(ilk.encode("utf-8"))
-        z[parcalar[0]] = ilk.encode("utf-8")
-        for i, p in zip(idler[1:], parcalar[1:]):
-            rels = rels.replace(hedef[i][0], "", 1)
-            silinen.add(p)
-        z[rels_ad] = rels.encode("utf-8")
-        tek = s[bul[0].start():bul[0].end()]
-        tek = re.sub(r"(<x14:slicerList\b[^>]*>).*?(</x14:slicerList>)", lambda k: k.group(1) + refler[0] + k.group(2),
-                     tek, count=1, flags=re.S)
-        for k in reversed(bul[1:]):
-            s = s[:k.start()] + s[k.end():]
-        s = s[:bul[0].start()] + tek + s[bul[0].end():]
-        _ET.fromstring(s.encode("utf-8"))
-        z[ad] = s.encode("utf-8")
-        birlesen += 1
-    if not birlesen:
-        return veri
-    if silinen:
-        ct = z["[Content_Types].xml"].decode("utf-8")
-        for p in silinen:
-            ct = re.sub(r'<Override\b[^>]*PartName="/' + re.escape(p) + r'"[^>]*/>', "", ct)
-        z["[Content_Types].xml"] = ct.encode("utf-8")
-    cikti = BytesIO()
-    with zipfile.ZipFile(cikti, "w", zipfile.ZIP_DEFLATED) as zo:
-        for ad in sira:
-            if ad not in silinen:
-                zo.writestr(ad, z[ad])
-    return cikti.getvalue()
-
-
-def _st_gorselleri_tazele():
-    """openpyxl ilk kayıtta görsel akışlarını kapatır; ikinci kayıt için görselleri son yazılan dosyadan geri yükler."""
-    imgs = [img for w in wb.worksheets for img in getattr(w, "_images", [])]
-    if not imgs:
-        return
-    medya = {}
-    if isinstance(globals().get("_veri"), (bytes, bytearray)):
-        with zipfile.ZipFile(BytesIO(_veri)) as z:
-            for ad in z.namelist():
-                m = re.match(r"xl/media/image(\d+)\.\w+$", ad)
-                if m:
-                    medya[int(m.group(1))] = z.read(ad)
-    for i, img in enumerate(imgs, 1):
-        if getattr(img.ref, "closed", False):
-            if i in medya:
-                img.ref = BytesIO(medya[i])
-            else:
-                raise RuntimeError("Görsel verisi bulunamadı: önce 18. hücreyi yeniden çalıştırın, sonra bu hücreyi.")
-
-
-for _ad, _t in (("stabilite_degiskenler", _ST_T_DEG), ("stabilite_dagilim_ozeti", _ST_T_OZET),
-                ("stabilite_model_skor", _ST_T_MOD), ("stabil_olmayan_degiskenler", _ST_CIKAR)):
-    _b = BytesIO()
-    pd.DataFrame(_t).to_csv(_b, index=False, encoding="utf-8")
-    _b.seek(0)
-    mf.upload_stream(f"/{_ad}.csv", _b)
-_st_gorselleri_tazele()
-_st_ws = _st_sayfa()
-wb._sheets.remove(_st_ws)                                     # karşılaştırma sheet'lerinin arkasına
-_st_once = [s for s in (globals().get("FK_SAYFA"), globals().get("KT_SAYFA"), KARSILASTIRMA_SAYFA) if s and s in wb.sheetnames]
-_st_i = wb.sheetnames.index(_st_once[0]) + 1 if _st_once else len(wb._sheets)
-wb._sheets.insert(_st_i, _st_ws)
-if _VERI_WS:                                                  # gizli grafik verisi en sonda kalsın
-    wb._sheets.remove(_VERI_WS[0])
-    wb._sheets.append(_VERI_WS[0])
-wb.active = 0
-wb.calculation.fullCalcOnLoad = True
-_st_grafik_yerlesimi(wb)
-_buf = BytesIO()
-wb.save(_buf)
-_veri = _buf.getvalue()
-_n_dilim = 0
-if DILIMLEYICI_PLANI:
-    _dilimsiz = _veri
-    try:
-        _veri, _n_dilim = _dilimleyici_ekle(_dilimsiz, DILIMLEYICI_PLANI)
-        _veri = _st_dilimleyicileri_birlestir(_veri)            # çok tablolu sheet: Excel onarım uyarısı vermesin
-    except Exception as e:
-        _veri, _n_dilim = _dilimsiz, 0
-        _log(f"⚠ Dilimleyiciler eklenemedi ({type(e).__name__}: {e}); dosya dilimleyicisiz yazılıyor")
-mf.upload_stream(CIKTI_DOSYA, BytesIO(_veri))
-_log(f"✓ {MAIN_FOLDER}{CIKTI_DOSYA} yeniden yazıldı (sheet: {_ST_SAYFA}) | stabilite_degiskenler.csv "
-     f"({len(_ST_T_DEG)} satır), stabilite_dagilim_ozeti.csv ({len(_ST_T_OZET)} satır), stabilite_model_skor.csv, "
-     f"stabil_olmayan_degiskenler.csv ({len(_ST_CIKAR)} satır)")
+if "MBB_NO" in _OK_V.columns:
+    print(f"\n4) Aynı müşterinin aynı takvim ayındaki {_OK_SERI} değeri farklı dönem satırlarında aynı mı "
+          "(o dönemde tek satırı olan KK müşterileri; ikisi de boşsa aynı sayılır)")
+    _ok_tek = {}
+    for d in _OK_DON:
+        pos = np.flatnonzero((_OK_DONEM_A == d) & _OK_KK_A)
+        m = _OK_V["MBB_NO"].iloc[pos].astype(str).to_numpy()
+        say = pd.Series(m).value_counts()
+        tek = np.isin(m, say.index[say.to_numpy() == 1])
+        _ok_tek[d] = pd.DataFrame(_ok_mat(pos[tek]), index=m[tek], columns=_OK_AYLAR)
+    for i, a in enumerate(_OK_DON):
+        for b in _OK_DON[i + 1:]:
+            ortak = _ok_tek[a].index.intersection(_ok_tek[b].index)
+            A, B = _ok_tek[a].loc[ortak], _ok_tek[b].loc[ortak]
+            fark = _ok_ay(b) - _ok_ay(a)                    # b satırında aynı ay fark kadar daha eski kolonda
+            satir, top_n, top_esit = [], 0, 0
+            for j in range(12 - fark):
+                va, vb = A.iloc[:, j].to_numpy(), B.iloc[:, j + fark].to_numpy()
+                esit = (va == vb) | (np.isnan(va) & np.isnan(vb))
+                top_n, top_esit = top_n + len(esit), top_esit + int(esit.sum())
+                if len(esit) and esit.mean() < 0.999:
+                    farkli = ~esit & np.isfinite(va) & np.isfinite(vb)
+                    satir.append(f"      {_ok_ay_ad(_ok_ay(a) - (j + 1))} ({a} {_OK_AYLAR[j]} = {b} "
+                                 f"{_OK_AYLAR[j + fark]}): aynı {_ok_y(float(esit.mean()), 2)} | yalnız birinde boş "
+                                 f"{_ok_y(float(np.mean(np.isnan(va) != np.isnan(vb))), 2)} | ikisi dolu ve farklı "
+                                 f"{_ok_y(float(farkli.mean()), 2)}"
+                                 + (f", medyan fark {_ok_s(float(np.median(np.abs(va - vb)[farkli])), 2)}" if farkli.any() else ""))
+            if not top_n:
+                print(f"   {a} ile {b}: ortak takvim ayı ya da ortak müşteri yok")
+                continue
+            print(f"   {a} ile {b}: {len(ortak):,}".replace(",", ".") + f" ortak müşteri, {12 - fark} ortak ay | aynı "
+                  f"{_ok_y(top_esit / top_n, 2)}" + ("" if satir else " | bütün aylar %99,9 üstü aynı"))
+            for s in satir:
+                print(s)
+else:
+    print("\n4) MBB_NO kolonu yok; aynı müşteri kontrolü atlandı.")
