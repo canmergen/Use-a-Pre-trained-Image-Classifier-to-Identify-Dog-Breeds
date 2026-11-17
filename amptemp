@@ -1,74 +1,79 @@
+# =====================================================================
+# VERİ YÜKLEME FONKSİYONU: Dataiku dataset'ini S3'ten DOĞRUDAN parquet olarak okur
+#
+# NEDEN BÖYLE: d.get_dataframe() aynı işi tek satırda yapar ama tüm
+# veriyi Dataiku backend'i üzerinden stream eder; 23M satırda çok
+# yavaş ve bellek dostu değil. Burada dataset'in S3'teki parquet
+# dosyalarına pyarrow ile DOĞRUDAN bağlanıyoruz: paralel okuma
+# (use_threads) + tek kopya pandas dönüşümü. Sonuç: dakikalar yerine
+# ~2dk, yaklaşık yarı RAM.
+# Dataset S3 parquet değilse (örn. SQL tablosu) get_dataframe() ile okur.
+# =====================================================================
+
+import time
+import psutil
 import dataiku
-import os
-import shutil
+import pyarrow.fs as pafs
+import pyarrow.dataset as pads
 
-DRY_RUN   = True                          # True: sadece ne taşınacağını listeler, False: gerçekten taşır
-ARSIV_ADI = "ARSIV_GUNCEL"                # GOC_MODEL_RESULTS içinde açılacak yeni klasör
-HARIC     = {"ARSIV", ARSIV_ADI}          # Bu klasörlere dokunulmaz, taşınmaz
-folder    = dataiku.Folder("GOC_MODEL_RESULTS")
+def s3_parquet_oku(dataset_adi, endpoint="loscdlhp.aknet.akb:9000"):
+    t0 = time.time()                                         # yükleme süresini ölçmek için başlangıç zamanı
 
-def _haric_mi(yol):
-    return yol.strip("/").split("/")[0] in HARIC
+    # --- 1) Dataset'in S3'teki yerini ve erişim bilgilerini Dataiku'dan al ---
+    d    = dataiku.Dataset(dataset_adi)
+    info = d.get_location_info(sensitive_info=True)["info"]  # sensitive_info=True: access/secret key'leri de getir
+    yol  = info.get("path", "")
+    print("Kaynak:", yol if yol else "(path yok, S3 dataset değil)")
 
-def _tum_dosyalar(f, path="/"):
-    """Folder'ı kökten başlayıp alt klasörlere inerek gezer, tüm dosya yollarını döner."""
-    detay = f.get_path_details(path)
-    out = []
-    for c in detay.get("children", []):
-        if c.get("directory"):
-            out += _tum_dosyalar(f, c["fullPath"])
-        else:
-            out.append(c["fullPath"])
+    # --- 2) Kolon tiplerini Dataiku şemasından al ---
+    # NEDEN: parquet'teki ham tipler ile Dataiku'nun beklediği tipler farklı
+    # olabilir (örn. int kolonlar null içerdiği için float'a çevrilmeli).
+    # get_dataframe_schema_st bize Dataiku'nun "doğru" tip haritasını verir.
+    sch = d.read_schema()
+    names, dtypes, date_idx = d.get_dataframe_schema_st(sch, int_as_float=True)
+    date_cols = {names[i] for i in date_idx} if date_idx else set()  # tarih kolonları ayrı işlenir, cast'e girmez
+
+    vm0 = psutil.virtual_memory().used                       # RAM ölçümü için okuma öncesi seviye
+
+    if yol.startswith("s3://"):
+        # --- 3) S3 dosya sistemine pyarrow ile bağlan (bu dataset'in kendi anahtarlarıyla) ---
+        cp = info["connectionParams"]                        # S3 bağlantı bilgileri (key'ler, endpoint)
+        fs = pafs.S3FileSystem(
+            access_key              = cp["accessKey"],
+            secret_key              = cp["secretKey"],
+            endpoint_override       = endpoint,              # kurum içi S3 (MinIO benzeri); AWS değil
+            scheme                  = "https",
+            force_virtual_addressing= False,                 # kurum içi S3'ler path-style adresleme kullanır
+        )
+
+        # --- 4) Parquet dataset'i tanı ve boyutunu göster (henüz veri OKUNMUYOR) ---
+        ds = pads.dataset(yol.replace("s3://", ""), filesystem=fs, format="parquet")  # pyarrow "s3://" öneki istemez
+        print(f"Dataset Boyutu: {ds.count_rows():,} satır x {len(ds.schema)} sütun")
+
+        # --- 5) Asıl okuma: S3 -> Arrow tablosu -> pandas ---
+        tbl = ds.to_table(use_threads=True)                  # tüm parquet parçalarını PARALEL indir (en uzun adım)
+        out = tbl.to_pandas(self_destruct=True, split_blocks=True)
+        #   self_destruct=True : Arrow tablosu pandas'a dönüşürken imha edilir
+        #                        -> veri bellekte İKİ kopya olarak durmaz (~%50 RAM tasarrufu)
+        #   split_blocks=True  : kolonlar ayrı bloklara açılır, kopyasız dönüşümü kolaylaştırır
+        del tbl
+        cast = {c: t for c, t in dtypes.items() if c in out.columns and c not in date_cols}
+        out  = out.astype(cast)[names]                       # Dataiku tiplerine çevir + kolonları şema sırasına diz
+    else:
+        print("S3 parquet değil, d.get_dataframe() ile okunuyor (daha yavaş olabilir)")
+        out = d.get_dataframe()
+
+    # --- 6) Özet: süre, RAM, boyut ---
+    _elapsed = time.time() - t0
+    _vm      = psutil.virtual_memory()
+    _ram_add = (_vm.used - vm0) / 1e9                        # sadece bu okuma adımının RAM maliyeti
+
+    print(f"Yükleme süresi : {int(_elapsed//60)}dk {int(_elapsed%60)}sn")
+    print(f"Bu adım RAM    : +{_ram_add:.1f} GB")
+    print(f"Sunucu RAM     : {_vm.used/1e9:.0f} / {_vm.total/1e9:.0f} GB  (%{_vm.percent:.0f} dolu)")
+    print(f"Kalan RAM      : {_vm.available/1e9:.0f} GB")
+    print(f"\nDataFrame: {out.shape[0]:,} satır x {out.shape[1]:,} sütun")
+    if "DONEM" in out.columns:
+        print(f"Dönemler : {sorted(out['DONEM'].dropna().astype(int).unique().tolist())}")
+    print(f"Bellek   : {out.memory_usage(deep=True).sum()/1e9:.1f} GB")
     return out
-
-# Folder yerel diskteyse get_path() çalışır, değilse (S3, HDFS vb.) hata verir
-try:
-    kok = folder.get_path()
-    yerel = True
-except Exception:
-    yerel = False
-
-print(f"Folder tipi: {'yerel disk' if yerel else 'uzak depolama (stream ile kopyalanacak)'}")
-print(f"Hedef: GOC_MODEL_RESULTS/{ARSIV_ADI}/ | Hariç: {sorted(HARIC)} | DRY_RUN = {DRY_RUN}\n")
-
-if yerel:
-    # --- Yerel disk: kökteki her şeyi (HARIC hariç) doğrudan ARSIV_GUNCEL içine taşı ---
-    tasinacaklar = [e for e in sorted(os.listdir(kok)) if e not in HARIC]
-    print(f"Taşınacak ({len(tasinacaklar)}):")
-    for e in tasinacaklar:
-        print("  -", e)
-
-    if not DRY_RUN:
-        hedef_kok = os.path.join(kok, ARSIV_ADI)
-        os.makedirs(hedef_kok, exist_ok=True)
-        for e in tasinacaklar:
-            shutil.move(os.path.join(kok, e), os.path.join(hedef_kok, e))
-        print(f"\nTamamlandı: {len(tasinacaklar)} öğe {ARSIV_ADI}/ içine taşındı.")
-
-else:
-    # --- Uzak depolama: önce ARSIV_GUNCEL içine kopyala, kopya tamsa orijinali sil ---
-    dosyalar = [p for p in _tum_dosyalar(folder) if not _haric_mi(p)]
-    ust_seviye = sorted({p.strip("/").split("/")[0] for p in dosyalar})
-    print(f"Taşınacak üst seviye öğe ({len(ust_seviye)}), toplam dosya: {len(dosyalar)}")
-    for e in ust_seviye:
-        print("  -", e)
-
-    if not DRY_RUN:
-        hatalar = []
-        for p in dosyalar:
-            hedef = f"/{ARSIV_ADI}/{p.strip('/')}"
-            try:
-                with folder.get_download_stream(p) as s:
-                    folder.upload_stream(hedef, s)
-            except Exception as ex:
-                hatalar.append((p, str(ex)))
-
-        if hatalar:
-            print(f"\n⚠ {len(hatalar)} dosya kopyalanamadı, orijinaller SİLİNMEDİ:")
-            for p, ex in hatalar[:20]:
-                print("  ", p, "->", ex)
-        else:
-            for e in ust_seviye:
-                folder.delete_path("/" + e)
-            print(f"\nTamamlandı: {len(dosyalar)} dosya {ARSIV_ADI}/ içine taşındı, orijinaller silindi.")
-
