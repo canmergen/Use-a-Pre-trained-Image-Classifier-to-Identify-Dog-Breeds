@@ -38,9 +38,11 @@ from openpyxl.worksheet.properties import Outline
 #      Bölüm 2: modelin kendi hedefinde FPD skoru modelin yerini tutar mı (20. hücredeki gibi, her dönem için).
 #      Bölüm 3: tersi; model FPD'yi önceden öngörebiliyor mu: skor dönemindeki model skoru ile aynı ya da sonraki dönemdeki
 #               FPD hedefi, aynı müşterilerde FPD skoruyla kıyaslanır.
-#   5) PredCs: FPD modelinin df_baz'da bütün müşterilere ürettiği skor (şu an yalnızca 202601). FPD tablosunda yalnızca
-#      FPD kaydı olanlar var (eşleşme az); PredCs ile model, modelin hedefinde bütün kitle üzerinde kıyaslanır ve iki skorla
-#      ayrı ayrı bucketlanır. PredCs önce df'te aranır, yoksa bellekteki df_baz'dan MBB_NO + DONEM ile alınır.
+#   5) PredCs: FPD modelinin bütün müşterilere ürettiği skor. FPD tablosunda yalnızca FPD kaydı olanlar var (eşleşme az);
+#      PredCs ile aynı sorular bütün müşterilerde sorulur: Bölüm 1 modelin 20 grubunda ortalama PredCs (FPD sheet'indeki
+#      Bölüm 1'in karşılığı), Bölüm 2 modelin hedefinde model mi PredCs mi, Bölüm 3 iki skorla ayrı ayrı bucketlar.
+#      Yalnızca PredCs'nin müşterilerin en az yarısında dolu olduğu dönemler alınır (şu an 202601). PredCs önce df'te
+#      aranır, yoksa bellekteki df_baz'dan MBB_NO + DONEM ile alınır.
 #   Kontrol: 202504 ve 202506'da kitle ve vaka sayısı eğitim özetiyle (renk_bazli_train_val_oot_ozet.csv), 202506'da Gini
 #   de OOT Gini'siyle aynı olmalı ("Eğitimle Kontrol" kolonu). Farklıysa hedef tanımı ya da veri eğitimdekinden farklıdır.
 # ÇIKTI: "Dönem Bucket Özeti", "Dönem Bucket Detayı" (20'lik ve 100'lük), "Dönem FPD Karşılaştırma" ve
@@ -55,6 +57,7 @@ _BD_SAYFA_O, _BD_SAYFA_D, _BD_SAYFA_F = "Dönem Bucket Özeti", "Dönem Bucket D
 _BD_SAYFA_P = "PredCs Karşılaştırma"
 _BD_ESKI_SAYFALAR = ["Dönem Bucketları"]                     # önceki sürümün sheet'i; varsa kaldırılır
 _BD_SURUM = 3
+_BD_PC_ESIK = 0.5                                            # PredCs bu paydan az müşteride doluysa dönem alınmaz
 _BD_EK_AD = {**{f"AKB_TAKIP_YY_{n}M_FLG": f"Takip {n} Ay" for n in (3, 6, 12, 15)},
              **{f"AKB_GECIKME_SONRAKI_{n}M": f"Gecikme {n} Ay" for n in (3, 6, 12)}}
 _BD_FPD_DATASET = globals().get("FK_FPD_DATASET", globals().get(
@@ -545,6 +548,23 @@ def _bd_fpd_bolum3(y, s_m, s_f):
     return sat
 
 
+def _bd_beklenen_gini(p, s):
+    """Sonuç her müşteride p olasılığıyla gerçekleşirse s skorunun Gini'si (beklenen değer): müşteri p ağırlığıyla vaka,
+    1 - p ağırlığıyla vaka değil sayılır. p olasılık değilse (0 ile 1 dışında) boş."""
+    p, s = np.asarray(p, dtype="float64"), np.asarray(s, dtype="float64")
+    ok = np.isfinite(p) & np.isfinite(s)
+    p, s = p[ok], s[ok]
+    if not len(p) or p.min() < 0 or p.max() > 1:
+        return np.nan
+    top_p, top_q = float(p.sum()), float((1.0 - p).sum())
+    if top_p <= 0 or top_q <= 0:
+        return np.nan
+    _, yer = np.unique(s, return_inverse=True)                 # aynı skorlular yarım sayılır
+    pg, qg = np.bincount(yer, weights=p), np.bincount(yer, weights=1.0 - p)
+    auc = float((pg * (np.cumsum(qg) - qg + 0.5 * qg)).sum() / (top_p * top_q))
+    return 2.0 * auc - 1.0
+
+
 def _bd_ay_fark(once, sonra):
     return (int(sonra) // 100 * 12 + int(sonra) % 100) - (int(once) // 100 * 12 + int(once) % 100)
 
@@ -695,7 +715,7 @@ if globals().get("_BD_FPD_ANAHTAR") != _bd_fpd_anahtar:
     except Exception as e:
         _log(f"   ⚠ FPD okunamadı ({type(e).__name__}: {e}); FPD sheet'i boş kalacak (hücre tekrar çalışınca yeniden denenir)")
         _BD_FPD, _BD_FPD_BILGI, _BD_FPD_ANAHTAR = None, {}, None
-    for _k in [k for k in _BD_ONB if k[-1] == "fpd"]:
+    for _k in [k for k in _BD_ONB if str(k[-1]).startswith("fpd")]:
         del _BD_ONB[_k]
 else:
     _log("   FPD bellekten")
@@ -787,6 +807,14 @@ if globals().get("_BD_KAPSAM_ANAHTAR") != _bd_kapsam_anahtar:
     _BD_KAPSAM, _BD_PC_BILGI = _bd_kapsam()
     _BD_KAPSAM_ANAHTAR = _bd_kapsam_anahtar
 _BD_PC_YON = _BD_PC_BILGI["yon"]
+_BD_PC_DONEM = [r["donem"] for r in _BD_KAPSAM if r["n"] and r["pc"] / r["n"] >= _BD_PC_ESIK]
+_BD_PC_ALINMAYAN = {r["donem"]: r["pc"] / r["n"] for r in _BD_KAPSAM if r["n"] and 0 < r["pc"] / r["n"] < _BD_PC_ESIK}
+
+
+def _bd_etiket(donem):
+    """Önbellek etiketi: PredCs'li dönemlerin sonuçları ayrı tutulur (hesabı değişince yalnızca onlar yenilenir)."""
+    return "fpd+pc2" if donem in _BD_PC_DONEM else "fpd"
+
 
 
 def _bd_yzd(x):
@@ -810,6 +838,9 @@ else:
     _log(f"   PredCs: {_BD_PC_KAYNAK} | büyük değer = {'riskli' if _BD_PC_YON == 1 else 'iyi (işaret çevrildi)'}"
          + (f" | FPD hedefinde ({_BD_PC_BILGI['h']}, {_adet(_BD_PC_BILGI['n'])} müşteri) Gini "
             f"{_bd_yzd(_BD_PC_BILGI['g_pc'])}" if np.isfinite(_BD_PC_BILGI["g_pc"]) else ""))
+    _log(f"   PredCs karşılaştırması yapılan dönemler: {', '.join(map(str, _BD_PC_DONEM)) or 'yok'}"
+         + (" | alınmayan (PredCs müşterilerin azında dolu): "
+            + ", ".join(f"{d} ({_bd_yzd(v)})" for d, v in _BD_PC_ALINMAYAN.items()) if _BD_PC_ALINMAYAN else ""))
 
 _bd_v0 = (id(_BD_VERI), len(_BD_VERI), _BD_SURUM, _BD_PC_KAYNAK, _BD_PC_YON,
           id(globals().get("df_baz")) if _BD_PC_P else None)
@@ -912,8 +943,10 @@ def _bd_hesapla(mdl, kod, donem, paket, skor, M, mbb, oz, ek, ileri, pc):
         pk = pc[kitle]
         ok = np.isfinite(pk)
         if ok.any():
-            yo, so, po = yk[ok], sk[ok], _BD_PC_YON * pk[ok]
+            yo, so, pr = yk[ok], sk[ok], pk[ok]              # pr: ham PredCs; po: büyük = riskli
+            po = _BD_PC_YON * pr
             sat = {**ortak, "hd": kisa, "nk": int(len(sk)), "pd": int(ok.sum()), "pdp": float(ok.mean()),
+                   "po": float(pr.mean()), "pg": _bd_beklenen_gini(pr, so) if _BD_PC_YON == 1 else np.nan,
                    **_bd_fpd_bolum2(pd.DataFrame({"Y": yo, "SKOR": so, "FSKOR": po}), "Y")}
             sat["hk"] = _bd_hukum(sat).replace("FPD SKORU YETER", "PREDCS YETER")
             if sat.get("sonuc"):
@@ -922,13 +955,20 @@ def _bd_hesapla(mdl, kod, donem, paket, skor, M, mbb, oz, ek, ileri, pc):
             fo = {h: a[ok] for h, a in ekk["fpd"].items()}
             for nb in (20, 100):
                 gp = _bd_bucket(yo, po, nb, {"fpd": fo}).to_dict("records")
-                gm = _bd_bucket(yo, so, nb, {}).to_dict("records")
+                gm = _bd_bucket(yo, so, nb, {"ek": {"PC": pr}}).to_dict("records")   # e_PC_o: ortalama PredCs
+                if nb == _BD_N_GRUP:                           # FPD sheet'indeki Bölüm 1'in karşılığı
+                    ust_t = sum(c["e_PC_a"] for c in gm[:_BD_UST])
+                    ust_n = sum(c["n"] for c in gm[:_BD_UST])
+                    sat.update(p20=ust_t / ust_n if ust_n else np.nan,
+                               py=ust_t / float(pr.sum()) if pr.sum() > 0 else np.nan,
+                               **{f"pb{int(c['b'])}": c["e_PC_o"] for c in gm})
+                    sat["plift"] = sat["p20"] / sat["po"] if sat["po"] > 0 else np.nan
                 for a, c in zip(gp, gm):
                     alt, ust = (a["s_alt"], a["s_ust"]) if _BD_PC_YON == 1 else (-a["s_ust"], -a["s_alt"])
                     r = {**ortak, "nb": nb, "b": int(a["b"]), "p_n": a["n"], "p_alt": alt, "p_ust": ust,
                          **{f"p_{k}": a[k] for k in ("vaka", "oran", "lift", "cap", "prec")},
                          "m_n": c["n"], **{f"m_{k}": c[k] for k in ("vaka", "oran", "lift", "cap", "prec")},
-                         "rfark": c["cap"] - a["cap"]}
+                         "m_pc": c["e_PC_o"], "rfark": c["cap"] - a["cap"]}
                     for h in fo:
                         r[f"f_{h}_e"], r[f"f_{h}_o"] = a[f"f_{h}_e"], a[f"f_{h}_o"]
                     b5.append(r)
@@ -974,13 +1014,14 @@ for _kod, _ad, _ in RENKLER:
         _gruplar.setdefault(tuple(p["required_raw_features"]), []).append(kl)
     for d in [x for x in _BD_DON if x in _bd_donem_var]:
         _t0, _hesap = time.time(), False
-        lazim = [kl for kl in _pk if (_bd_v0, kl, _kod, d, "fpd") not in _BD_ONB]
+        lazim = [kl for kl in _pk if (_bd_v0, kl, _kod, d, _bd_etiket(d)) not in _BD_ONB]
         if lazim:
             _hesap = True
             pos = np.flatnonzero((_BD_RENK_A == _kod) & (_BD_DONEM_A == d) & _BD_KK_A)
             M = _bd_kolonlar(pos, _bd_hedef_kol)
             mbb = _bd_tamsayi(_BD_VERI["MBB_NO"].iloc[pos]).to_numpy()
-            ek_d, ileri_d, pc_d = _bd_ek_diziler(M, mbb, d), _bd_ileri(mbb, d), _bd_pc_dizi(pos, mbb, d)
+            ek_d, ileri_d, pc_d = (_bd_ek_diziler(M, mbb, d), _bd_ileri(mbb, d),
+                                    _bd_pc_dizi(pos, mbb, d) if d in _BD_PC_DONEM else None)
             for ham, kls in _gruplar.items():
                 kls = [kl for kl in kls if kl in lazim]
                 if not kls:
@@ -1001,13 +1042,13 @@ for _kod, _ad, _ in RENKLER:
                     except Exception as e:
                         _bd_atlanan.append(f"{kl} renk {_kod} {d}: skorlanamadı ({type(e).__name__}: {e})")
                         continue
-                    _BD_ONB[(_bd_v0, kl, _kod, d, "fpd")] = _bd_hesapla(m, _kod, d, p, skor, M, mbb, _oz.get(kl),
+                    _BD_ONB[(_bd_v0, kl, _kod, d, _bd_etiket(d))] = _bd_hesapla(m, _kod, d, p, skor, M, mbb, _oz.get(kl),
                                                                         ek_d, ileri_d, pc_d)
                 del U, eng, X
             del M, ek_d, ileri_d, pc_d
         for kl in _pk:
-            if (_bd_v0, kl, _kod, d, "fpd") in _BD_ONB:
-                _BD_SONUC[(kl, _kod, d)] = _BD_ONB[(_bd_v0, kl, _kod, d, "fpd")]
+            if (_bd_v0, kl, _kod, d, _bd_etiket(d)) in _BD_ONB:
+                _BD_SONUC[(kl, _kod, d)] = _BD_ONB[(_bd_v0, kl, _kod, d, _bd_etiket(d))]
         _n = int(((_BD_RENK_A == _kod) & (_BD_DONEM_A == d) & _BD_KK_A).sum())
         _log(f"   renk {_kod} {d}: {_adet(_n)} müşteri | {len(_pk)} model | "
              + (f"hesaplandı ({time.time() - _t0:.0f} sn)" if _hesap else "bellekten"))
@@ -1024,8 +1065,8 @@ _BD_T_B1 = [r for k in _bd_anahtarlar for r in _BD_SONUC[k]["b1"]]
 _BD_T_B2 = [r for k in _bd_anahtarlar for r in _BD_SONUC[k]["b2"]]
 _BD_T_B3 = sorted([r for k in _bd_anahtarlar for r in _BD_SONUC[k]["b3"]],
                   key=lambda r: (r["kod"], _bd_sira[r["kl"]], r["_sira"]))   # renk, model, FPD hedefi, FPD dönemi, en yakın skor
-_BD_T_P1 = [r for k in _bd_anahtarlar for r in _BD_SONUC[k]["b4"]]
-_BD_T_P2 = [r for k in _bd_anahtarlar for r in _BD_SONUC[k]["b5"]]
+_BD_T_P1 = [r for k in _bd_anahtarlar if k[2] in _BD_PC_DONEM for r in _BD_SONUC[k]["b4"]]
+_BD_T_P2 = [r for k in _bd_anahtarlar if k[2] in _BD_PC_DONEM for r in _BD_SONUC[k]["b5"]]
 if _BD_T_B3:
     _bd_h3 = pd.Series([r["hk3"] for r in _BD_T_B3]).value_counts()
     _log(f"   Bölüm 3 (model FPD'yi önceden öngörüyor mu): {len(_BD_T_B3)} satır | "
@@ -1115,6 +1156,20 @@ _BD_K_F3 = _BD_M[:3] + [
 _BD_G_F3 = {"M": "Model, skor dönemi, FPD dönemi ve hedefi", "K": "Ortak kitle, FPD hedefi",
             "G": "FPD hedefinde ayırma gücü (aynı müşteriler)", "S": "Yalnızca birinin riskli dediği",
             "I": "İkisinin aynı dediği"}
+_BD_K_P0 = _BD_M + [
+    ("M", "Model Hedefi", None, 13, "hd"),
+    ("K", "Model Kitle", "#,##0", 11, "nk"), ("K", "PredCs Dolu", "#,##0", 11, "pd"),
+    ("K", "PredCs Dolu Payı", "0.0%", 9, "pdp"), ("K", "Ortalama PredCs", "0.00%", 9, "po"),
+    ("A", "Model Hedefinde: Gini", "0.0%", 10, "gm"),
+    ("A", f"Model Hedefinde: Yakalama %{_BD_RISKLI_YZD}", "0.0%", 10, "ym"),
+    ("A", "PredCs'de: Beklenen Gini", "0.0%", 10, "pg"),
+    ("A", f"PredCs'de: Beklenen Yakalama %{_BD_RISKLI_YZD}", "0.0%", 10, "py"),
+    ("A", f"PredCs'de: En Riskli %{_BD_RISKLI_YZD} Ortalaması", "0.00%", 10, "p20"),
+    ("A", "PredCs'de: Lift", "0.00", 8, "plift"),
+] + [("B", f"B{i}", "0.00%", 7, f"pb{i}") for i in range(1, _BD_N_GRUP + 1)]
+_BD_G_P0 = {"M": "Model ve dönem", "K": "Kitle ve PredCs",
+            "A": "Ayırma ve yakalama: modelin kendi hedefinde ve PredCs'de",
+            "B": "Ortalama PredCs: modelin 20 grubunda (B1 = en riskli %5)"}
 _BD_K_P1 = _BD_M + [
     ("M", "Model Hedefi", None, 13, "hd"),
     ("K", "Model Kitle", "#,##0", 11, "nk"), ("K", "PredCs Dolu", "#,##0", 11, "pd"),
@@ -1135,7 +1190,8 @@ _BD_K_P2 = _BD_M + [
     ("D", "Model: Kitle", "#,##0", 10, "m_n"), ("D", "Model: Vaka", "#,##0", 9, "m_vaka"),
     ("D", "Model: Hedef Oranı", "0.0%", 9, "m_oran"), ("D", "Model: Lift", "0.00", 8, "m_lift"),
     ("D", "Model: Recall", "0.0%", 9, "m_cap"), ("D", "Model: Precision", "0.0%", 10, "m_prec"),
-    ("D", "Recall Farkı (Model - PredCs)", "+0.0%;-0.0%;0.0%", 10, "rfark")] + \
+    ("D", "Recall Farkı (Model - PredCs)", "+0.0%;-0.0%;0.0%", 10, "rfark"),
+    ("D", "Model: Ortalama PredCs", "0.00%", 10, "m_pc")] + \
     ([("F", f"{h}: {t}", f, 12, f"f_{h}_{k}") for h in _BD_FPD_ADLAR for t, f, k in (("Eşleşen", "#,##0", "e"),
                                                                                     ("Oran", "0.0%", "o"))]
      if _BD_FPD is not None else [])
@@ -1428,13 +1484,12 @@ def _bd_sayfa_fpd():
 
 def _bd_sayfa_predcs():
     _bd_sayfa_sil(_BD_SAYFA_P)
-    ws = _yeni_sayfa(_BD_SAYFA_P, _bd_genislik(_BD_K_P1, _BD_K_P2))
-    son = 1 + max(len(_BD_K_P1), len(_BD_K_P2))
+    ws = _yeni_sayfa(_BD_SAYFA_P, _bd_genislik(_BD_K_P0, _BD_K_P1, _BD_K_P2))
+    son = 1 + max(len(_BD_K_P0), len(_BD_K_P1), len(_BD_K_P2))
     S = Sayfa(ws, son)
     L = get_column_letter
-    pc_don = sorted({int(r["donem"][:6]) for r in _BD_T_P1})
     r = 2
-    S.baslik(r, "PredCs ile karşılaştırma" + (f": {', '.join(map(str, pc_don))}" if pc_don else ""), c2=son)
+    S.baslik(r, "PredCs ile karşılaştırma" + (f": {', '.join(map(str, _BD_PC_DONEM))}" if _BD_PC_DONEM else ""), c2=son)
     r += 1
     b = _BD_PC_BILGI
     if _BD_PC_KAYNAK is None:
@@ -1450,46 +1505,63 @@ def _bd_sayfa_predcs():
                 pc_metni += (f"; bunların FPD skoru dolu {_adet(b['n_f'])} olanında PredCs {_bd_yzd(b['g_pc_f'])}, "
                              f"FPD skoru {_bd_yzd(b['g_f'])}")
             pc_metni += "."
+    don_metni = ("PredCs'nin müşterilerin en az yarısında dolu olduğu dönemler alındı: "
+                 f"{', '.join(map(str, _BD_PC_DONEM)) or 'yok'}.")
+    if _BD_PC_ALINMAYAN:
+        don_metni += (" Alınmayanlar (PredCs yalnızca küçük, seçilmiş bir grupta dolu; bütün kitleyi temsil etmez): "
+                      + ", ".join(f"{d} ({_bd_yzd(v)})" for d, v in _BD_PC_ALINMAYAN.items()) + ".")
     esik = _adet(_BD_GEREKLI_PUAN * 100)
     for e, m, yuk in [
         ("Neden", "FPD Karşılaştırma'daki FPD verisinde yalnızca o dönemde FPD tablosunda kaydı olan müşteriler var "
-                  "(aşağıdaki kapsam satırları); eşleşmenin az olması bundandır. PredCs, FPD modelinin df_baz'da bütün "
-                  "müşterilere ürettiği skordur; bu sheet'te modelle bütün kitle üzerinde kıyaslanır.", 32),
-        ("Ne kıyaslanıyor", "Modelin kendi hedefinde (takip / kırmızı), PredCs'si dolu model kitlesi; iki skor aynı "
-                            "müşterilerde. FPD hedefi yalnızca FPD kaydı olanlarda var, bütün kitlede FPD vakası olmadığı "
-                            "için PredCs burada modelin hedefini ne kadar ayırdığıyla ölçülür. Soru: model yerine PredCs "
-                            "yeter mi?", 32),
+                  "(aşağıdaki kapsam satırları); eşleşmenin az olması bundandır. PredCs, FPD modelinin bütün müşterilere "
+                  "ürettiği skordur; bu sheet'te aynı sorular bütün müşteriler üzerinde sorulur.", 32),
+        ("Bölüm 1", "Dönem FPD Karşılaştırma'daki Bölüm 1'in PredCs'li hali. Orada modelin 20 grubunda gerçekleşen FPD "
+                    "oranı yalnızca FPD kaydı olanlarda hesaplanır; burada aynı gruplarda bütün müşterilerin ortalama "
+                    "PredCs'si (FPD modelinin öngördüğü FPD olasılığı) var. Beklenen Gini ve Beklenen Yakalama: FPD, "
+                    "PredCs'nin öngördüğü olasılıkla gerçekleşirse modelin FPD'deki Gini'si ve FPD vakalarının modelin en "
+                    f"riskli %{_BD_RISKLI_YZD}'sinde kalan payı. Lift: en riskli %{_BD_RISKLI_YZD}'nin ortalama PredCs'si / "
+                    "genel ortalama.", 44),
+        ("Bölüm 2", "Modelin kendi hedefinde (takip / kırmızı) model mi PredCs mi daha iyi ayırıyor; iki skor aynı "
+                    "müşterilerde. FPD vakası bütün kitlede olmadığı için burada ölçü modelin hedefidir. Hüküm: Gini farkı "
+                    f"(Model - PredCs) {esik} puan ve üstü MODEL GEREKLİ, 0 ile {esik} arası SINIRDA, 0 ve altı PREDCS "
+                    "YETER. Model Hedefi Olgunlaşmadı ise oranlar eksik gözlenmiştir; Yok ise hedef yoktur.", 32),
+        ("Bölüm 3", "Aynı müşteriler hem PredCs'ye hem modele göre 20 ve 100 eşit gruba ayrıldı (B1 = en riskli). "
+                    "Recall / Precision: bu bucket ve üstü riskli denirse. Recall Farkı artıysa model o kesme noktasında "
+                    "PredCs'den çok vaka yakalıyor. FPD kolonları PredCs'nin kendi hedefinde çalıştığını gösterir.", 32),
         ("PredCs", pc_metni, 32),
-        ("Hüküm", f"Gini farkı (Model - PredCs) {esik} puan ve üstü MODEL GEREKLİ, 0 ile {esik} arası SINIRDA, 0 ve altı "
-                  "PREDCS YETER. Model Hedefi Olgunlaşmadı ise oranlar eksik gözlenmiştir; Yok ise hedef yoktur.", 18),
-        ("Bucketlar", "Aynı müşteriler hem PredCs'ye hem modele göre 20 ve 100 eşit gruba ayrıldı (B1 = en riskli). "
-                      "Recall / Precision: bu bucket ve üstü riskli denirse. Recall Farkı artıysa model o kesme noktasında "
-                      "PredCs'den çok vaka yakalıyor. FPD kolonları PredCs'nin kendi hedefinde çalıştığını gösterir.", 32),
+        ("Dönemler", don_metni, 18),
         ("Kapsam", "Model renklerindeki KK müşterilerinden kaçının FPD tablosunda kaydı, FPD hedefi, FPD skoru ve PredCs'si "
                    "var (dönem dönem aşağıda).", 18),
     ] + [(str(d), m, 18) for d, m in _BD_KAPSAM_METIN.items()]:
         S.satir(r, e, m, yuk)
         r += 1
     r += 1
-    S.baslik(r, "Bölüm 1: Model mi PredCs mi? (modelin hedefinde; PredCs'si dolu bütün kitle)", c2=son)
+    S.baslik(r, "Bölüm 1: Modelin 20 grubunda PredCs (FPD modelinin öngördüğü FPD olasılığı; PredCs'si dolu bütün "
+                "müşteriler)", c2=son)
     r += 1
     if not _BD_T_P1:
-        S.not_satiri(r, "PredCs'si dolu dönem yok; bu sheet yalnızca kapsamı gösteriyor.", c2=son)
+        S.not_satiri(r, "PredCs'nin müşterilerin çoğunda dolu olduğu dönem yok; bu sheet yalnızca kapsamı gösteriyor.",
+                     c2=son)
         _yazdir(ws)
         return ws
     r += 1
     acilis = _bd_acilis_renk(_BD_T_P1)
-    R0, RS, C1 = _bd_tablo(ws, S, r, _BD_K_P1, _BD_G_P1, _BD_T_P1, "Donem_PredCs_Kiyas",
-                           [("seg", 46, 4, N_RENK), ("model", 34, 7, 1), ("vade", 16, 4, 3), ("donem", 40, 4, 2)],
-                           {"seg": acilis})
+    dilim = [("seg", 46, 4, N_RENK), ("model", 34, 7, 1), ("vade", 16, 4, 3), ("donem", 40, 4, 2)]
+    R0, RS, C0 = _bd_tablo(ws, S, r, _BD_K_P0, _BD_G_P0, _BD_T_P1, "Donem_PredCs_Grup", dilim, {"seg": acilis})
+    for rr in range(R0 + 1, RS + 1):
+        ws.conditional_formatting.add(f"{L(C0['pb1'])}{rr}:{L(C0[f'pb{_BD_N_GRUP}'])}{rr}", ColorScaleRule(
+            start_type="min", start_color="FFFFFF", end_type="max", end_color="F8696B"))
+    r = RS + 3
+    S.baslik(r, "Bölüm 2: Model mi PredCs mi? (modelin hedefinde; PredCs'si dolu bütün müşteriler)", c2=son)
+    r += 2
+    R0, RS, C1 = _bd_tablo(ws, S, r, _BD_K_P1, _BD_G_P1, _BD_T_P1, "Donem_PredCs_Kiyas", dilim, {"seg": acilis})
     ws.conditional_formatting.add(f"{L(C1['gfark'])}{R0 + 1}:{L(C1['gfark'])}{RS}", ColorScaleRule(
         start_type="num", start_value=0, start_color="FFFFFF", end_type="num", end_value=0.3, end_color="63BE7B"))
     r = RS + 3
-    S.baslik(r, "Bölüm 2: Bucketlar; PredCs'ye ve modele göre (aynı müşteriler, B1 = en riskli)", c2=son)
+    S.baslik(r, "Bölüm 3: Bucketlar; PredCs'ye ve modele göre (aynı müşteriler, B1 = en riskli)", c2=son)
     r += 2
     R0, RS, C2 = _bd_tablo(ws, S, r, _BD_K_P2, _BD_G_P2, _BD_T_P2, "Donem_PredCs_Bucket",
-                           [("seg", 46, 4, N_RENK), ("model", 34, 7, 1), ("vade", 16, 4, 3), ("donem", 40, 4, 2),
-                            ("nb", 16, 4, 2)], {"seg": acilis, "nb": 20})
+                           dilim + [("nb", 16, 4, 2)], {"seg": acilis, "nb": 20})
     for k in ("p_lift", "m_lift"):
         ws.conditional_formatting.add(f"{L(C2[k])}{R0 + 1}:{L(C2[k])}{RS}", ColorScaleRule(
             start_type="num", start_value=0, start_color="FFFFFF", mid_type="num", mid_value=1, mid_color="FFFFFF",
